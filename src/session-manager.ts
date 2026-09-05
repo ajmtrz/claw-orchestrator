@@ -40,6 +40,7 @@ function getPluginVersion(): string {
 
 const PERSIST_DIR = path.join(os.homedir(), '.openclaw');
 const PERSIST_FILE = path.join(PERSIST_DIR, 'claude-sessions.json');
+const PERSIST_LOCK_FILE = `${PERSIST_FILE}.lock`;
 // PERSIST_DISK_TTL_MS imported from ./constants.js
 
 interface PersistedSession {
@@ -66,21 +67,79 @@ interface PersistedSession {
   agentReleasedSessionId?: string;
 }
 
+const AGENT_FENCE_FIELDS = [
+  'agentGeneration',
+  'agentOwnerInstanceId',
+  'agentSessionId',
+  'agentReleasePending',
+  'agentReleaseOwnerInstanceId',
+  'agentReleasedGeneration',
+  'agentReleasedOwnerInstanceId',
+  'agentReleasedSessionId',
+] as const satisfies ReadonlyArray<keyof PersistedSession>;
+
+function hasAgentFence(session: PersistedSession): boolean {
+  return AGENT_FENCE_FIELDS.some((field) => session[field] !== undefined);
+}
+
+function sameAgentFence(left: PersistedSession, right: PersistedSession): boolean {
+  return AGENT_FENCE_FIELDS.every((field) => left[field] === right[field]);
+}
+
+/**
+ * Merge an ordinary registry snapshot without letting a stale manager publish
+ * or erase Autoloop fencing state. Agent transitions use the locked CAS path;
+ * lifecycle persistence may update only a fence that is still authoritative.
+ */
+function mergeRegistrySnapshot(
+  authoritative: Map<string, PersistedSession>,
+  desired: Map<string, PersistedSession>,
+): Map<string, PersistedSession> {
+  const merged = new Map(desired);
+
+  for (const [name, authoritativeSession] of authoritative) {
+    const desiredSession = desired.get(name);
+    if (!hasAgentFence(authoritativeSession)) {
+      if (desiredSession && hasAgentFence(desiredSession)) merged.set(name, authoritativeSession);
+      continue;
+    }
+    if (!desiredSession || !sameAgentFence(authoritativeSession, desiredSession)) {
+      merged.set(name, authoritativeSession);
+      continue;
+    }
+
+    const withAuthoritativeFence: PersistedSession = { ...desiredSession };
+    const mutableFence = withAuthoritativeFence as unknown as Record<string, unknown>;
+    for (const field of AGENT_FENCE_FIELDS) {
+      const value = authoritativeSession[field];
+      if (value === undefined) delete mutableFence[field];
+      else mutableFence[field] = value;
+    }
+    merged.set(name, withAuthoritativeFence);
+  }
+
+  for (const [name, desiredSession] of desired) {
+    if (!authoritative.has(name) && hasAgentFence(desiredSession)) merged.delete(name);
+  }
+  return merged;
+}
+
 function loadPersistedSessions(): Map<string, PersistedSession> {
   try {
     if (!fs.existsSync(PERSIST_FILE)) return new Map();
     const raw = fs.readFileSync(PERSIST_FILE, 'utf8');
     const arr: PersistedSession[] = JSON.parse(raw);
     const now = Date.now();
-    // Filter out entries older than disk TTL
-    const valid = arr.filter((s) => now - s.lastActivity < PERSIST_DISK_TTL_MS);
+    // A durable generation fence cannot expire merely because its ordinary
+    // resumable-session metadata is old. Recovery must explicitly release it.
+    const valid = arr.filter((s) => hasAgentFence(s) || now - s.lastActivity < PERSIST_DISK_TTL_MS);
     return new Map(valid.map((s) => [s.name, s]));
   } catch {
     return new Map();
   }
 }
 
-// Atomic write: write to .tmp then rename to avoid corrupt reads on crash
+// Atomic write used only while PERSIST_LOCK_FILE is held.
 function savePersistedSessions(sessions: Map<string, PersistedSession>, logger?: Logger): boolean {
   try {
     fs.mkdirSync(PERSIST_DIR, { recursive: true });
@@ -93,32 +152,6 @@ function savePersistedSessions(sessions: Map<string, PersistedSession>, logger?:
     (logger || createConsoleLogger('SessionManager')).warn('Failed to persist sessions:', (err as Error).message);
     return false;
   }
-}
-
-// Async version for hot-path (sendMessage, TTL cleanup)
-function savePersistedSessionsAsync(sessions: Map<string, PersistedSession>, logger?: Logger): void {
-  const log = logger || createConsoleLogger('SessionManager');
-  const arr = Array.from(sessions.values());
-  const tmp = PERSIST_FILE + '.tmp';
-  fs.mkdir(PERSIST_DIR, { recursive: true }, (mkdirErr) => {
-    if (mkdirErr) {
-      log.error('Failed to create persist dir:', mkdirErr.message);
-      return;
-    }
-    fs.writeFile(tmp, JSON.stringify(arr, null, 2), (writeErr) => {
-      if (writeErr) {
-        log.error('Failed to write session file:', writeErr.message);
-        return;
-      }
-      fs.rename(tmp, PERSIST_FILE, (renameErr) => {
-        if (renameErr) {
-          log.error('Failed to rename session file:', renameErr.message);
-          // Clean up orphan tmp file
-          fs.unlink(tmp, () => {});
-        }
-      });
-    });
-  });
 }
 
 // Debounce helper — coalesces rapid writes into one
@@ -136,6 +169,7 @@ function makeDebounced(fn: () => void, ms: number): () => void {
 import { type Logger, createConsoleLogger } from './logger.js';
 import { CircuitBreaker } from './circuit-breaker.js';
 import { detectRepoLang } from './kernel/repo.js';
+import { withFileLock } from './kernel/file-lock.js';
 import { RunKernel, runDir as kernelRunDir } from './kernel/engine.js';
 import { registerDefaultExecutors } from './kernel/nodes/index.js';
 import { autoloopStateFromRecord, makeAutoloopExecutor, type AutoloopHandle } from './kernel/nodes/autoloop.js';
@@ -520,6 +554,7 @@ function validateAutoloopRole(
 }
 
 export class SessionManager implements AgentRuntimeProbe {
+  private static liveAutoloopOwnerInstanceIds = new Set<string>();
   private sessions = new Map<string, ManagedSession>();
   private _pendingSessions = new Map<string, Promise<SessionInfo>>();
   readonly autoloopOwnerInstanceId = `session-manager:${process.pid}:${randomUUID()}`;
@@ -559,13 +594,13 @@ export class SessionManager implements AgentRuntimeProbe {
 
     // Load persisted session registry from disk
     this.persistedSessions = loadPersistedSessions();
+    SessionManager.liveAutoloopOwnerInstanceIds.add(this.autoloopOwnerInstanceId);
     // Clean up orphaned child processes from a previous unclean exit
     this._cleanupOrphanedPids();
-    // Debounced async writer — at most one write per 5 seconds on hot paths
-    this._debouncedSave = makeDebounced(
-      () => savePersistedSessionsAsync(this.persistedSessions, this.logger),
-      DEBOUNCED_SAVE_MS,
-    );
+    // Debounced writer — at most one write per 5 seconds on hot paths. The
+    // eventual write still enters the shared registry lock so it cannot race a
+    // generation transition from another process.
+    this._debouncedSave = makeDebounced(() => this._persistRegistrySnapshot(), DEBOUNCED_SAVE_MS);
 
     // Start TTL cleanup timer
     this.cleanupTimer = setInterval(() => this._cleanupIdleSessions(), CLEANUP_INTERVAL_MS);
@@ -622,6 +657,48 @@ export class SessionManager implements AgentRuntimeProbe {
 
   // ─── Session Lifecycle ─────────────────────────────────────────────────
 
+  private _syncPersistedSessions(authoritative: Map<string, PersistedSession>): void {
+    this.persistedSessions.clear();
+    for (const [name, session] of authoritative) this.persistedSessions.set(name, session);
+  }
+
+  private _withAgentRegistryLock<T>(
+    operation: (authoritative: Map<string, PersistedSession>) => {
+      value: T;
+      updatedSessions?: Map<string, PersistedSession>;
+    },
+  ): { ok: true; value: T } | { ok: false } {
+    let visibleSessions: Map<string, PersistedSession> | undefined;
+    const locked = withFileLock(
+      PERSIST_LOCK_FILE,
+      () => {
+        const authoritative = loadPersistedSessions();
+        const result = operation(authoritative);
+        const updated = result.updatedSessions;
+        if (updated && !savePersistedSessions(updated, this.logger)) {
+          visibleSessions = authoritative;
+          return { persisted: false, value: result.value };
+        }
+        visibleSessions = updated ?? authoritative;
+        return { persisted: true, value: result.value };
+      },
+      { createParent: true },
+    );
+    if (!locked.ok) return { ok: false };
+    this._syncPersistedSessions(visibleSessions!);
+    if (!locked.value.persisted) return { ok: false };
+    return { ok: true, value: locked.value.value };
+  }
+
+  private _persistRegistrySnapshot(): boolean {
+    const desired = new Map(this.persistedSessions);
+    const transaction = this._withAgentRegistryLock((authoritative) => ({
+      value: true,
+      updatedSessions: mergeRegistrySnapshot(authoritative, desired),
+    }));
+    return transaction.ok && transaction.value;
+  }
+
   /**
    * Atomically reserve an Autoloop physical name for one durable generation.
    * The existing session registry is the reservation store; no parallel
@@ -638,53 +715,53 @@ export class SessionManager implements AgentRuntimeProbe {
       return false;
     }
 
-    const existing = this.persistedSessions.get(generation.session_name);
-    if (existing?.agentReleasePending) return false;
-    if (existing?.agentGeneration !== undefined) {
-      return (
-        existing.agentGeneration === generation.generation &&
-        existing.agentOwnerInstanceId === generation.owner_instance_id &&
-        existing.agentSessionId === generation.session_id
-      );
-    }
-    if (existing && existing.agentReleasedGeneration === undefined) {
-      // Legacy registry-only entries must be explicitly released as generation
-      // zero before they can be converted into a fenced reservation.
-      return false;
-    }
-    if (
-      existing?.agentReleasedGeneration !== undefined &&
-      generation.generation !== existing.agentReleasedGeneration + 1
-    ) {
-      return false;
-    }
+    const transaction = this._withAgentRegistryLock((authoritative) => {
+      const existing = authoritative.get(generation.session_name);
+      if (existing?.agentReleasePending) return { value: false };
+      if (existing?.agentGeneration !== undefined) {
+        return {
+          value:
+            existing.agentGeneration === generation.generation &&
+            existing.agentOwnerInstanceId === generation.owner_instance_id &&
+            existing.agentSessionId === generation.session_id,
+        };
+      }
+      if (existing && existing.agentReleasedGeneration === undefined) {
+        // Legacy registry-only entries must be explicitly released as
+        // generation zero before they can become a fenced reservation.
+        return { value: false };
+      }
+      if (
+        existing?.agentReleasedGeneration !== undefined &&
+        generation.generation !== existing.agentReleasedGeneration + 1
+      ) {
+        return { value: false };
+      }
 
-    const observedAt = Date.parse(generation.last_activity_at);
-    this.persistedSessions.set(generation.session_name, {
-      name: generation.session_name,
-      claudeSessionId: existing?.claudeSessionId ?? '',
-      cwd: existing?.cwd ?? cwd,
-      model: existing?.model,
-      engine: existing?.engine,
-      sandboxMode: existing?.sandboxMode,
-      originalCreated: existing?.originalCreated ?? generation.created_at,
-      lastResumed: existing?.lastResumed ?? generation.created_at,
-      lastActivity: Number.isNaN(observedAt) ? Date.now() : observedAt,
-      agentGeneration: generation.generation,
-      agentOwnerInstanceId: generation.owner_instance_id,
-      agentSessionId: generation.session_id,
-      agentReleasePending: undefined,
-      agentReleaseOwnerInstanceId: undefined,
-      agentReleasedGeneration: existing?.agentReleasedGeneration,
-      agentReleasedOwnerInstanceId: existing?.agentReleasedOwnerInstanceId,
-      agentReleasedSessionId: existing?.agentReleasedSessionId,
+      const observedAt = Date.parse(generation.last_activity_at);
+      const updatedSessions = new Map(authoritative);
+      updatedSessions.set(generation.session_name, {
+        name: generation.session_name,
+        claudeSessionId: existing?.claudeSessionId ?? '',
+        cwd: existing?.cwd ?? cwd,
+        model: existing?.model,
+        engine: existing?.engine,
+        sandboxMode: existing?.sandboxMode,
+        originalCreated: existing?.originalCreated ?? generation.created_at,
+        lastResumed: existing?.lastResumed ?? generation.created_at,
+        lastActivity: Number.isNaN(observedAt) ? Date.now() : observedAt,
+        agentGeneration: generation.generation,
+        agentOwnerInstanceId: generation.owner_instance_id,
+        agentSessionId: generation.session_id,
+        agentReleasePending: undefined,
+        agentReleaseOwnerInstanceId: undefined,
+        agentReleasedGeneration: existing?.agentReleasedGeneration,
+        agentReleasedOwnerInstanceId: existing?.agentReleasedOwnerInstanceId,
+        agentReleasedSessionId: existing?.agentReleasedSessionId,
+      });
+      return { value: true, updatedSessions };
     });
-    if (!savePersistedSessions(this.persistedSessions, this.logger)) {
-      if (existing) this.persistedSessions.set(generation.session_name, existing);
-      else this.persistedSessions.delete(generation.session_name);
-      return false;
-    }
-    return true;
+    return transaction.ok && transaction.value;
   }
 
   /** Inspect only runtime/session-registry facts for one physical name. */
@@ -727,6 +804,18 @@ export class SessionManager implements AgentRuntimeProbe {
       return 'unknown';
     }
 
+    if (entry.ownerPid === process.pid) {
+      const locallyOwnedPid = this._activePids.get(sessionName);
+      if (locallyOwnedPid !== undefined) {
+        if (locallyOwnedPid !== entry.pid) return 'unknown';
+        return this._probePidLiveness(entry.pid);
+      }
+      // A host-shared file can retain an entry written by an earlier manager
+      // instance in this same process. The process being alive is not proof
+      // that this manager still owns the child.
+      return this._probePidLiveness(entry.pid) === 'absent' ? 'absent' : 'unknown';
+    }
+
     const ownerLiveness = this._probePidLiveness(entry.ownerPid);
     if (ownerLiveness === 'live') return 'live';
     if (ownerLiveness === 'unknown') return 'unknown';
@@ -742,6 +831,19 @@ export class SessionManager implements AgentRuntimeProbe {
     }
   }
 
+  private _inspectReleaseOwner(ownerInstanceId: string): AgentRuntimeLiveness {
+    if (SessionManager.liveAutoloopOwnerInstanceIds.has(ownerInstanceId)) return 'live';
+    const match = /^session-manager:(\d+):[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.exec(ownerInstanceId);
+    if (!match) return 'unknown';
+    const ownerPid = Number(match[1]);
+    if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) return 'unknown';
+    // A same-process owner absent from the local live-owner set completed
+    // shutdown. Merely probing our own process would otherwise make the stale
+    // owner look live forever.
+    if (ownerPid === process.pid) return 'absent';
+    return this._probePidLiveness(ownerPid);
+  }
+
   /**
    * Compare-and-release a name reservation. Active or in-flight sessions are
    * never released, and a stale generation cannot release its replacement.
@@ -749,107 +851,123 @@ export class SessionManager implements AgentRuntimeProbe {
   async releaseReservation(
     sessionName: string,
     expectedGeneration: number,
-    options: AgentReservationReleaseOptions = {},
+    options: AgentReservationReleaseOptions,
   ): Promise<boolean> {
     if (this.sessions.has(sessionName) || this._pendingSessions.has(sessionName)) return false;
-    const existing = this.persistedSessions.get(sessionName);
-    if (!existing) return false;
 
     if (options.rollbackUncommittedReservation) {
-      if (
-        existing.agentReleasePending ||
-        existing.agentGeneration !== expectedGeneration ||
-        options.expectedOwnerInstanceId === undefined ||
-        existing.agentOwnerInstanceId !== options.expectedOwnerInstanceId ||
-        options.expectedSessionId === undefined ||
-        existing.agentSessionId !== options.expectedSessionId
-      ) {
-        return false;
-      }
-      if (existing.agentReleasedGeneration === undefined) {
-        this.persistedSessions.delete(sessionName);
-      } else {
-        this.persistedSessions.set(sessionName, {
-          ...existing,
-          agentGeneration: undefined,
-          agentOwnerInstanceId: undefined,
-          agentSessionId: undefined,
-          agentReleasePending: undefined,
-          agentReleaseOwnerInstanceId: undefined,
-        });
-      }
-      if (!savePersistedSessions(this.persistedSessions, this.logger)) {
-        this.persistedSessions.set(sessionName, existing);
-        return false;
-      }
-      return true;
-    }
-
-    if (
-      existing.agentGeneration === undefined &&
-      existing.agentReleasePending !== true &&
-      existing.agentReleasedGeneration !== undefined
-    ) {
-      if (existing.agentReleasedGeneration !== expectedGeneration) return false;
-      const hasFullReleasedTuple =
-        existing.agentReleasedOwnerInstanceId !== undefined && existing.agentReleasedSessionId !== undefined;
-      if (
-        hasFullReleasedTuple &&
-        (existing.agentReleasedOwnerInstanceId !== options.expectedOwnerInstanceId ||
-          existing.agentReleasedSessionId !== options.expectedSessionId)
-      ) {
-        return false;
-      }
-      return true;
+      const rollback = this._withAgentRegistryLock((authoritative) => {
+        const existing = authoritative.get(sessionName);
+        if (
+          !existing ||
+          existing.agentReleasePending ||
+          existing.agentGeneration !== expectedGeneration ||
+          options.expectedOwnerInstanceId === undefined ||
+          existing.agentOwnerInstanceId !== options.expectedOwnerInstanceId ||
+          options.expectedSessionId === undefined ||
+          existing.agentSessionId !== options.expectedSessionId
+        ) {
+          return { value: false };
+        }
+        const updatedSessions = new Map(authoritative);
+        if (existing.agentReleasedGeneration === undefined) {
+          updatedSessions.delete(sessionName);
+        } else {
+          updatedSessions.set(sessionName, {
+            ...existing,
+            agentGeneration: undefined,
+            agentOwnerInstanceId: undefined,
+            agentSessionId: undefined,
+            agentReleasePending: undefined,
+            agentReleaseOwnerInstanceId: undefined,
+          });
+        }
+        return { value: true, updatedSessions };
+      });
+      return rollback.ok && rollback.value;
     }
 
     const activeTupleMatches = (reservation: PersistedSession): boolean =>
       reservation.agentGeneration === expectedGeneration &&
       reservation.agentOwnerInstanceId === options.expectedOwnerInstanceId &&
       reservation.agentSessionId === options.expectedSessionId;
+    const claim = this._withAgentRegistryLock((authoritative) => {
+      const existing = authoritative.get(sessionName);
+      if (!existing) return { value: 'rejected' as const };
 
-    let pending: PersistedSession;
-    if (existing.agentReleasePending) {
       if (
-        !activeTupleMatches(existing) ||
-        options.releaseOwnerInstanceId === undefined ||
-        existing.agentReleaseOwnerInstanceId !== options.releaseOwnerInstanceId
+        existing.agentGeneration === undefined &&
+        existing.agentReleasePending !== true &&
+        existing.agentReleasedGeneration !== undefined
       ) {
-        return false;
+        if (existing.agentReleasedGeneration !== expectedGeneration) {
+          return { value: 'rejected' as const };
+        }
+        if (
+          (existing.agentReleasedOwnerInstanceId !== undefined &&
+            existing.agentReleasedOwnerInstanceId !== options.expectedOwnerInstanceId) ||
+          (existing.agentReleasedSessionId !== undefined &&
+            existing.agentReleasedSessionId !== options.expectedSessionId)
+        ) {
+          return { value: 'rejected' as const };
+        }
+        return { value: 'idempotent' as const };
       }
-      pending = existing;
-    } else if (existing.agentGeneration !== undefined) {
-      if (!activeTupleMatches(existing) || !options.releaseOwnerInstanceId) return false;
-      pending = {
-        ...existing,
-        agentReleasePending: true,
-        agentReleaseOwnerInstanceId: options.releaseOwnerInstanceId,
-      };
-      this.persistedSessions.set(sessionName, pending);
-      if (!savePersistedSessions(this.persistedSessions, this.logger)) {
-        this.persistedSessions.set(sessionName, existing);
-        return false;
+
+      if (existing.agentReleasePending) {
+        if (!activeTupleMatches(existing) || !options.releaseOwnerInstanceId) {
+          return { value: 'rejected' as const };
+        }
+        const priorReleaseOwner = existing.agentReleaseOwnerInstanceId;
+        if (priorReleaseOwner === options.releaseOwnerInstanceId) return { value: 'claimed' as const };
+        if (priorReleaseOwner !== undefined && this._inspectReleaseOwner(priorReleaseOwner) !== 'absent') {
+          return { value: 'rejected' as const };
+        }
+        const updatedSessions = new Map(authoritative);
+        updatedSessions.set(sessionName, {
+          ...existing,
+          agentReleaseOwnerInstanceId: options.releaseOwnerInstanceId,
+        });
+        return { value: 'claimed' as const, updatedSessions };
       }
-    } else {
+
+      if (existing.agentGeneration !== undefined) {
+        if (!activeTupleMatches(existing) || !options.releaseOwnerInstanceId) {
+          return { value: 'rejected' as const };
+        }
+        const updatedSessions = new Map(authoritative);
+        updatedSessions.set(sessionName, {
+          ...existing,
+          agentReleasePending: true,
+          agentReleaseOwnerInstanceId: options.releaseOwnerInstanceId,
+        });
+        return { value: 'claimed' as const, updatedSessions };
+      }
+
       // A pre-generation registry entry is fenced as generation zero instead
       // of being deleted, so a crash cannot expose its name between evidence
       // writes.
-      if (expectedGeneration !== 0) return false;
-      if (options.expectedOwnerInstanceId !== 'legacy-registry' || !options.releaseOwnerInstanceId) return false;
-      pending = {
+      if (
+        expectedGeneration !== 0 ||
+        options.expectedOwnerInstanceId !== 'legacy-registry' ||
+        !Object.prototype.hasOwnProperty.call(options, 'expectedSessionId') ||
+        !options.releaseOwnerInstanceId
+      ) {
+        return { value: 'rejected' as const };
+      }
+      const updatedSessions = new Map(authoritative);
+      updatedSessions.set(sessionName, {
         ...existing,
         agentGeneration: 0,
         agentOwnerInstanceId: options.expectedOwnerInstanceId,
         agentSessionId: options.expectedSessionId,
         agentReleasePending: true,
         agentReleaseOwnerInstanceId: options.releaseOwnerInstanceId,
-      };
-      this.persistedSessions.set(sessionName, pending);
-      if (!savePersistedSessions(this.persistedSessions, this.logger)) {
-        this.persistedSessions.set(sessionName, existing);
-        return false;
-      }
-    }
+      });
+      return { value: 'claimed' as const, updatedSessions };
+    });
+    if (!claim.ok || claim.value === 'rejected') return false;
+    if (claim.value === 'idempotent') return true;
 
     options.beforeRelease?.();
 
@@ -859,31 +977,30 @@ export class SessionManager implements AgentRuntimeProbe {
     if (!options.persistReleaseEvidence) return false;
     options.persistReleaseEvidence();
 
-    const stillPending = this.persistedSessions.get(sessionName);
-    if (
-      !stillPending?.agentReleasePending ||
-      !activeTupleMatches(stillPending) ||
-      stillPending.agentReleaseOwnerInstanceId !== options.releaseOwnerInstanceId
-    ) {
-      return false;
-    }
-    const completed: PersistedSession = {
-      ...stillPending,
-      agentGeneration: undefined,
-      agentOwnerInstanceId: undefined,
-      agentSessionId: undefined,
-      agentReleasePending: undefined,
-      agentReleaseOwnerInstanceId: undefined,
-      agentReleasedGeneration: expectedGeneration,
-      agentReleasedOwnerInstanceId: stillPending.agentOwnerInstanceId,
-      agentReleasedSessionId: stillPending.agentSessionId,
-    };
-    this.persistedSessions.set(sessionName, completed);
-    if (!savePersistedSessions(this.persistedSessions, this.logger)) {
-      this.persistedSessions.set(sessionName, stillPending);
-      return false;
-    }
-    return true;
+    const completion = this._withAgentRegistryLock((authoritative) => {
+      const stillPending = authoritative.get(sessionName);
+      if (
+        !stillPending?.agentReleasePending ||
+        !activeTupleMatches(stillPending) ||
+        stillPending.agentReleaseOwnerInstanceId !== options.releaseOwnerInstanceId
+      ) {
+        return { value: false };
+      }
+      const updatedSessions = new Map(authoritative);
+      updatedSessions.set(sessionName, {
+        ...stillPending,
+        agentGeneration: undefined,
+        agentOwnerInstanceId: undefined,
+        agentSessionId: undefined,
+        agentReleasePending: undefined,
+        agentReleaseOwnerInstanceId: undefined,
+        agentReleasedGeneration: expectedGeneration,
+        agentReleasedOwnerInstanceId: stillPending.agentOwnerInstanceId,
+        agentReleasedSessionId: stillPending.agentSessionId,
+      });
+      return { value: true, updatedSessions };
+    });
+    return completion.ok && completion.value;
   }
 
   async startSession(
@@ -1513,7 +1630,7 @@ export class SessionManager implements AgentRuntimeProbe {
       } else {
         this.persistedSessions.delete(name);
       }
-      savePersistedSessions(this.persistedSessions, this.logger);
+      this._persistRegistrySnapshot();
     }
   }
 
@@ -1973,7 +2090,8 @@ export class SessionManager implements AgentRuntimeProbe {
       this._proxyPort = null;
     }
     // Persist final state (TTL-expired sessions already removed by cleanup)
-    savePersistedSessions(this.persistedSessions, this.logger);
+    this._persistRegistrySnapshot();
+    SessionManager.liveAutoloopOwnerInstanceIds.delete(this.autoloopOwnerInstanceId);
   }
 
   // ─── Codex /goal helpers (codex-app engine only) ─────────────────────
@@ -3919,7 +4037,12 @@ export class SessionManager implements AgentRuntimeProbe {
       this.persistedSessions.delete(`autoloop-${runId}-planner`);
       this.persistedSessions.delete(`autoloop-${runId}-coder`);
       this.persistedSessions.delete(`autoloop-${runId}-reviewer`);
-      savePersistedSessions(this.persistedSessions, this.logger);
+      const names = [`autoloop-${runId}-planner`, `autoloop-${runId}-coder`, `autoloop-${runId}-reviewer`];
+      this._withAgentRegistryLock((authoritative) => {
+        const updatedSessions = new Map(authoritative);
+        for (const name of names) updatedSessions.delete(name);
+        return { value: true, updatedSessions };
+      });
     }
     // No registry to scrub: the run record IS the registry, and removing it is
     // the delete. The ledger directory under tasks/<runId>/ is deliberately left
@@ -3976,6 +4099,6 @@ export class SessionManager implements AgentRuntimeProbe {
         pruned = true;
       }
     }
-    if (pruned) savePersistedSessionsAsync(this.persistedSessions);
+    if (pruned) this._persistRegistrySnapshot();
   }
 }

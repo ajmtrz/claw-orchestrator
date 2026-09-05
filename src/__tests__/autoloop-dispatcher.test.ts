@@ -15,7 +15,12 @@ import { ClaudeAgentDispatcher } from '../autoloop/dispatcher.js';
 import { AutoloopRunner } from '../autoloop/runner.js';
 import { type AnyAutoloopMessage, Msg } from '../autoloop/messages.js';
 import type { SessionManager } from '../session-manager.js';
-import type { AutoloopState, PhysicalAgentGeneration, PushPolicy } from '../autoloop/types.js';
+import type {
+  AgentReservationReleaseOptions,
+  AutoloopState,
+  PhysicalAgentGeneration,
+  PushPolicy,
+} from '../autoloop/types.js';
 import { DEFAULT_PUSH_POLICY, LEDGER_SCHEMA_VERSION } from '../autoloop/types.js';
 
 interface StubCalls {
@@ -27,15 +32,6 @@ interface StubCalls {
   reserveAgentGeneration: ReturnType<typeof vi.fn>;
   getStatus: ReturnType<typeof vi.fn>;
   compactSession: ReturnType<typeof vi.fn>;
-}
-
-interface ReleaseReservationOptions {
-  expectedOwnerInstanceId?: string;
-  expectedSessionId?: string;
-  releaseOwnerInstanceId?: string;
-  rollbackUncommittedReservation?: boolean;
-  beforeRelease?: () => void;
-  persistReleaseEvidence?: () => void;
 }
 
 function makeStubManager(
@@ -88,7 +84,7 @@ function makeStubManager(
       return activeNames.has(name) ? 'live' : 'absent';
     }),
     releaseReservation: vi.fn(
-      async (name: string, expectedGeneration: number, options: ReleaseReservationOptions = {}) => {
+      async (name: string, expectedGeneration: number, options: AgentReservationReleaseOptions) => {
         if (options.rollbackUncommittedReservation) {
           const reservation = reservations.get(name);
           if (
@@ -381,6 +377,45 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
     ]);
   });
 
+  it('surfaces a typed rollback postcondition failure when append and rollback persistence both fail', async () => {
+    const { dispatcher, calls, ledgerDir, reservations } = makeDispatcher({
+      ownerInstanceId: 'owner-new',
+      now: () => new Date(AGENT_NOW),
+    });
+    const generationsPath = path.join(ledgerDir, 'agent-generations.jsonl');
+    const reserveAgentGeneration = calls.reserveAgentGeneration.getMockImplementation()!;
+    calls.reserveAgentGeneration.mockImplementationOnce((generation: PhysicalAgentGeneration) => {
+      const reserved = reserveAgentGeneration(generation);
+      fs.mkdirSync(generationsPath, { recursive: true });
+      return reserved;
+    });
+    const releaseReservation = calls.releaseReservation.getMockImplementation()!;
+    calls.releaseReservation.mockImplementation(
+      async (name: string, generation: number, options: AgentReservationReleaseOptions) => {
+        if (options.rollbackUncommittedReservation) return false;
+        return await releaseReservation(name, generation, options);
+      },
+    );
+
+    let failure: unknown;
+    try {
+      await dispatcher.init(state);
+    } catch (err) {
+      failure = err;
+    }
+    fs.rmSync(generationsPath, { recursive: true });
+
+    expect(failure).toMatchObject({
+      name: 'AutoloopAgentConflictError',
+      code: 'AUTOLOOP_AGENT_ROLLBACK_POSTCONDITION_FAILED',
+      cause: expect.objectContaining({ code: 'EISDIR' }),
+    });
+    expect((failure as Error).message).toContain('could not roll back uncommitted generation 1');
+    expect(reservations.has('autoloop-r1-planner')).toBe(true);
+    expect(calls.startSession).not.toHaveBeenCalled();
+    expect(readGenerationEvents(ledgerDir)).toEqual([]);
+  });
+
   it('keeps a genuinely live conflicting owner as a typed hard stop', async () => {
     const { dispatcher, calls, ledgerDir, activeNames, reservations } = makeDispatcher({
       ownerInstanceId: 'owner-new',
@@ -443,35 +478,37 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
     reservations.set(current.session_name, current);
     const releaseReservation = calls.releaseReservation.getMockImplementation()!;
     let competingReservation: boolean | undefined;
-    calls.releaseReservation.mockImplementationOnce(async (name, generation, options = {}) => {
-      if (!options.persistReleaseEvidence) {
-        // Pre-fix behavior released the registry here, then appended release
-        // evidence after this call returned.
-        reservations.delete(name);
-        competingReservation = calls.reserveAgentGeneration(competing);
-        expect(competingReservation).toBe(false);
-        return true;
-      }
-      expect(options.persistReleaseEvidence).toBeTypeOf('function');
-      return await releaseReservation(name, generation, {
-        ...options,
-        beforeRelease: () => {
-          options.beforeRelease?.();
-          expect(readGenerationEvents(ledgerDir).map((entry) => entry.kind)).toEqual([
-            'agent_generation_started',
-            'agent_generation_orphaned',
-          ]);
-        },
-        persistReleaseEvidence: () => {
-          expect(readGenerationEvents(ledgerDir).map((entry) => entry.kind)).toEqual([
-            'agent_generation_started',
-            'agent_generation_orphaned',
-          ]);
+    calls.releaseReservation.mockImplementationOnce(
+      async (name, generation, options: AgentReservationReleaseOptions) => {
+        if (!options.persistReleaseEvidence) {
+          // Pre-fix behavior released the registry here, then appended release
+          // evidence after this call returned.
+          reservations.delete(name);
           competingReservation = calls.reserveAgentGeneration(competing);
-          options.persistReleaseEvidence?.();
-        },
-      });
-    });
+          expect(competingReservation).toBe(false);
+          return true;
+        }
+        expect(options.persistReleaseEvidence).toBeTypeOf('function');
+        return await releaseReservation(name, generation, {
+          ...options,
+          beforeRelease: () => {
+            options.beforeRelease?.();
+            expect(readGenerationEvents(ledgerDir).map((entry) => entry.kind)).toEqual([
+              'agent_generation_started',
+              'agent_generation_orphaned',
+            ]);
+          },
+          persistReleaseEvidence: () => {
+            expect(readGenerationEvents(ledgerDir).map((entry) => entry.kind)).toEqual([
+              'agent_generation_started',
+              'agent_generation_orphaned',
+            ]);
+            competingReservation = calls.reserveAgentGeneration(competing);
+            options.persistReleaseEvidence?.();
+          },
+        });
+      },
+    );
 
     await dispatcher.init(state);
 
@@ -518,27 +555,29 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
     });
     const releaseReservation = calls.releaseReservation.getMockImplementation()!;
     let competingReservation: boolean | undefined;
-    calls.releaseReservation.mockImplementationOnce(async (name, generation, options = {}) => {
-      if (!options.persistReleaseEvidence) {
-        // The legacy pre-fix path entered registry release before orphan
-        // evidence existed; assert at that actual call boundary.
-        expect(readGenerationEvents(ledgerDir).map((entry) => entry.kind)).toEqual(['agent_generation_orphaned']);
-        return true;
-      }
-      expect(options.persistReleaseEvidence).toBeTypeOf('function');
-      return await releaseReservation(name, generation, {
-        ...options,
-        beforeRelease: () => {
-          options.beforeRelease?.();
+    calls.releaseReservation.mockImplementationOnce(
+      async (name, generation, options: AgentReservationReleaseOptions) => {
+        if (!options.persistReleaseEvidence) {
+          // The legacy pre-fix path entered registry release before orphan
+          // evidence existed; assert at that actual call boundary.
           expect(readGenerationEvents(ledgerDir).map((entry) => entry.kind)).toEqual(['agent_generation_orphaned']);
-        },
-        persistReleaseEvidence: () => {
-          expect(readGenerationEvents(ledgerDir).map((entry) => entry.kind)).toEqual(['agent_generation_orphaned']);
-          competingReservation = calls.reserveAgentGeneration(competing);
-          options.persistReleaseEvidence?.();
-        },
-      });
-    });
+          return true;
+        }
+        expect(options.persistReleaseEvidence).toBeTypeOf('function');
+        return await releaseReservation(name, generation, {
+          ...options,
+          beforeRelease: () => {
+            options.beforeRelease?.();
+            expect(readGenerationEvents(ledgerDir).map((entry) => entry.kind)).toEqual(['agent_generation_orphaned']);
+          },
+          persistReleaseEvidence: () => {
+            expect(readGenerationEvents(ledgerDir).map((entry) => entry.kind)).toEqual(['agent_generation_orphaned']);
+            competingReservation = calls.reserveAgentGeneration(competing);
+            options.persistReleaseEvidence?.();
+          },
+        });
+      },
+    );
 
     await dispatcher.init(state);
 
@@ -589,9 +628,10 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
     const current = physicalGeneration('planner');
     appendGenerationEvent(ledgerDir, 'agent_generation_started', current);
     reservations.set(current.session_name, current);
+    const before = structuredClone(reservations.get(current.session_name));
     let orphanCallbackProvided = false;
     calls.releaseReservation.mockImplementationOnce(
-      async (_name, _generation, options: ReleaseReservationOptions = {}) => {
+      async (_name, _generation, options: AgentReservationReleaseOptions) => {
         orphanCallbackProvided = options.beforeRelease !== undefined;
         return false;
       },
@@ -601,6 +641,8 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
 
     expect(orphanCallbackProvided).toBe(true);
     expect(readGenerationEvents(ledgerDir).map((entry) => entry.kind)).toEqual(['agent_generation_started']);
+    expect(reservations.get(current.session_name)).toEqual(before);
+    expect(calls.reserveAgentGeneration).not.toHaveBeenCalled();
     expect(calls.startSession).not.toHaveBeenCalled();
   });
 
@@ -616,7 +658,7 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
     const savedGenerationsPath = path.join(ledgerDir, 'agent-generations.saved');
     const releaseReservation = calls.releaseReservation.getMockImplementation()!;
     let interruptReleaseEvidence = true;
-    calls.releaseReservation.mockImplementation(async (name, generation, options = {}) => {
+    calls.releaseReservation.mockImplementation(async (name, generation, options: AgentReservationReleaseOptions) => {
       return await releaseReservation(name, generation, {
         ...options,
         persistReleaseEvidence: () => {

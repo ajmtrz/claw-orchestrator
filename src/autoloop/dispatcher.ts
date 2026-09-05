@@ -238,6 +238,7 @@ type AutoloopAgentConflictCode =
   | 'AUTOLOOP_AGENT_LIVENESS_UNKNOWN'
   | 'AUTOLOOP_AGENT_LEASE_ACTIVE'
   | 'AUTOLOOP_AGENT_GENERATION_CONFLICT'
+  | 'AUTOLOOP_AGENT_ROLLBACK_POSTCONDITION_FAILED'
   | 'AUTOLOOP_AGENT_LEDGER_INVALID';
 
 /** Coalesce physical-agent reconciliation across dispatcher handles owned by this process. */
@@ -247,8 +248,9 @@ export class AutoloopAgentConflictError extends Error {
   constructor(
     readonly code: AutoloopAgentConflictCode,
     message: string,
+    options?: ErrorOptions,
   ) {
-    super(message);
+    super(message, options);
     this.name = 'AutoloopAgentConflictError';
   }
 }
@@ -437,7 +439,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     return this.readGenerationHistory(role).reduce((highest, entry) => Math.max(highest, entry.generation), 0) + 1;
   }
 
-  private newGeneration(role: AutoloopRoleName): PhysicalAgentGeneration {
+  private newGeneration(role: AutoloopRoleName): PhysicalAgentGeneration & { session_id: string } {
     const now = this.now();
     const timestamp = now.toISOString();
     return {
@@ -549,6 +551,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     };
     const released = await this.runtimeProbe.releaseReservation(sessionName, 0, {
       expectedOwnerInstanceId: legacy.owner_instance_id,
+      expectedSessionId: legacy.session_id,
       releaseOwnerInstanceId: this.ownerInstanceId,
       beforeRelease: () => {
         const current = this.currentGeneration(role);
@@ -641,11 +644,29 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     try {
       this.appendGenerationEvent('agent_generation_reserved', generation);
     } catch (err) {
-      await this.runtimeProbe.releaseReservation(generation.session_name, generation.generation, {
-        expectedOwnerInstanceId: generation.owner_instance_id,
-        expectedSessionId: generation.session_id,
-        rollbackUncommittedReservation: true,
-      });
+      let rolledBack = false;
+      let rollbackError: unknown;
+      try {
+        rolledBack = await this.runtimeProbe.releaseReservation(generation.session_name, generation.generation, {
+          expectedOwnerInstanceId: generation.owner_instance_id,
+          expectedSessionId: generation.session_id,
+          rollbackUncommittedReservation: true,
+        });
+      } catch (releaseErr) {
+        rollbackError = releaseErr;
+      }
+      if (!rolledBack) {
+        const appendMessage = err instanceof Error ? err.message : String(err);
+        const rollbackContext =
+          rollbackError === undefined
+            ? ''
+            : `; rollback failed with ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`;
+        throw new AutoloopAgentConflictError(
+          'AUTOLOOP_AGENT_ROLLBACK_POSTCONDITION_FAILED',
+          `Autoloop session name '${generation.session_name}' could not roll back uncommitted generation ${generation.generation} after reservation ledger append failed: ${appendMessage}${rollbackContext}`,
+          { cause: err },
+        );
+      }
       throw err;
     }
     return { generation, reuseLiveSession: false };

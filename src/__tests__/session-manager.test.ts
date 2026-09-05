@@ -20,7 +20,7 @@ import type {
   CostBreakdown,
   EffortLevel,
 } from '../types.js';
-import type { PhysicalAgentGeneration } from '../autoloop/types.js';
+import type { AgentReservationReleaseOptions, PhysicalAgentGeneration } from '../autoloop/types.js';
 
 // ─── Mock ISession ──────────────────────────────────────────────────────────
 
@@ -194,6 +194,10 @@ function patchCreateSession(manager: InstanceType<typeof SessionManager>): void 
 const TEST_WF_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'clawo-sm-wf-'));
 process.env.CLAWO_WF_DIR = TEST_WF_DIR;
 
+const persistenceFsState = vi.hoisted(() => ({
+  files: new Map<string, string>(),
+}));
+
 vi.mock('node:fs', async () => {
   const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
 
@@ -205,19 +209,33 @@ vi.mock('node:fs', async () => {
   // the run store writes its checkpoints through the same `fs`, so a
   // kernel-backed mode looked like it had lost every run. A mock that stubs a
   // whole module to protect two paths is a landmine; this one names them.
-  const PROTECTED = ['claude-sessions.json', 'session-pids.json'];
-  const isProtected = (p: unknown): boolean => typeof p === 'string' && PROTECTED.some((name) => p.includes(name));
+  const isProtectedDataFile = (p: unknown): p is string =>
+    typeof p === 'string' &&
+    (p.endsWith('/claude-sessions.json') ||
+      p.endsWith('/claude-sessions.json.tmp') ||
+      p.endsWith('/session-pids.json'));
+  const missingFile = (p: string): NodeJS.ErrnoException =>
+    Object.assign(new Error(`ENOENT: no such file or directory, open '${p}'`), { code: 'ENOENT' });
 
-  const existsSync = vi.fn((p: string) => (isProtected(p) ? false : actual.existsSync(p)));
-  const readFileSync = vi.fn((p: string, enc?: string) =>
-    isProtected(p) ? '[]' : actual.readFileSync(p, enc as BufferEncoding),
+  const existsSync = vi.fn((p: string) =>
+    isProtectedDataFile(p) ? persistenceFsState.files.has(p) : actual.existsSync(p),
   );
+  const readFileSync = vi.fn((p: string, enc?: string) => {
+    if (!isProtectedDataFile(p)) return actual.readFileSync(p, enc as BufferEncoding);
+    const value = persistenceFsState.files.get(p);
+    if (value === undefined) throw missingFile(p);
+    return value;
+  });
   const writeFileSync = vi.fn((p: unknown, ...rest: unknown[]) => {
-    if (isProtected(p)) return;
+    if (isProtectedDataFile(p)) {
+      const data = rest[0];
+      persistenceFsState.files.set(p, Buffer.isBuffer(data) ? data.toString() : String(data));
+      return;
+    }
     (actual.writeFileSync as (...a: unknown[]) => void)(p, ...rest);
   });
   const appendFileSync = vi.fn((p: unknown, ...rest: unknown[]) => {
-    if (isProtected(p)) return;
+    if (isProtectedDataFile(p)) return;
     (actual.appendFileSync as (...a: unknown[]) => void)(p, ...rest);
   });
   const openSync = vi.fn((p: unknown, ...rest: unknown[]) =>
@@ -227,12 +245,25 @@ vi.mock('node:fs', async () => {
     (actual.writeSync as (...a: unknown[]) => number)(fd, ...rest),
   );
   const mkdirSync = vi.fn((p: unknown, ...rest: unknown[]) => {
-    if (isProtected(p)) return undefined;
     return (actual.mkdirSync as (...a: unknown[]) => string | undefined)(p, ...rest);
   });
   const renameSync = vi.fn((from: unknown, to: unknown) => {
-    if (isProtected(from) || isProtected(to)) return;
+    if (isProtectedDataFile(from) && isProtectedDataFile(to)) {
+      const value = persistenceFsState.files.get(from);
+      if (value === undefined) throw missingFile(from);
+      persistenceFsState.files.set(to, value);
+      persistenceFsState.files.delete(from);
+      return;
+    }
     (actual.renameSync as (...a: unknown[]) => void)(from, to);
+  });
+
+  const unlinkSync = vi.fn((p: unknown) => {
+    if (isProtectedDataFile(p)) {
+      if (!persistenceFsState.files.delete(p)) throw missingFile(p);
+      return;
+    }
+    (actual.unlinkSync as (path: unknown) => void)(p);
   });
 
   const shim = {
@@ -244,12 +275,29 @@ vi.mock('node:fs', async () => {
     writeSync,
     mkdirSync,
     renameSync,
+    unlinkSync,
     // The async persistence path is stubbed wholesale: nothing else in the
     // codebase uses these callback forms.
-    writeFile: vi.fn((_p: unknown, _d: unknown, cb: (err: null) => void) => cb(null)),
-    rename: vi.fn((_o: unknown, _n: unknown, cb: (err: null) => void) => cb(null)),
+    writeFile: vi.fn((p: unknown, data: unknown, cb: (err: null) => void) => {
+      if (isProtectedDataFile(p)) {
+        persistenceFsState.files.set(p, Buffer.isBuffer(data) ? data.toString() : String(data));
+      }
+      cb(null);
+    }),
+    rename: vi.fn((from: unknown, to: unknown, cb: (err: NodeJS.ErrnoException | null) => void) => {
+      if (isProtectedDataFile(from) && isProtectedDataFile(to)) {
+        const value = persistenceFsState.files.get(from);
+        if (value === undefined) return cb(missingFile(from));
+        persistenceFsState.files.set(to, value);
+        persistenceFsState.files.delete(from);
+      }
+      cb(null);
+    }),
     mkdir: vi.fn((_p: unknown, _opts: unknown, cb: (err: null) => void) => cb(null)),
-    unlink: vi.fn((_p: unknown, cb: () => void) => cb()),
+    unlink: vi.fn((p: unknown, cb: () => void) => {
+      if (isProtectedDataFile(p)) persistenceFsState.files.delete(p);
+      cb();
+    }),
   };
 
   return { ...actual, ...shim, default: { ...actual, ...shim } };
@@ -258,6 +306,9 @@ vi.mock('node:fs', async () => {
 // Import AFTER mocking fs
 const { SessionManager } = await import('../session-manager.js');
 const { Msg: AutoloopMsg } = await import('../autoloop/messages.js');
+
+const SESSION_REGISTRY_FILE = path.join(os.homedir(), '.openclaw', 'claude-sessions.json');
+const SESSION_PID_FILE = path.join(os.homedir(), '.openclaw', 'session-pids.json');
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -296,18 +347,27 @@ function managerGeneration(
   };
 }
 
-function mockSharedPidFile(entries: Record<string, unknown>): void {
-  vi.mocked(fs.existsSync).mockReturnValueOnce(true);
-  vi.mocked(fs.readFileSync).mockReturnValueOnce(JSON.stringify(entries) as never);
+function mockSharedPidContents(contents: string): void {
+  persistenceFsState.files.set(SESSION_PID_FILE, contents);
 }
 
-interface ManagerReleaseOptions {
-  expectedOwnerInstanceId?: string;
-  expectedSessionId?: string;
-  releaseOwnerInstanceId?: string;
-  rollbackUncommittedReservation?: boolean;
-  beforeRelease?: () => void;
-  persistReleaseEvidence?: () => void;
+function mockSharedPidFile(entries: Record<string, unknown>): void {
+  mockSharedPidContents(JSON.stringify(entries));
+}
+
+function persistManagerRegistry(manager: InstanceType<typeof SessionManager>): void {
+  const reservations = (
+    manager as unknown as {
+      persistedSessions: Map<string, Record<string, unknown>>;
+    }
+  ).persistedSessions;
+  persistenceFsState.files.set(SESSION_REGISTRY_FILE, JSON.stringify(Array.from(reservations.values())));
+}
+
+type ManagerReleaseOptions = AgentReservationReleaseOptions;
+
+function uncheckedReleaseOptions(options: Record<string, unknown>): ManagerReleaseOptions {
+  return options as unknown as ManagerReleaseOptions;
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -317,6 +377,7 @@ describe('SessionManager', () => {
 
   beforeEach(() => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
+    persistenceFsState.files.clear();
     mockSessions = [];
     createdConfigs = [];
     // Fresh run store per test. These cases use fixed run ids, and the store
@@ -486,6 +547,34 @@ describe('SessionManager', () => {
   });
 
   describe('autoloop agent runtime probe', () => {
+    it('types rollback and normal release as explicit mutually exclusive tuples', () => {
+      const rollback = {
+        rollbackUncommittedReservation: true,
+        expectedOwnerInstanceId: 'reservation-owner',
+        expectedSessionId: 'reservation-session',
+      } satisfies AgentReservationReleaseOptions;
+      const normal = {
+        expectedOwnerInstanceId: 'reservation-owner',
+        expectedSessionId: undefined,
+        releaseOwnerInstanceId: 'release-owner',
+      } satisfies AgentReservationReleaseOptions;
+
+      // @ts-expect-error release without ownership evidence is never valid
+      const empty: AgentReservationReleaseOptions = {};
+      // @ts-expect-error rollback requires the exact physical session
+      const incompleteRollback: AgentReservationReleaseOptions = {
+        rollbackUncommittedReservation: true,
+        expectedOwnerInstanceId: 'reservation-owner',
+      };
+      // @ts-expect-error normal release requires a durable release claimant
+      const incompleteNormal: AgentReservationReleaseOptions = {
+        expectedOwnerInstanceId: 'reservation-owner',
+        expectedSessionId: 'reservation-session',
+      };
+
+      expect([rollback, normal, empty, incompleteRollback, incompleteNormal]).toHaveLength(5);
+    });
+
     it('reports shared PID ownership by another live manager as live', async () => {
       const sessionName = 'autoloop-probe-shared-live-planner';
       mockSharedPidFile({
@@ -512,8 +601,6 @@ describe('SessionManager', () => {
           ownerPid: deadOwnerPid,
           since: '2026-09-05T10:00:00.000Z',
         },
-      });
-      mockSharedPidFile({
         [deadSessionName]: {
           pid: deadChildPid,
           ownerPid: deadOwnerPid,
@@ -523,6 +610,52 @@ describe('SessionManager', () => {
 
       await expect(mgr.inspect(lingeringSessionName)).resolves.toBe('unknown');
       await expect(mgr.inspect(deadSessionName)).resolves.toBe('absent');
+    });
+
+    it('does not infer liveness from a self PID when local ownership evidence is stale', async () => {
+      const deadChildPid = 2_000_000_011;
+      const indeterminateChildPid = 2_000_000_012;
+      const originalKill = process.kill.bind(process);
+      const killSpy = vi.spyOn(process, 'kill').mockImplementation(((pid: number, signal?: number | NodeJS.Signals) => {
+        if (pid === deadChildPid) throw Object.assign(new Error('missing child'), { code: 'ESRCH' });
+        if (pid === indeterminateChildPid) throw Object.assign(new Error('probe denied'), { code: 'EPERM' });
+        return originalKill(pid, signal);
+      }) as typeof process.kill);
+      try {
+        for (const [sessionName, childPid, expected] of [
+          ['autoloop-probe-self-stale-dead', deadChildPid, 'absent'],
+          ['autoloop-probe-self-stale-live', process.ppid, 'unknown'],
+          ['autoloop-probe-self-stale-indeterminate', indeterminateChildPid, 'unknown'],
+        ] as const) {
+          mockSharedPidFile({
+            [sessionName]: {
+              pid: childPid,
+              ownerPid: process.pid,
+              since: '2026-09-05T10:00:00.000Z',
+            },
+          });
+          await expect(mgr.inspect(sessionName)).resolves.toBe(expected);
+        }
+      } finally {
+        killSpy.mockRestore();
+      }
+    });
+
+    it('keeps malformed and incomplete shared PID evidence conservatively unknown', async () => {
+      const sessionName = 'autoloop-probe-malformed-pid-evidence';
+      const malformedInputs = [
+        '{',
+        '[]',
+        '42',
+        JSON.stringify({ [sessionName]: 42 }),
+        JSON.stringify({ [sessionName]: { pid: 1234 } }),
+        JSON.stringify({ [sessionName]: { pid: 0, ownerPid: 'invalid' } }),
+      ];
+
+      for (const contents of malformedInputs) {
+        mockSharedPidContents(contents);
+        await expect(mgr.inspect(sessionName)).resolves.toBe('unknown');
+      }
     });
 
     it('requires the full generation owner and session tuple to release an active reservation', async () => {
@@ -538,18 +671,30 @@ describe('SessionManager', () => {
       for (const [index, tuple] of invalidOptions.entries()) {
         const sessionName = `autoloop-probe-incomplete-tuple-${index}-planner`;
         const generation = managerGeneration(sessionName);
+        const reservations = (
+          mgr as unknown as {
+            persistedSessions: Map<string, Record<string, unknown>>;
+          }
+        ).persistedSessions;
         expect(mgr.reserveAgentGeneration(generation, '/tmp')).toBe(true);
+        const before = structuredClone(reservations.get(sessionName));
         results.push(
-          await mgr.releaseReservation(sessionName, generation.generation, {
-            ...tuple,
-            beforeRelease: () => {
-              evidenceHookCount += 1;
-            },
-            persistReleaseEvidence: () => {
-              evidenceHookCount += 1;
-            },
-          } as ManagerReleaseOptions),
+          await mgr.releaseReservation(
+            sessionName,
+            generation.generation,
+            uncheckedReleaseOptions({
+              ...tuple,
+              beforeRelease: () => {
+                evidenceHookCount += 1;
+              },
+              persistReleaseEvidence: () => {
+                evidenceHookCount += 1;
+              },
+            }),
+          ),
         );
+        expect(reservations.get(sessionName)).toEqual(before);
+        expect(reservations.get(sessionName)).not.toHaveProperty('agentReleasePending');
       }
 
       expect(results).toEqual([false, false, false, false]);
@@ -567,20 +712,57 @@ describe('SessionManager', () => {
 
       expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
       await expect(
-        mgr.releaseReservation(sessionName, first.generation, {
-          expectedOwnerInstanceId: first.owner_instance_id,
-          expectedSessionId: first.session_id,
-          rollbackUncommittedReservation: true,
-          beforeRelease: () => {
-            evidenceHookCount += 1;
-          },
-          persistReleaseEvidence: () => {
-            evidenceHookCount += 1;
-          },
-        } as ManagerReleaseOptions),
+        mgr.releaseReservation(
+          sessionName,
+          first.generation,
+          uncheckedReleaseOptions({
+            expectedOwnerInstanceId: first.owner_instance_id,
+            expectedSessionId: first.session_id,
+            rollbackUncommittedReservation: true,
+            beforeRelease: () => {
+              evidenceHookCount += 1;
+            },
+            persistReleaseEvidence: () => {
+              evidenceHookCount += 1;
+            },
+          }),
+        ),
       ).resolves.toBe(true);
 
       expect(evidenceHookCount).toBe(0);
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(true);
+    });
+
+    it('restores an uncommitted reservation when rollback persistence fails and permits a safe retry', async () => {
+      const sessionName = 'autoloop-probe-uncommitted-rollback-save-failure-planner';
+      const first = managerGeneration(sessionName);
+      const replacement = managerGeneration(sessionName, {
+        session_id: 'replacement-physical-session',
+        owner_instance_id: 'replacement-owner',
+      });
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      const rollbackOptions: AgentReservationReleaseOptions = {
+        rollbackUncommittedReservation: true,
+        expectedOwnerInstanceId: first.owner_instance_id,
+        expectedSessionId: first.session_id!,
+      };
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      const before = structuredClone(reservations.get(sessionName));
+      vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+        throw new Error('rollback registry rename failed');
+      });
+
+      await expect(mgr.releaseReservation(sessionName, first.generation, rollbackOptions)).resolves.toBe(false);
+      expect(reservations.get(sessionName)).toEqual(before);
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(false);
+
+      await expect(mgr.releaseReservation(sessionName, first.generation, rollbackOptions)).resolves.toBe(true);
+      expect(reservations.has(sessionName)).toBe(false);
       expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(true);
     });
 
@@ -602,6 +784,7 @@ describe('SessionManager', () => {
         agentReleasedOwnerInstanceId: 'prior-owner',
         agentReleasedSessionId: 'prior-physical-session',
       });
+      persistManagerRegistry(mgr);
       const uncommitted = managerGeneration(sessionName, {
         generation: 2,
         session_id: 'uncommitted-physical-session',
@@ -645,10 +828,13 @@ describe('SessionManager', () => {
       let mismatchedOrphan = false;
       await expect(
         mgr.releaseReservation(sessionName, 2, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: 'release-owner-mismatch',
           beforeRelease: () => {
             mismatchedOrphan = true;
           },
-        } as ManagerReleaseOptions),
+        }),
       ).resolves.toBe(false);
       expect(mismatchedOrphan).toBe(false);
       expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(false);
@@ -694,13 +880,18 @@ describe('SessionManager', () => {
 
       expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
       const starting = mgr.startSession({ name: sessionName, cwd: '/tmp' }, first);
+      const releaseOptions: ManagerReleaseOptions = {
+        expectedOwnerInstanceId: first.owner_instance_id,
+        expectedSessionId: first.session_id,
+        releaseOwnerInstanceId: 'release-owner-1',
+      };
 
       await expect(mgr.inspect(sessionName, first.session_id)).resolves.toBe('unknown');
-      await expect(mgr.releaseReservation(sessionName, 1)).resolves.toBe(false);
+      await expect(mgr.releaseReservation(sessionName, 1, releaseOptions)).resolves.toBe(false);
       releaseStart();
       await starting;
       await expect(mgr.inspect(sessionName, first.session_id)).resolves.toBe('live');
-      await expect(mgr.releaseReservation(sessionName, 1)).resolves.toBe(false);
+      await expect(mgr.releaseReservation(sessionName, 1, releaseOptions)).resolves.toBe(false);
 
       await mgr.stopSession(sessionName);
       await expect(mgr.inspect(sessionName, first.session_id)).resolves.toBe('absent');
@@ -737,6 +928,7 @@ describe('SessionManager', () => {
         lastResumed: '2026-09-05T10:00:00.000Z',
         lastActivity: Date.parse('2026-09-05T10:00:00.000Z'),
       });
+      persistManagerRegistry(mgr);
       let orphanEvidenceDurable = false;
       let releaseEvidenceDurable = false;
       let competingReservation: boolean | undefined;
@@ -744,6 +936,7 @@ describe('SessionManager', () => {
       await expect(
         mgr.releaseReservation(sessionName, 0, {
           expectedOwnerInstanceId: 'legacy-registry',
+          expectedSessionId: undefined,
           releaseOwnerInstanceId: 'release-owner-1',
           beforeRelease: () => {
             orphanEvidenceDurable = true;
@@ -779,12 +972,14 @@ describe('SessionManager', () => {
         }
       ).persistedSessions;
       reservations.set(sessionName, legacyTombstone);
+      persistManagerRegistry(mgr);
       let evidenceHookCount = 0;
 
       await expect(
         mgr.releaseReservation(sessionName, 0, {
           expectedOwnerInstanceId: 'arbitrary-owner-that-was-never-stored',
           expectedSessionId: 'arbitrary-session-that-was-never-stored',
+          releaseOwnerInstanceId: 'release-owner-idempotent-retry',
           beforeRelease: () => {
             evidenceHookCount += 1;
           },
@@ -796,6 +991,84 @@ describe('SessionManager', () => {
 
       expect(evidenceHookCount).toBe(0);
       expect(reservations.get(sessionName)).toEqual(legacyTombstone);
+    });
+
+    it('rejects every mismatch against each field present on a released tombstone without side effects', async () => {
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      const baseTombstone = {
+        claudeSessionId: 'released-session-id',
+        cwd: '/tmp',
+        originalCreated: '2026-09-05T10:00:00.000Z',
+        lastResumed: '2026-09-05T10:00:00.000Z',
+        lastActivity: Date.parse('2026-09-05T10:00:00.000Z'),
+        agentReleasedGeneration: 1,
+      };
+      const cases = [
+        {
+          name: 'released-owner-only',
+          stored: { agentReleasedOwnerInstanceId: 'stored-owner' },
+          generation: 1,
+          expectedOwnerInstanceId: 'wrong-owner',
+          expectedSessionId: undefined,
+        },
+        {
+          name: 'released-session-only',
+          stored: { agentReleasedSessionId: 'stored-session' },
+          generation: 1,
+          expectedOwnerInstanceId: 'unused-owner',
+          expectedSessionId: 'wrong-session',
+        },
+        {
+          name: 'released-wrong-generation',
+          stored: {},
+          generation: 2,
+          expectedOwnerInstanceId: 'unused-owner',
+          expectedSessionId: undefined,
+        },
+        {
+          name: 'released-modern-mismatch',
+          stored: {
+            agentReleasedOwnerInstanceId: 'stored-owner',
+            agentReleasedSessionId: 'stored-session',
+          },
+          generation: 1,
+          expectedOwnerInstanceId: 'stored-owner',
+          expectedSessionId: 'wrong-session',
+        },
+      ];
+      let evidenceHookCount = 0;
+
+      for (const testCase of cases) {
+        reservations.set(testCase.name, {
+          ...baseTombstone,
+          name: testCase.name,
+          ...testCase.stored,
+        });
+      }
+      persistManagerRegistry(mgr);
+
+      for (const testCase of cases) {
+        const before = structuredClone(reservations.get(testCase.name));
+        await expect(
+          mgr.releaseReservation(testCase.name, testCase.generation, {
+            expectedOwnerInstanceId: testCase.expectedOwnerInstanceId,
+            expectedSessionId: testCase.expectedSessionId,
+            releaseOwnerInstanceId: 'release-owner-must-not-run',
+            beforeRelease: () => {
+              evidenceHookCount += 1;
+            },
+            persistReleaseEvidence: () => {
+              evidenceHookCount += 1;
+            },
+          } as ManagerReleaseOptions),
+        ).resolves.toBe(false);
+        expect(reservations.get(testCase.name)).toEqual(before);
+      }
+      expect(evidenceHookCount).toBe(0);
     });
 
     it('keeps the generation reservation when an engine has no resumable conversation id yet', async () => {
@@ -905,6 +1178,222 @@ describe('SessionManager', () => {
       expect(competingHookCount).toBe(0);
     });
 
+    it('lets the first exact-tuple claimant own a pre-fix pending release with no release owner', async () => {
+      const sessionName = 'autoloop-probe-ownerless-pending-planner';
+      const first = managerGeneration(sessionName);
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      let evidenceHookCount = 0;
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      reservations.set(sessionName, {
+        ...reservations.get(sessionName),
+        agentReleasePending: true,
+        agentReleaseOwnerInstanceId: undefined,
+      });
+      persistManagerRegistry(mgr);
+
+      await expect(
+        mgr.releaseReservation(sessionName, first.generation, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: 'wrong-physical-session',
+          releaseOwnerInstanceId: 'release-owner-wrong-tuple',
+          beforeRelease: () => {
+            evidenceHookCount += 1;
+          },
+          persistReleaseEvidence: () => {
+            evidenceHookCount += 1;
+          },
+        }),
+      ).resolves.toBe(false);
+      expect(reservations.get(sessionName)).toMatchObject({ agentReleasePending: true });
+      expect(reservations.get(sessionName)).not.toHaveProperty('agentReleaseOwnerInstanceId');
+      expect(evidenceHookCount).toBe(0);
+
+      await expect(
+        mgr.releaseReservation(sessionName, first.generation, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: 'release-owner-first-claimant',
+          beforeRelease: () => {
+            evidenceHookCount += 1;
+          },
+          persistReleaseEvidence: () => {
+            evidenceHookCount += 1;
+          },
+        } as ManagerReleaseOptions),
+      ).resolves.toBe(true);
+
+      expect(evidenceHookCount).toBe(2);
+      expect(reservations.get(sessionName)).toMatchObject({
+        agentGeneration: undefined,
+        agentReleasePending: undefined,
+        agentReleasedGeneration: first.generation,
+      });
+    });
+
+    it('transfers a pending release only after its prior manager owner shuts down and completes once', async () => {
+      const sessionName = 'autoloop-probe-restart-release-owner-planner';
+      const first = managerGeneration(sessionName);
+      let priorOwnerHookCount = 0;
+      let successorHookCount = 0;
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      await expect(
+        mgr.releaseReservation(sessionName, first.generation, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+          beforeRelease: () => {
+            priorOwnerHookCount += 1;
+            throw new Error('simulated crash after pending claim');
+          },
+          persistReleaseEvidence: () => {
+            priorOwnerHookCount += 1;
+          },
+        } as ManagerReleaseOptions),
+      ).rejects.toThrow('simulated crash after pending claim');
+
+      const successor = createManager();
+      const successorOptions: ManagerReleaseOptions = {
+        expectedOwnerInstanceId: first.owner_instance_id,
+        expectedSessionId: first.session_id,
+        releaseOwnerInstanceId: successor.autoloopOwnerInstanceId,
+        beforeRelease: () => {
+          successorHookCount += 1;
+        },
+        persistReleaseEvidence: () => {
+          successorHookCount += 1;
+        },
+      };
+      try {
+        await expect(successor.releaseReservation(sessionName, first.generation, successorOptions)).resolves.toBe(
+          false,
+        );
+        expect(successorHookCount).toBe(0);
+
+        await mgr.shutdown();
+
+        await expect(successor.releaseReservation(sessionName, first.generation, successorOptions)).resolves.toBe(true);
+        await expect(successor.releaseReservation(sessionName, first.generation, successorOptions)).resolves.toBe(true);
+        expect(priorOwnerHookCount).toBe(1);
+        expect(successorHookCount).toBe(2);
+      } finally {
+        await successor.shutdown();
+      }
+    });
+
+    it('keeps a pending release fenced when the prior release owner is indeterminate', async () => {
+      const sessionName = 'autoloop-probe-unknown-release-owner-planner';
+      const first = managerGeneration(sessionName);
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      let evidenceHookCount = 0;
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      reservations.set(sessionName, {
+        ...reservations.get(sessionName),
+        agentReleasePending: true,
+        agentReleaseOwnerInstanceId: 'session-manager:2000000000:not-a-valid-instance-id',
+      });
+      persistManagerRegistry(mgr);
+      const before = structuredClone(reservations.get(sessionName));
+      const claimant = createManager();
+      try {
+        await expect(
+          claimant.releaseReservation(sessionName, first.generation, {
+            expectedOwnerInstanceId: first.owner_instance_id,
+            expectedSessionId: first.session_id,
+            releaseOwnerInstanceId: claimant.autoloopOwnerInstanceId,
+            beforeRelease: () => {
+              evidenceHookCount += 1;
+            },
+            persistReleaseEvidence: () => {
+              evidenceHookCount += 1;
+            },
+          }),
+        ).resolves.toBe(false);
+
+        expect(evidenceHookCount).toBe(0);
+        expect(claimant.listPersistedSessions().find((entry) => entry.name === sessionName)).toEqual(before);
+      } finally {
+        await claimant.shutdown();
+      }
+    });
+
+    it('uses the shared registry as CAS authority so stale managers run one writer and preserve a successor', async () => {
+      const sessionName = 'autoloop-probe-cross-manager-cas-planner';
+      const first = managerGeneration(sessionName);
+      const successorGeneration = managerGeneration(sessionName, {
+        generation: 2,
+        owner_instance_id: 'successor-generation-owner',
+        session_id: 'successor-generation-session',
+      });
+      const hookOwners: string[] = [];
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      const contender = createManager();
+      const staleCompletion = createManager();
+      let competingRelease: Promise<boolean> | undefined;
+      const release = (manager: InstanceType<typeof SessionManager>, contend = false) =>
+        manager.releaseReservation(sessionName, first.generation, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: manager.autoloopOwnerInstanceId,
+          beforeRelease: () => {
+            hookOwners.push(manager.autoloopOwnerInstanceId);
+            if (contend) competingRelease = release(contender);
+          },
+          persistReleaseEvidence: () => {
+            hookOwners.push(manager.autoloopOwnerInstanceId);
+          },
+        } as ManagerReleaseOptions);
+
+      try {
+        await expect(release(mgr, true)).resolves.toBe(true);
+        await expect(competingRelease).resolves.toBe(false);
+        await expect(release(contender)).resolves.toBe(true);
+        expect(hookOwners).toEqual([mgr.autoloopOwnerInstanceId, mgr.autoloopOwnerInstanceId]);
+        expect(contender.reserveAgentGeneration(successorGeneration, '/tmp')).toBe(true);
+
+        await expect(release(staleCompletion)).resolves.toBe(false);
+        expect(hookOwners).toEqual([mgr.autoloopOwnerInstanceId, mgr.autoloopOwnerInstanceId]);
+        const authoritativeSuccessor = staleCompletion
+          .listPersistedSessions()
+          .find((entry) => entry.name === sessionName);
+        expect(authoritativeSuccessor).toMatchObject({
+          agentGeneration: successorGeneration.generation,
+          agentOwnerInstanceId: successorGeneration.owner_instance_id,
+          agentSessionId: successorGeneration.session_id,
+        });
+        expect(authoritativeSuccessor).not.toHaveProperty('agentReleasePending');
+
+        // The winning manager still holds a released-generation snapshot. Its
+        // later lifecycle persistence must not overwrite the successor that a
+        // different manager committed through the shared CAS authority.
+        await mgr.shutdown();
+        const verifier = createManager();
+        try {
+          expect(verifier.listPersistedSessions().find((entry) => entry.name === sessionName)).toMatchObject({
+            agentGeneration: successorGeneration.generation,
+            agentOwnerInstanceId: successorGeneration.owner_instance_id,
+            agentSessionId: successorGeneration.session_id,
+          });
+        } finally {
+          await verifier.shutdown();
+        }
+      } finally {
+        await contender.shutdown();
+        await staleCompletion.shutdown();
+      }
+    });
+
     it('keeps failed orphan evidence fenced for retry by the exact release owner', async () => {
       const sessionName = 'autoloop-probe-release-retry-planner';
       const first = managerGeneration(sessionName);
@@ -988,8 +1477,9 @@ describe('SessionManager', () => {
       let releaseEvidenceCount = 0;
 
       expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      const persistRename = vi.mocked(fs.renameSync).getMockImplementation()!;
       vi.mocked(fs.renameSync)
-        .mockImplementationOnce(() => undefined)
+        .mockImplementationOnce(persistRename)
         .mockImplementationOnce(() => {
           throw new Error('registry rename failed');
         });

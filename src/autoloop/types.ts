@@ -36,18 +36,28 @@ export interface PhysicalAgentGeneration {
 export type AgentRuntimeLiveness = 'live' | 'absent' | 'unknown';
 
 /** Durable evidence hooks run while the exact runtime generation remains fenced. */
-export interface AgentReservationReleaseOptions {
-  expectedOwnerInstanceId?: string;
-  expectedSessionId?: string;
-  /** Identifies the one runtime owner allowed to finish a pending release. */
-  releaseOwnerInstanceId?: string;
-  /** Restore a just-created reservation whose durable ledger append failed. */
-  rollbackUncommittedReservation?: boolean;
-  /** Runs only after the exact release-owner fence is durable. */
-  beforeRelease?: () => void;
-  /** Runs after the pending tombstone is durable and before the name becomes reusable. */
-  persistReleaseEvidence?: () => void;
-}
+export type AgentReservationReleaseOptions =
+  | {
+      /** Restore a just-created reservation whose durable ledger append failed. */
+      rollbackUncommittedReservation: true;
+      expectedOwnerInstanceId: string;
+      expectedSessionId: string;
+      releaseOwnerInstanceId?: never;
+      beforeRelease?: never;
+      persistReleaseEvidence?: never;
+    }
+  | {
+      rollbackUncommittedReservation?: false;
+      expectedOwnerInstanceId: string;
+      /** Explicit undefined is the legacy generation-zero session identity. */
+      expectedSessionId: string | undefined;
+      /** Identifies the one runtime owner allowed to finish a pending release. */
+      releaseOwnerInstanceId: string;
+      /** Runs only after the exact release-owner fence is durable. */
+      beforeRelease?: () => void;
+      /** Runs after the pending tombstone is durable and before the name becomes reusable. */
+      persistReleaseEvidence?: () => void;
+    };
 
 /** Runtime-only facts used to fence durable physical-agent generations. */
 export interface AgentRuntimeProbe {
@@ -55,7 +65,7 @@ export interface AgentRuntimeProbe {
   releaseReservation(
     sessionName: string,
     expectedGeneration: number,
-    options?: AgentReservationReleaseOptions,
+    options: AgentReservationReleaseOptions,
   ): Promise<boolean>;
 }
 
