@@ -3210,6 +3210,143 @@ describe('SessionManager', () => {
       expect(after.spec).toEqual(before!.spec);
     });
 
+    describe('strict Planner turn success', () => {
+      it('rejects transport success with an empty logical reply without advancing phase', async () => {
+        const runId = 'planner-empty-reply';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: '   ',
+          event: { type: 'result', result: '   ' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'return a reply')).rejects.toMatchObject({
+          code: 'AUTOLOOP_EMPTY_REPLY',
+        });
+        expect(handle.runner.state).toMatchObject({
+          status: 'planning',
+          iter: 0,
+          subagents_spawned: false,
+        });
+      });
+
+      it('rejects a Planner reply when its physical generation is absent after send', async () => {
+        const runId = 'planner-session-absent';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        vi.spyOn(mgr, 'inspect').mockResolvedValue('absent');
+
+        await expect(mgr.autoloopChat(runId, 'return a reply')).rejects.toMatchObject({
+          code: 'AUTOLOOP_SESSION_NOT_CREATED',
+        });
+        expect(handle.runner.state).toMatchObject({
+          status: 'planning',
+          iter: 0,
+          subagents_spawned: false,
+        });
+      });
+
+      it('rejects a Planner turn whose required tool was denied without advancing phase', async () => {
+        const runId = 'planner-required-tool-denied';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].turnsSucceededOverride = 0;
+
+        await expect(mgr.autoloopChat(runId, 'inspect with the required tool')).rejects.toMatchObject({
+          code: 'AUTOLOOP_REQUIRED_TOOL_DENIED',
+        });
+        expect(handle.runner.state).toMatchObject({
+          status: 'planning',
+          iter: 0,
+          subagents_spawned: false,
+        });
+      });
+
+      it('rejects a claimed control with no matching persisted event without advancing phase', async () => {
+        const runId = 'planner-control-not-persisted';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const planner = mockSessions[0];
+        planner.sendImplementation = async () => ({
+          text: ['starting agents', '```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'starting agents' },
+        });
+        const decisionsPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+        const appendFile = vi.mocked(fs.appendFileSync);
+        const appendImplementation = appendFile.getMockImplementation()!;
+        appendFile.mockImplementation(((file: unknown, ...args: unknown[]) => {
+          if (String(file) === decisionsPath) return;
+          return (appendImplementation as (...values: unknown[]) => unknown)(file, ...args);
+        }) as typeof fs.appendFileSync);
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'start the approved implementation')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_NOT_PERSISTED',
+          });
+          expect(handle.runner.state).toMatchObject({
+            status: 'planning',
+            iter: 0,
+            subagents_spawned: false,
+          });
+        } finally {
+          appendFile.mockImplementation(appendImplementation);
+        }
+      });
+
+      it('returns a structured reset failure when the exact reservation remains occupied', async () => {
+        const runId = 'reset-reservation-occupied';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const plannerName = handle.dispatcher.sessionNames.planner;
+        const reservations = (
+          mgr as unknown as {
+            persistedSessions: Map<string, Record<string, unknown>>;
+          }
+        ).persistedSessions;
+        vi.spyOn(mgr, 'releaseReservation').mockImplementation(
+          async (_name, _generation, options: AgentReservationReleaseOptions) => {
+            if (!options.rollbackUncommittedReservation) {
+              options.beforeRelease?.();
+              options.persistReleaseEvidence?.();
+            }
+            return true;
+          },
+        );
+
+        const result = await handle.dispatcher.resetAgent('planner', { force: true });
+
+        expect(result).toMatchObject({
+          ok: false,
+          code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+          agent: 'planner',
+          previous_generation: 1,
+        });
+        expect(reservations.get(plannerName)).toMatchObject({ agentGeneration: 1 });
+      });
+
+      it('does not map a failed reset postcondition to legacy boolean success', async () => {
+        const runId = 'reset-legacy-false';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        vi.spyOn(mgr, 'releaseReservation').mockImplementation(
+          async (_name, _generation, options: AgentReservationReleaseOptions) => {
+            if (!options.rollbackUncommittedReservation) {
+              options.beforeRelease?.();
+              options.persistReleaseEvidence?.();
+            }
+            return true;
+          },
+        );
+
+        await expect(mgr.autoloopResetAgent(runId, 'planner', { force: true })).resolves.toBe(false);
+      });
+    });
+
     describe('Autoloop send-timeout resume migration', () => {
       type ResumeOverride = {
         sendTimeoutMs?: unknown;

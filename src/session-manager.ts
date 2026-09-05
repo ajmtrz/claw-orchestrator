@@ -935,6 +935,25 @@ export class SessionManager implements AgentRuntimeProbe {
     return transaction.value;
   }
 
+  /** Prove that one exact generation is a released tombstone, not an occupied reservation. */
+  isAgentGenerationReleased(generation: PhysicalAgentGeneration): boolean {
+    const transaction = this._withAgentRegistryLock((authoritative) => {
+      const reservation = authoritative.get(generation.session_name);
+      return {
+        value: Boolean(
+          reservation &&
+          reservation.agentGeneration === undefined &&
+          reservation.agentReleasePending !== true &&
+          reservation.agentReleasedGeneration === generation.generation &&
+          reservation.agentReleasedOwnerInstanceId === generation.owner_instance_id &&
+          reservation.agentReleasedSessionId === generation.session_id,
+        ),
+      };
+    });
+    if (!transaction.ok) throw transaction.error;
+    return transaction.value;
+  }
+
   /** Inspect only runtime/session-registry facts for one physical name. */
   async inspect(sessionName: string, sessionId?: string): Promise<AgentRuntimeLiveness> {
     if (this.sessions.has(sessionName)) return 'live';
@@ -3762,7 +3781,9 @@ export class SessionManager implements AgentRuntimeProbe {
       onSpawnSubagents: async (args) => {
         this.logger.info?.(`[autoloop/${runId}] spawn_subagents starting Coder + Reviewer sessions`);
         await dispatcherRef?.spawnSubagents(args);
-        runnerRef?.markSubagentsSpawned();
+      },
+      onPlannerTurnSucceeded: (controls) => {
+        if (controls.includes('spawn_subagents')) runnerRef?.markSubagentsSpawned();
       },
       onRoleSelectionChanged: async (selection) => {
         // Used to write a row into a private append-only registry file. The run
@@ -3979,8 +4000,8 @@ export class SessionManager implements AgentRuntimeProbe {
   ): Promise<boolean> {
     const ctx = this.kernel.handle<AutoloopHandle & { dispatcher: ClaudeAgentDispatcher }>(runId, LEGACY_NODE);
     if (!ctx) return false;
-    await ctx.dispatcher.resetAgent(agent, opts);
-    return true;
+    const result = await ctx.dispatcher.resetAgent(agent, opts);
+    return result.ok;
   }
 
   async autoloopStop(runId: string, reason = 'user-stop'): Promise<boolean> {

@@ -52,6 +52,7 @@ import {
   applyPlannerToolCalls,
   parsePlannerReply,
   type PlannerToolEffects,
+  type PlannerToolName,
   type SpawnSubagentsArgs,
 } from './planner-tools.js';
 import { extractIterComplete, extractReviewComplete, parseAgentReply } from './agent-tools.js';
@@ -144,6 +145,8 @@ export interface ClaudeAgentDispatcherConfig {
     coder: { engine: EngineType; model?: string };
     reviewer: { engine: EngineType; model?: string };
   }) => Promise<void> | void;
+  /** Apply runner phase changes only after the complete Planner turn contract is proven. */
+  onPlannerTurnSucceeded?: (controls: readonly PlannerToolName[]) => Promise<void> | void;
 }
 
 function resolveConfigByName(filename: string): string {
@@ -169,6 +172,121 @@ interface SendMessageResult {
   fatal?: boolean;
   /** Genuine send deadlines pause for an explicit resume instead of retrying. */
   recoverable_timeout?: SendTimeoutPayload;
+}
+
+type AutoloopOperationErrorCode =
+  | 'AUTOLOOP_EMPTY_REPLY'
+  | 'AUTOLOOP_SESSION_NOT_CREATED'
+  | 'AUTOLOOP_REQUIRED_TOOL_DENIED'
+  | 'AUTOLOOP_CONTROL_NOT_PERSISTED'
+  | 'AUTOLOOP_RESET_POSTCONDITION_FAILED';
+
+export class AutoloopOperationError extends Error {
+  readonly retryable = true;
+
+  constructor(
+    readonly code: AutoloopOperationErrorCode,
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = 'AutoloopOperationError';
+  }
+}
+
+export type AutoloopResetResult =
+  | {
+      ok: true;
+      agent: AutoloopRoleName;
+      previous_generation?: number;
+      active_generation?: number;
+      reusable: true;
+    }
+  | {
+      ok: false;
+      code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED';
+      agent: AutoloopRoleName;
+      previous_generation?: number;
+      message: string;
+      retryable: true;
+    };
+
+interface PlannerTurnResult {
+  reply: string;
+  generation?: PhysicalAgentGeneration;
+  generationLiveness?: 'live' | 'absent' | 'unknown';
+  requiredToolDenied?: boolean;
+  persistedControl?: PlannerControlEvidence;
+}
+
+interface PlannerTurnExpectation {
+  requireReply: boolean;
+  expectedGeneration?: PhysicalAgentGeneration;
+  expectedControl?: Omit<PlannerControlEvidence, 'control_id' | 'persisted_at'>;
+}
+
+interface PlannerControlEvidence {
+  control_id: string;
+  persisted_at: string;
+  dispatch_id: string;
+  message_id: string;
+  iter: number;
+  generation: number;
+  owner_instance_id: string;
+  session_id?: string;
+  tools: PlannerToolName[];
+  controls_sha256: string;
+}
+
+function assertPlannerTurnSucceeded(result: PlannerTurnResult, expected: PlannerTurnExpectation): void {
+  if (expected.expectedGeneration) {
+    const observed = result.generation;
+    if (
+      !observed ||
+      observed.state !== 'live' ||
+      result.generationLiveness !== 'live' ||
+      observed.generation !== expected.expectedGeneration.generation ||
+      observed.owner_instance_id !== expected.expectedGeneration.owner_instance_id ||
+      observed.session_id !== expected.expectedGeneration.session_id
+    ) {
+      throw new AutoloopOperationError(
+        'AUTOLOOP_SESSION_NOT_CREATED',
+        `Planner generation ${expected.expectedGeneration.generation} was not live after its turn`,
+      );
+    }
+  }
+  if (result.requiredToolDenied) {
+    throw new AutoloopOperationError(
+      'AUTOLOOP_REQUIRED_TOOL_DENIED',
+      'Planner turn completed without the engine accepting its required tool work',
+    );
+  }
+  if (expected.expectedControl) {
+    const persisted = result.persistedControl;
+    const expectedControl = expected.expectedControl;
+    if (
+      !persisted ||
+      persisted.dispatch_id !== expectedControl.dispatch_id ||
+      persisted.message_id !== expectedControl.message_id ||
+      persisted.iter !== expectedControl.iter ||
+      persisted.generation !== expectedControl.generation ||
+      persisted.owner_instance_id !== expectedControl.owner_instance_id ||
+      persisted.session_id !== expectedControl.session_id ||
+      persisted.controls_sha256 !== expectedControl.controls_sha256 ||
+      JSON.stringify(persisted.tools) !== JSON.stringify(expectedControl.tools)
+    ) {
+      throw new AutoloopOperationError(
+        'AUTOLOOP_CONTROL_NOT_PERSISTED',
+        'Planner control claims have no matching persisted event for this physical generation',
+      );
+    }
+  }
+  if (expected.requireReply && !result.reply.trim()) {
+    throw new AutoloopOperationError(
+      'AUTOLOOP_EMPTY_REPLY',
+      'Planner transport completed without a non-empty logical reply',
+    );
+  }
 }
 
 type PendingSendTimeout = Omit<SendTimeoutPayload, 'error'>;
@@ -221,6 +339,7 @@ interface DecisionLogEntry {
     | 'update_push_policy'
     | 'compact'
     | 'spawn_subagents'
+    | 'planner_turn_control'
     | 'phase_error'
     | 'send_timeout'
     | 'policy_silence_blocked';
@@ -1035,34 +1154,96 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   async resetAgent(
     agent: 'planner' | 'coder' | 'reviewer',
     opts: { force?: boolean; eagerRestart?: boolean } = {},
-  ): Promise<void> {
+  ): Promise<AutoloopResetResult> {
     if (agent === 'planner' && !opts.force) {
       throw new Error('Refusing to reset Planner without force=true (would discard chat context)');
     }
     const name = agent === 'planner' ? this.plannerName : agent === 'coder' ? this.coderName : this.reviewerName;
+    const previous = this.currentGeneration(agent);
     this.appendDecisionLog({
       kind: 'reset_agent',
       actor: 'dispatcher',
       payload: { agent, force: !!opts.force, eagerRestart: !!opts.eagerRestart },
     });
-    let stopped = false;
+    let stopError: unknown;
     try {
       await this.config.manager.stopSession(name);
-      stopped = true;
     } catch (err) {
+      stopError = err;
       this.logger.warn?.(`[autoloop] resetAgent stop failed for ${name}: ${(err as Error).message}`);
     }
-    if (stopped) await this.releaseStoppedGeneration(agent);
-    if (agent === 'planner') this.plannerStarted = false;
-    if (agent === 'coder') this.coderStarted = false;
-    if (agent === 'reviewer') {
-      this.reviewerStarted = false;
-      this.reviewerSessionPrompt = null;
-    }
-    if (opts.eagerRestart) {
-      if (agent === 'planner') await this.ensurePlanner();
-      else if (agent === 'coder') await this.ensureCoder();
-      else await this.ensureReviewer();
+
+    const failure = (detail: string, cause?: unknown): AutoloopResetResult => ({
+      ok: false,
+      code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+      agent,
+      previous_generation: previous?.generation,
+      message: cause instanceof Error ? `${detail}: ${cause.message}` : detail,
+      retryable: true,
+    });
+
+    try {
+      const stoppedLiveness = await this.runtimeProbe.inspect(name, previous?.session_id);
+      if (stoppedLiveness !== 'absent') {
+        return failure(
+          `Autoloop session '${name}' remained ${stoppedLiveness} after reset stop${
+            stopError instanceof Error ? ` (${stopError.message})` : ''
+          }`,
+        );
+      }
+
+      this.setRoleStarted(agent, false);
+      if (agent === 'reviewer') this.reviewerSessionPrompt = null;
+      if (previous && previous.state !== 'released') await this.releaseGeneration(previous, false);
+
+      const managerProbe = this.config.manager as SessionManager & {
+        isAgentGenerationReleased?: (generation: PhysicalAgentGeneration) => boolean;
+      };
+      if (previous && managerProbe.isAgentGenerationReleased) {
+        if (!managerProbe.isAgentGenerationReleased(previous)) {
+          return failure(`Autoloop session '${name}' retained generation ${previous.generation} after release`);
+        }
+      } else {
+        // Test doubles and legacy SessionManager implementations use the same
+        // fenced reserve/rollback path as startup to prove the name is reusable.
+        const probeGeneration = this.newGeneration(agent);
+        if (!this.config.manager.reserveAgentGeneration(probeGeneration, this.config.workspace)) {
+          return failure(`Autoloop session '${name}' could not reserve a replacement generation`);
+        }
+        const rolledBack = await this.runtimeProbe.releaseReservation(name, probeGeneration.generation, {
+          rollbackUncommittedReservation: true,
+          expectedOwnerInstanceId: probeGeneration.owner_instance_id,
+          expectedSessionId: probeGeneration.session_id,
+        });
+        if (!rolledBack) {
+          return failure(`Autoloop session '${name}' could not roll back its replacement probe`);
+        }
+      }
+
+      let activeGeneration: number | undefined;
+      if (opts.eagerRestart) {
+        if (agent === 'planner') await this.ensurePlanner();
+        else if (agent === 'coder') await this.ensureCoder();
+        else await this.ensureReviewer();
+        const active = this.currentGeneration(agent);
+        const activeLiveness = active
+          ? await this.runtimeProbe.inspect(active.session_name, active.session_id)
+          : 'absent';
+        if (!active || active.state !== 'live' || activeLiveness !== 'live') {
+          return failure(`Autoloop session '${name}' did not create a live replacement generation`);
+        }
+        activeGeneration = active.generation;
+      }
+
+      return {
+        ok: true,
+        agent,
+        previous_generation: previous?.generation,
+        active_generation: activeGeneration,
+        reusable: true,
+      };
+    } catch (error) {
+      return failure(`Autoloop session '${name}' reset postcondition failed`, error);
     }
   }
 
@@ -1121,7 +1302,8 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       throw new Error(result.error);
     } catch (err) {
       this.logger.warn?.(`[autoloop] ${agent} send threw, attempting reset+retry: ${(err as Error).message}`);
-      await this.resetAgent(agent, { eagerRestart: true });
+      const reset = await this.resetAgent(agent, { eagerRestart: true });
+      if (!reset.ok) return { output: '', error: reset.message, fatal: true };
       // Let the freshly-restarted subprocess settle before retrying — an
       // immediate retry routinely hits the same transient failure (e.g. the
       // old socket still in TIME_WAIT → ECONNREFUSED). Small jitter avoids
@@ -1152,6 +1334,59 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     } catch (err) {
       this.logger.warn?.(`[autoloop] decisions.jsonl append failed: ${(err as Error).message}`);
     }
+  }
+
+  private persistPlannerControls(
+    env: AnyAutoloopMessage,
+    dispatchId: string,
+    generation: PhysicalAgentGeneration,
+    tools: readonly PlannerToolName[],
+    controlsSha256: string,
+  ): PlannerControlEvidence {
+    const evidence: PlannerControlEvidence = {
+      control_id: `planner_control_${randomUUID()}`,
+      persisted_at: this.now().toISOString(),
+      dispatch_id: dispatchId,
+      message_id: env.msg_id,
+      iter: env.iter,
+      generation: generation.generation,
+      owner_instance_id: generation.owner_instance_id,
+      session_id: generation.session_id,
+      tools: [...tools],
+      controls_sha256: controlsSha256,
+    };
+    const decision = {
+      ts: evidence.persisted_at,
+      kind: 'planner_turn_control',
+      actor: 'planner',
+      payload: { ...evidence },
+    } satisfies DecisionLogEntry;
+    const decisionsPath = path.join(this.ledgerDir, 'decisions.jsonl');
+
+    try {
+      fs.mkdirSync(this.ledgerDir, { recursive: true });
+      fs.appendFileSync(decisionsPath, `${JSON.stringify(decision)}\n`);
+      const found = fs
+        .readFileSync(decisionsPath, 'utf8')
+        .split('\n')
+        .filter(Boolean)
+        .some((line) => {
+          try {
+            const row = JSON.parse(line) as { kind?: unknown; payload?: { control_id?: unknown } };
+            return row.kind === 'planner_turn_control' && row.payload?.control_id === evidence.control_id;
+          } catch {
+            return false;
+          }
+        });
+      if (!found) throw new Error('the appended control event was not readable');
+    } catch (error) {
+      throw new AutoloopOperationError(
+        'AUTOLOOP_CONTROL_NOT_PERSISTED',
+        `Planner control event could not be persisted: ${(error as Error).message}`,
+        { cause: error },
+      );
+    }
+    return evidence;
   }
 
   /**
@@ -1273,6 +1508,16 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     });
   }
 
+  private plannerTurnCounters(): { turns: number; turnsSucceeded: number } | undefined {
+    try {
+      const stats = this.config.manager.getStatus(this.plannerName).stats;
+      if (!Number.isFinite(stats.turns) || !Number.isFinite(stats.turnsSucceeded)) return undefined;
+      return { turns: stats.turns, turnsSucceeded: stats.turnsSucceeded };
+    } catch {
+      return undefined;
+    }
+  }
+
   private async deliverToPlanner(env: AnyAutoloopMessage, dispatchId: string): Promise<AnyAutoloopMessage[]> {
     if (env.type !== 'chat' && env.type !== 'directive_ack' && env.type !== 'iter_done') {
       // Other types (push_user / pause / resume / terminate) are runner-only
@@ -1297,6 +1542,8 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       promptText = `[system] iter ${env.iter} done. verdict=${env.payload.verdict} metric=${env.payload.metric}`;
     }
 
+    const expectedGeneration = this.currentGeneration('planner');
+    const countersBefore = this.plannerTurnCounters();
     const pendingTimeout = this.pendingSendTimeout(env, 'planner', dispatchId);
     const result = await this.sendAttempt(
       this.plannerName,
@@ -1314,6 +1561,23 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     }
 
     const replyText = (result.output ?? '').trim();
+    const observedGeneration = this.currentGeneration('planner');
+    const generationLiveness = observedGeneration
+      ? await this.runtimeProbe.inspect(observedGeneration.session_name, observedGeneration.session_id)
+      : 'absent';
+    const countersAfter = this.plannerTurnCounters();
+    const requiredToolDenied = Boolean(
+      result.error ||
+      (countersBefore &&
+        countersAfter &&
+        countersAfter.turns > countersBefore.turns &&
+        countersAfter.turnsSucceeded <= countersBefore.turnsSucceeded),
+    );
+    const requireReply = countersBefore !== undefined && countersAfter !== undefined;
+    assertPlannerTurnSucceeded(
+      { reply: replyText, generation: observedGeneration, generationLiveness, requiredToolDenied },
+      { requireReply, expectedGeneration },
+    );
 
     // Feed the transcript that engines without native conversation replay next
     // turn. Recorded AFTER the send so the current message isn't duplicated in
@@ -1400,10 +1664,65 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     // After iter_done(N) the run has advanced to iter N+1 in runner state;
     // any directive Planner emits in response targets the new iter.
     const nextIter = env.type === 'iter_done' ? env.iter + 1 : env.iter;
-    const handlerResult = await applyPlannerToolCalls(parsed.calls, effects, nextIter);
+    const handlerResult =
+      parsed.parse_errors.length > 0
+        ? {
+            emitted_messages: [],
+            errors: parsed.parse_errors.map(({ block_index, error }) => ({
+              tool: `autoloop block ${block_index}`,
+              error,
+            })),
+          }
+        : await applyPlannerToolCalls(parsed.calls, effects, nextIter);
     for (const errEntry of handlerResult.errors) {
       this.logger.warn?.(`[autoloop] tool '${errEntry.tool}' failed: ${errEntry.error}`);
     }
+    if (handlerResult.errors.length > 0) {
+      assertPlannerTurnSucceeded(
+        {
+          reply: replyText,
+          generation: observedGeneration,
+          generationLiveness,
+          requiredToolDenied: true,
+        },
+        { requireReply, expectedGeneration },
+      );
+    }
+
+    const controlTools = parsed.calls.map(({ tool }) => tool);
+    let persistedControl: PlannerControlEvidence | undefined;
+    let expectedControl: PlannerTurnExpectation['expectedControl'];
+    if (controlTools.length > 0) {
+      const controlGeneration = observedGeneration ?? expectedGeneration;
+      if (!controlGeneration) {
+        throw new AutoloopOperationError(
+          'AUTOLOOP_SESSION_NOT_CREATED',
+          'Planner control could not be bound to a physical generation',
+        );
+      }
+      const controlsSha256 = createHash('sha256').update(JSON.stringify(parsed.calls)).digest('hex');
+      expectedControl = {
+        dispatch_id: dispatchId,
+        message_id: env.msg_id,
+        iter: env.iter,
+        generation: controlGeneration.generation,
+        owner_instance_id: controlGeneration.owner_instance_id,
+        session_id: controlGeneration.session_id,
+        tools: controlTools,
+        controls_sha256: controlsSha256,
+      };
+      persistedControl = this.persistPlannerControls(env, dispatchId, controlGeneration, controlTools, controlsSha256);
+    }
+    assertPlannerTurnSucceeded(
+      {
+        reply: replyText,
+        generation: observedGeneration,
+        generationLiveness,
+        persistedControl,
+      },
+      { requireReply, expectedGeneration, expectedControl },
+    );
+    await this.config.onPlannerTurnSucceeded?.(controlTools);
 
     // Emit cleaned reply (without raw JSON blocks) for the chat tool to surface.
     if (parsed.cleaned_reply) {
