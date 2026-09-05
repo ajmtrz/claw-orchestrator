@@ -15,13 +15,16 @@ import { ClaudeAgentDispatcher } from '../autoloop/dispatcher.js';
 import { AutoloopRunner } from '../autoloop/runner.js';
 import { type AnyAutoloopMessage, Msg } from '../autoloop/messages.js';
 import type { SessionManager } from '../session-manager.js';
-import type { PushPolicy } from '../autoloop/types.js';
+import type { AutoloopState, PhysicalAgentGeneration, PushPolicy } from '../autoloop/types.js';
 import { DEFAULT_PUSH_POLICY, LEDGER_SCHEMA_VERSION } from '../autoloop/types.js';
 
 interface StubCalls {
   startSession: ReturnType<typeof vi.fn>;
   sendMessage: ReturnType<typeof vi.fn>;
   stopSession: ReturnType<typeof vi.fn>;
+  inspect: ReturnType<typeof vi.fn>;
+  releaseReservation: ReturnType<typeof vi.fn>;
+  reserveAgentGeneration: ReturnType<typeof vi.fn>;
   getStatus: ReturnType<typeof vi.fn>;
   compactSession: ReturnType<typeof vi.fn>;
 }
@@ -34,15 +37,27 @@ function makeStubManager(
     startThrowsFor?: 'planner' | 'coder' | 'reviewer';
     contextPercent?: number;
   } = {},
-): { manager: SessionManager; calls: StubCalls } {
+): {
+  manager: SessionManager;
+  calls: StubCalls;
+  activeNames: Set<string>;
+  reservations: Map<string, PhysicalAgentGeneration>;
+} {
   let throwsRemaining = opts.sendThrows ?? 0;
   let sendIndex = 0;
+  const activeNames = new Set<string>();
+  const reservations = new Map<string, PhysicalAgentGeneration>();
   const calls: StubCalls = {
     startSession: vi.fn(async (config: { name: string }) => {
       if (opts.startThrowsFor && config.name.endsWith(`-${opts.startThrowsFor}`)) {
         throw new Error(`${opts.startThrowsFor} failed to start`);
       }
-      return { name: 'x', state: 'ready' };
+      activeNames.add(config.name);
+      return {
+        name: config.name,
+        state: 'ready',
+        claudeSessionId: reservations.get(config.name)?.session_id,
+      };
     }),
     sendMessage: vi.fn(async () => {
       if (throwsRemaining > 0) {
@@ -53,7 +68,33 @@ function makeStubManager(
       sendIndex += 1;
       return { output, error: undefined };
     }),
-    stopSession: vi.fn(async () => undefined),
+    stopSession: vi.fn(async (name: string) => {
+      activeNames.delete(name);
+    }),
+    inspect: vi.fn(async (name: string, sessionId?: string) => {
+      const reservation = reservations.get(name);
+      if (reservation && sessionId && reservation.session_id !== sessionId) return 'unknown';
+      return activeNames.has(name) ? 'live' : 'absent';
+    }),
+    releaseReservation: vi.fn(async (name: string, expectedGeneration: number) => {
+      const reservation = reservations.get(name);
+      if (activeNames.has(name) || reservation?.generation !== expectedGeneration) return false;
+      reservations.delete(name);
+      return true;
+    }),
+    reserveAgentGeneration: vi.fn((candidate: PhysicalAgentGeneration) => {
+      const existing = reservations.get(candidate.session_name);
+      if (
+        existing &&
+        (existing.generation !== candidate.generation ||
+          existing.owner_instance_id !== candidate.owner_instance_id ||
+          existing.session_id !== candidate.session_id)
+      ) {
+        return false;
+      }
+      reservations.set(candidate.session_name, candidate);
+      return true;
+    }),
     getStatus: vi.fn(() => ({
       stats: { contextPercent: opts.contextPercent ?? 10, tokensIn: 0, tokensOut: 0, cachedTokens: 0 },
     })),
@@ -63,10 +104,13 @@ function makeStubManager(
     startSession: calls.startSession,
     sendMessage: calls.sendMessage,
     stopSession: calls.stopSession,
+    inspect: calls.inspect,
+    releaseReservation: calls.releaseReservation,
+    reserveAgentGeneration: calls.reserveAgentGeneration,
     getStatus: calls.getStatus,
     compactSession: calls.compactSession,
   } as unknown as SessionManager;
-  return { manager, calls };
+  return { manager, calls, activeNames, reservations };
 }
 
 let tmpRoot: string;
@@ -88,8 +132,10 @@ function makeDispatcher(
   calls: StubCalls;
   ledgerDir: string;
   workspace: string;
+  activeNames: Set<string>;
+  reservations: Map<string, PhysicalAgentGeneration>;
 } {
-  const { manager, calls } = makeStubManager(managerOpts);
+  const { manager, calls, activeNames, reservations } = makeStubManager(managerOpts);
   const workspace = tmpRoot;
   const dispatcher = new ClaudeAgentDispatcher({
     manager,
@@ -98,7 +144,7 @@ function makeDispatcher(
     ...overrides,
   });
   const ledgerDir = path.join(workspace, 'tasks', 'r1');
-  return { dispatcher, calls, ledgerDir, workspace };
+  return { dispatcher, calls, ledgerDir, workspace, activeNames, reservations };
 }
 
 function findStart(calls: StubCalls, role: 'planner' | 'coder' | 'reviewer'): Record<string, unknown> {
@@ -136,6 +182,237 @@ function sendTimeout(replies: AnyAutoloopMessage[]): ObservedSendTimeout {
 function genuineSendTimeout(): Error {
   return new Error('Timeout waiting for response');
 }
+
+const AGENT_NOW = '2026-09-05T12:00:00.000Z';
+
+type AgentGenerationEventKind =
+  | 'agent_generation_reserved'
+  | 'agent_generation_started'
+  | 'agent_generation_lease_renewed'
+  | 'agent_generation_orphaned'
+  | 'agent_generation_released';
+
+interface AgentGenerationEvent {
+  kind: AgentGenerationEventKind;
+  payload: PhysicalAgentGeneration;
+}
+
+function physicalGeneration(
+  role: PhysicalAgentGeneration['role'],
+  overrides: Partial<PhysicalAgentGeneration> = {},
+): PhysicalAgentGeneration {
+  return {
+    role,
+    generation: 1,
+    session_name: `autoloop-r1-${role}`,
+    session_id: `${role}-physical-1`,
+    owner_instance_id: 'owner-old',
+    created_at: '2026-09-05T10:00:00.000Z',
+    last_activity_at: '2026-09-05T11:00:00.000Z',
+    lease_expires_at: '2026-09-05T11:30:00.000Z',
+    state: 'live',
+    ...overrides,
+  };
+}
+
+function appendGenerationEvent(
+  ledgerDir: string,
+  kind: AgentGenerationEventKind,
+  generation: PhysicalAgentGeneration,
+): void {
+  fs.mkdirSync(ledgerDir, { recursive: true });
+  fs.appendFileSync(
+    path.join(ledgerDir, 'agent-generations.jsonl'),
+    `${JSON.stringify({ ts: generation.last_activity_at, kind, actor: 'dispatcher', payload: generation })}\n`,
+  );
+}
+
+function readGenerationEvents(ledgerDir: string): AgentGenerationEvent[] {
+  const generationsPath = path.join(ledgerDir, 'agent-generations.jsonl');
+  if (!fs.existsSync(generationsPath)) return [];
+  return fs
+    .readFileSync(generationsPath, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as { kind?: string; payload?: unknown })
+    .filter((entry): entry is AgentGenerationEvent => entry.kind?.startsWith('agent_generation_') === true);
+}
+
+describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
+  const state = {} as AutoloopState;
+
+  it('persists a generation reservation before creating the physical session', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({
+      ownerInstanceId: 'owner-new',
+      now: () => new Date(AGENT_NOW),
+      agentLeaseMs: 60_000,
+    });
+    calls.startSession.mockImplementationOnce(async (config: { name: string }) => {
+      expect(readGenerationEvents(ledgerDir)).toMatchObject([
+        {
+          kind: 'agent_generation_reserved',
+          payload: {
+            role: 'planner',
+            generation: 1,
+            session_name: config.name,
+            owner_instance_id: 'owner-new',
+            created_at: AGENT_NOW,
+            lease_expires_at: '2026-09-05T12:01:00.000Z',
+            state: 'stale',
+          },
+        },
+      ]);
+      return { name: config.name, state: 'ready' };
+    });
+
+    await dispatcher.init(state);
+
+    expect(readGenerationEvents(ledgerDir).map((entry) => entry.kind)).toEqual([
+      'agent_generation_reserved',
+      'agent_generation_started',
+    ]);
+  });
+
+  it('keeps a genuinely live conflicting owner as a typed hard stop', async () => {
+    const { dispatcher, calls, ledgerDir, activeNames, reservations } = makeDispatcher({
+      ownerInstanceId: 'owner-new',
+      now: () => new Date(AGENT_NOW),
+    });
+    const current = physicalGeneration('planner');
+    appendGenerationEvent(ledgerDir, 'agent_generation_started', current);
+    reservations.set(current.session_name, current);
+    activeNames.add(current.session_name);
+
+    await expect(dispatcher.init(state)).rejects.toMatchObject({ code: 'AUTOLOOP_AGENT_LIVE_CONFLICT' });
+    expect(calls.releaseReservation).not.toHaveBeenCalled();
+    expect(calls.startSession).not.toHaveBeenCalled();
+  });
+
+  it('keeps unknown runtime liveness as a typed hard stop', async () => {
+    const { dispatcher, calls, ledgerDir, reservations } = makeDispatcher({
+      ownerInstanceId: 'owner-new',
+      now: () => new Date(AGENT_NOW),
+    });
+    const current = physicalGeneration('planner');
+    appendGenerationEvent(ledgerDir, 'agent_generation_started', current);
+    reservations.set(current.session_name, current);
+    calls.inspect.mockResolvedValueOnce('unknown');
+
+    await expect(dispatcher.init(state)).rejects.toMatchObject({ code: 'AUTOLOOP_AGENT_LIVENESS_UNKNOWN' });
+    expect(calls.releaseReservation).not.toHaveBeenCalled();
+    expect(calls.startSession).not.toHaveBeenCalled();
+  });
+
+  it('does not reclaim an absent owner until its lease has expired', async () => {
+    const { dispatcher, calls, ledgerDir, reservations } = makeDispatcher({
+      ownerInstanceId: 'owner-new',
+      now: () => new Date(AGENT_NOW),
+    });
+    const current = physicalGeneration('planner', {
+      lease_expires_at: '2026-09-05T12:05:00.000Z',
+    });
+    appendGenerationEvent(ledgerDir, 'agent_generation_started', current);
+    reservations.set(current.session_name, current);
+
+    await expect(dispatcher.init(state)).rejects.toMatchObject({ code: 'AUTOLOOP_AGENT_LEASE_ACTIVE' });
+    expect(calls.releaseReservation).not.toHaveBeenCalled();
+    expect(calls.startSession).not.toHaveBeenCalled();
+  });
+
+  it('reclaims an expired dead owner and appends orphan and release evidence before name reuse', async () => {
+    const { dispatcher, calls, ledgerDir, reservations } = makeDispatcher({
+      ownerInstanceId: 'owner-new',
+      now: () => new Date(AGENT_NOW),
+      agentLeaseMs: 60_000,
+    });
+    const current = physicalGeneration('planner');
+    appendGenerationEvent(ledgerDir, 'agent_generation_started', current);
+    reservations.set(current.session_name, current);
+
+    await dispatcher.init(state);
+
+    expect(calls.releaseReservation).toHaveBeenCalledWith(current.session_name, 1);
+    const events = readGenerationEvents(ledgerDir);
+    expect(events.map((entry) => entry.kind)).toEqual([
+      'agent_generation_started',
+      'agent_generation_orphaned',
+      'agent_generation_released',
+      'agent_generation_reserved',
+      'agent_generation_started',
+    ]);
+    expect(events.map((entry) => entry.payload.generation)).toEqual([1, 1, 1, 2, 2]);
+    expect(events[3].payload).toMatchObject({ owner_instance_id: 'owner-new', state: 'stale' });
+  });
+
+  it('reclaims a stale registry-only legacy reservation before generation one starts', async () => {
+    const { dispatcher, calls, ledgerDir, reservations } = makeDispatcher({
+      ownerInstanceId: 'owner-new',
+      now: () => new Date(AGENT_NOW),
+    });
+    const legacy = physicalGeneration('planner', {
+      generation: 0,
+      session_id: 'legacy-registry-only',
+      owner_instance_id: 'legacy-owner',
+      state: 'stale',
+    });
+    reservations.set(legacy.session_name, legacy);
+
+    await dispatcher.init(state);
+
+    expect(calls.releaseReservation).toHaveBeenCalledWith(legacy.session_name, 0);
+    expect(readGenerationEvents(ledgerDir).map((entry) => [entry.kind, entry.payload.generation])).toEqual([
+      ['agent_generation_orphaned', 0],
+      ['agent_generation_released', 0],
+      ['agent_generation_reserved', 1],
+      ['agent_generation_started', 1],
+    ]);
+  });
+
+  it('rejects cleanup when the runtime reservation no longer matches the durable generation', async () => {
+    const { dispatcher, calls, ledgerDir, reservations } = makeDispatcher({
+      ownerInstanceId: 'owner-new',
+      now: () => new Date(AGENT_NOW),
+    });
+    const durable = physicalGeneration('planner');
+    const replacement = physicalGeneration('planner', {
+      generation: 2,
+      session_id: 'planner-physical-2',
+      owner_instance_id: 'owner-replacement',
+    });
+    appendGenerationEvent(ledgerDir, 'agent_generation_started', durable);
+    reservations.set(replacement.session_name, replacement);
+    calls.inspect.mockResolvedValueOnce('absent');
+
+    await expect(dispatcher.init(state)).rejects.toMatchObject({ code: 'AUTOLOOP_AGENT_GENERATION_CONFLICT' });
+    expect(calls.releaseReservation).not.toHaveBeenCalled();
+    expect(readGenerationEvents(ledgerDir)).toHaveLength(1);
+  });
+
+  it('coalesces two concurrent recoverers into one compare-and-release and one replacement', async () => {
+    const { dispatcher, calls, ledgerDir, reservations } = makeDispatcher({
+      ownerInstanceId: 'owner-new',
+      now: () => new Date(AGENT_NOW),
+    });
+    const competingDispatcher = new ClaudeAgentDispatcher({ ...dispatcher.config });
+    const current = physicalGeneration('planner');
+    appendGenerationEvent(ledgerDir, 'agent_generation_started', current);
+    reservations.set(current.session_name, current);
+
+    const results = await Promise.all([dispatcher.init(state), competingDispatcher.init(state)]);
+
+    expect(results).toEqual([undefined, undefined]);
+    expect(calls.releaseReservation).toHaveBeenCalledTimes(1);
+    expect(
+      calls.reserveAgentGeneration.mock.calls.filter(
+        ([candidate]) => (candidate as PhysicalAgentGeneration).generation === 2,
+      ),
+    ).toHaveLength(1);
+    expect(calls.startSession).toHaveBeenCalledTimes(1);
+    expect(readGenerationEvents(ledgerDir).filter((entry) => entry.kind === 'agent_generation_released')).toHaveLength(
+      1,
+    );
+  });
+});
 
 describe('ClaudeAgentDispatcher — role engine configuration', () => {
   it('keeps the legacy Claude model defaults when no role overrides are provided', async () => {
@@ -503,9 +780,7 @@ describe('ClaudeAgentDispatcher — recoverable send timeout and dispatch identi
 
     const deliveryA = dispatcher.deliver(first);
     const deliveryB = dispatcher.deliver(duplicate);
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(calls.sendMessage).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(calls.sendMessage).toHaveBeenCalledTimes(1));
 
     resolveSend({ output: '', error: undefined });
     await Promise.all([deliveryA, deliveryB]);

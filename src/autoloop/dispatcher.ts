@@ -18,7 +18,7 @@
  */
 
 import { EventEmitter } from 'node:events';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -34,12 +34,15 @@ import { writeEvidence } from '../verify/evidence.js';
 import type { AcceptanceContract } from '../verify/contract.js';
 import { type AnyAutoloopMessage, Msg, type SendTimeoutPayload } from './messages.js';
 import {
+  DEFAULT_ACTIVITY_LEASE_MS,
   DEFAULT_SEND_TIMEOUT_MS,
   LEDGER_SCHEMA_VERSION,
   validateAutoloopTimeoutConfig,
+  type AgentRuntimeProbe,
   type AgentDispatcher,
   type AutoloopRoleName,
   type AutoloopState,
+  type PhysicalAgentGeneration,
   type PushPolicy,
 } from './types.js';
 
@@ -96,6 +99,14 @@ export interface ClaudeAgentDispatcherConfig {
   reviewerCustomEngine?: CustomEngineConfig;
   /** Per-message wall-clock cap. Default 10 min. */
   sendTimeoutMs?: number;
+  /** Physical-agent lease length. Defaults to the Autoloop activity lease. */
+  agentLeaseMs?: number;
+  /** Runtime/session-registry boundary. Production uses SessionManager. */
+  runtimeProbe?: AgentRuntimeProbe;
+  /** Stable owner identity for this SessionManager process. */
+  ownerInstanceId?: string;
+  /** Deterministic clock seam for lease tests. */
+  now?: () => Date;
   /** Internal failure-atomic resume marker; never accepted from an agent. */
   suppressFailedStartAudit?: boolean;
   /**
@@ -215,6 +226,65 @@ interface DecisionLogEntry {
   payload: Record<string, unknown>;
 }
 
+type AgentGenerationEventKind =
+  | 'agent_generation_reserved'
+  | 'agent_generation_started'
+  | 'agent_generation_lease_renewed'
+  | 'agent_generation_orphaned'
+  | 'agent_generation_released';
+
+type AutoloopAgentConflictCode =
+  | 'AUTOLOOP_AGENT_LIVE_CONFLICT'
+  | 'AUTOLOOP_AGENT_LIVENESS_UNKNOWN'
+  | 'AUTOLOOP_AGENT_LEASE_ACTIVE'
+  | 'AUTOLOOP_AGENT_GENERATION_CONFLICT'
+  | 'AUTOLOOP_AGENT_LEDGER_INVALID';
+
+/** Coalesce physical-agent reconciliation across dispatcher handles owned by this process. */
+const AGENT_START_OPERATIONS = new Map<string, Promise<void>>();
+
+export class AutoloopAgentConflictError extends Error {
+  constructor(
+    readonly code: AutoloopAgentConflictCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'AutoloopAgentConflictError';
+  }
+}
+
+function isAgentGenerationEventKind(value: unknown): value is AgentGenerationEventKind {
+  return (
+    value === 'agent_generation_reserved' ||
+    value === 'agent_generation_started' ||
+    value === 'agent_generation_lease_renewed' ||
+    value === 'agent_generation_orphaned' ||
+    value === 'agent_generation_released'
+  );
+}
+
+function asPhysicalAgentGeneration(value: unknown): PhysicalAgentGeneration | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const candidate = value as Partial<PhysicalAgentGeneration>;
+  if (
+    (candidate.role !== 'planner' && candidate.role !== 'coder' && candidate.role !== 'reviewer') ||
+    !Number.isInteger(candidate.generation) ||
+    typeof candidate.session_name !== 'string' ||
+    typeof candidate.owner_instance_id !== 'string' ||
+    typeof candidate.created_at !== 'string' ||
+    typeof candidate.last_activity_at !== 'string' ||
+    typeof candidate.lease_expires_at !== 'string' ||
+    (candidate.state !== 'live' &&
+      candidate.state !== 'stale' &&
+      candidate.state !== 'orphaned' &&
+      candidate.state !== 'released') ||
+    (candidate.session_id !== undefined && typeof candidate.session_id !== 'string')
+  ) {
+    return null;
+  }
+  return { ...candidate } as PhysicalAgentGeneration;
+}
+
 export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatcher {
   readonly config: ClaudeAgentDispatcherConfig;
   private logger: Logger;
@@ -231,6 +301,10 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   private plannerSelection: AutoloopRoleSelection;
   private coderSelection: AutoloopRoleSelection;
   private reviewerSelection: AutoloopRoleSelection;
+  private readonly runtimeProbe: AgentRuntimeProbe;
+  private readonly ownerInstanceId: string;
+  private readonly now: () => Date;
+  private readonly agentLeaseMs: number;
   /** Where Reviewer reads from. Created lazily by stageReviewSandbox(). */
   private reviewerSandboxDir: string;
   private ledgerDir: string;
@@ -279,12 +353,318 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       model: config.reviewerModel,
       customEngine: config.reviewerCustomEngine,
     };
+    this.runtimeProbe = config.runtimeProbe ?? config.manager;
+    this.ownerInstanceId =
+      config.ownerInstanceId ?? config.manager.autoloopOwnerInstanceId ?? `dispatcher:${config.runId}`;
+    this.now = config.now ?? (() => new Date());
+    this.agentLeaseMs = config.agentLeaseMs ?? DEFAULT_ACTIVITY_LEASE_MS;
     this.ledgerDir = path.join(config.workspace, 'tasks', config.runId);
     this.reviewerSandboxDir = path.join(this.ledgerDir, 'reviewer_sandbox');
   }
 
   get sessionNames(): { planner: string; coder: string; reviewer: string } {
     return { planner: this.plannerName, coder: this.coderName, reviewer: this.reviewerName };
+  }
+
+  private sessionNameFor(role: AutoloopRoleName): string {
+    return role === 'planner' ? this.plannerName : role === 'coder' ? this.coderName : this.reviewerName;
+  }
+
+  private roleStarted(role: AutoloopRoleName): boolean {
+    return role === 'planner' ? this.plannerStarted : role === 'coder' ? this.coderStarted : this.reviewerStarted;
+  }
+
+  private setRoleStarted(role: AutoloopRoleName, started: boolean): void {
+    if (role === 'planner') this.plannerStarted = started;
+    else if (role === 'coder') this.coderStarted = started;
+    else this.reviewerStarted = started;
+  }
+
+  private readGenerationHistory(role: AutoloopRoleName): PhysicalAgentGeneration[] {
+    const generationsPath = path.join(this.ledgerDir, 'agent-generations.jsonl');
+    if (!fs.existsSync(generationsPath)) return [];
+
+    const history: PhysicalAgentGeneration[] = [];
+    const lines = fs.readFileSync(generationsPath, 'utf8').split('\n');
+    for (const line of lines) {
+      if (!line) continue;
+      let entry: { kind?: unknown; payload?: unknown };
+      try {
+        entry = JSON.parse(line) as { kind?: unknown; payload?: unknown };
+      } catch {
+        throw new AutoloopAgentConflictError(
+          'AUTOLOOP_AGENT_LEDGER_INVALID',
+          `Autoloop agent generation ledger for '${this.config.runId}' contains malformed JSON`,
+        );
+      }
+      if (!isAgentGenerationEventKind(entry.kind)) continue;
+      const generation = asPhysicalAgentGeneration(entry.payload);
+      if (!generation) {
+        throw new AutoloopAgentConflictError(
+          'AUTOLOOP_AGENT_LEDGER_INVALID',
+          `Autoloop agent generation ledger for '${this.config.runId}' contains invalid ${String(entry.kind)} evidence`,
+        );
+      }
+      if (generation.role === role && generation.session_name === this.sessionNameFor(role)) {
+        history.push(generation);
+      }
+    }
+    return history;
+  }
+
+  private currentGeneration(role: AutoloopRoleName): PhysicalAgentGeneration | undefined {
+    return this.readGenerationHistory(role).at(-1);
+  }
+
+  private appendGenerationEvent(kind: AgentGenerationEventKind, generation: PhysicalAgentGeneration): void {
+    fs.mkdirSync(this.ledgerDir, { recursive: true });
+    const line = JSON.stringify({
+      schema_version: LEDGER_SCHEMA_VERSION,
+      ts: this.now().toISOString(),
+      kind,
+      actor: 'dispatcher',
+      payload: { ...generation },
+    });
+    fs.appendFileSync(path.join(this.ledgerDir, 'agent-generations.jsonl'), `${line}\n`);
+  }
+
+  private conflict(code: AutoloopAgentConflictCode, role: AutoloopRoleName, detail: string): never {
+    const name = this.sessionNameFor(role);
+    throw new AutoloopAgentConflictError(code, `Autoloop session name '${name}' ${detail}`);
+  }
+
+  private nextGeneration(role: AutoloopRoleName): number {
+    return this.readGenerationHistory(role).reduce((highest, entry) => Math.max(highest, entry.generation), 0) + 1;
+  }
+
+  private newGeneration(role: AutoloopRoleName): PhysicalAgentGeneration {
+    const now = this.now();
+    const timestamp = now.toISOString();
+    return {
+      role,
+      generation: this.nextGeneration(role),
+      session_name: this.sessionNameFor(role),
+      session_id: randomUUID(),
+      owner_instance_id: this.ownerInstanceId,
+      created_at: timestamp,
+      last_activity_at: timestamp,
+      lease_expires_at: new Date(now.getTime() + this.agentLeaseMs).toISOString(),
+      state: 'stale',
+    };
+  }
+
+  private async releaseGeneration(generation: PhysicalAgentGeneration, orphaned: boolean): Promise<void> {
+    const latest = this.currentGeneration(generation.role);
+    if (
+      !latest ||
+      latest.generation !== generation.generation ||
+      latest.owner_instance_id !== generation.owner_instance_id ||
+      latest.session_id !== generation.session_id
+    ) {
+      this.conflict(
+        'AUTOLOOP_AGENT_GENERATION_CONFLICT',
+        generation.role,
+        `changed while generation ${generation.generation} was being released`,
+      );
+    }
+
+    // Re-materialize/compare the exact durable fence in SessionManager before
+    // appending orphan evidence. A replacement reservation makes this return
+    // false, so stale cleanup cannot mark or release the new owner.
+    if (!this.config.manager.reserveAgentGeneration(generation, this.config.workspace)) {
+      this.conflict(
+        'AUTOLOOP_AGENT_GENERATION_CONFLICT',
+        generation.role,
+        `no longer belongs to generation ${generation.generation} and owner '${generation.owner_instance_id}'`,
+      );
+    }
+
+    const observedAt = this.now().toISOString();
+    if (orphaned && latest.state !== 'orphaned') {
+      this.appendGenerationEvent('agent_generation_orphaned', {
+        ...latest,
+        last_activity_at: observedAt,
+        state: 'orphaned',
+      });
+    }
+
+    const released = await this.runtimeProbe.releaseReservation(generation.session_name, generation.generation);
+    if (!released) {
+      const completed = this.currentGeneration(generation.role);
+      if (completed?.generation === generation.generation && completed.state === 'released') return;
+      this.conflict(
+        'AUTOLOOP_AGENT_GENERATION_CONFLICT',
+        generation.role,
+        `could not compare-and-release generation ${generation.generation}`,
+      );
+    }
+    this.appendGenerationEvent('agent_generation_released', {
+      ...latest,
+      last_activity_at: observedAt,
+      state: 'released',
+    });
+  }
+
+  private async releaseStoppedGeneration(role: AutoloopRoleName): Promise<void> {
+    const current = this.currentGeneration(role);
+    if (!current || current.state === 'released') return;
+    const runtime = await this.runtimeProbe.inspect(current.session_name, current.session_id);
+    if (runtime !== 'absent') {
+      this.conflict(
+        runtime === 'live' ? 'AUTOLOOP_AGENT_LIVE_CONFLICT' : 'AUTOLOOP_AGENT_LIVENESS_UNKNOWN',
+        role,
+        `could not prove generation ${current.generation} absent after stop`,
+      );
+    }
+    await this.releaseGeneration(current, false);
+  }
+
+  private async releaseLegacyReservation(role: AutoloopRoleName): Promise<void> {
+    const sessionName = this.sessionNameFor(role);
+    if (!(await this.runtimeProbe.releaseReservation(sessionName, 0))) return;
+    const observedAt = this.now().toISOString();
+    const legacy: PhysicalAgentGeneration = {
+      role,
+      generation: 0,
+      session_name: sessionName,
+      owner_instance_id: 'legacy-registry',
+      created_at: observedAt,
+      last_activity_at: observedAt,
+      lease_expires_at: observedAt,
+      state: 'orphaned',
+    };
+    this.appendGenerationEvent('agent_generation_orphaned', legacy);
+    this.appendGenerationEvent('agent_generation_released', { ...legacy, state: 'released' });
+  }
+
+  private async prepareGeneration(
+    role: AutoloopRoleName,
+  ): Promise<{ generation: PhysicalAgentGeneration; reuseLiveSession: boolean }> {
+    const current = this.currentGeneration(role);
+    const sessionName = this.sessionNameFor(role);
+
+    if (current && current.state !== 'released') {
+      const runtime = await this.runtimeProbe.inspect(sessionName, current.session_id);
+      if (runtime === 'unknown') {
+        this.conflict('AUTOLOOP_AGENT_LIVENESS_UNKNOWN', role, 'has unknown runtime liveness');
+      }
+      if (runtime === 'live') {
+        if (current.owner_instance_id !== this.ownerInstanceId) {
+          this.conflict('AUTOLOOP_AGENT_LIVE_CONFLICT', role, 'is already in use by a live owner');
+        }
+        if (!this.config.manager.reserveAgentGeneration(current, this.config.workspace)) {
+          this.conflict(
+            'AUTOLOOP_AGENT_GENERATION_CONFLICT',
+            role,
+            `no longer belongs to generation ${current.generation}`,
+          );
+        }
+        const now = this.now();
+        const renewed: PhysicalAgentGeneration = {
+          ...current,
+          last_activity_at: now.toISOString(),
+          lease_expires_at: new Date(now.getTime() + this.agentLeaseMs).toISOString(),
+          state: 'live',
+        };
+        this.appendGenerationEvent('agent_generation_lease_renewed', renewed);
+        return { generation: renewed, reuseLiveSession: true };
+      }
+
+      const leaseExpiresAt = Date.parse(current.lease_expires_at);
+      if (Number.isNaN(leaseExpiresAt)) {
+        this.conflict('AUTOLOOP_AGENT_LEDGER_INVALID', role, 'has an invalid durable lease expiry');
+      }
+      if (current.state !== 'orphaned' && leaseExpiresAt > this.now().getTime()) {
+        this.conflict('AUTOLOOP_AGENT_LEASE_ACTIVE', role, 'has an unexpired owner lease');
+      }
+      await this.releaseGeneration(current, true);
+    } else {
+      const runtime = await this.runtimeProbe.inspect(sessionName);
+      if (runtime === 'live') {
+        this.conflict('AUTOLOOP_AGENT_LIVE_CONFLICT', role, 'is already in use by a live owner');
+      }
+      if (runtime === 'unknown') {
+        this.conflict('AUTOLOOP_AGENT_LIVENESS_UNKNOWN', role, 'has unknown runtime liveness');
+      }
+      if (!current) await this.releaseLegacyReservation(role);
+    }
+
+    const generation = this.newGeneration(role);
+    if (!this.config.manager.reserveAgentGeneration(generation, this.config.workspace)) {
+      this.conflict(
+        'AUTOLOOP_AGENT_GENERATION_CONFLICT',
+        role,
+        `could not reserve generation ${generation.generation}`,
+      );
+    }
+    try {
+      this.appendGenerationEvent('agent_generation_reserved', generation);
+    } catch (err) {
+      await this.runtimeProbe.releaseReservation(generation.session_name, generation.generation);
+      throw err;
+    }
+    return { generation, reuseLiveSession: false };
+  }
+
+  private async ensureAgentSession(
+    role: AutoloopRoleName,
+    start: (generation: PhysicalAgentGeneration) => Promise<void>,
+  ): Promise<void> {
+    if (this.roleStarted(role)) return;
+    const operationKey = `${this.ownerInstanceId}\0${this.sessionNameFor(role)}`;
+    const existing = AGENT_START_OPERATIONS.get(operationKey);
+    if (existing) {
+      await existing;
+      this.setRoleStarted(role, true);
+      return;
+    }
+
+    const operation = (async () => {
+      const prepared = await this.prepareGeneration(role);
+      if (prepared.reuseLiveSession) {
+        this.setRoleStarted(role, true);
+        return;
+      }
+
+      let physicalStarted = false;
+      try {
+        await start(prepared.generation);
+        physicalStarted = true;
+        this.appendGenerationEvent('agent_generation_started', {
+          ...prepared.generation,
+          last_activity_at: this.now().toISOString(),
+          state: 'live',
+        });
+        this.setRoleStarted(role, true);
+      } catch (err) {
+        if (physicalStarted) {
+          try {
+            await this.config.manager.stopSession(prepared.generation.session_name);
+          } catch {
+            // The runtime probe below decides whether release is safe.
+          }
+        }
+        try {
+          if (
+            (await this.runtimeProbe.inspect(prepared.generation.session_name, prepared.generation.session_id)) ===
+            'absent'
+          ) {
+            await this.releaseGeneration(prepared.generation, true);
+          }
+        } catch (cleanupErr) {
+          this.logger.warn?.(
+            `[autoloop] failed to release generation ${prepared.generation.generation} after startup error: ${(cleanupErr as Error).message}`,
+          );
+        }
+        throw err;
+      }
+    })();
+    AGENT_START_OPERATIONS.set(operationKey, operation);
+    try {
+      await operation;
+    } finally {
+      if (AGENT_START_OPERATIONS.get(operationKey) === operation) AGENT_START_OPERATIONS.delete(operationKey);
+    }
   }
 
   async init(state: AutoloopState): Promise<void> {
@@ -304,9 +684,11 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     // keepPersisted: true keeps the persistedSessions entry on disk so a
     // later /autoloop/<id>/resume can re-attach the Planner's Claude
     // conversation. Only autoloopDelete passes purge:true (real teardown).
-    for (const name of [this.plannerName, this.coderName, this.reviewerName]) {
+    for (const role of ['planner', 'coder', 'reviewer'] as const) {
+      const name = this.sessionNameFor(role);
       try {
         await this.config.manager.stopSession(name, { keepPersisted: !opts.purge });
+        await this.releaseStoppedGeneration(role);
       } catch (err) {
         this.logger.warn?.(`[autoloop] failed to stop ${name}: ${(err as Error).message}`);
       }
@@ -400,9 +782,10 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
    * started, which is the safe lie: a later engine change is then rejected
    * instead of silently binding the run to a process that never went away.
    */
-  private async stopRolledBackSession(name: string): Promise<boolean> {
+  private async stopRolledBackSession(role: AutoloopRoleName, name: string): Promise<boolean> {
     try {
       await this.config.manager.stopSession(name);
+      await this.releaseStoppedGeneration(role);
       return true;
     } catch (stopErr) {
       this.logger.error?.(
@@ -543,10 +926,10 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       // engine in decisions.jsonl and the registry — the exact divergence that
       // guard exists to prevent.
       if (!coderWasStarted && this.coderStarted) {
-        this.coderStarted = !(await this.stopRolledBackSession(this.coderName));
+        this.coderStarted = !(await this.stopRolledBackSession('coder', this.coderName));
       }
       if (!reviewerWasStarted && this.reviewerStarted) {
-        this.reviewerStarted = !(await this.stopRolledBackSession(this.reviewerName));
+        this.reviewerStarted = !(await this.stopRolledBackSession('reviewer', this.reviewerName));
       }
       this.coderSelection = previousCoder;
       this.reviewerSelection = previousReviewer;
@@ -591,11 +974,14 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       actor: 'dispatcher',
       payload: { agent, force: !!opts.force, eagerRestart: !!opts.eagerRestart },
     });
+    let stopped = false;
     try {
       await this.config.manager.stopSession(name);
+      stopped = true;
     } catch (err) {
       this.logger.warn?.(`[autoloop] resetAgent stop failed for ${name}: ${(err as Error).message}`);
     }
+    if (stopped) await this.releaseStoppedGeneration(agent);
     if (agent === 'planner') this.plannerStarted = false;
     if (agent === 'coder') this.coderStarted = false;
     if (agent === 'reviewer') {
@@ -791,25 +1177,29 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   private async ensurePlanner(): Promise<void> {
     if (this.plannerStarted) return;
     this.validateSelection('planner', this.plannerSelection);
-    await this.config.manager.startSession({
-      name: this.plannerName,
-      cwd: this.config.workspace,
-      engine: this.plannerSelection.engine,
-      model: this.roleModel('planner', this.plannerSelection),
-      customEngine: this.plannerSelection.engine === 'custom' ? this.plannerSelection.customEngine : undefined,
-      permissionMode: this.plannerSelection.engine === 'claude' ? 'bypassPermissions' : 'manual',
-      sandboxMode: this.plannerSelection.engine === 'claude' ? undefined : 'read-only',
-      systemPrompt: this.plannerSystemPrompt,
-      // Hard role boundary: Planner must NEVER author content files itself.
-      // Its only writes are plan.md / goal.json via the write_plan /
-      // write_goal autoloop tools. Disallowing the editing tools here is
-      // the load-bearing enforcement — prompt rules alone proved
-      // insufficient (the model would happily produce user-requested
-      // deliverables directly). Read/Glob/Grep/Bash stay enabled so
-      // Planner can still discover, audit, and `git status` the workspace.
-      disallowedTools: ['Write', 'Edit', 'MultiEdit', 'NotebookEdit'],
+    await this.ensureAgentSession('planner', async (generation) => {
+      await this.config.manager.startSession(
+        {
+          name: this.plannerName,
+          cwd: this.config.workspace,
+          engine: this.plannerSelection.engine,
+          model: this.roleModel('planner', this.plannerSelection),
+          customEngine: this.plannerSelection.engine === 'custom' ? this.plannerSelection.customEngine : undefined,
+          permissionMode: this.plannerSelection.engine === 'claude' ? 'bypassPermissions' : 'manual',
+          sandboxMode: this.plannerSelection.engine === 'claude' ? undefined : 'read-only',
+          systemPrompt: this.plannerSystemPrompt,
+          // Hard role boundary: Planner must NEVER author content files itself.
+          // Its only writes are plan.md / goal.json via the write_plan /
+          // write_goal autoloop tools. Disallowing the editing tools here is
+          // the load-bearing enforcement — prompt rules alone proved
+          // insufficient (the model would happily produce user-requested
+          // deliverables directly). Read/Glob/Grep/Bash stay enabled so
+          // Planner can still discover, audit, and `git status` the workspace.
+          disallowedTools: ['Write', 'Edit', 'MultiEdit', 'NotebookEdit'],
+        },
+        generation,
+      );
     });
-    this.plannerStarted = true;
   }
 
   private async deliverToPlanner(env: AnyAutoloopMessage, dispatchId: string): Promise<AnyAutoloopMessage[]> {
@@ -959,16 +1349,20 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   private async ensureCoder(): Promise<void> {
     if (this.coderStarted) return;
     this.validateSelection('coder', this.coderSelection);
-    await this.config.manager.startSession({
-      name: this.coderName,
-      cwd: this.config.workspace,
-      engine: this.coderSelection.engine,
-      model: this.roleModel('coder', this.coderSelection),
-      customEngine: this.coderSelection.engine === 'custom' ? this.coderSelection.customEngine : undefined,
-      permissionMode: 'bypassPermissions',
-      systemPrompt: this.coderSystemPrompt,
+    await this.ensureAgentSession('coder', async (generation) => {
+      await this.config.manager.startSession(
+        {
+          name: this.coderName,
+          cwd: this.config.workspace,
+          engine: this.coderSelection.engine,
+          model: this.roleModel('coder', this.coderSelection),
+          customEngine: this.coderSelection.engine === 'custom' ? this.coderSelection.customEngine : undefined,
+          permissionMode: 'bypassPermissions',
+          systemPrompt: this.coderSystemPrompt,
+        },
+        generation,
+      );
     });
-    this.coderStarted = true;
   }
 
   private async deliverToCoder(env: AnyAutoloopMessage, dispatchId: string): Promise<AnyAutoloopMessage[]> {
@@ -1178,16 +1572,20 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     const sessionPrompt = this.buildReviewerSystemPrompt();
     this.reviewerSessionPrompt = sessionPrompt;
     try {
-      await this.config.manager.startSession({
-        name: this.reviewerName,
-        cwd: this.reviewerSandboxDir,
-        engine: this.reviewerSelection.engine,
-        model: this.roleModel('reviewer', this.reviewerSelection),
-        customEngine: this.reviewerSelection.engine === 'custom' ? this.reviewerSelection.customEngine : undefined,
-        permissionMode: 'bypassPermissions',
-        systemPrompt: sessionPrompt,
+      await this.ensureAgentSession('reviewer', async (generation) => {
+        await this.config.manager.startSession(
+          {
+            name: this.reviewerName,
+            cwd: this.reviewerSandboxDir,
+            engine: this.reviewerSelection.engine,
+            model: this.roleModel('reviewer', this.reviewerSelection),
+            customEngine: this.reviewerSelection.engine === 'custom' ? this.reviewerSelection.customEngine : undefined,
+            permissionMode: 'bypassPermissions',
+            systemPrompt: sessionPrompt,
+          },
+          generation,
+        );
       });
-      this.reviewerStarted = true;
     } catch (err) {
       this.reviewerSessionPrompt = null;
       throw err;

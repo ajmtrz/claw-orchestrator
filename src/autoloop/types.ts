@@ -33,6 +33,14 @@ export interface PhysicalAgentGeneration {
   state: 'live' | 'stale' | 'orphaned' | 'released';
 }
 
+export type AgentRuntimeLiveness = 'live' | 'absent' | 'unknown';
+
+/** Runtime-only facts used to fence durable physical-agent generations. */
+export interface AgentRuntimeProbe {
+  inspect(sessionName: string, sessionId?: string): Promise<AgentRuntimeLiveness>;
+  releaseReservation(sessionName: string, expectedGeneration: number): Promise<boolean>;
+}
+
 export interface RecoveryAssessment {
   run_id: string;
   phase: AutoloopPhase;

@@ -52,6 +52,12 @@ interface PersistedSession {
   originalCreated: string;
   lastResumed: string;
   lastActivity: number;
+  /** Generation fence for an Autoloop-owned physical session name. */
+  agentGeneration?: number;
+  agentOwnerInstanceId?: string;
+  agentSessionId?: string;
+  /** Retained after release so a stale caller cannot reuse an older generation. */
+  agentReleasedGeneration?: number;
 }
 
 function loadPersistedSessions(): Map<string, PersistedSession> {
@@ -69,15 +75,17 @@ function loadPersistedSessions(): Map<string, PersistedSession> {
 }
 
 // Atomic write: write to .tmp then rename to avoid corrupt reads on crash
-function savePersistedSessions(sessions: Map<string, PersistedSession>, logger?: Logger): void {
+function savePersistedSessions(sessions: Map<string, PersistedSession>, logger?: Logger): boolean {
   try {
     fs.mkdirSync(PERSIST_DIR, { recursive: true });
     const arr = Array.from(sessions.values());
     const tmp = PERSIST_FILE + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(arr, null, 2));
     fs.renameSync(tmp, PERSIST_FILE);
+    return true;
   } catch (err) {
     (logger || createConsoleLogger('SessionManager')).warn('Failed to persist sessions:', (err as Error).message);
+    return false;
   }
 }
 
@@ -199,7 +207,13 @@ import { Council } from './council.js';
 import { Fanout, type FanoutConfig, type FanoutSession, type FanoutAgentSpec } from './fanout.js';
 import { AutoloopRunner } from './autoloop/runner.js';
 import { ClaudeAgentDispatcher, type ClaudeAgentDispatcherConfig } from './autoloop/dispatcher.js';
-import type { AutoloopState, PushPolicy } from './autoloop/types.js';
+import type {
+  AgentRuntimeLiveness,
+  AgentRuntimeProbe,
+  AutoloopState,
+  PhysicalAgentGeneration,
+  PushPolicy,
+} from './autoloop/types.js';
 import { DEFAULT_PUSH_POLICY, DEFAULT_SEND_TIMEOUT_MS, validateAutoloopTimeoutConfig } from './autoloop/types.js';
 import { Msg as AutoloopMsg, type PushChannel, type PushLevel, type SendTimeoutPayload } from './autoloop/messages.js';
 import { appendPushLog, notifyUserFallbackChain } from './autoloop/notify.js';
@@ -498,9 +512,10 @@ function validateAutoloopRole(
   return resolved;
 }
 
-export class SessionManager {
+export class SessionManager implements AgentRuntimeProbe {
   private sessions = new Map<string, ManagedSession>();
   private _pendingSessions = new Map<string, Promise<SessionInfo>>();
+  readonly autoloopOwnerInstanceId = `session-manager:${process.pid}:${randomUUID()}`;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
   private pluginConfig: PluginConfig;
   private persistedSessions: Map<string, PersistedSession>;
@@ -600,8 +615,134 @@ export class SessionManager {
 
   // ─── Session Lifecycle ─────────────────────────────────────────────────
 
-  async startSession(config: Partial<SessionConfig> & { name?: string }): Promise<SessionInfo> {
+  /**
+   * Atomically reserve an Autoloop physical name for one durable generation.
+   * The existing session registry is the reservation store; no parallel
+   * database is introduced.
+   */
+  reserveAgentGeneration(generation: PhysicalAgentGeneration, cwd: string): boolean {
+    if (
+      !Number.isInteger(generation.generation) ||
+      generation.generation < 1 ||
+      generation.session_name.length === 0 ||
+      generation.owner_instance_id.length === 0 ||
+      !generation.session_id
+    ) {
+      return false;
+    }
+
+    const existing = this.persistedSessions.get(generation.session_name);
+    if (existing?.agentGeneration !== undefined) {
+      return (
+        existing.agentGeneration === generation.generation &&
+        existing.agentOwnerInstanceId === generation.owner_instance_id &&
+        existing.agentSessionId === generation.session_id
+      );
+    }
+    if (existing && existing.agentReleasedGeneration === undefined) {
+      // Legacy registry-only entries must be explicitly released as generation
+      // zero before they can be converted into a fenced reservation.
+      return false;
+    }
+    if (
+      existing?.agentReleasedGeneration !== undefined &&
+      generation.generation !== existing.agentReleasedGeneration + 1
+    ) {
+      return false;
+    }
+
+    const observedAt = Date.parse(generation.last_activity_at);
+    this.persistedSessions.set(generation.session_name, {
+      name: generation.session_name,
+      claudeSessionId: existing?.claudeSessionId ?? '',
+      cwd: existing?.cwd ?? cwd,
+      model: existing?.model,
+      engine: existing?.engine,
+      sandboxMode: existing?.sandboxMode,
+      originalCreated: existing?.originalCreated ?? generation.created_at,
+      lastResumed: existing?.lastResumed ?? generation.created_at,
+      lastActivity: Number.isNaN(observedAt) ? Date.now() : observedAt,
+      agentGeneration: generation.generation,
+      agentOwnerInstanceId: generation.owner_instance_id,
+      agentSessionId: generation.session_id,
+      agentReleasedGeneration: existing?.agentReleasedGeneration,
+    });
+    if (!savePersistedSessions(this.persistedSessions, this.logger)) {
+      if (existing) this.persistedSessions.set(generation.session_name, existing);
+      else this.persistedSessions.delete(generation.session_name);
+      return false;
+    }
+    return true;
+  }
+
+  /** Inspect only runtime/session-registry facts for one physical name. */
+  async inspect(sessionName: string, sessionId?: string): Promise<AgentRuntimeLiveness> {
+    if (this.sessions.has(sessionName)) return 'live';
+    if (this._pendingSessions.has(sessionName)) return 'unknown';
+
+    const reservation = this.persistedSessions.get(sessionName);
+    if (reservation?.agentSessionId && sessionId && reservation.agentSessionId !== sessionId) {
+      return 'unknown';
+    }
+    return 'absent';
+  }
+
+  /**
+   * Compare-and-release a name reservation. Active or in-flight sessions are
+   * never released, and a stale generation cannot release its replacement.
+   */
+  async releaseReservation(sessionName: string, expectedGeneration: number): Promise<boolean> {
+    if (this.sessions.has(sessionName) || this._pendingSessions.has(sessionName)) return false;
+    const existing = this.persistedSessions.get(sessionName);
+    if (!existing) return false;
+
+    if (expectedGeneration === 0) {
+      if (existing.agentGeneration !== undefined || existing.agentReleasedGeneration !== undefined) return false;
+      this.persistedSessions.delete(sessionName);
+      if (!savePersistedSessions(this.persistedSessions, this.logger)) {
+        this.persistedSessions.set(sessionName, existing);
+        return false;
+      }
+      return true;
+    }
+    if (existing.agentGeneration !== expectedGeneration) return false;
+
+    this.persistedSessions.set(sessionName, {
+      ...existing,
+      agentGeneration: undefined,
+      agentOwnerInstanceId: undefined,
+      agentSessionId: undefined,
+      agentReleasedGeneration: expectedGeneration,
+    });
+    if (!savePersistedSessions(this.persistedSessions, this.logger)) {
+      this.persistedSessions.set(sessionName, existing);
+      return false;
+    }
+    return true;
+  }
+
+  async startSession(
+    config: Partial<SessionConfig> & { name?: string },
+    agentGeneration?: PhysicalAgentGeneration,
+  ): Promise<SessionInfo> {
     const name = config.name || `session-${Date.now()}`;
+
+    const reservation = this.persistedSessions.get(name);
+    const reservationMatches =
+      agentGeneration !== undefined &&
+      reservation?.agentGeneration === agentGeneration.generation &&
+      reservation.agentOwnerInstanceId === agentGeneration.owner_instance_id &&
+      reservation.agentSessionId === agentGeneration.session_id;
+    if (
+      (reservation?.agentGeneration !== undefined ||
+        reservation?.agentReleasedGeneration !== undefined ||
+        agentGeneration !== undefined) &&
+      !reservationMatches
+    ) {
+      throw Object.assign(new Error(`Autoloop session name '${name}' has a conflicting generation reservation`), {
+        code: 'AUTOLOOP_AGENT_GENERATION_CONFLICT',
+      });
+    }
 
     // Check pending first — a concurrent caller may have already started creation
     const pending = this._pendingSessions.get(name);
@@ -1197,7 +1338,14 @@ export class SessionManager {
       // Callers that want the session resumable (autoloop terminate that
       // should still allow /autoloop/<id>/resume to reattach the Planner's
       // Claude conversation) pass keepPersisted: true.
-      this.persistedSessions.delete(name);
+      const persisted = this.persistedSessions.get(name);
+      if (persisted?.agentGeneration !== undefined) {
+        // Keep the generation fence until the dispatcher has durably appended
+        // its release evidence and performs compare-and-release.
+        this.persistedSessions.set(name, { ...persisted, claudeSessionId: '' });
+      } else {
+        this.persistedSessions.delete(name);
+      }
       savePersistedSessions(this.persistedSessions, this.logger);
     }
   }
@@ -2170,14 +2318,18 @@ export class SessionManager {
 
   private _persistSession(name: string, managed: ManagedSession): void {
     const resumeSessionId = this._managedResumeId(managed);
+    const existing = this.persistedSessions.get(name);
     if (!resumeSessionId) {
-      if (managed.config.engine === 'agy' && this.persistedSessions.delete(name)) {
+      if (
+        managed.config.engine === 'agy' &&
+        existing?.agentGeneration === undefined &&
+        this.persistedSessions.delete(name)
+      ) {
         this._debouncedSave();
       }
       return;
     }
     managed.claudeSessionId = resumeSessionId;
-    const existing = this.persistedSessions.get(name);
     this.persistedSessions.set(name, {
       name,
       claudeSessionId: resumeSessionId,
@@ -2188,6 +2340,10 @@ export class SessionManager {
       originalCreated: existing?.originalCreated || managed.created,
       lastResumed: new Date().toISOString(),
       lastActivity: managed.lastActivity,
+      agentGeneration: existing?.agentGeneration,
+      agentOwnerInstanceId: existing?.agentOwnerInstanceId,
+      agentSessionId: existing?.agentSessionId,
+      agentReleasedGeneration: existing?.agentReleasedGeneration,
     });
     this._debouncedSave();
   }
@@ -3030,12 +3186,6 @@ export class SessionManager {
     const plannerEngine = validateAutoloopRole('planner', opts.plannerEngine, opts.plannerCustomEngine);
     const coderEngine = validateAutoloopRole('coder', opts.coderEngine, opts.coderCustomEngine);
     const reviewerEngine = validateAutoloopRole('reviewer', opts.reviewerEngine, opts.reviewerCustomEngine);
-    for (const role of ['planner', 'coder', 'reviewer'] as const) {
-      const sessionName = `autoloop-${opts.runId}-${role}`;
-      if (this.sessions.has(sessionName) || this._pendingSessions.has(sessionName)) {
-        throw new Error(`Autoloop session name '${sessionName}' is already in use`);
-      }
-    }
     const ledgerDir = path.join(opts.workspace, 'tasks', opts.runId);
     if (!fs.existsSync(ledgerDir)) {
       fs.mkdirSync(ledgerDir, { recursive: true });
@@ -3061,6 +3211,9 @@ export class SessionManager {
       reviewerModel: opts.reviewerModel,
       reviewerCustomEngine: opts.reviewerCustomEngine,
       sendTimeoutMs: opts.sendTimeoutMs,
+      agentLeaseMs: opts.activityLeaseMs,
+      runtimeProbe: this,
+      ownerInstanceId: this.autoloopOwnerInstanceId,
       suppressFailedStartAudit: opts._resumeTimeoutMigration,
       logger: this.logger,
       pushPolicyRef: pushPolicy,
@@ -3169,12 +3322,6 @@ export class SessionManager {
     validateAutoloopRole('planner', opts.plannerEngine, opts.plannerCustomEngine);
     validateAutoloopRole('coder', opts.coderEngine, opts.coderCustomEngine);
     validateAutoloopRole('reviewer', opts.reviewerEngine, opts.reviewerCustomEngine);
-    for (const role of ['planner', 'coder', 'reviewer'] as const) {
-      const sessionName = `autoloop-${opts.runId}-${role}`;
-      if (this.sessions.has(sessionName) || this._pendingSessions.has(sessionName)) {
-        throw new Error(`Autoloop session name '${sessionName}' is already in use`);
-      }
-    }
 
     const tag = `${opts.runId}:${randomUUID()}`;
     const ready = new Promise<{ plannerSession: string; state: AutoloopState }>((resolve, reject) => {

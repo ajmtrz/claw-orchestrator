@@ -20,6 +20,7 @@ import type {
   CostBreakdown,
   EffortLevel,
 } from '../types.js';
+import type { PhysicalAgentGeneration } from '../autoloop/types.js';
 
 // ─── Mock ISession ──────────────────────────────────────────────────────────
 
@@ -277,6 +278,24 @@ function lastMock(): MockSession {
   return mockSessions[mockSessions.length - 1];
 }
 
+function managerGeneration(
+  sessionName: string,
+  overrides: Partial<PhysicalAgentGeneration> = {},
+): PhysicalAgentGeneration {
+  return {
+    role: 'planner',
+    generation: 1,
+    session_name: sessionName,
+    session_id: 'physical-session-1',
+    owner_instance_id: 'owner-1',
+    created_at: '2026-09-05T10:00:00.000Z',
+    last_activity_at: '2026-09-05T11:00:00.000Z',
+    lease_expires_at: '2026-09-05T11:30:00.000Z',
+    state: 'stale',
+    ...overrides,
+  };
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 describe('SessionManager', () => {
@@ -449,6 +468,110 @@ describe('SessionManager', () => {
 
     it('getStatus throws for unknown session', () => {
       expect(() => mgr.getStatus('nope')).toThrow("Session 'nope' not found");
+    });
+  });
+
+  describe('autoloop agent runtime probe', () => {
+    it('generation-fences release of a stale registry-only reservation', async () => {
+      const sessionName = 'autoloop-probe-stale-planner';
+      const first = managerGeneration(sessionName);
+      const replacement = managerGeneration(sessionName, {
+        generation: 2,
+        session_id: 'physical-session-2',
+        owner_instance_id: 'owner-2',
+      });
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      await expect(mgr.inspect(sessionName, first.session_id)).resolves.toBe('absent');
+      await expect(mgr.releaseReservation(sessionName, 2)).resolves.toBe(false);
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(false);
+      await expect(mgr.releaseReservation(sessionName, 1)).resolves.toBe(true);
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(true);
+    });
+
+    it('reports pending creation as unknown and keeps a stopped name reserved until fenced release', async () => {
+      const sessionName = 'autoloop-probe-pending-planner';
+      const first = managerGeneration(sessionName);
+      const replacement = managerGeneration(sessionName, {
+        generation: 2,
+        session_id: 'physical-session-2',
+        owner_instance_id: 'owner-2',
+      });
+      let releaseStart!: () => void;
+      const startGate = new Promise<void>((resolve) => {
+        releaseStart = resolve;
+      });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (mgr as any)._createSession = (): ISession => {
+        const mock = new MockSession();
+        mock.start = async () => {
+          await startGate;
+          mock.sessionId = 'engine-session-1';
+          return mock;
+        };
+        mockSessions.push(mock);
+        return mock;
+      };
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      const starting = mgr.startSession({ name: sessionName, cwd: '/tmp' }, first);
+
+      await expect(mgr.inspect(sessionName, first.session_id)).resolves.toBe('unknown');
+      await expect(mgr.releaseReservation(sessionName, 1)).resolves.toBe(false);
+      releaseStart();
+      await starting;
+      await expect(mgr.inspect(sessionName, first.session_id)).resolves.toBe('live');
+      await expect(mgr.releaseReservation(sessionName, 1)).resolves.toBe(false);
+
+      await mgr.stopSession(sessionName);
+      await expect(mgr.inspect(sessionName, first.session_id)).resolves.toBe('absent');
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(false);
+      await expect(mgr.releaseReservation(sessionName, 1)).resolves.toBe(true);
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(true);
+    });
+
+    it('keeps the generation reservation when an engine has no resumable conversation id yet', async () => {
+      const sessionName = 'autoloop-probe-one-shot-planner';
+      const generation = managerGeneration(sessionName);
+
+      expect(mgr.reserveAgentGeneration(generation, '/tmp')).toBe(true);
+      await mgr.startSession({ name: sessionName, cwd: '/tmp', engine: 'agy' }, generation);
+
+      const persisted = (
+        mgr as unknown as {
+          persistedSessions: Map<string, { agentGeneration?: number; agentOwnerInstanceId?: string }>;
+        }
+      ).persistedSessions.get(sessionName);
+      expect(persisted).toMatchObject({
+        agentGeneration: generation.generation,
+        agentOwnerInstanceId: generation.owner_instance_id,
+      });
+    });
+
+    it('rolls back reservation changes when the atomic registry write fails', async () => {
+      const sessionName = 'autoloop-probe-persist-failure-planner';
+      const first = managerGeneration(sessionName);
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, { agentGeneration?: number; agentOwnerInstanceId?: string }>;
+        }
+      ).persistedSessions;
+
+      vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+        throw new Error('registry rename failed');
+      });
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(false);
+      expect(reservations.has(sessionName)).toBe(false);
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+        throw new Error('registry rename failed');
+      });
+      await expect(mgr.releaseReservation(sessionName, first.generation)).resolves.toBe(false);
+      expect(reservations.get(sessionName)).toMatchObject({
+        agentGeneration: first.generation,
+        agentOwnerInstanceId: first.owner_instance_id,
+      });
     });
   });
 
