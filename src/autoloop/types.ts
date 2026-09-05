@@ -35,10 +35,24 @@ export interface PhysicalAgentGeneration {
 
 export type AgentRuntimeLiveness = 'live' | 'absent' | 'unknown';
 
+/** Durable evidence hooks run while the exact runtime generation remains fenced. */
+export interface AgentReservationReleaseOptions {
+  expectedOwnerInstanceId?: string;
+  expectedSessionId?: string;
+  /** Runs after tuple validation but before the registry enters release-pending state. */
+  beforeRelease?: () => void;
+  /** Runs after the pending tombstone is durable and before the name becomes reusable. */
+  persistReleaseEvidence?: () => void;
+}
+
 /** Runtime-only facts used to fence durable physical-agent generations. */
 export interface AgentRuntimeProbe {
   inspect(sessionName: string, sessionId?: string): Promise<AgentRuntimeLiveness>;
-  releaseReservation(sessionName: string, expectedGeneration: number): Promise<boolean>;
+  releaseReservation(
+    sessionName: string,
+    expectedGeneration: number,
+    options?: AgentReservationReleaseOptions,
+  ): Promise<boolean>;
 }
 
 export interface RecoveryAssessment {

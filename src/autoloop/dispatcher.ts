@@ -454,55 +454,69 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   }
 
   private async releaseGeneration(generation: PhysicalAgentGeneration, orphaned: boolean): Promise<void> {
-    const latest = this.currentGeneration(generation.role);
-    if (
-      !latest ||
-      latest.generation !== generation.generation ||
-      latest.owner_instance_id !== generation.owner_instance_id ||
-      latest.session_id !== generation.session_id
-    ) {
-      this.conflict(
-        'AUTOLOOP_AGENT_GENERATION_CONFLICT',
-        generation.role,
-        `changed while generation ${generation.generation} was being released`,
-      );
-    }
+    const exactCurrentGeneration = (): PhysicalAgentGeneration => {
+      const current = this.currentGeneration(generation.role);
+      if (
+        !current ||
+        current.generation !== generation.generation ||
+        current.owner_instance_id !== generation.owner_instance_id ||
+        current.session_id !== generation.session_id
+      ) {
+        this.conflict(
+          'AUTOLOOP_AGENT_GENERATION_CONFLICT',
+          generation.role,
+          `changed while generation ${generation.generation} was being released`,
+        );
+      }
+      return current;
+    };
 
-    // Re-materialize/compare the exact durable fence in SessionManager before
-    // appending orphan evidence. A replacement reservation makes this return
-    // false, so stale cleanup cannot mark or release the new owner.
-    if (!this.config.manager.reserveAgentGeneration(generation, this.config.workspace)) {
-      this.conflict(
-        'AUTOLOOP_AGENT_GENERATION_CONFLICT',
-        generation.role,
-        `no longer belongs to generation ${generation.generation} and owner '${generation.owner_instance_id}'`,
-      );
-    }
-
+    exactCurrentGeneration();
     const observedAt = this.now().toISOString();
-    if (orphaned && latest.state !== 'orphaned') {
-      this.appendGenerationEvent('agent_generation_orphaned', {
-        ...latest,
-        last_activity_at: observedAt,
-        state: 'orphaned',
-      });
-    }
-
-    const released = await this.runtimeProbe.releaseReservation(generation.session_name, generation.generation);
+    const released = await this.runtimeProbe.releaseReservation(generation.session_name, generation.generation, {
+      expectedOwnerInstanceId: generation.owner_instance_id,
+      expectedSessionId: generation.session_id,
+      beforeRelease: () => {
+        const current = exactCurrentGeneration();
+        if (orphaned && current.state !== 'orphaned' && current.state !== 'released') {
+          this.appendGenerationEvent('agent_generation_orphaned', {
+            ...current,
+            last_activity_at: observedAt,
+            state: 'orphaned',
+          });
+        }
+      },
+      persistReleaseEvidence: () => {
+        const current = exactCurrentGeneration();
+        if (current.state === 'released') return;
+        if (orphaned && current.state !== 'orphaned') {
+          this.conflict(
+            'AUTOLOOP_AGENT_GENERATION_CONFLICT',
+            generation.role,
+            `has no durable orphan evidence for generation ${generation.generation}`,
+          );
+        }
+        this.appendGenerationEvent('agent_generation_released', {
+          ...current,
+          last_activity_at: observedAt,
+          state: 'released',
+        });
+      },
+    });
     if (!released) {
-      const completed = this.currentGeneration(generation.role);
-      if (completed?.generation === generation.generation && completed.state === 'released') return;
       this.conflict(
         'AUTOLOOP_AGENT_GENERATION_CONFLICT',
         generation.role,
         `could not compare-and-release generation ${generation.generation}`,
       );
     }
-    this.appendGenerationEvent('agent_generation_released', {
-      ...latest,
-      last_activity_at: observedAt,
-      state: 'released',
-    });
+    if (exactCurrentGeneration().state !== 'released') {
+      this.conflict(
+        'AUTOLOOP_AGENT_GENERATION_CONFLICT',
+        generation.role,
+        `has no durable release evidence for generation ${generation.generation}`,
+      );
+    }
   }
 
   private async releaseStoppedGeneration(role: AutoloopRoleName): Promise<void> {
@@ -521,7 +535,6 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
 
   private async releaseLegacyReservation(role: AutoloopRoleName): Promise<void> {
     const sessionName = this.sessionNameFor(role);
-    if (!(await this.runtimeProbe.releaseReservation(sessionName, 0))) return;
     const observedAt = this.now().toISOString();
     const legacy: PhysicalAgentGeneration = {
       role,
@@ -533,8 +546,26 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       lease_expires_at: observedAt,
       state: 'orphaned',
     };
-    this.appendGenerationEvent('agent_generation_orphaned', legacy);
-    this.appendGenerationEvent('agent_generation_released', { ...legacy, state: 'released' });
+    const released = await this.runtimeProbe.releaseReservation(sessionName, 0, {
+      beforeRelease: () => {
+        const current = this.currentGeneration(role);
+        if (!current) this.appendGenerationEvent('agent_generation_orphaned', legacy);
+      },
+      persistReleaseEvidence: () => {
+        const current = this.currentGeneration(role);
+        if (current?.generation === 0 && current.state === 'released') return;
+        if (current?.generation !== 0 || current.state !== 'orphaned') {
+          this.conflict('AUTOLOOP_AGENT_GENERATION_CONFLICT', role, 'has invalid legacy orphan evidence');
+        }
+        this.appendGenerationEvent('agent_generation_released', { ...current, state: 'released' });
+      },
+    });
+    if (released) {
+      const current = this.currentGeneration(role);
+      if (current?.generation !== 0 || current.state !== 'released') {
+        this.conflict('AUTOLOOP_AGENT_GENERATION_CONFLICT', role, 'has no durable legacy release evidence');
+      }
+    }
   }
 
   private async prepareGeneration(
@@ -590,7 +621,14 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     }
 
     const generation = this.newGeneration(role);
-    if (!this.config.manager.reserveAgentGeneration(generation, this.config.workspace)) {
+    let reserved = this.config.manager.reserveAgentGeneration(generation, this.config.workspace);
+    if (!reserved && current?.state === 'released') {
+      // Release evidence may have survived a crash before the registry's final
+      // tombstone transition. Finish that exact transition, then retry once.
+      await this.releaseGeneration(current, false);
+      reserved = this.config.manager.reserveAgentGeneration(generation, this.config.workspace);
+    }
+    if (!reserved) {
       this.conflict(
         'AUTOLOOP_AGENT_GENERATION_CONFLICT',
         role,

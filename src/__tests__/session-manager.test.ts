@@ -296,6 +296,13 @@ function managerGeneration(
   };
 }
 
+interface ManagerReleaseOptions {
+  expectedOwnerInstanceId?: string;
+  expectedSessionId?: string;
+  beforeRelease?: () => void;
+  persistReleaseEvidence?: () => void;
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 describe('SessionManager', () => {
@@ -483,9 +490,28 @@ describe('SessionManager', () => {
 
       expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
       await expect(mgr.inspect(sessionName, first.session_id)).resolves.toBe('absent');
-      await expect(mgr.releaseReservation(sessionName, 2)).resolves.toBe(false);
+      let mismatchedOrphan = false;
+      await expect(
+        mgr.releaseReservation(sessionName, 2, {
+          beforeRelease: () => {
+            mismatchedOrphan = true;
+          },
+        } as ManagerReleaseOptions),
+      ).resolves.toBe(false);
+      expect(mismatchedOrphan).toBe(false);
       expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(false);
-      await expect(mgr.releaseReservation(sessionName, 1)).resolves.toBe(true);
+      let competingReservation: boolean | undefined;
+      await expect(
+        mgr.releaseReservation(sessionName, 1, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          beforeRelease: () => undefined,
+          persistReleaseEvidence: () => {
+            competingReservation = mgr.reserveAgentGeneration(replacement, '/tmp');
+          },
+        } as ManagerReleaseOptions),
+      ).resolves.toBe(true);
+      expect(competingReservation).toBe(false);
       expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(true);
     });
 
@@ -526,8 +552,58 @@ describe('SessionManager', () => {
       await mgr.stopSession(sessionName);
       await expect(mgr.inspect(sessionName, first.session_id)).resolves.toBe('absent');
       expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(false);
-      await expect(mgr.releaseReservation(sessionName, 1)).resolves.toBe(true);
+      let competingReservation: boolean | undefined;
+      await expect(
+        mgr.releaseReservation(sessionName, 1, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          beforeRelease: () => undefined,
+          persistReleaseEvidence: () => {
+            competingReservation = mgr.reserveAgentGeneration(replacement, '/tmp');
+          },
+        } as ManagerReleaseOptions),
+      ).resolves.toBe(true);
+      expect(competingReservation).toBe(false);
       expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(true);
+    });
+
+    it('keeps a legacy generation-zero tombstone fenced until release evidence is durable', async () => {
+      const sessionName = 'autoloop-probe-legacy-planner';
+      const next = managerGeneration(sessionName);
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      reservations.set(sessionName, {
+        name: sessionName,
+        claudeSessionId: 'legacy-session-id',
+        cwd: '/tmp',
+        originalCreated: '2026-09-05T10:00:00.000Z',
+        lastResumed: '2026-09-05T10:00:00.000Z',
+        lastActivity: Date.parse('2026-09-05T10:00:00.000Z'),
+      });
+      let orphanEvidenceDurable = false;
+      let releaseEvidenceDurable = false;
+      let competingReservation: boolean | undefined;
+
+      await expect(
+        mgr.releaseReservation(sessionName, 0, {
+          beforeRelease: () => {
+            orphanEvidenceDurable = true;
+          },
+          persistReleaseEvidence: () => {
+            expect(orphanEvidenceDurable).toBe(true);
+            competingReservation = mgr.reserveAgentGeneration(next, '/tmp');
+            releaseEvidenceDurable = true;
+          },
+        } as ManagerReleaseOptions),
+      ).resolves.toBe(true);
+
+      expect(orphanEvidenceDurable).toBe(true);
+      expect(releaseEvidenceDurable).toBe(true);
+      expect(competingReservation).toBe(false);
+      expect(mgr.reserveAgentGeneration(next, '/tmp')).toBe(true);
     });
 
     it('keeps the generation reservation when an engine has no resumable conversation id yet', async () => {
@@ -564,14 +640,60 @@ describe('SessionManager', () => {
       expect(reservations.has(sessionName)).toBe(false);
 
       expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      let orphanEvidenceCount = 0;
+      let releaseEvidenceCount = 0;
       vi.mocked(fs.renameSync).mockImplementationOnce(() => {
         throw new Error('registry rename failed');
       });
-      await expect(mgr.releaseReservation(sessionName, first.generation)).resolves.toBe(false);
+      await expect(
+        mgr.releaseReservation(sessionName, first.generation, {
+          beforeRelease: () => {
+            orphanEvidenceCount += 1;
+          },
+          persistReleaseEvidence: () => {
+            releaseEvidenceCount += 1;
+          },
+        } as ManagerReleaseOptions),
+      ).resolves.toBe(false);
+      expect(orphanEvidenceCount).toBe(1);
+      expect(releaseEvidenceCount).toBe(0);
       expect(reservations.get(sessionName)).toMatchObject({
         agentGeneration: first.generation,
         agentOwnerInstanceId: first.owner_instance_id,
       });
+    });
+
+    it('keeps a prepared tombstone fenced when completion persistence fails, then finishes idempotently', async () => {
+      const sessionName = 'autoloop-probe-completion-failure-planner';
+      const first = managerGeneration(sessionName);
+      const replacement = managerGeneration(sessionName, {
+        generation: 2,
+        session_id: 'physical-session-2',
+        owner_instance_id: 'owner-2',
+      });
+      const options: ManagerReleaseOptions = {
+        expectedOwnerInstanceId: first.owner_instance_id,
+        expectedSessionId: first.session_id,
+        beforeRelease: () => undefined,
+        persistReleaseEvidence: () => {
+          releaseEvidenceCount = 1;
+        },
+      };
+      let releaseEvidenceCount = 0;
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      vi.mocked(fs.renameSync)
+        .mockImplementationOnce(() => undefined)
+        .mockImplementationOnce(() => {
+          throw new Error('registry rename failed');
+        });
+      await expect(mgr.releaseReservation(sessionName, 1, options)).resolves.toBe(false);
+      expect(releaseEvidenceCount).toBe(1);
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(false);
+      await expect(mgr.releaseReservation(sessionName, 1, options)).resolves.toBe(true);
+      await expect(mgr.releaseReservation(sessionName, 1, options)).resolves.toBe(true);
+      expect(releaseEvidenceCount).toBe(1);
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(true);
     });
   });
 
