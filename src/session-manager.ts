@@ -4059,7 +4059,7 @@ export class SessionManager implements AgentRuntimeProbe {
       throw new AutoloopChatStateError(
         'AUTOLOOP_RUN_PAUSED',
         `Autoloop run '${runId}' is paused; Planner chat '${chatEnvelope.msg_id}' remains parked`,
-        true,
+        false,
         undefined,
         ctx.runner.state.status_reason,
       );

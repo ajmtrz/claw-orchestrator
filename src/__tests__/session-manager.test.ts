@@ -7,6 +7,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -391,6 +392,20 @@ type ManagerReleaseOptions = AgentReservationReleaseOptions;
 
 function uncheckedReleaseOptions(options: Record<string, unknown>): ManagerReleaseOptions {
   return options as unknown as ManagerReleaseOptions;
+}
+
+function runGit(workspace: string, ...args: string[]): string {
+  return execFileSync('git', args, { cwd: workspace, encoding: 'utf8' });
+}
+
+function initializeGitWorkspace(workspace: string): string {
+  runGit(workspace, 'init', '--quiet');
+  runGit(workspace, 'config', 'user.name', 'Autoloop Test');
+  runGit(workspace, 'config', 'user.email', 'autoloop-test@example.invalid');
+  fs.writeFileSync(path.join(workspace, 'README.md'), 'baseline\n');
+  runGit(workspace, 'add', '--', 'README.md');
+  runGit(workspace, 'commit', '--quiet', '-m', 'test baseline');
+  return runGit(workspace, 'rev-parse', 'HEAD').trim();
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -6499,7 +6514,7 @@ describe('SessionManager', () => {
         expect(mockSessions[0].sendCalls).toHaveLength(2);
       });
 
-      it('reports an ordinary paused chat as parked without consuming it', async () => {
+      it('reports an ordinary paused chat as non-retryable and resumes the parked turn exactly once', async () => {
         const runId = 'planner-chat-ordinary-pause';
         const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
         await mgr.autoloopStart({ runId, workspace });
@@ -6508,7 +6523,7 @@ describe('SessionManager', () => {
 
         await expect(mgr.autoloopChat(runId, 'park this exact turn')).rejects.toMatchObject({
           code: 'AUTOLOOP_RUN_PAUSED',
-          retryable: true,
+          retryable: false,
           pending_dispatch: undefined,
           status_reason: 'operator-review',
         });
@@ -6516,6 +6531,13 @@ describe('SessionManager', () => {
           (handle.runner as unknown as { pausedBuffer: Array<{ payload: { text?: string } }> }).pausedBuffer,
         ).toEqual([expect.objectContaining({ payload: { text: 'park this exact turn' } })]);
         expect(mockSessions[0].sendCalls).toHaveLength(0);
+
+        await handle.runner.send(AutoloopMsg.resume(0));
+        await vi.waitFor(() => expect(mockSessions[0].sendCalls).toHaveLength(1));
+        expect(mockSessions[0].sendCalls[0].message).toContain('park this exact turn');
+        expect(
+          (handle.runner as unknown as { pausedBuffer: Array<{ payload: { text?: string } }> }).pausedBuffer,
+        ).toEqual([]);
       });
 
       it('does not attribute an older send-timeout dispatch to a newly parked chat', async () => {
@@ -6536,7 +6558,7 @@ describe('SessionManager', () => {
 
         await expect(mgr.autoloopChat(runId, 'a distinct parked chat')).rejects.toMatchObject({
           code: 'AUTOLOOP_RUN_PAUSED',
-          retryable: true,
+          retryable: false,
           pending_dispatch: undefined,
         });
         expect(handle.runner.state.pending_dispatch).toEqual(originalPending);
@@ -6671,18 +6693,23 @@ describe('SessionManager', () => {
       });
 
       it.each(['coder', 'reviewer'] as const)(
-        'does not retain a fatal rejected %s send in replay history',
+        'does not retain a fatal rejected one-shot %s send in replay history or the next prompt',
         async (role) => {
           const runId = `fatal-${role}-history-exclusion`;
           const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
-          await mgr.autoloopStart({ runId, workspace });
+          await mgr.autoloopStart({
+            runId,
+            workspace,
+            ...(role === 'coder' ? { coderEngine: 'cursor' as const } : { reviewerEngine: 'cursor' as const }),
+          });
           const handle = mgr.getAutoloop(runId)!;
           await handle.dispatcher.spawnSubagents();
           const roleIndex = role === 'coder' ? 1 : 2;
+          const rejectedMarker = role === 'coder' ? 'FATAL_CODER_TURN_MUST_NOT_REPLAY' : '987654321';
           mockSessions[roleIndex].sendImplementation = async () => {
             throw new Error(`${role} fatal turn`);
           };
-          vi.spyOn(handle.dispatcher, 'resetAgent').mockResolvedValue({
+          const reset = vi.spyOn(handle.dispatcher, 'resetAgent').mockResolvedValue({
             ok: false,
             code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
             agent: role,
@@ -6692,20 +6719,20 @@ describe('SessionManager', () => {
           });
 
           if (role === 'coder') {
-            await handle.runner.send(
+            await handle.dispatcher.deliver(
               AutoloopMsg.directive(0, {
-                goal: 'rejected fatal coder turn',
+                goal: rejectedMarker,
                 constraints: [],
                 success_criteria: [],
                 max_attempts: 1,
               }),
             );
           } else {
-            await handle.runner.send(
+            await handle.dispatcher.deliver(
               AutoloopMsg.reviewRequest(0, {
                 iter: 0,
                 ledger_path: path.join(workspace, 'tasks', runId),
-                prior_metrics: [],
+                prior_metrics: [Number(rejectedMarker)],
               }),
             );
           }
@@ -6717,10 +6744,86 @@ describe('SessionManager', () => {
               }
             ).transcripts[role],
           ).toEqual([]);
+
+          mockSessions[roleIndex].sendImplementation = async () => ({
+            text: role === 'coder' ? 'next coder reply' : 'next reviewer reply',
+            event: { type: 'result', result: 'accepted next turn' },
+          });
+          if (role === 'coder') {
+            await handle.dispatcher.deliver(
+              AutoloopMsg.directive(1, {
+                goal: 'accepted next coder turn',
+                constraints: [],
+                success_criteria: [],
+                max_attempts: 1,
+              }),
+            );
+          } else {
+            await handle.dispatcher.deliver(
+              AutoloopMsg.reviewRequest(1, {
+                iter: 1,
+                ledger_path: path.join(workspace, 'tasks', runId),
+                prior_metrics: [123],
+              }),
+            );
+          }
+
+          expect(String(mockSessions[roleIndex].sendCalls.at(-1)?.message)).not.toContain(rejectedMarker);
+          reset.mockRestore();
         },
       );
 
-      it('preserves critical push-policy severity across an allowed partial update', async () => {
+      it.each(['wechat', 'webchat', 'email'] as const)(
+        'rejects critical push-policy diversion to the $channel channel',
+        async (channel) => {
+          const runId = `planner-critical-policy-channel-${channel}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          const before = JSON.stringify(handle.runner.config.push_policy);
+          mockSessions[0].sendImplementation = async () => ({
+            text: [
+              '```autoloop',
+              JSON.stringify({ tool: 'update_push_policy', args: { on_phase_error: { channel } } }),
+              '```',
+            ].join('\n'),
+            event: { type: 'result', result: 'unsafe critical channel update' },
+          });
+
+          await expect(mgr.autoloopChat(runId, 'do not divert the critical channel')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_MALFORMED',
+            retryable: false,
+          });
+          expect(JSON.stringify(handle.runner.config.push_policy)).toBe(before);
+        },
+      );
+
+      it.each(['on_phase_error', 'on_decision_needed'] as const)(
+        'repairs a legacy non-fallback $key channel during an allowed partial update',
+        async (key) => {
+          const runId = `planner-critical-policy-defensive-${key}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          const requiredLevel = key === 'on_phase_error' ? 'error' : 'decision';
+          handle.runner.config.push_policy![key] = { level: requiredLevel, channel: 'webchat' };
+          mockSessions[0].sendImplementation = async () => ({
+            text: [
+              '```autoloop',
+              JSON.stringify({ tool: 'update_push_policy', args: { [key]: { level: requiredLevel } } }),
+              '```',
+            ].join('\n'),
+            event: { type: 'result', result: 'repair legacy critical channel' },
+          });
+
+          await expect(mgr.autoloopChat(runId, 'retain a fallback-capable channel')).resolves.toMatchObject({
+            reply: expect.stringContaining('update_push_policy'),
+          });
+          expect(handle.runner.config.push_policy?.[key]).toEqual({ level: requiredLevel, channel: 'both' });
+        },
+      );
+
+      it('preserves critical push-policy severity across an allowed fallback-capable partial update', async () => {
         const runId = 'planner-critical-policy-partial-update';
         const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
         await mgr.autoloopStart({ runId, workspace });
@@ -6728,7 +6831,7 @@ describe('SessionManager', () => {
         mockSessions[0].sendImplementation = async () => ({
           text: [
             '```autoloop',
-            '{"tool":"update_push_policy","args":{"on_phase_error":{"channel":"wechat"}}}',
+            '{"tool":"update_push_policy","args":{"on_phase_error":{"channel":"auto"}}}',
             '```',
           ].join('\n'),
           event: { type: 'result', result: 'partial critical update' },
@@ -6737,7 +6840,7 @@ describe('SessionManager', () => {
         await expect(mgr.autoloopChat(runId, 'narrow only the channel')).resolves.toMatchObject({
           reply: expect.stringContaining('update_push_policy'),
         });
-        expect(handle.runner.config.push_policy?.on_phase_error).toEqual({ level: 'error', channel: 'wechat' });
+        expect(handle.runner.config.push_policy?.on_phase_error).toEqual({ level: 'error', channel: 'auto' });
       });
 
       it('rejects a weakening critical push-policy severity atomically', async () => {
@@ -6847,6 +6950,146 @@ describe('SessionManager', () => {
         ]);
         expect(updatePushPolicy).not.toHaveBeenCalled();
       });
+
+      it.each(['pause_loop', 'terminate'] as const)(
+        'rejects a supplied blank %s reason while preserving the omitted default',
+        async (tool) => {
+          const blank = validatePlannerToolCalls([{ tool, args: { reason: '   ' } }]);
+          expect(blank.calls).toEqual([]);
+          expect(blank.errors).toEqual([
+            expect.objectContaining({ tool, error: expect.stringContaining('must be a non-empty string') }),
+          ]);
+
+          const omitted = validatePlannerToolCalls([{ tool, args: {} }]);
+          expect(omitted.errors).toEqual([]);
+          const applied = await applyValidatedPlannerToolCalls(
+            omitted,
+            {
+              spawnSubagents: async () => undefined,
+              updatePushPolicy: () => undefined,
+              writePlanFile: async () => undefined,
+            },
+            0,
+          );
+          expect(applied.errors).toEqual([]);
+          expect(applied.emitted_messages).toEqual([
+            expect.objectContaining({
+              type: tool === 'pause_loop' ? 'pause' : 'terminate',
+              payload: { reason: tool === 'pause_loop' ? 'planner-pause' : 'planner-terminate' },
+            }),
+          ]);
+        },
+      );
+
+      it.each([
+        { tool: 'write_plan' as const, file: 'plan.md' as const, content: '# must not be written' },
+        { tool: 'write_goal' as const, file: 'goal.json' as const, content: '{"must_not":"be written"}' },
+      ])(
+        'aborts $tool after termination begins during an earlier persisted spawn effect',
+        async ({ tool, file, content }) => {
+          const runId = `planner-terminal-batch-${tool}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          const originalHead = initializeGitWorkspace(workspace);
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          handle.dispatcher.config.onSpawnSubagents = async () => {
+            await handle.runner.send(AutoloopMsg.terminate(0, { reason: 'terminal-during-spawn-effect' }));
+          };
+          mockSessions[0].sendImplementation = async () => ({
+            text: [
+              '```autoloop',
+              '{"tool":"spawn_subagents","args":{}}',
+              '```',
+              '```autoloop',
+              JSON.stringify({ tool, args: { content } }),
+              '```',
+            ].join('\n'),
+            event: { type: 'result', result: 'persisted multi-control batch' },
+          });
+
+          await expect(mgr.autoloopChat(runId, 'terminate between persisted effects')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+            retryable: false,
+          });
+          expect(handle.runner.state).toMatchObject({
+            status: 'terminated',
+            status_reason: 'terminal-during-spawn-effect',
+          });
+          expect(fs.existsSync(path.join(workspace, file))).toBe(false);
+          expect(runGit(workspace, 'rev-parse', 'HEAD').trim()).toBe(originalHead);
+
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string; payload?: { tools?: string[] } });
+          expect(decisions).toContainEqual(
+            expect.objectContaining({
+              kind: 'planner_turn_control',
+              payload: expect.objectContaining({ tools: ['spawn_subagents', tool] }),
+            }),
+          );
+        },
+      );
+
+      it('commits only the exact Planner control artifact and leaves unrelated dirty state untouched', async () => {
+        const runId = 'planner-exact-control-commit-scope';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        fs.mkdirSync(workspace, { recursive: true });
+        initializeGitWorkspace(workspace);
+        fs.writeFileSync(path.join(workspace, 'dirty.txt'), 'baseline dirty\n');
+        fs.writeFileSync(path.join(workspace, 'staged.txt'), 'baseline staged\n');
+        runGit(workspace, 'add', '--', 'dirty.txt', 'staged.txt');
+        runGit(workspace, 'commit', '--quiet', '-m', 'unrelated baselines');
+        fs.writeFileSync(path.join(workspace, 'dirty.txt'), 'unstaged user change\n');
+        fs.writeFileSync(path.join(workspace, 'staged.txt'), 'staged user change\n');
+        runGit(workspace, 'add', '--', 'staged.txt');
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"write_plan","args":{"content":"# Exact plan"}}', '```'].join('\n'),
+          event: { type: 'result', result: 'write exact plan' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'commit only plan.md')).resolves.toMatchObject({
+          reply: expect.stringContaining('write_plan'),
+        });
+
+        expect(
+          runGit(workspace, 'show', '--pretty=format:', '--name-only', 'HEAD').trim().split('\n').filter(Boolean),
+        ).toEqual(['plan.md']);
+        expect(runGit(workspace, 'diff', '--name-only')).toContain('dirty.txt');
+        expect(runGit(workspace, 'diff', '--cached', '--name-only')).toContain('staged.txt');
+        expect(runGit(workspace, 'status', '--porcelain', '--', 'tasks')).toContain('?? tasks/');
+      });
+
+      it.each(['status', 'add', 'commit'] as const)(
+        'surfaces a Planner git %s failure instead of claiming control success',
+        async (failedStep) => {
+          const runId = `planner-git-${failedStep}-failure`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          initializeGitWorkspace(workspace);
+          await mgr.autoloopStart({ runId, workspace });
+          if (failedStep === 'status') {
+            fs.writeFileSync(path.join(workspace, '.git', 'index'), 'corrupt index');
+          } else if (failedStep === 'add') {
+            fs.writeFileSync(path.join(workspace, '.git', 'index.lock'), 'locked');
+          } else {
+            const hook = path.join(workspace, '.git', 'hooks', 'pre-commit');
+            fs.writeFileSync(hook, '#!/bin/sh\necho intentional commit failure >&2\nexit 1\n');
+            fs.chmodSync(hook, 0o755);
+          }
+          mockSessions[0].sendImplementation = async () => ({
+            text: ['```autoloop', '{"tool":"write_plan","args":{"content":"# Failing plan"}}', '```'].join('\n'),
+            event: { type: 'result', result: 'git operation should fail' },
+          });
+
+          await expect(mgr.autoloopChat(runId, `surface ${failedStep} failure`)).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+            retryable: false,
+            message: expect.stringContaining(`git ${failedStep}`),
+          });
+        },
+      );
 
       it('refuses a pre-planted plan symlink without touching its external target', async () => {
         const runId = 'planner-plan-symlink-refusal';
@@ -6995,6 +7238,42 @@ describe('SessionManager', () => {
           flush.mockImplementation(flushImplementation);
         }
       });
+
+      it.skipIf(process.platform === 'win32')(
+        'fails reset closed when the generation-ledger parent directory cannot be flushed on POSIX',
+        async () => {
+          const runId = 'generation-release-directory-flush-failure';
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          const ledgerDir = path.join(workspace, 'tasks', runId);
+          const openedTargets = new Map<number, string>();
+          const openFile = vi.mocked(fs.openSync);
+          const openImplementation = openFile.getMockImplementation()!;
+          openFile.mockImplementation(((target: unknown, ...args: unknown[]) => {
+            const fd = (openImplementation as (...values: unknown[]) => number)(target, ...args);
+            openedTargets.set(fd, String(target));
+            return fd;
+          }) as typeof fs.openSync);
+          const flush = vi.mocked(fs.fsyncSync);
+          const flushImplementation = flush.getMockImplementation()!;
+          flush.mockImplementation((fd) => {
+            if (openedTargets.get(fd) === ledgerDir) throw new Error('generation directory flush failed');
+            return flushImplementation(fd);
+          });
+
+          try {
+            await expect(handle.dispatcher.resetAgent('planner', { force: true })).resolves.toMatchObject({
+              ok: false,
+              code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+              message: expect.stringContaining('generation directory flush failed'),
+            });
+          } finally {
+            openFile.mockImplementation(openImplementation);
+            flush.mockImplementation(flushImplementation);
+          }
+        },
+      );
 
       it('keeps Planner reply listeners isolated across simultaneous runs', async () => {
         const firstWorkspace = fs.mkdtempSync(path.join(TEST_WF_DIR, 'cross-run-first-'));

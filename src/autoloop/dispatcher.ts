@@ -1875,6 +1875,9 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       );
     }
     const effects: PlannerToolEffects = {
+      assertActive: () => {
+        if (this.terminal) throw new Error('Autoloop run became terminal during Planner control application');
+      },
       spawnSubagents: async (args) => {
         if (this.terminal) return;
         if (this.config.onSpawnSubagents) {
@@ -1900,6 +1903,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
             delete rule.silent;
             if (k === 'on_phase_error') rule.level = 'error';
             if (k === 'on_decision_needed' && rule.level !== 'error') rule.level = 'decision';
+            if (rule.channel !== 'auto' && rule.channel !== 'both') rule.channel = baseline.channel;
           }
           (this.config.pushPolicyRef as unknown as Record<string, unknown>)[k] = rule;
           applied[k] = rule;
@@ -2501,26 +2505,42 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         child.on('exit', (code) => resolve({ code: code ?? 0, out, err }));
       });
 
-    // Allow either a workspace-rooted plan.md or one inside tasks/<run_id>/.
-    // We don't know which; best-effort `git add -A` keeps it simple and the
-    // commit message captures the intent. Empty diff → skip (no error).
-    const status = await run(['git', 'status', '--porcelain']);
+    const detailFor = (result: { code: number; out: string; err: string }): string =>
+      (result.err || result.out || `exit ${result.code}`).trim().slice(0, 300);
+    const repository = await run(['git', 'rev-parse', '--is-inside-work-tree']);
+    if (repository.code !== 0) {
+      if (/not a git repository/i.test(repository.err + repository.out)) {
+        this.logger.info?.(`[autoloop] commit_${filename}: workspace is not a git repository`);
+        return;
+      }
+      throw new Error(`git rev-parse failed for ${filename} (code=${repository.code}): ${detailFor(repository)}`);
+    }
+    if (repository.out.trim() !== 'true') {
+      throw new Error(`git rev-parse did not confirm a work tree for ${filename}`);
+    }
+
+    // Planner owns exactly one control artifact. Scope every git operation to
+    // that path so pre-existing staged or dirty product work remains untouched.
+    const status = await run(['git', 'status', '--porcelain', '--', filename]);
     if (status.code !== 0) {
-      this.logger.warn?.(`[autoloop] git status failed: ${status.err.slice(0, 200)}`);
-      return;
+      throw new Error(`git status failed for ${filename} (code=${status.code}): ${detailFor(status)}`);
     }
     if (status.out.trim() === '') {
       this.logger.info?.(`[autoloop] commit_${filename}: no changes to commit`);
       return;
     }
-    await run(['git', 'add', '-A']);
-    const commit = await run(['git', 'commit', '-m', message]);
+    const add = await run(['git', 'add', '--', filename]);
+    if (add.code !== 0) {
+      throw new Error(`git add failed for ${filename} (code=${add.code}): ${detailFor(add)}`);
+    }
+    const commit = await run(['git', 'commit', '--only', '-m', message, '--', filename]);
     if (commit.code !== 0) {
-      const detail = commit.err.slice(0, 200);
+      const detail = detailFor(commit);
       // Surface, don't just log: a silent commit failure leaves the file on disk
       // but uncommitted, so the next Coder iter sees inconsistent git state.
       this.logger.error?.(`[autoloop] git commit failed for ${filename}: ${detail}`);
       this.emit('planner_error', new Error(`git commit failed for ${filename}: ${detail}`));
+      throw new Error(`git commit failed for ${filename} (code=${commit.code}): ${detail}`);
     }
   }
 }

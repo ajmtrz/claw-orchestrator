@@ -100,6 +100,8 @@ export interface SpawnSubagentsArgs {
 }
 
 export interface PlannerToolEffects {
+  /** Abort the batch when its owning run can no longer accept effects. */
+  assertActive?: () => void;
   /** Start Coder + Reviewer persistent sessions. */
   spawnSubagents: (args: SpawnSubagentsArgs) => Promise<void>;
   /** Apply an already validated/canonical in-memory push-policy delta. */
@@ -129,6 +131,7 @@ interface PreparedPlannerToolCall {
 
 const VALID_PUSH_LEVELS = new Set<PushLevel>(['info', 'warn', 'decision', 'error']);
 const VALID_PUSH_CHANNELS = new Set<PushChannel>(['auto', 'wechat', 'webchat', 'both', 'email']);
+const FALLBACK_CAPABLE_PUSH_CHANNELS = new Set<PushChannel>(['auto', 'both']);
 const PUSH_POLICY_KEYS = new Set([
   'on_start',
   'on_iter_done_ok',
@@ -228,6 +231,7 @@ function sanitizePushPolicyDelta(raw: Record<string, unknown>, blockedSilence: s
     throw new Error('update_push_policy must include at least one policy key');
   }
   const delta: Record<string, unknown> = {};
+  const unsafeFallbackChannels: Array<{ key: string; channel: PushChannel }> = [];
   for (const [key, value] of Object.entries(raw)) {
     if (!PUSH_POLICY_KEYS.has(key)) throw new Error(`update_push_policy key '${key}' is not supported`);
     if (!isPlainObject(value)) throw new Error(`update_push_policy ${key} must be a plain object`);
@@ -241,6 +245,12 @@ function sanitizePushPolicyDelta(raw: Record<string, unknown>, blockedSilence: s
     if ('channel' in input) {
       if (typeof input.channel !== 'string' || !VALID_PUSH_CHANNELS.has(input.channel as PushChannel)) {
         throw new Error(`update_push_policy ${key} channel '${String(input.channel)}' is not supported`);
+      }
+      if (
+        UNSILENCEABLE_PUSH_POLICY_KEYS.has(key) &&
+        !FALLBACK_CAPABLE_PUSH_CHANNELS.has(input.channel as PushChannel)
+      ) {
+        unsafeFallbackChannels.push({ key, channel: input.channel as PushChannel });
       }
       rule.channel = input.channel;
     }
@@ -264,6 +274,12 @@ function sanitizePushPolicyDelta(raw: Record<string, unknown>, blockedSilence: s
       } else rule.silent = input.silent;
     }
     if (!prohibitedSilenceOnly) delta[key] = rule;
+  }
+  const unsafeFallbackChannel = unsafeFallbackChannels[0];
+  if (unsafeFallbackChannel) {
+    throw new Error(
+      `update_push_policy ${unsafeFallbackChannel.key} channel '${unsafeFallbackChannel.channel}' bypasses the required fallback chain`,
+    );
   }
   return delta;
 }
@@ -332,13 +348,13 @@ function sanitizePlannerToolCall(call: PlannerToolCall, blockedPolicySilence: st
     case 'send_directive':
       return { tool: call.tool, args: sanitizeDirectiveArgs(raw, 'send_directive') };
     case 'pause_loop': {
-      const reason = optionalString(raw.reason, 'pause_loop reason');
+      const reason = raw.reason === undefined ? undefined : nonEmptyString(raw.reason, 'pause_loop reason');
       return { tool: call.tool, args: reason === undefined ? {} : { reason } };
     }
     case 'resume_loop':
       return { tool: call.tool, args: {} };
     case 'terminate': {
-      const reason = optionalString(raw.reason, 'terminate reason');
+      const reason = raw.reason === undefined ? undefined : nonEmptyString(raw.reason, 'terminate reason');
       return { tool: call.tool, args: reason === undefined ? {} : { reason } };
     }
     case 'update_push_policy':
@@ -642,7 +658,10 @@ export async function applyValidatedPlannerToolCalls(
 
   for (const control of prepared) {
     try {
-      emitted_messages.push(...(await control.apply()));
+      fx.assertActive?.();
+      const messages = await control.apply();
+      fx.assertActive?.();
+      emitted_messages.push(...messages);
     } catch (err) {
       errors.push({ tool: control.tool, error: (err as Error).message });
       break;
