@@ -1575,6 +1575,118 @@ describe('SessionManager', () => {
       }
     });
 
+    it('waits for a durably claimed release whose evidence hook body has not started', async () => {
+      const sessionName = 'autoloop-probe-queued-release-shutdown-planner';
+      const first = managerGeneration(sessionName);
+      const successor = createManager();
+      let priorEvidenceCount = 0;
+      let successorEvidenceCount = 0;
+      let startQueuedRelease: (() => void) | undefined;
+      let resolveQueuedRelease!: (value: boolean) => void;
+      let rejectQueuedRelease!: (reason?: unknown) => void;
+      const queuedRelease = new Promise<boolean>((resolve, reject) => {
+        resolveQueuedRelease = resolve;
+        rejectQueuedRelease = reject;
+      });
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      const nativePromiseResolve = Promise.resolve.bind(Promise);
+      const resolveSpy = vi.spyOn(Promise, 'resolve').mockImplementationOnce((() => ({
+        then: (runRelease: () => boolean) => {
+          startQueuedRelease = () => {
+            try {
+              resolveQueuedRelease(runRelease());
+            } catch (err) {
+              rejectQueuedRelease(err);
+            }
+          };
+          return queuedRelease;
+        },
+      })) as typeof Promise.resolve);
+      let release: Promise<boolean>;
+      try {
+        release = mgr.releaseReservation(sessionName, first.generation, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+          beforeRelease: () => {
+            priorEvidenceCount += 1;
+          },
+          persistReleaseEvidence: () => {
+            priorEvidenceCount += 1;
+          },
+        });
+      } finally {
+        resolveSpy.mockRestore();
+      }
+
+      expect(startQueuedRelease).toBeDefined();
+      let shutdownSettled = false;
+      const shutdown = mgr.shutdown().then(() => {
+        shutdownSettled = true;
+      });
+      await nativePromiseResolve();
+      await nativePromiseResolve();
+
+      expect(shutdownSettled).toBe(false);
+      expect(priorEvidenceCount).toBe(0);
+      try {
+        await expect(
+          successor.releaseReservation(sessionName, first.generation, {
+            expectedOwnerInstanceId: first.owner_instance_id,
+            expectedSessionId: first.session_id,
+            releaseOwnerInstanceId: successor.autoloopOwnerInstanceId,
+            beforeRelease: () => {
+              successorEvidenceCount += 1;
+            },
+            persistReleaseEvidence: () => {
+              successorEvidenceCount += 1;
+            },
+          }),
+        ).resolves.toBe(false);
+        expect(successorEvidenceCount).toBe(0);
+
+        startQueuedRelease!();
+        await expect(release).resolves.toBe(true);
+        await shutdown;
+        expect(priorEvidenceCount).toBe(2);
+      } finally {
+        await successor.shutdown();
+      }
+    });
+
+    it('does not admit a new release after shutdown establishes its lifecycle fence', async () => {
+      const sessionName = 'autoloop-probe-post-shutdown-release-planner';
+      const first = managerGeneration(sessionName);
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      let evidenceHookCount = 0;
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      const before = structuredClone(reservations.get(sessionName));
+      const shutdown = mgr.shutdown();
+      await expect(
+        mgr.releaseReservation(sessionName, first.generation, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+          beforeRelease: () => {
+            evidenceHookCount += 1;
+          },
+          persistReleaseEvidence: () => {
+            evidenceHookCount += 1;
+          },
+        }),
+      ).resolves.toBe(false);
+      await shutdown;
+
+      expect(reservations.get(sessionName)).toEqual(before);
+      expect(evidenceHookCount).toBe(0);
+    });
+
     it('keeps a pending release fenced when the prior release owner is indeterminate', async () => {
       const sessionName = 'autoloop-probe-unknown-release-owner-planner';
       const first = managerGeneration(sessionName);
@@ -2612,6 +2724,28 @@ describe('SessionManager', () => {
       await vi.waitFor(() => expect(mgr.ultrareviewStatus(review.id)?.status).toBe('running'));
       await mgr.shutdown();
       expect(cancelled).toBe(true);
+    });
+
+    it('waits for kernel-triggered Autoloop reservation releases before closing the release fence', async () => {
+      const runId = 'shutdown-agent-releases';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      fs.mkdirSync(workspace, { recursive: true });
+      await mgr.autoloopStart({ runId, workspace });
+      await mgr.getAutoloop(runId)!.dispatcher.spawnSubagents();
+
+      await mgr.shutdown();
+
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      for (const role of ['planner', 'coder', 'reviewer']) {
+        const reservation = reservations.get(`autoloop-${runId}-${role}`);
+        expect(reservation).toMatchObject({ agentReleasedGeneration: 1 });
+        expect(reservation).not.toHaveProperty('agentGeneration');
+        expect(reservation).not.toHaveProperty('agentReleasePending');
+      }
     });
 
     it('is idempotent', async () => {

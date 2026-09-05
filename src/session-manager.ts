@@ -685,6 +685,8 @@ export class SessionManager implements AgentRuntimeProbe {
   private _agentReleasesInFlight = 0;
   private _agentReleaseWaiters: Array<() => void> = [];
   private _agentReleaseOperations = new Map<string, Promise<boolean>>();
+  private _agentReleaseFenceClosed = false;
+  private _shutdownPromise: Promise<void> | null = null;
   private _completedBeforeReleaseHooks = new Set<string>();
   private _completedReleaseEvidenceHooks = new Set<string>();
   private _circuitBreaker = new CircuitBreaker();
@@ -1028,6 +1030,7 @@ export class SessionManager implements AgentRuntimeProbe {
     if (this.sessions.has(sessionName) || this._pendingSessions.has(sessionName)) return false;
 
     if (options.rollbackUncommittedReservation) {
+      if (this._agentReleaseFenceClosed) return false;
       const rollback = this._withAgentRegistryLock((authoritative) => {
         const existing = authoritative.get(sessionName);
         if (
@@ -1063,6 +1066,7 @@ export class SessionManager implements AgentRuntimeProbe {
     const releaseOperationKey = this._agentReleaseOperationKey(sessionName, expectedGeneration, options);
     const activeRelease = this._agentReleaseOperations.get(releaseOperationKey);
     if (activeRelease) return await activeRelease;
+    if (this._agentReleaseFenceClosed) return false;
 
     const activeTupleMatches = (reservation: PersistedSession): boolean =>
       reservation.agentGeneration === expectedGeneration &&
@@ -1147,56 +1151,62 @@ export class SessionManager implements AgentRuntimeProbe {
     if (claim.value === 'rejected') return false;
     if (claim.value === 'idempotent') return true;
 
-    const releaseOperation = Promise.resolve().then(() => {
-      this._agentReleasesInFlight += 1;
-      try {
-        if (options.beforeRelease && !this._completedBeforeReleaseHooks.has(releaseOperationKey)) {
-          options.beforeRelease();
-          this._completedBeforeReleaseHooks.add(releaseOperationKey);
-        }
-
-        // Returning false without this hook deliberately leaves the durable
-        // tombstone in place. A caller may retry with the evidence writer, but may
-        // not make the physical name reusable without it.
-        if (!options.persistReleaseEvidence) return false;
-        if (!this._completedReleaseEvidenceHooks.has(releaseOperationKey)) {
-          options.persistReleaseEvidence();
-          this._completedReleaseEvidenceHooks.add(releaseOperationKey);
-        }
-
-        const completion = this._withAgentRegistryLock((authoritative) => {
-          const stillPending = authoritative.get(sessionName);
-          if (
-            !stillPending?.agentReleasePending ||
-            !activeTupleMatches(stillPending) ||
-            stillPending.agentReleaseOwnerInstanceId !== options.releaseOwnerInstanceId
-          ) {
-            return { value: false };
+    this._agentReleasesInFlight += 1;
+    let releaseOperation: Promise<boolean>;
+    try {
+      releaseOperation = Promise.resolve().then(() => {
+        try {
+          if (options.beforeRelease && !this._completedBeforeReleaseHooks.has(releaseOperationKey)) {
+            options.beforeRelease();
+            this._completedBeforeReleaseHooks.add(releaseOperationKey);
           }
-          const updatedSessions = new Map(authoritative);
-          updatedSessions.set(sessionName, {
-            ...stillPending,
-            agentGeneration: undefined,
-            agentOwnerInstanceId: undefined,
-            agentSessionId: undefined,
-            agentReleasePending: undefined,
-            agentReleaseOwnerInstanceId: undefined,
-            agentReleasedGeneration: expectedGeneration,
-            agentReleasedOwnerInstanceId: stillPending.agentOwnerInstanceId,
-            agentReleasedSessionId: stillPending.agentSessionId,
+
+          // Returning false without this hook deliberately leaves the durable
+          // tombstone in place. A caller may retry with the evidence writer, but may
+          // not make the physical name reusable without it.
+          if (!options.persistReleaseEvidence) return false;
+          if (!this._completedReleaseEvidenceHooks.has(releaseOperationKey)) {
+            options.persistReleaseEvidence();
+            this._completedReleaseEvidenceHooks.add(releaseOperationKey);
+          }
+
+          const completion = this._withAgentRegistryLock((authoritative) => {
+            const stillPending = authoritative.get(sessionName);
+            if (
+              !stillPending?.agentReleasePending ||
+              !activeTupleMatches(stillPending) ||
+              stillPending.agentReleaseOwnerInstanceId !== options.releaseOwnerInstanceId
+            ) {
+              return { value: false };
+            }
+            const updatedSessions = new Map(authoritative);
+            updatedSessions.set(sessionName, {
+              ...stillPending,
+              agentGeneration: undefined,
+              agentOwnerInstanceId: undefined,
+              agentSessionId: undefined,
+              agentReleasePending: undefined,
+              agentReleaseOwnerInstanceId: undefined,
+              agentReleasedGeneration: expectedGeneration,
+              agentReleasedOwnerInstanceId: stillPending.agentOwnerInstanceId,
+              agentReleasedSessionId: stillPending.agentSessionId,
+            });
+            return { value: true, updatedSessions };
           });
-          return { value: true, updatedSessions };
-        });
-        if (!completion.ok) throw completion.error;
-        if (completion.value) {
-          this._completedBeforeReleaseHooks.delete(releaseOperationKey);
-          this._completedReleaseEvidenceHooks.delete(releaseOperationKey);
+          if (!completion.ok) throw completion.error;
+          if (completion.value) {
+            this._completedBeforeReleaseHooks.delete(releaseOperationKey);
+            this._completedReleaseEvidenceHooks.delete(releaseOperationKey);
+          }
+          return completion.value;
+        } finally {
+          this._finishAgentRelease();
         }
-        return completion.value;
-      } finally {
-        this._finishAgentRelease();
-      }
-    });
+      });
+    } catch (err) {
+      this._finishAgentRelease();
+      throw err;
+    }
     this._agentReleaseOperations.set(releaseOperationKey, releaseOperation);
     try {
       return await releaseOperation;
@@ -2262,7 +2272,19 @@ export class SessionManager implements AgentRuntimeProbe {
    *
    * After shutdown(), no new sessions can be started. Idempotent.
    */
-  async shutdown(): Promise<void> {
+  shutdown(): Promise<void> {
+    if (this._shutdownPromise) return this._shutdownPromise;
+    let resolveShutdown!: () => void;
+    let rejectShutdown!: (reason?: unknown) => void;
+    this._shutdownPromise = new Promise<void>((resolve, reject) => {
+      resolveShutdown = resolve;
+      rejectShutdown = reject;
+    });
+    void this._performShutdown().then(resolveShutdown, rejectShutdown);
+    return this._shutdownPromise;
+  }
+
+  private async _performShutdown(): Promise<void> {
     if (this.cleanupTimer) {
       clearInterval(this.cleanupTimer);
       this.cleanupTimer = null;
@@ -2293,6 +2315,10 @@ export class SessionManager implements AgentRuntimeProbe {
       this._proxyServer = null;
       this._proxyPort = null;
     }
+    // Kernel teardown may legitimately release Autoloop agents. Once it has
+    // finished initiating those releases, close the fence before observing
+    // the registered-operation count so no later claim can escape the wait.
+    this._agentReleaseFenceClosed = true;
     await this._waitForAgentReleases();
     this._debouncedSave.cancel();
     // Persist final state (TTL-expired sessions already removed by cleanup)
@@ -3627,21 +3653,25 @@ export class SessionManager implements AgentRuntimeProbe {
       };
       const done = (): boolean => runner.state.status === 'terminated' || runner.state.status === 'crashed';
       if (done()) return resolve();
+      let settling = false;
       const check = (): void => {
-        if (done() || signal.aborted) {
-          runner.off('state', check);
-          clearInterval(poll);
-          if (signal.aborted) {
-            // Cancelling a run has to tear the loop down the way a stop does.
-            // Without this the three persistent agents keep running and their
-            // session names stay claimed, so the run cannot be restarted — the
-            // failure looks like "session name already in use" a long way from
-            // its cause.
-            runner.stop();
-            void handle.dispatcher.shutdown('cancelled').catch(() => undefined);
-          }
-          resolve();
-        }
+        if ((!done() && !signal.aborted) || settling) return;
+        settling = true;
+        runner.off('state', check);
+        clearInterval(poll);
+        if (!signal.aborted) return resolve();
+        // Cancelling a run has to tear the loop down the way a stop does.
+        // Without this the three persistent agents keep running and their
+        // session names stay claimed, so the run cannot be restarted — the
+        // failure looks like "session name already in use" a long way from
+        // its cause. The kernel exit remains pending through that teardown so
+        // SessionManager shutdown cannot close its release-admission fence
+        // while the dispatcher is still releasing physical generations.
+        runner.stop();
+        void handle.dispatcher
+          .shutdown('cancelled')
+          .catch(() => undefined)
+          .then(() => resolve());
       };
       runner.on('state', check);
       // The runner emits on state changes, but a cancel arrives out of band and
