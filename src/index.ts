@@ -44,9 +44,25 @@ export { PersistentCustomSession } from './persistent-custom-session.js';
 export { Council, getDefaultCouncilConfig } from './council.js';
 export { AutoloopRunner } from './autoloop/runner.js';
 export { ClaudeAgentDispatcher } from './autoloop/dispatcher.js';
+export { assessRecovery, computeRecoveryToken } from './autoloop/recovery.js';
 export { Msg as AutoloopMsg, validateMessage as autoloopValidate } from './autoloop/messages.js';
 export type { AutoloopEnvelope, AnyAutoloopMessage, AutoloopMessageType, AutoloopRole } from './autoloop/messages.js';
-export type { AgentDispatcher, AutoloopConfig, AutoloopState, AutoloopStatus, PushPolicy } from './autoloop/types.js';
+export type {
+  AgentDispatcher,
+  AutoloopAgentRole,
+  AutoloopConfig,
+  AutoloopPhase,
+  AutoloopState,
+  AutoloopStatus,
+  PhysicalAgentGeneration,
+  PushPolicy,
+  RecoveryAgentEvidence,
+  RecoveryArtifactName,
+  RecoveryAssessment,
+  RecoveryDeliveryEvidence,
+  RecoveryInput,
+  RecoveryIterationEvidence,
+} from './autoloop/types.js';
 export { parseConsensus, stripConsensusTags, hasConsensusMarker } from './consensus.js';
 export { sanitizeCwd, validateRegex, validateName } from './validation.js';
 export { type Logger, createConsoleLogger, nullLogger } from './logger.js';

@@ -6,8 +6,78 @@ import type { AnyAutoloopMessage, PushChannel, PushLevel, SendTimeoutPayload } f
 
 export type AutoloopStatus = 'planning' | 'running' | 'paused' | 'terminated' | 'crashed';
 
+export type AutoloopPhase =
+  | 'PLANNING'
+  | 'AWAITING_CODER'
+  | 'CODER_RUNNING'
+  | 'AWAITING_REVIEW'
+  | 'REVIEWER_RUNNING'
+  | 'PAUSED_RECOVERABLE'
+  | 'BLOCKED'
+  | 'COMPLETED';
+
+export type AutoloopAgentRole = 'planner' | 'coder' | 'reviewer';
+
 /** The three autoloop roles. Single source of truth — dispatcher and SessionManager both use it. */
-export type AutoloopRoleName = 'planner' | 'coder' | 'reviewer';
+export type AutoloopRoleName = AutoloopAgentRole;
+
+export interface PhysicalAgentGeneration {
+  role: AutoloopAgentRole;
+  generation: number;
+  session_name: string;
+  session_id?: string;
+  owner_instance_id: string;
+  created_at: string;
+  last_activity_at: string;
+  lease_expires_at: string;
+  state: 'live' | 'stale' | 'orphaned' | 'released';
+}
+
+export interface RecoveryAssessment {
+  run_id: string;
+  phase: AutoloopPhase;
+  evidence: string[];
+  agents: PhysicalAgentGeneration[];
+  pending_delivery_ids: string[];
+  next_safe_action: 'none' | 'resume_planner' | 'dispatch_coder' | 'request_review' | 'manual_resolution';
+  recovery_token: string;
+}
+
+export type RecoveryArtifactName = 'directive' | 'coder_summary' | 'eval_output' | 'diff';
+
+export interface RecoveryIterationEvidence {
+  iter: number;
+  artifacts: readonly RecoveryArtifactName[];
+  verdict?: 'advance' | 'hold' | 'rollback';
+}
+
+export interface RecoveryDeliveryEvidence {
+  delivery_id: string;
+  iter: number;
+  kind: 'coder_directive' | 'review_request';
+  acknowledged: boolean;
+}
+
+export interface RecoveryAgentEvidence {
+  generation: PhysicalAgentGeneration;
+  /** Runtime observation for this exact generation and owner tuple. */
+  matching_runtime: 'live' | 'absent' | 'unknown';
+}
+
+export interface RecoveryInput {
+  run_id: string;
+  /** Caller-supplied clock keeps assessment deterministic and side-effect free. */
+  observed_at: string;
+  /** Optional because state written before recovery support has no recovery fields. */
+  legacy_state?: Partial<
+    Pick<AutoloopState, 'status' | 'iter' | 'subagents_spawned' | 'status_reason' | 'pending_dispatch'>
+  >;
+  iterations: readonly RecoveryIterationEvidence[];
+  deliveries: readonly RecoveryDeliveryEvidence[];
+  agents: readonly RecoveryAgentEvidence[];
+  /** Explicit durable terminal evidence; legacy `terminated` alone is not completion. */
+  completed?: boolean;
+}
 
 export interface AutoloopState {
   run_id: string;
