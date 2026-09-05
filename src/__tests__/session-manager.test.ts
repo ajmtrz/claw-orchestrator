@@ -22,6 +22,7 @@ import type {
 } from '../types.js';
 import type { AgentReservationReleaseOptions, PhysicalAgentGeneration } from '../autoloop/types.js';
 import type { PhaseErrorPayload } from '../autoloop/messages.js';
+import type { PlannerToolCall } from '../autoloop/planner-tools.js';
 
 // ─── Mock ISession ──────────────────────────────────────────────────────────
 
@@ -309,6 +310,7 @@ vi.mock('node:fs', async () => {
 // Import AFTER mocking fs
 const { SessionManager } = await import('../session-manager.js');
 const { Msg: AutoloopMsg } = await import('../autoloop/messages.js');
+const { validatePlannerToolCalls } = await import('../autoloop/planner-tools.js');
 
 const SESSION_REGISTRY_FILE = path.join(os.homedir(), '.openclaw', 'claude-sessions.json');
 const SESSION_PID_FILE = path.join(os.homedir(), '.openclaw', 'session-pids.json');
@@ -3402,6 +3404,179 @@ describe('SessionManager', () => {
         });
       });
 
+      it('keeps every concurrent runner sender pending until the active drain reaches idle', async () => {
+        const runId = 'planner-runner-drain-waiters';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        let releaseFirst!: () => void;
+        const firstGate = new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+        let markFirstEntered!: () => void;
+        const firstEntered = new Promise<void>((resolve) => {
+          markFirstEntered = resolve;
+        });
+        let turn = 0;
+        mockSessions[0].sendImplementation = async () => {
+          turn += 1;
+          if (turn === 1) {
+            markFirstEntered();
+            await firstGate;
+          }
+          return { text: `runner reply ${turn}`, event: { type: 'result', result: `runner reply ${turn}` } };
+        };
+
+        const first = handle.runner.send(AutoloopMsg.chat(0, { text: 'first direct runner chat' }));
+        await firstEntered;
+        let secondSettled = false;
+        const second = handle.runner.send(AutoloopMsg.chat(0, { text: 'second direct runner chat' })).finally(() => {
+          secondSettled = true;
+        });
+        await new Promise<void>((resolve) => nativeSetImmediate(resolve));
+
+        expect(secondSettled).toBe(false);
+        releaseFirst();
+        await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined]);
+        expect(mockSessions[0].sendCalls).toHaveLength(2);
+      });
+
+      it('publishes the active drain before synchronous message listeners can send again', async () => {
+        const runId = 'planner-runner-reentrant-drain-waiter';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        let releasePlanner!: () => void;
+        const plannerGate = new Promise<void>((resolve) => {
+          releasePlanner = resolve;
+        });
+        let markPlannerEntered!: () => void;
+        const plannerEntered = new Promise<void>((resolve) => {
+          markPlannerEntered = resolve;
+        });
+        mockSessions[0].sendImplementation = async () => {
+          markPlannerEntered();
+          await plannerGate;
+          return { text: 'planner reply', event: { type: 'result', result: 'planner reply' } };
+        };
+        let reentrantSettled = false;
+        let reentrant: Promise<void> | undefined;
+        handle.runner.on('message', (env: { type?: string }) => {
+          if (env.type !== 'chat' || reentrant) return;
+          reentrant = handle.runner.send(AutoloopMsg.pause(0, { reason: 'listener pause' })).finally(() => {
+            reentrantSettled = true;
+          });
+        });
+
+        const first = handle.runner.send(AutoloopMsg.chat(0, { text: 'trigger synchronous listener' }));
+        await plannerEntered;
+        await new Promise<void>((resolve) => nativeSetImmediate(resolve));
+
+        expect(reentrant).toBeDefined();
+        expect(reentrantSettled).toBe(false);
+        releasePlanner();
+        await expect(Promise.all([first, reentrant!])).resolves.toEqual([undefined, undefined]);
+        expect(handle.runner.state).toMatchObject({ status: 'paused', status_reason: 'listener pause' });
+      });
+
+      it('serializes overlapping chats so each caller receives only its own ordered Planner reply', async () => {
+        const runId = 'planner-overlapping-chat-replies';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        let releaseFirst!: () => void;
+        const firstGate = new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+        let markFirstEntered!: () => void;
+        const firstEntered = new Promise<void>((resolve) => {
+          markFirstEntered = resolve;
+        });
+        let turn = 0;
+        mockSessions[0].sendImplementation = async () => {
+          turn += 1;
+          if (turn === 1) {
+            markFirstEntered();
+            await firstGate;
+          }
+          return { text: `reply ${turn}`, event: { type: 'result', result: `reply ${turn}` } };
+        };
+
+        const first = mgr.autoloopChat(runId, 'first user chat');
+        await firstEntered;
+        let secondSettled = false;
+        const second = mgr
+          .autoloopChat(runId, 'second user chat')
+          .then(
+            (value) => ({ value }),
+            (error: unknown) => ({ error }),
+          )
+          .finally(() => {
+            secondSettled = true;
+          });
+        await new Promise<void>((resolve) => nativeSetImmediate(resolve));
+
+        expect(secondSettled).toBe(false);
+        expect(mockSessions[0].sendCalls).toHaveLength(1);
+        releaseFirst();
+        await expect(first).resolves.toEqual({ reply: 'reply 1' });
+        await expect(second).resolves.toEqual({ value: { reply: 'reply 2' } });
+        expect(mockSessions[0].sendCalls).toHaveLength(2);
+        expect(
+          (mgr as unknown as { _autoloopChatTransactions: Map<string, Promise<void>> })._autoloopChatTransactions.size,
+        ).toBe(0);
+      });
+
+      it('does not let a rejected overlapping chat poison or consume the following chat reply', async () => {
+        const runId = 'planner-overlapping-chat-rejection';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        let releaseFirst!: () => void;
+        const firstGate = new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+        let markFirstEntered!: () => void;
+        const firstEntered = new Promise<void>((resolve) => {
+          markFirstEntered = resolve;
+        });
+        let turn = 0;
+        mockSessions[0].sendImplementation = async () => {
+          turn += 1;
+          if (turn === 1) {
+            markFirstEntered();
+            await firstGate;
+            return {
+              text: ['```autoloop', '{"tool":"notify_user","args":{}}', '```'].join('\n'),
+              event: { type: 'result', result: 'rejected first control' },
+            };
+          }
+          return { text: 'fresh second reply', event: { type: 'result', result: 'fresh second reply' } };
+        };
+
+        const first = mgr.autoloopChat(runId, 'first rejected user chat');
+        await firstEntered;
+        let secondSettled = false;
+        const second = mgr
+          .autoloopChat(runId, 'second valid user chat')
+          .then(
+            (value) => ({ value }),
+            (error: unknown) => ({ error }),
+          )
+          .finally(() => {
+            secondSettled = true;
+          });
+        await new Promise<void>((resolve) => nativeSetImmediate(resolve));
+
+        expect(secondSettled).toBe(false);
+        expect(mockSessions[0].sendCalls).toHaveLength(1);
+        releaseFirst();
+        await expect(first).rejects.toMatchObject({ code: 'AUTOLOOP_CONTROL_MALFORMED' });
+        await expect(second).resolves.toEqual({ value: { reply: 'fresh second reply' } });
+        expect(mockSessions[0].sendCalls).toHaveLength(2);
+        expect(
+          (mgr as unknown as { _autoloopChatTransactions: Map<string, Promise<void>> })._autoloopChatTransactions.size,
+        ).toBe(0);
+      });
+
       it('rejects a Planner reply when its physical generation is absent after send', async () => {
         const runId = 'planner-session-absent';
         const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
@@ -3535,6 +3710,210 @@ describe('SessionManager', () => {
         expect(decisions.filter((row) => row.kind === 'phase_error').at(-1)?.payload.code).toBe(
           'AUTOLOOP_CONTROL_MALFORMED',
         );
+      });
+
+      it('bounds every durable Planner metadata field by UTF-8 bytes and every directive array by count', () => {
+        const metadataLimit = 8_192;
+        const arrayItemLimit = 128;
+        const oversizedAscii = 'x'.repeat(metadataLimit + 1);
+        const oversizedUtf8 = '🚀'.repeat(metadataLimit / 4 + 1);
+        const tooManyItems = Array.from({ length: arrayItemLimit + 1 }, () => 'bounded');
+        const cases: Array<{ label: string; control: PlannerToolCall; expected: string }> = [
+          {
+            label: 'notify summary',
+            control: { tool: 'notify_user', args: { summary: oversizedUtf8 } },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+          {
+            label: 'notify detail',
+            control: { tool: 'notify_user', args: { summary: 'status', detail: oversizedAscii } },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+          {
+            label: 'directive goal',
+            control: { tool: 'send_directive', args: { goal: oversizedAscii } },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+          {
+            label: 'directive constraint element',
+            control: { tool: 'send_directive', args: { goal: 'ship', constraints: [oversizedUtf8] } },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+          {
+            label: 'directive success-criteria count',
+            control: { tool: 'send_directive', args: { goal: 'ship', success_criteria: tooManyItems } },
+            expected: `${arrayItemLimit}-item limit`,
+          },
+          {
+            label: 'pause reason',
+            control: { tool: 'pause_loop', args: { reason: oversizedAscii } },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+          {
+            label: 'coder model',
+            control: { tool: 'spawn_subagents', args: { coder_model: oversizedUtf8 } },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+          {
+            label: 'reviewer model',
+            control: { tool: 'spawn_subagents', args: { reviewer_model: oversizedAscii } },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+          {
+            label: 'plan commit message',
+            control: { tool: 'write_plan', args: { content: '# plan', commit_message: oversizedAscii } },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+          {
+            label: 'goal commit message',
+            control: { tool: 'write_goal', args: { content: '{}', commit_message: oversizedUtf8 } },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+        ];
+
+        for (const { label, control, expected } of cases) {
+          const validation = validatePlannerToolCalls([control]);
+          expect(validation.calls, label).toEqual([]);
+          expect(validation.errors[0]?.error, label).toContain(expected);
+        }
+      });
+
+      it('accepts exact metadata, array-count, content, and normalized serialized-batch boundaries', () => {
+        const metadataLimit = 8_192;
+        const arrayItemLimit = 128;
+        const contentLimit = 1_048_576;
+        const batchLimit = 1_114_112;
+        const exactUtf8 = '🚀'.repeat(metadataLimit / 4);
+        const exactItems = Array.from({ length: arrayItemLimit }, () => 'bounded');
+
+        expect(
+          validatePlannerToolCalls([
+            { tool: 'notify_user', args: { summary: exactUtf8, detail: 'x'.repeat(metadataLimit) } },
+            {
+              tool: 'send_directive',
+              args: { goal: 'g'.repeat(metadataLimit), constraints: exactItems, success_criteria: exactItems },
+            },
+            {
+              tool: 'spawn_subagents',
+              args: { coder_model: 'c'.repeat(metadataLimit), reviewer_model: exactUtf8 },
+            },
+            {
+              tool: 'write_goal',
+              args: { content: '{}', commit_message: 'm'.repeat(metadataLimit) },
+            },
+          ]).errors,
+        ).toEqual([]);
+
+        // One content allocation is shared by both the exact and +1-byte batch
+        // checks. The literal component lengths make the JSON boundary exact:
+        // 1 MiB content + 45 bytes for write_plan, then three 16,441-byte
+        // notify additions and one 16,168-byte addition (including commas).
+        const content = 'p'.repeat(contentLimit);
+        const exactBatch: PlannerToolCall[] = [
+          { tool: 'write_plan', args: { content } },
+          ...Array.from({ length: 3 }, () => ({
+            tool: 'notify_user' as const,
+            args: { summary: 's'.repeat(metadataLimit), detail: 'd'.repeat(metadataLimit) },
+          })),
+          {
+            tool: 'notify_user',
+            args: { summary: 's'.repeat(metadataLimit), detail: 'd'.repeat(7_919) },
+          },
+        ];
+        const exact = validatePlannerToolCalls(exactBatch);
+        expect(exact.errors).toEqual([]);
+        expect(Buffer.byteLength(exact.controls_json ?? '', 'utf8')).toBe(batchLimit);
+
+        const overBoundary = exactBatch.map((control, index) =>
+          index === exactBatch.length - 1
+            ? {
+                tool: control.tool,
+                args: { ...control.args, detail: `${String(control.args.detail)}x` },
+              }
+            : control,
+        );
+        const oversized = validatePlannerToolCalls(overBoundary);
+        expect(oversized.calls).toEqual([]);
+        expect(oversized.errors[0]?.error).toContain(`${batchLimit}-byte UTF-8 limit`);
+      });
+
+      it('rejects too many controls before allocating a durable batch', () => {
+        const controls = Array.from<unknown, PlannerToolCall>({ length: 65 }, () => ({
+          tool: 'notify_user',
+          args: { summary: 'bounded' },
+        }));
+
+        const validation = validatePlannerToolCalls(controls);
+
+        expect(validation.calls).toEqual([]);
+        expect(validation.errors[0]?.error).toContain('64-control limit');
+      });
+
+      it('rejects an oversized mixed batch at the chat boundary without a durable control or earlier effect', async () => {
+        const runId = 'planner-oversized-mixed-batch';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents');
+        const individuallyValidControls: PlannerToolCall[] = [
+          { tool: 'spawn_subagents', args: {} },
+          { tool: 'write_plan', args: { content: 'p'.repeat(1_048_576) } },
+          ...Array.from({ length: 4 }, () => ({
+            tool: 'notify_user' as const,
+            args: { summary: 's'.repeat(8_192), detail: 'd'.repeat(8_192) },
+          })),
+        ];
+        mockSessions[0].sendImplementation = async () => ({
+          text: individuallyValidControls
+            .flatMap((control) => ['```autoloop', JSON.stringify(control), '```'])
+            .join('\n'),
+          event: { type: 'result', result: 'oversized mixed batch' },
+        });
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'apply the oversized mixed batch')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_MALFORMED',
+            retryable: false,
+          });
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string });
+          expect(decisions.filter((row) => row.kind === 'planner_turn_control')).toEqual([]);
+          expect(decisions.filter((row) => row.kind === 'spawn_subagents')).toEqual([]);
+          expect(spawn).not.toHaveBeenCalled();
+          expect(mockSessions).toHaveLength(1);
+          expect(fs.existsSync(path.join(workspace, 'plan.md'))).toBe(false);
+          expect(handle.runner.state).toMatchObject({ status: 'planning', subagents_spawned: false });
+        } finally {
+          spawn.mockRestore();
+        }
+      });
+
+      it('rejects a truly empty push-policy control without durable evidence or an effect', async () => {
+        const runId = 'planner-empty-push-policy-control';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const policyBefore = JSON.stringify(handle.runner.config.push_policy);
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"update_push_policy","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'empty policy control' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'apply an empty policy update')).rejects.toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+          retryable: false,
+        });
+        const decisions = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string });
+        expect(decisions.filter((row) => row.kind === 'planner_turn_control')).toEqual([]);
+        expect(decisions.filter((row) => row.kind === 'update_push_policy')).toEqual([]);
+        expect(JSON.stringify(handle.runner.config.push_policy)).toBe(policyBefore);
       });
 
       it('rejects and sanitizes the complete control batch before persisting or applying an earlier spawn', async () => {
@@ -3774,6 +4153,43 @@ describe('SessionManager', () => {
         expect(pushes).toEqual([{ level: 'info', summary: 'allowlisted status', detail: undefined, channel: 'auto' }]);
       });
 
+      it('round-trips legitimate multi-chunk plan and goal controls through durable persistence and application', async () => {
+        const runId = 'planner-large-control-tail-round-trip';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const planContent = `# Approved plan\n${'plan detail\n'.repeat(900)}`;
+        const goalContent = JSON.stringify({ goal: 'g'.repeat(9_000), success: ['tests pass'] });
+        expect(Buffer.byteLength(planContent, 'utf8')).toBeGreaterThan(8_192);
+        expect(Buffer.byteLength(goalContent, 'utf8')).toBeGreaterThan(8_192);
+        mockSessions[0].sendImplementation = async () => ({
+          text: [
+            '```autoloop',
+            JSON.stringify({ tool: 'write_plan', args: { content: planContent } }),
+            '```',
+            '```autoloop',
+            JSON.stringify({ tool: 'write_goal', args: { content: goalContent } }),
+            '```',
+          ].join('\n'),
+          event: { type: 'result', result: 'persist both large artifacts' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'persist the approved artifacts')).resolves.toEqual({
+          reply: 'Planner controls persisted: write_plan, write_goal',
+        });
+
+        expect(fs.readFileSync(path.join(workspace, 'plan.md'), 'utf8')).toBe(planContent);
+        expect(fs.readFileSync(path.join(workspace, 'goal.json'), 'utf8')).toBe(goalContent);
+        const decisions = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { controls?: PlannerToolCall[] } });
+        expect(decisions.find((row) => row.kind === 'planner_turn_control')?.payload.controls).toEqual([
+          { tool: 'write_plan', args: { content: planContent } },
+          { tool: 'write_goal', args: { content: goalContent } },
+        ]);
+      });
+
       it('crash-flushes a new control file and its parent directory before applying its first effect', async () => {
         const runId = 'planner-control-flush-order';
         const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
@@ -3991,23 +4407,25 @@ describe('SessionManager', () => {
           event: { type: 'result', result: 'spawn on win32' },
         });
         const order: string[] = [];
-        const openedTargets = new Map<number, string>();
-        const openedFlags = new Map<number, unknown>();
+        const openHistory: Array<{ fd: number; target: string; flags: unknown }> = [];
+        const currentOpens = new Map<number, { target: string; flags: unknown }>();
         const controlFlushFlags: unknown[] = [];
         const openFile = vi.mocked(fs.openSync);
         const openImplementation = openFile.getMockImplementation()!;
         openFile.mockImplementation(((target: unknown, ...args: unknown[]) => {
           const fd = (openImplementation as (...values: unknown[]) => number)(target, ...args);
-          openedTargets.set(fd, String(target));
-          openedFlags.set(fd, args[0]);
+          const opened = { target: String(target), flags: args[0] };
+          openHistory.push({ fd, ...opened });
+          currentOpens.set(fd, opened);
           return fd;
         }) as typeof fs.openSync);
         const flush = vi.mocked(fs.fsyncSync);
         const flushImplementation = flush.getMockImplementation()!;
         flush.mockImplementation((fd) => {
-          if (openedTargets.get(fd) === decisionsPath) {
+          const currentOpen = currentOpens.get(fd);
+          if (currentOpen?.target === decisionsPath) {
             order.push('control-flushed');
-            controlFlushFlags.push(openedFlags.get(fd));
+            controlFlushFlags.push(currentOpen.flags);
           }
           return flushImplementation(fd);
         });
@@ -4024,7 +4442,7 @@ describe('SessionManager', () => {
             reply: 'Planner controls persisted: spawn_subagents',
           });
           expect(order).toEqual(['control-flushed', 'effect-started']);
-          expect([...openedTargets.values()]).not.toContain(ledgerDir);
+          expect(openHistory.map(({ target }) => target)).not.toContain(ledgerDir);
           expect(controlFlushFlags).toEqual(['r+']);
           expect(warn).toHaveBeenCalledWith(
             '[autoloop] parent-directory fsync is unavailable on win32; control file contents were flushed without a POSIX directory-entry guarantee',
@@ -4822,6 +5240,74 @@ describe('SessionManager', () => {
                 row.kind === 'phase_error' &&
                 row.payload.agent === role &&
                 row.payload.code === 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+            ),
+          ).toHaveLength(1);
+        },
+      );
+
+      it.each(['coder', 'reviewer'] as const)(
+        'classifies an exhausted %s reset-and-retry send as AUTOLOOP_ENGINE_FAILURE',
+        async (role) => {
+          const runId = `engine-code-${role}-exhausted-send`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          await handle.dispatcher.spawnSubagents();
+          const roleIndex = role === 'coder' ? 1 : 2;
+          mockSessions[roleIndex].sendImplementation = async () => {
+            throw new Error(`${role} engine unavailable`);
+          };
+          const reset = vi.spyOn(handle.dispatcher, 'resetAgent').mockResolvedValue({
+            ok: true,
+            agent: role,
+            previous_generation: 1,
+            active_generation: 2,
+            reusable: true,
+          });
+          const phaseErrors: PhaseErrorPayload[] = [];
+          handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+
+          const dispatch =
+            role === 'coder'
+              ? handle.runner.send(
+                  AutoloopMsg.directive(0, {
+                    goal: 'exercise exhausted coder recovery',
+                    constraints: [],
+                    success_criteria: [],
+                    max_attempts: 1,
+                  }),
+                )
+              : handle.runner.send(
+                  AutoloopMsg.reviewRequest(0, {
+                    iter: 0,
+                    ledger_path: path.join(workspace, 'tasks', runId),
+                    prior_metrics: [],
+                  }),
+                );
+          await vi.advanceTimersByTimeAsync(1_000);
+          await dispatch;
+
+          expect(reset).toHaveBeenCalledTimes(1);
+          expect(mockSessions[roleIndex].sendCalls).toHaveLength(2);
+          expect(phaseErrors).toEqual([
+            {
+              agent: role,
+              phase: 'send',
+              code: 'AUTOLOOP_ENGINE_FAILURE',
+              error: `${role} engine unavailable`,
+            },
+          ]);
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string; payload: PhaseErrorPayload });
+          expect(
+            decisions.filter(
+              (row) =>
+                row.kind === 'phase_error' &&
+                row.payload.agent === role &&
+                row.payload.code === 'AUTOLOOP_ENGINE_FAILURE',
             ),
           ).toHaveLength(1);
         },

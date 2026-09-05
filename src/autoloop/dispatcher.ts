@@ -244,21 +244,27 @@ interface PlannerControlEvidence {
   controls_sha256: string;
 }
 
-function normalizePlannerControlValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(normalizePlannerControlValue);
-  if (!value || typeof value !== 'object') return value;
-  return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>)
-      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
-      .map(([key, entry]) => [key, normalizePlannerControlValue(entry)]),
-  );
+function plannerControlsSha256(controls: readonly PlannerToolCall[]): string {
+  return createHash('sha256').update(JSON.stringify(controls)).digest('hex');
 }
 
-function normalizePlannerControls(controls: readonly PlannerToolCall[]): PlannerToolCall[] {
-  return controls.map(({ tool, args }) => ({
-    tool,
-    args: normalizePlannerControlValue(args) as Record<string, unknown>,
-  }));
+function plannerControlClaimMatches(
+  observed: PlannerControlEvidence | undefined,
+  expected: Omit<PlannerControlEvidence, 'control_id' | 'persisted_at'>,
+): observed is PlannerControlEvidence {
+  return Boolean(
+    observed &&
+    observed.dispatch_id === expected.dispatch_id &&
+    observed.message_id === expected.message_id &&
+    observed.iter === expected.iter &&
+    observed.generation === expected.generation &&
+    observed.owner_instance_id === expected.owner_instance_id &&
+    observed.session_id === expected.session_id &&
+    observed.controls_sha256 === expected.controls_sha256 &&
+    plannerControlsSha256(observed.controls) === observed.controls_sha256 &&
+    observed.tools.length === expected.tools.length &&
+    observed.tools.every((tool, index) => tool === expected.tools[index]),
+  );
 }
 
 function plannerControlEvidenceMatches(
@@ -269,15 +275,7 @@ function plannerControlEvidenceMatches(
     observed &&
     observed.control_id === expected.control_id &&
     observed.persisted_at === expected.persisted_at &&
-    observed.dispatch_id === expected.dispatch_id &&
-    observed.message_id === expected.message_id &&
-    observed.iter === expected.iter &&
-    observed.generation === expected.generation &&
-    observed.owner_instance_id === expected.owner_instance_id &&
-    observed.session_id === expected.session_id &&
-    observed.controls_sha256 === expected.controls_sha256 &&
-    JSON.stringify(observed.tools) === JSON.stringify(expected.tools) &&
-    JSON.stringify(observed.controls) === JSON.stringify(expected.controls),
+    plannerControlClaimMatches(observed, expected),
   );
 }
 
@@ -306,19 +304,7 @@ function assertPlannerTurnSucceeded(result: PlannerTurnResult, expected: Planner
   }
   if (expected.expectedControl) {
     const persisted = result.persistedControl;
-    const expectedControl = expected.expectedControl;
-    if (
-      !persisted ||
-      persisted.dispatch_id !== expectedControl.dispatch_id ||
-      persisted.message_id !== expectedControl.message_id ||
-      persisted.iter !== expectedControl.iter ||
-      persisted.generation !== expectedControl.generation ||
-      persisted.owner_instance_id !== expectedControl.owner_instance_id ||
-      persisted.session_id !== expectedControl.session_id ||
-      persisted.controls_sha256 !== expectedControl.controls_sha256 ||
-      JSON.stringify(persisted.tools) !== JSON.stringify(expectedControl.tools) ||
-      JSON.stringify(persisted.controls) !== JSON.stringify(expectedControl.controls)
-    ) {
+    if (!plannerControlClaimMatches(persisted, expected.expectedControl)) {
       throw new AutoloopOperationError(
         'AUTOLOOP_CONTROL_NOT_PERSISTED',
         'Planner control claims have no matching persisted event for this physical generation',
@@ -1417,7 +1403,12 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         throw new Error(result.error);
       } catch (err2) {
         this.logger.error?.(`[autoloop] ${agent} second attempt failed after reset: ${(err2 as Error).message}`);
-        return { output: '', error: (err2 as Error).message, fatal: true };
+        return {
+          output: '',
+          error: (err2 as Error).message,
+          fatal: true,
+          code: 'AUTOLOOP_ENGINE_FAILURE',
+        };
       }
     }
   }
@@ -1775,7 +1766,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     // This allowlisted batch is the sole source for canonicalization, digest,
     // persistence, comparison, and application. Raw Planner arguments never
     // cross the durable control boundary.
-    const normalizedControls = normalizePlannerControls(validation.calls);
+    const normalizedControls = validation.calls;
     const effects: PlannerToolEffects = {
       spawnSubagents: async (args) => {
         if (this.config.onSpawnSubagents) {
@@ -1822,7 +1813,9 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
           'Planner control could not be bound to a physical generation',
         );
       }
-      const controlsSha256 = createHash('sha256').update(JSON.stringify(normalizedControls)).digest('hex');
+      const controlsSha256 = createHash('sha256')
+        .update(validation.controls_json ?? '[]')
+        .digest('hex');
       expectedControl = {
         dispatch_id: dispatchId,
         message_id: env.msg_id,

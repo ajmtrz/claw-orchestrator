@@ -142,31 +142,45 @@ const PUSH_POLICY_KEYS = new Set([
 const UNSILENCEABLE_PUSH_POLICY_KEYS = new Set(['on_phase_error', 'on_decision_needed']);
 const PUSH_POLICY_RULE_FIELDS = new Set(['channel', 'level', 'silent']);
 
+/** Maximum UTF-8 bytes accepted for one durable metadata string. */
+export const MAX_PLANNER_CONTROL_METADATA_BYTES = 8_192;
+/** Maximum entries accepted in one directive metadata array. */
+export const MAX_PLANNER_CONTROL_ARRAY_ITEMS = 128;
+/** Maximum controls accepted from one Planner turn. */
+export const MAX_PLANNER_CONTROL_CALLS = 64;
 /**
  * Maximum UTF-8 bytes accepted for one durable write_plan/write_goal payload.
- * Planner controls are synchronously appended, fsynced, and tail-verified, so
- * this 1 MiB ceiling bounds event-loop blocking while leaving ample room for
- * legitimate planning artifacts.
+ * The complete normalized batch has a separate ceiling with 64 KiB reserved
+ * for its JSON structure and bounded metadata.
  */
 export const MAX_PLANNER_CONTROL_CONTENT_BYTES = 1_048_576;
+/**
+ * Maximum UTF-8 bytes in the final normalized JSON control batch. Planner
+ * controls are synchronously appended, fsynced, and tail-verified; bounding
+ * the serialized representation (not only artifact content) bounds that work.
+ */
+export const MAX_PLANNER_CONTROL_BATCH_BYTES = MAX_PLANNER_CONTROL_CONTENT_BYTES + 65_536;
 
-function nonEmptyString(value: unknown, label: string): string {
-  if (typeof value !== 'string' || !value.trim()) throw new Error(`${label} must be a non-empty string`);
+function boundedString(value: string, label: string, maxBytes = MAX_PLANNER_CONTROL_METADATA_BYTES): string {
+  if (Buffer.byteLength(value, 'utf8') > maxBytes) {
+    throw new Error(`${label} exceeds the ${maxBytes}-byte UTF-8 limit`);
+  }
   return value;
 }
 
+function nonEmptyString(value: unknown, label: string, maxBytes = MAX_PLANNER_CONTROL_METADATA_BYTES): string {
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`${label} must be a non-empty string`);
+  return boundedString(value, label, maxBytes);
+}
+
 function boundedPlannerContent(value: unknown, label: 'write_plan content' | 'write_goal content'): string {
-  const content = nonEmptyString(value, label);
-  if (Buffer.byteLength(content, 'utf8') > MAX_PLANNER_CONTROL_CONTENT_BYTES) {
-    throw new Error(`${label} exceeds the ${MAX_PLANNER_CONTROL_CONTENT_BYTES}-byte UTF-8 limit`);
-  }
-  return content;
+  return nonEmptyString(value, label, MAX_PLANNER_CONTROL_CONTENT_BYTES);
 }
 
 function optionalString(value: unknown, label: string): string | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== 'string') throw new Error(`${label} must be a string`);
-  return value;
+  return boundedString(value, label);
 }
 
 function optionalStringArray(value: unknown, label: string): string[] | undefined {
@@ -174,7 +188,10 @@ function optionalStringArray(value: unknown, label: string): string[] | undefine
   if (!Array.isArray(value) || !value.every((entry) => typeof entry === 'string')) {
     throw new Error(`${label} must be an array of strings`);
   }
-  return [...value];
+  if (value.length > MAX_PLANNER_CONTROL_ARRAY_ITEMS) {
+    throw new Error(`${label} exceeds the ${MAX_PLANNER_CONTROL_ARRAY_ITEMS}-item limit`);
+  }
+  return value.map((entry, index) => boundedString(entry, `${label}[${index}]`));
 }
 
 function optionalPositiveInteger(value: unknown, label: string): number | undefined {
@@ -202,6 +219,9 @@ function sanitizeDirectiveArgs(
 }
 
 function sanitizePushPolicyDelta(raw: Record<string, unknown>, blockedSilence: string[]): Record<string, unknown> {
+  if (Object.keys(raw).length === 0) {
+    throw new Error('update_push_policy must include at least one policy key');
+  }
   const delta: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(raw)) {
     if (!PUSH_POLICY_KEYS.has(key)) throw new Error(`update_push_policy key '${key}' is not supported`);
@@ -344,10 +364,41 @@ export interface PlannerToolValidationResult {
   calls: PlannerToolCall[];
   errors: Array<{ tool: string; error: string }>;
   blocked_policy_silence: string[];
+  /** Canonical normalized bytes used for batch sizing and the durable digest. */
+  controls_json?: string;
+}
+
+function normalizePlannerControlValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(normalizePlannerControlValue);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .map(([key, entry]) => [key, normalizePlannerControlValue(entry)]),
+  );
+}
+
+function normalizePlannerControls(controls: readonly PlannerToolCall[]): PlannerToolCall[] {
+  return controls.map(({ tool, args }) => ({
+    tool,
+    args: normalizePlannerControlValue(args) as Record<string, unknown>,
+  }));
 }
 
 /** Validate and sanitize the complete batch without performing any effect. */
 export function validatePlannerToolCalls(calls: readonly PlannerToolCall[]): PlannerToolValidationResult {
+  if (calls.length > MAX_PLANNER_CONTROL_CALLS) {
+    return {
+      calls: [],
+      errors: [
+        {
+          tool: 'batch',
+          error: `Planner control batch exceeds the ${MAX_PLANNER_CONTROL_CALLS}-control limit`,
+        },
+      ],
+      blocked_policy_silence: [],
+    };
+  }
   const validated: PlannerToolCall[] = [];
   const errors: Array<{ tool: string; error: string }> = [];
   const blockedPolicySilence: string[] = [];
@@ -364,10 +415,27 @@ export function validatePlannerToolCalls(calls: readonly PlannerToolCall[]): Pla
       errors.push({ tool: call.tool, error: (error as Error).message });
     }
   }
+  if (errors.length > 0) return { calls: [], errors, blocked_policy_silence: [] };
+
+  const normalized = normalizePlannerControls(validated);
+  const controlsJson = JSON.stringify(normalized);
+  if (Buffer.byteLength(controlsJson, 'utf8') > MAX_PLANNER_CONTROL_BATCH_BYTES) {
+    return {
+      calls: [],
+      errors: [
+        {
+          tool: 'batch',
+          error: `Planner control batch exceeds the ${MAX_PLANNER_CONTROL_BATCH_BYTES}-byte UTF-8 limit`,
+        },
+      ],
+      blocked_policy_silence: [],
+    };
+  }
   return {
-    calls: errors.length === 0 ? validated : [],
-    errors,
-    blocked_policy_silence: errors.length === 0 ? blockedPolicySilence : [],
+    calls: normalized,
+    errors: [],
+    blocked_policy_silence: blockedPolicySilence,
+    controls_json: controlsJson,
   };
 }
 

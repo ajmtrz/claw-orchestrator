@@ -114,6 +114,8 @@ export class AutoloopRunner extends EventEmitter {
    */
   private pausedBuffer: AnyAutoloopMessage[] = [];
   private draining = false;
+  /** Shared completion for every sender that joins the active queue drain. */
+  private drainPromise: Promise<void> | null = null;
   private regressionStreak = 0;
   private rejectStreak = 0;
   /** Recent push events for dedup (5 min window). */
@@ -354,6 +356,14 @@ export class AutoloopRunner extends EventEmitter {
   async send(env: AnyAutoloopMessage): Promise<void> {
     validateMessage(env);
     this.recordActivity('queue_message_accepted');
+    if (this.drainPromise && env.to === 'runner' && env.type === 'terminate') {
+      // Termination is the one pre-emptive control: queueing it behind a stuck
+      // agent send would make the operator unable to stop that send. Apply the
+      // terminal transition now; terminate() clears queued work, and the active
+      // delivery is ignored when it eventually returns into terminal state.
+      await this.handleOne(env);
+      return;
+    }
     this.queue.push(env);
     await this.drain();
   }
@@ -404,57 +414,84 @@ export class AutoloopRunner extends EventEmitter {
 
   // ─── Drain loop ────────────────────────────────────────────────────────────
 
-  private async drain(): Promise<void> {
-    if (this.draining) return; // a previous send() is already draining; new items will be picked up
+  private drain(): Promise<void> {
+    if (this.drainPromise) return this.drainPromise;
+
+    let resolveDrain!: () => void;
+    let rejectDrain!: (error: unknown) => void;
+    const activeDrain = new Promise<void>((resolve, reject) => {
+      resolveDrain = resolve;
+      rejectDrain = reject;
+    });
+
+    // Publish the shared completion before starting the loop. handleOne()
+    // emits synchronously, so a listener can re-enter send() before the first
+    // awaited delivery; that sender must join this drain rather than start a
+    // competing consumer.
+    this.drainPromise = activeDrain;
     this.draining = true;
+    const settle = (): void => {
+      this.draining = false;
+      if (this.drainPromise === activeDrain) this.drainPromise = null;
+    };
+    void this.drainUntilIdle().then(
+      () => {
+        settle();
+        resolveDrain();
+      },
+      (error: unknown) => {
+        settle();
+        rejectDrain(error);
+      },
+    );
+    return activeDrain;
+  }
+
+  private async drainUntilIdle(): Promise<void> {
     let plannerFailure: PlannerOperationFailure | undefined;
     let pendingPlannerPhaseError: AnyAutoloopMessage | undefined;
-    try {
-      const maxDepth = this.config.maxDispatchDepth ?? MAX_DISPATCH_DEPTH;
-      let depth = 0;
-      while (this.queue.length > 0) {
-        if (depth++ > maxDepth) {
-          const next = this.queue[0];
-          const routingError = new AutoloopRoutingError(
-            `dispatch depth exceeded ${maxDepth} at iter ${this.state.iter} (next='${next?.type ?? '?'}' to '${next?.to ?? '?'}') — likely message ping-pong; raise config.maxDispatchDepth for legitimately deep workflows`,
-          );
-          if (plannerFailure) {
-            if (pendingPlannerPhaseError) {
-              const pendingIndex = this.queue.indexOf(pendingPlannerPhaseError);
-              if (pendingIndex >= 0) this.queue.splice(pendingIndex, 1);
-            }
-            preserveSecondaryPlannerFailure(plannerFailure, routingError);
-            break;
+    const maxDepth = this.config.maxDispatchDepth ?? MAX_DISPATCH_DEPTH;
+    let depth = 0;
+    while (this.queue.length > 0) {
+      if (depth++ > maxDepth) {
+        const next = this.queue[0];
+        const routingError = new AutoloopRoutingError(
+          `dispatch depth exceeded ${maxDepth} at iter ${this.state.iter} (next='${next?.type ?? '?'}' to '${next?.to ?? '?'}') — likely message ping-pong; raise config.maxDispatchDepth for legitimately deep workflows`,
+        );
+        if (plannerFailure) {
+          if (pendingPlannerPhaseError) {
+            const pendingIndex = this.queue.indexOf(pendingPlannerPhaseError);
+            if (pendingIndex >= 0) this.queue.splice(pendingIndex, 1);
           }
-          throw routingError;
+          preserveSecondaryPlannerFailure(plannerFailure, routingError);
+          break;
         }
-        const env = this.queue.shift();
-        if (!env) break;
-        if (env === pendingPlannerPhaseError) pendingPlannerPhaseError = undefined;
-        try {
-          await this.handleOne(env);
-        } catch (error) {
-          if (env.to === 'planner' && isPlannerOperationFailure(error)) {
-            plannerFailure ??= error;
-            pendingPlannerPhaseError = Msg.phaseError(env.iter, {
-              agent: 'planner',
-              phase: 'planner_turn',
-              code: error.code,
-              error: error.message,
-            });
-            this.queue.unshift(pendingPlannerPhaseError);
-          } else if (plannerFailure) {
-            // The synthetic phase-error route may itself fail (for example an
-            // out-of-band notifier throws). Keep that evidence on the primary
-            // typed failure, but never let it replace the caller-visible code.
-            preserveSecondaryPlannerFailure(plannerFailure, error);
-          } else {
-            throw error;
-          }
+        throw routingError;
+      }
+      const env = this.queue.shift();
+      if (!env) break;
+      if (env === pendingPlannerPhaseError) pendingPlannerPhaseError = undefined;
+      try {
+        await this.handleOne(env);
+      } catch (error) {
+        if (env.to === 'planner' && isPlannerOperationFailure(error)) {
+          plannerFailure ??= error;
+          pendingPlannerPhaseError = Msg.phaseError(env.iter, {
+            agent: 'planner',
+            phase: 'planner_turn',
+            code: error.code,
+            error: error.message,
+          });
+          this.queue.unshift(pendingPlannerPhaseError);
+        } else if (plannerFailure) {
+          // The synthetic phase-error route may itself fail (for example an
+          // out-of-band notifier throws). Keep that evidence on the primary
+          // typed failure, but never let it replace the caller-visible code.
+          preserveSecondaryPlannerFailure(plannerFailure, error);
+        } else {
+          throw error;
         }
       }
-    } finally {
-      this.draining = false;
     }
     if (plannerFailure) throw plannerFailure;
   }

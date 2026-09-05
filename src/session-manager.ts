@@ -3439,6 +3439,12 @@ export class SessionManager implements AgentRuntimeProbe {
   private _autoloopSelection = new Map<string, unknown>();
   /** Per-run checkpoint refreshers, registered by the autoloop node executor. */
   private _autoloopPublishers = new Map<string, () => void>();
+  /**
+   * Per-run Planner-chat transaction tails. Dispatcher reply/phase-error events
+   * are run-scoped rather than message-scoped, so only one listener pair may
+   * own a run at a time.
+   */
+  private _autoloopChatTransactions = new Map<string, Promise<void>>();
 
   async ultraplanStart(
     task: string,
@@ -3979,6 +3985,25 @@ export class SessionManager implements AgentRuntimeProbe {
    * natural-language reply.
    */
   async autoloopChat(runId: string, text: string): Promise<{ reply: string }> {
+    const predecessor = this._autoloopChatTransactions.get(runId) ?? Promise.resolve();
+    let release!: () => void;
+    const transaction = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = predecessor.then(() => transaction);
+    this._autoloopChatTransactions.set(runId, tail);
+    await predecessor;
+    try {
+      return await this._autoloopChatTransaction(runId, text);
+    } finally {
+      release();
+      if (this._autoloopChatTransactions.get(runId) === tail) {
+        this._autoloopChatTransactions.delete(runId);
+      }
+    }
+  }
+
+  private async _autoloopChatTransaction(runId: string, text: string): Promise<{ reply: string }> {
     const ctx = this._liveAutoloop(runId);
     let reply = '';
     let plannerFailure: AutoloopOperationError | undefined;
