@@ -1271,7 +1271,11 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         );
       }
 
-      if (previous && previous.state !== 'released') {
+      if (previous) {
+        // The release event can be durable while SessionManager's matching
+        // registry tombstone is still pending. Retrying the exact generation is
+        // idempotent and lets releaseReservation finish that existing fence;
+        // skipping it would leave repeated reset calls permanently blocked.
         await this.releaseGeneration(previous, false, () => {
           previousGenerationReleased = true;
           this.setRoleStarted(agent, false);

@@ -3717,49 +3717,129 @@ describe('SessionManager', () => {
         expect(roleState.reviewerSessionPrompt).toBe(priorPrompt);
       });
 
-      it('does not resurrect an exact generation when registry finalization fails after durable release', async () => {
+      it('finishes a real pending registry release exactly once before creating the next generation', async () => {
         const runId = 'reset-release-evidence-then-registry-failure';
         const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
         await mgr.autoloopStart({ runId, workspace });
         const handle = mgr.getAutoloop(runId)!;
+        const plannerName = handle.dispatcher.sessionNames.planner;
         const roleState = handle.dispatcher as unknown as { plannerStarted: boolean };
-        vi.spyOn(mgr, 'releaseReservation').mockImplementationOnce(
-          async (_name, _generation, options: AgentReservationReleaseOptions) => {
-            options.beforeRelease?.();
-            options.persistReleaseEvidence?.();
-            throw new Error('registry finalization failed after release evidence');
-          },
-        );
+        const generationLedgerPath = path.join(workspace, 'tasks', runId, 'agent-generations.jsonl');
+        const readRegistryReservation = () =>
+          (JSON.parse(persistenceFsState.files.get(SESSION_REGISTRY_FILE)!) as Array<Record<string, unknown>>).find(
+            (reservation) => reservation.name === plannerName,
+          );
+        const readGenerationRows = () =>
+          fs
+            .readFileSync(generationLedgerPath, 'utf8')
+            .trim()
+            .split('\n')
+            .map(
+              (line) =>
+                JSON.parse(line) as {
+                  kind: string;
+                  payload: PhysicalAgentGeneration;
+                },
+            );
+        const persistedRename = vi.mocked(fs.renameSync).getMockImplementation()!;
+        let completionFailureInjected = false;
+        vi.mocked(fs.renameSync).mockImplementation(((from: unknown, to: unknown) => {
+          if (!completionFailureInjected && String(to) === SESSION_REGISTRY_FILE) {
+            const pendingSnapshot = persistenceFsState.files.get(String(from));
+            const plannerReservation = pendingSnapshot
+              ? (JSON.parse(pendingSnapshot) as Array<Record<string, unknown>>).find(
+                  (reservation) => reservation.name === plannerName,
+                )
+              : undefined;
+            if (
+              plannerReservation?.agentReleasedGeneration === 1 &&
+              plannerReservation.agentGeneration === undefined &&
+              plannerReservation.agentReleasePending !== true
+            ) {
+              completionFailureInjected = true;
+              throw new Error('registry finalization failed after release evidence');
+            }
+          }
+          return (persistedRename as unknown as (source: unknown, destination: unknown) => void)(from, to);
+        }) as typeof fs.renameSync);
 
-        await expect(handle.dispatcher.resetAgent('planner', { force: true })).resolves.toMatchObject({
-          ok: false,
-          code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
-          previous_generation: 1,
-        });
-        expect(roleState.plannerStarted).toBe(false);
-        let generationRows = fs
-          .readFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), 'utf8')
-          .trim()
-          .split('\n')
-          .map((line) => JSON.parse(line) as { kind: string; payload: { generation: number; state: string } });
-        expect(generationRows.at(-1)).toMatchObject({
-          kind: 'agent_generation_released',
-          payload: { generation: 1, state: 'released' },
-        });
+        try {
+          await expect(handle.dispatcher.resetAgent('planner', { force: true })).resolves.toMatchObject({
+            ok: false,
+            code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+            previous_generation: 1,
+          });
 
-        await expect(mgr.autoloopChat(runId, 'continue after registry recovery')).resolves.toMatchObject({
-          reply: expect.any(String),
-        });
-        expect(roleState.plannerStarted).toBe(true);
-        generationRows = fs
-          .readFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), 'utf8')
-          .trim()
-          .split('\n')
-          .map((line) => JSON.parse(line) as { kind: string; payload: { generation: number; state: string } });
-        expect(generationRows.at(-1)).toMatchObject({
-          kind: 'agent_generation_started',
-          payload: { generation: 2, state: 'live' },
-        });
+          expect(completionFailureInjected).toBe(true);
+          expect(roleState.plannerStarted).toBe(false);
+          expect(readRegistryReservation()).toMatchObject({
+            agentGeneration: 1,
+            agentReleasePending: true,
+            agentReleaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+          });
+          expect(mgr.probeAgentNameReusable(plannerName, readGenerationRows().at(-1)!.payload)).toBe(false);
+          expect(readGenerationRows()).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                kind: 'agent_generation_released',
+                payload: expect.objectContaining({ generation: 1, state: 'released' }),
+              }),
+            ]),
+          );
+          expect(readGenerationRows().some(({ payload }) => payload.generation === 2)).toBe(false);
+
+          const blockedGeneration: PhysicalAgentGeneration = {
+            ...readGenerationRows().at(-1)!.payload,
+            generation: 2,
+            session_id: 'blocked-before-release-completion',
+            state: 'stale',
+          };
+          expect(mgr.reserveAgentGeneration(blockedGeneration, workspace)).toBe(false);
+          await expect(
+            mgr.startSession({ name: plannerName, cwd: workspace }, blockedGeneration),
+          ).rejects.toMatchObject({ code: 'AUTOLOOP_AGENT_GENERATION_CONFLICT' });
+          expect(mockSessions).toHaveLength(1);
+
+          await expect(handle.dispatcher.resetAgent('planner', { force: true })).resolves.toMatchObject({
+            ok: true,
+            previous_generation: 1,
+            reusable: true,
+          });
+          const reusableReservation = readRegistryReservation();
+          expect(reusableReservation).toMatchObject({ agentReleasedGeneration: 1 });
+          expect(reusableReservation).not.toHaveProperty('agentGeneration');
+          expect(reusableReservation).not.toHaveProperty('agentReleasePending');
+          expect(
+            readGenerationRows().filter(
+              ({ kind, payload }) => kind === 'agent_generation_released' && payload.generation === 1,
+            ),
+          ).toHaveLength(1);
+          expect(mockSessions).toHaveLength(1);
+
+          await expect(mgr.autoloopChat(runId, 'continue after registry recovery')).resolves.toMatchObject({
+            reply: expect.any(String),
+          });
+
+          expect(roleState.plannerStarted).toBe(true);
+          expect(mockSessions).toHaveLength(2);
+          expect(mgr.listSessions().filter(({ name }) => name === plannerName)).toHaveLength(1);
+          const generationRows = readGenerationRows();
+          expect(
+            generationRows.filter(
+              ({ kind, payload }) => kind === 'agent_generation_released' && payload.generation === 1,
+            ),
+          ).toHaveLength(1);
+          expect(
+            generationRows.filter(({ payload }) => payload.generation === 2 && payload.state === 'live'),
+          ).toHaveLength(1);
+          expect(generationRows.some(({ payload }) => payload.generation > 2)).toBe(false);
+          expect(generationRows.at(-1)).toMatchObject({
+            kind: 'agent_generation_started',
+            payload: { generation: 2, state: 'live' },
+          });
+        } finally {
+          vi.mocked(fs.renameSync).mockImplementation(persistedRename);
+        }
       });
 
       it('fails a post-release reusability probe without resurrecting the released Planner generation', async () => {
