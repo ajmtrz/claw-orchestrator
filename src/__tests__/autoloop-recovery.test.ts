@@ -304,6 +304,31 @@ describe('assessRecovery', () => {
     ).not.toBe(assessment.recovery_token);
   });
 
+  it('keeps recovery tokens stable when generation property insertion order differs', () => {
+    const ordered = generation('coder');
+    const reordered: PhysicalAgentGeneration = {
+      state: ordered.state,
+      lease_expires_at: ordered.lease_expires_at,
+      last_activity_at: ordered.last_activity_at,
+      created_at: ordered.created_at,
+      owner_instance_id: ordered.owner_instance_id,
+      session_id: ordered.session_id,
+      session_name: ordered.session_name,
+      generation: ordered.generation,
+      role: ordered.role,
+    };
+
+    const tokenFor = (agent: PhysicalAgentGeneration): string =>
+      computeRecoveryToken(
+        input({
+          agents: [{ generation: agent, matching_runtime: 'live' }],
+        }),
+      );
+
+    expect(reordered).toEqual(ordered);
+    expect(tokenFor(reordered)).toBe(tokenFor(ordered));
+  });
+
   it('does not mutate caller-provided durable evidence', () => {
     const original = input({
       iterations: [{ iter: 0, artifacts: ['directive'] }],

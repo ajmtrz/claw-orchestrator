@@ -18,6 +18,19 @@ function compareStrings(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
+function canonicalJson(value: unknown): string {
+  const serialized = JSON.stringify(value, (_key, nestedValue: unknown) => {
+    if (nestedValue === null || Array.isArray(nestedValue) || typeof nestedValue !== 'object') {
+      return nestedValue;
+    }
+
+    return Object.fromEntries(Object.entries(nestedValue).sort(([left], [right]) => compareStrings(left, right)));
+  });
+
+  if (serialized === undefined) throw new TypeError('Recovery token input is not JSON-serializable');
+  return serialized;
+}
+
 function sortEvidence(evidence: Iterable<string>): string[] {
   return [...new Set(evidence)].sort(compareStrings);
 }
@@ -224,7 +237,7 @@ function buildAssessment(input: RecoveryInput): AssessmentWithoutToken {
 
 function tokenForAssessment(assessment: AssessmentWithoutToken): string {
   return createHash('sha256')
-    .update(JSON.stringify({ schema_version: 1, ...assessment }))
+    .update(canonicalJson({ schema_version: 1, ...assessment }))
     .digest('hex');
 }
 
