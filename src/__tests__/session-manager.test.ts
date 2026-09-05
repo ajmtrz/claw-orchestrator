@@ -3494,6 +3494,25 @@ describe('SessionManager', () => {
         expect(decisions).not.toContain('planner_turn_control');
       });
 
+      it('rejects array spawn_subagents arguments before durable evidence or session effects', async () => {
+        const runId = 'planner-control-array-arguments';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents","args":[]}', '```'].join('\n'),
+          event: { type: 'result', result: 'array arguments are invalid' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'start the implementation')).rejects.toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+          retryable: false,
+        });
+        expect(mockSessions).toHaveLength(1);
+        const decisions = fs.readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8');
+        expect(decisions).not.toContain('planner_turn_control');
+        expect(decisions).not.toContain('spawn_subagents');
+      });
+
       it('classifies invalid Planner control arguments as malformed before persistence', async () => {
         const runId = 'planner-control-invalid-arguments';
         const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
@@ -3639,6 +3658,76 @@ describe('SessionManager', () => {
         },
       );
 
+      const invalidPushPolicies: Array<{ label: string; args: Record<string, unknown> }> = [
+        { label: 'level', args: { on_start: { level: 'debug' } } },
+        { label: 'channel', args: { on_start: { channel: 'sms' } } },
+        { label: 'silent flag', args: { on_start: { silent: 'yes' } } },
+        { label: 'rule value', args: { on_start: false } },
+        { label: 'policy key', args: { on_unknown_event: { level: 'info' } } },
+        { label: 'rule field', args: { on_start: { untrusted: true } } },
+      ];
+
+      it.each(invalidPushPolicies)(
+        'rejects an invalid push-policy $label atomically without changing live policy',
+        async ({ label, args }) => {
+          const runId = `planner-invalid-push-policy-${label.replaceAll(' ', '-')}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          const policyBefore = JSON.stringify(handle.runner.config.push_policy);
+          mockSessions[0].sendImplementation = async () => ({
+            text: [
+              '```autoloop',
+              '{"tool":"spawn_subagents","args":{}}',
+              '```',
+              '```autoloop',
+              JSON.stringify({ tool: 'update_push_policy', args }),
+              '```',
+            ].join('\n'),
+            event: { type: 'result', result: 'invalid push policy batch' },
+          });
+
+          await expect(mgr.autoloopChat(runId, 'apply the policy batch')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_MALFORMED',
+            retryable: false,
+          });
+
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string });
+          expect(decisions.filter((row) => row.kind === 'planner_turn_control')).toEqual([]);
+          expect(decisions.filter((row) => row.kind === 'spawn_subagents')).toEqual([]);
+          expect(mockSessions).toHaveLength(1);
+          expect(JSON.stringify(handle.runner.config.push_policy)).toBe(policyBefore);
+        },
+      );
+
+      it('treats an explicitly empty push-policy rule as an intentional reset', async () => {
+        const runId = 'planner-empty-push-policy-rule-reset';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"update_push_policy","args":{"on_start":{}}}', '```'].join('\n'),
+          event: { type: 'result', result: 'reset push policy rule' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'reset the start policy')).resolves.toEqual({
+          reply: 'Planner controls persisted: update_push_policy',
+        });
+        expect(handle.runner.config.push_policy?.on_start).toEqual({});
+        const decisions = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { controls?: unknown } });
+        expect(decisions.find((row) => row.kind === 'planner_turn_control')?.payload.controls).toEqual([
+          { tool: 'update_push_policy', args: { on_start: {} } },
+        ]);
+      });
+
       it('persists and applies only allowlisted arguments from an accepted Planner control', async () => {
         const runId = 'planner-control-allowlist';
         const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
@@ -3685,20 +3774,31 @@ describe('SessionManager', () => {
         expect(pushes).toEqual([{ level: 'info', summary: 'allowlisted status', detail: undefined, channel: 'auto' }]);
       });
 
-      it('crash-flushes an accepted control row before applying its first effect', async () => {
+      it('crash-flushes a new control file and its parent directory before applying its first effect', async () => {
         const runId = 'planner-control-flush-order';
         const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
         await mgr.autoloopStart({ runId, workspace });
         const handle = mgr.getAutoloop(runId)!;
+        const ledgerDir = path.join(workspace, 'tasks', runId);
+        const decisionsPath = path.join(ledgerDir, 'decisions.jsonl');
+        expect(fs.existsSync(decisionsPath)).toBe(false);
         mockSessions[0].sendImplementation = async () => ({
           text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
           event: { type: 'result', result: 'spawn after flush' },
         });
         const order: string[] = [];
+        const openedTargets = new Map<number, string>();
+        const openFile = vi.mocked(fs.openSync);
+        const openImplementation = openFile.getMockImplementation()!;
+        openFile.mockImplementation(((target: unknown, ...args: unknown[]) => {
+          const fd = (openImplementation as (...values: unknown[]) => number)(target, ...args);
+          openedTargets.set(fd, String(target));
+          return fd;
+        }) as typeof fs.openSync);
         const flush = vi.mocked(fs.fsyncSync);
         const flushImplementation = flush.getMockImplementation()!;
         flush.mockImplementation((fd) => {
-          order.push('control-flushed');
+          order.push(openedTargets.get(fd) === ledgerDir ? 'directory-flushed' : 'control-flushed');
           return flushImplementation(fd);
         });
         const spawnImplementation = handle.dispatcher.spawnSubagents.bind(handle.dispatcher);
@@ -3712,8 +3812,54 @@ describe('SessionManager', () => {
           await expect(mgr.autoloopChat(runId, 'spawn after durable evidence')).resolves.toEqual({
             reply: 'Planner controls persisted: spawn_subagents',
           });
-          expect(order).toEqual(['control-flushed', 'effect-started']);
+          expect(order).toEqual(['control-flushed', 'directory-flushed', 'effect-started']);
         } finally {
+          openFile.mockImplementation(openImplementation);
+          flush.mockImplementation(flushImplementation);
+          spawn.mockRestore();
+        }
+      });
+
+      it('fails closed when the required parent-directory durability step fails', async () => {
+        const runId = 'planner-control-directory-flush-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const ledgerDir = path.join(workspace, 'tasks', runId);
+        const openedTargets = new Map<number, string>();
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'directory flush must succeed' },
+        });
+        const openFile = vi.mocked(fs.openSync);
+        const openImplementation = openFile.getMockImplementation()!;
+        openFile.mockImplementation(((target: unknown, ...args: unknown[]) => {
+          const fd = (openImplementation as (...values: unknown[]) => number)(target, ...args);
+          openedTargets.set(fd, String(target));
+          return fd;
+        }) as typeof fs.openSync);
+        const flush = vi.mocked(fs.fsyncSync);
+        const flushImplementation = flush.getMockImplementation()!;
+        flush.mockImplementation((fd) => {
+          if (openedTargets.get(fd) === ledgerDir) throw new Error('directory entry flush failed');
+          return flushImplementation(fd);
+        });
+        const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents');
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'require directory durability')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_NOT_PERSISTED',
+            retryable: true,
+          });
+          expect(spawn).not.toHaveBeenCalled();
+          expect(mockSessions).toHaveLength(1);
+          expect(handle.runner.state).toMatchObject({
+            status: 'planning',
+            subagents_spawned: false,
+            consecutive_phase_errors: 1,
+          });
+        } finally {
+          openFile.mockImplementation(openImplementation);
           flush.mockImplementation(flushImplementation);
           spawn.mockRestore();
         }
@@ -4031,7 +4177,9 @@ describe('SessionManager', () => {
           event: { type: 'result', result: 'invalid control' },
         });
         const phaseErrors: PhaseErrorPayload[] = [];
+        const pushes: Array<{ summary: string }> = [];
         handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+        handle.runner.on('push', (payload: { summary: string }) => pushes.push(payload));
 
         let caught: unknown;
         try {
@@ -4053,6 +4201,35 @@ describe('SessionManager', () => {
         });
         expect(phaseErrors).toEqual([]);
         expect(handle.runner.state.consecutive_phase_errors).toBe(0);
+        const decisionsPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+        const phaseErrorRowsBeforeRetry = fs
+          .readFileSync(decisionsPath, 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string })
+          .filter((row) => row.kind === 'phase_error').length;
+
+        mockSessions[0].sendImplementation = async () => ({
+          text: 'fresh Planner reply',
+          event: { type: 'result', result: 'fresh Planner reply' },
+        });
+        await expect(mgr.autoloopChat(runId, 'retry after the rejected control')).resolves.toEqual({
+          reply: 'fresh Planner reply',
+        });
+
+        const decisions = fs
+          .readFileSync(decisionsPath, 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string });
+        expect(phaseErrors).toEqual([]);
+        expect(pushes).toEqual([]);
+        expect(decisions.filter((row) => row.kind === 'phase_error')).toHaveLength(phaseErrorRowsBeforeRetry);
+        expect(handle.runner.state).toMatchObject({
+          consecutive_phase_errors: 0,
+          recent_phase_errors: [],
+          push_log_count: 0,
+        });
       });
 
       it('keeps max dispatch depth as the primary error without a pending Planner failure', async () => {

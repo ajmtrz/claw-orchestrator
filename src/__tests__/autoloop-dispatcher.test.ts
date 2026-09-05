@@ -12,6 +12,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { ClaudeAgentDispatcher } from '../autoloop/dispatcher.js';
+import { parsePlannerReply, validatePlannerToolCalls } from '../autoloop/planner-tools.js';
 import { AutoloopRunner } from '../autoloop/runner.js';
 import { type AnyAutoloopMessage, Msg } from '../autoloop/messages.js';
 import type { SessionManager } from '../session-manager.js';
@@ -217,6 +218,38 @@ function makeDispatcher(
   const ledgerDir = path.join(workspace, 'tasks', 'r1');
   return { dispatcher, calls, ledgerDir, workspace, activeNames, reservations };
 }
+
+describe('Planner control argument shape', () => {
+  it.each([
+    'notify_user',
+    'spawn_subagents',
+    'send_directive',
+    'pause_loop',
+    'resume_loop',
+    'terminate',
+    'update_push_policy',
+    'write_plan',
+    'write_goal',
+  ])('rejects array arguments for %s at the parser boundary', (tool) => {
+    const parsed = parsePlannerReply(['```autoloop', JSON.stringify({ tool, args: [] }), '```'].join('\n'));
+
+    expect(parsed.calls).toEqual([]);
+    expect(parsed.parse_errors).toEqual([
+      expect.objectContaining({ block_index: 0, error: expect.stringContaining('tool/args') }),
+    ]);
+  });
+
+  it('rejects non-plain object arguments at the validator boundary', () => {
+    const validation = validatePlannerToolCalls([
+      { tool: 'resume_loop', args: new Date() as unknown as Record<string, unknown> },
+    ]);
+
+    expect(validation.calls).toEqual([]);
+    expect(validation.errors).toEqual([
+      expect.objectContaining({ tool: 'resume_loop', error: expect.stringContaining('plain object') }),
+    ]);
+  });
+});
 
 function findStart(calls: StubCalls, role: 'planner' | 'coder' | 'reviewer'): Record<string, unknown> {
   const call = calls.startSession.mock.calls.find(
@@ -1371,23 +1404,20 @@ describe('AutoloopRunner — recoverable dispatcher timeout state', () => {
 });
 
 describe('ClaudeAgentDispatcher — updatePushPolicy guard', () => {
-  it('strips silent=true from on_phase_error / on_decision_needed but applies other fields', async () => {
+  it('persists and applies the same canonical policy while auditing blocked critical silence', async () => {
     const policyRef: PushPolicy = JSON.parse(JSON.stringify(DEFAULT_PUSH_POLICY));
     const reply = `OK
 \`\`\`autoloop
-{"tool": "update_push_policy", "args": {"on_phase_error": {"silent": true, "channel": "email"}, "on_target_hit": {"silent": true}}}
+{"tool": "update_push_policy", "args": {"on_phase_error": {"silent": true, "channel": "email"}, "on_decision_needed": {"silent": true, "level": "warn"}, "on_target_hit": {"silent": true}}}
 \`\`\`
 `;
     const { dispatcher, ledgerDir } = makeDispatcher({ pushPolicyRef: policyRef }, { sendOutput: reply });
     await dispatcher.deliver(Msg.chat(0, { text: 'hi' }));
 
-    // on_phase_error: silent stripped, channel applied.
-    expect(policyRef.on_phase_error.silent).not.toBe(true);
-    expect(policyRef.on_phase_error.channel).toBe('email');
-    // on_target_hit is not critical → silence honoured.
-    expect(policyRef.on_target_hit.silent).toBe(true);
+    expect(policyRef.on_phase_error).toEqual({ channel: 'email' });
+    expect(policyRef.on_decision_needed).toEqual({ level: 'warn' });
+    expect(policyRef.on_target_hit).toEqual({ silent: true });
 
-    // decisions.jsonl should record both the block + the merge.
     const decisionsPath = path.join(ledgerDir, 'decisions.jsonl');
     expect(fs.existsSync(decisionsPath)).toBe(true);
     const lines = fs
@@ -1395,8 +1425,26 @@ describe('ClaudeAgentDispatcher — updatePushPolicy guard', () => {
       .trim()
       .split('\n')
       .map((l) => JSON.parse(l));
-    expect(lines.some((l) => l.kind === 'policy_silence_blocked')).toBe(true);
-    expect(lines.some((l) => l.kind === 'update_push_policy')).toBe(true);
+    expect(lines.find((line) => line.kind === 'planner_turn_control')?.payload.controls).toEqual([
+      {
+        tool: 'update_push_policy',
+        args: {
+          on_decision_needed: { level: 'warn' },
+          on_phase_error: { channel: 'email' },
+          on_target_hit: { silent: true },
+        },
+      },
+    ]);
+    expect(lines.find((line) => line.kind === 'policy_silence_blocked')?.payload).toEqual({
+      keys: ['on_phase_error', 'on_decision_needed'],
+    });
+    expect(lines.find((line) => line.kind === 'update_push_policy')?.payload).toEqual({
+      applied: {
+        on_decision_needed: { level: 'warn' },
+        on_phase_error: { channel: 'email' },
+        on_target_hit: { silent: true },
+      },
+    });
   });
 });
 

@@ -74,13 +74,6 @@ const REPLAY_CHAR_BUDGET = 24_000;
  */
 const REVIEWER_SANDBOX_PERSIST = new Set(['reviewer_memory.md', 'reviewer_log.jsonl']);
 
-/**
- * Push-policy keys that callers MUST NOT be able to silence at runtime.
- * Prompt-injection could otherwise let a confused/malicious Planner mute the
- * channels we use to surface phase errors and decision points.
- */
-const UNSILENCEABLE_POLICY_KEYS = new Set(['on_phase_error', 'on_decision_needed']);
-
 export interface ClaudeAgentDispatcherConfig {
   manager: SessionManager;
   runId: string;
@@ -1459,6 +1452,25 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     }
   }
 
+  private syncCreatedControlFileDirectory(filePath: string): void {
+    if (process.platform === 'win32') {
+      // Node does not expose a supported directory handle that can be passed
+      // to FlushFileBuffers on Windows. Keep the platform limitation explicit:
+      // the file contents are flushed, but POSIX directory-entry durability is
+      // not claimed here.
+      this.logger.warn?.(
+        '[autoloop] parent-directory fsync is unavailable on win32; control file contents were flushed without a POSIX directory-entry guarantee',
+      );
+      return;
+    }
+    const directoryFd = fs.openSync(path.dirname(filePath), 'r');
+    try {
+      fs.fsyncSync(directoryFd);
+    } finally {
+      fs.closeSync(directoryFd);
+    }
+  }
+
   private persistPlannerControls(
     env: AnyAutoloopMessage,
     dispatchId: string,
@@ -1486,6 +1498,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       payload: { ...evidence },
     } satisfies DecisionLogEntry;
     const decisionsPath = path.join(this.ledgerDir, 'decisions.jsonl');
+    const controlFileMayBeCreated = !fs.existsSync(decisionsPath);
 
     try {
       fs.mkdirSync(this.ledgerDir, { recursive: true });
@@ -1497,6 +1510,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         // audit data. Flush the appended row before tail verification and
         // before any prepared control effect can begin.
         fs.fsyncSync(fd);
+        if (controlFileMayBeCreated) this.syncCreatedControlFileDirectory(decisionsPath);
         let end = fs.fstatSync(fd).size;
         const byte = Buffer.allocUnsafe(1);
         while (end > 0) {
@@ -1778,47 +1792,11 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       },
       updatePushPolicy: (delta) => {
         if (!this.config.pushPolicyRef) return;
-        // Shallow-merge whitelisted keys onto the policy object.
-        const policyKeys = new Set([
-          'on_start',
-          'on_iter_done_ok',
-          'on_target_hit',
-          'on_metric_regression_2',
-          'on_reviewer_reject_2',
-          'on_phase_error',
-          'on_stall_30min',
-          'on_decision_needed',
-        ]);
         const applied: Record<string, unknown> = {};
-        const silenced_blocked: string[] = [];
-        const VALID_LEVELS = new Set(['info', 'warn', 'decision', 'error']);
-        const VALID_CHANNELS = new Set(['auto', 'wechat', 'webchat', 'both', 'email']);
         for (const [k, v] of Object.entries(delta)) {
-          if (!policyKeys.has(k) || typeof v !== 'object' || v === null) continue;
-          // Only accept known, correctly-typed fields — a malformed rule
-          // (wrong types, bogus level/channel) must not enter the live policy.
-          const raw = v as Record<string, unknown>;
-          const rule: Record<string, unknown> = {};
-          if (typeof raw.silent === 'boolean') rule.silent = raw.silent;
-          if (typeof raw.level === 'string' && VALID_LEVELS.has(raw.level)) rule.level = raw.level;
-          if (typeof raw.channel === 'string' && VALID_CHANNELS.has(raw.channel)) rule.channel = raw.channel;
-          // B2: refuse to silence the channels that surface phase errors and
-          // user decisions. Other fields on the same rule still apply, so the
-          // operator can re-target level/channel without going dark.
-          if (UNSILENCEABLE_POLICY_KEYS.has(k) && rule.silent === true) {
-            silenced_blocked.push(k);
-            this.logger.warn?.(`[autoloop] refused to set silent=true on critical policy key ${k}`);
-            delete rule.silent;
-          }
+          const rule = { ...(v as Record<string, unknown>) };
           (this.config.pushPolicyRef as unknown as Record<string, unknown>)[k] = rule;
           applied[k] = rule;
-        }
-        if (silenced_blocked.length > 0) {
-          this.appendDecisionLog({
-            kind: 'policy_silence_blocked',
-            actor: 'planner',
-            payload: { keys: silenced_blocked },
-          });
         }
         if (Object.keys(applied).length > 0) {
           this.appendDecisionLog({
@@ -1878,6 +1856,16 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       },
       { expectedGeneration, expectedControl },
     );
+    if (validation.blocked_policy_silence.length > 0) {
+      for (const key of validation.blocked_policy_silence) {
+        this.logger.warn?.(`[autoloop] refused to set silent=true on critical policy key ${key}`);
+      }
+      this.appendDecisionLog({
+        kind: 'policy_silence_blocked',
+        actor: 'planner',
+        payload: { keys: validation.blocked_policy_silence },
+      });
+    }
 
     // Persist and verify the complete Planner control claim before invoking
     // any control handler. A ledger failure must leave every control effect at

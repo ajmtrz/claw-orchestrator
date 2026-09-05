@@ -408,6 +408,7 @@ export class AutoloopRunner extends EventEmitter {
     if (this.draining) return; // a previous send() is already draining; new items will be picked up
     this.draining = true;
     let plannerFailure: PlannerOperationFailure | undefined;
+    let pendingPlannerPhaseError: AnyAutoloopMessage | undefined;
     try {
       const maxDepth = this.config.maxDispatchDepth ?? MAX_DISPATCH_DEPTH;
       let depth = 0;
@@ -418,6 +419,10 @@ export class AutoloopRunner extends EventEmitter {
             `dispatch depth exceeded ${maxDepth} at iter ${this.state.iter} (next='${next?.type ?? '?'}' to '${next?.to ?? '?'}') — likely message ping-pong; raise config.maxDispatchDepth for legitimately deep workflows`,
           );
           if (plannerFailure) {
+            if (pendingPlannerPhaseError) {
+              const pendingIndex = this.queue.indexOf(pendingPlannerPhaseError);
+              if (pendingIndex >= 0) this.queue.splice(pendingIndex, 1);
+            }
             preserveSecondaryPlannerFailure(plannerFailure, routingError);
             break;
           }
@@ -425,19 +430,19 @@ export class AutoloopRunner extends EventEmitter {
         }
         const env = this.queue.shift();
         if (!env) break;
+        if (env === pendingPlannerPhaseError) pendingPlannerPhaseError = undefined;
         try {
           await this.handleOne(env);
         } catch (error) {
           if (env.to === 'planner' && isPlannerOperationFailure(error)) {
             plannerFailure ??= error;
-            this.queue.unshift(
-              Msg.phaseError(env.iter, {
-                agent: 'planner',
-                phase: 'planner_turn',
-                code: error.code,
-                error: error.message,
-              }),
-            );
+            pendingPlannerPhaseError = Msg.phaseError(env.iter, {
+              agent: 'planner',
+              phase: 'planner_turn',
+              code: error.code,
+              error: error.message,
+            });
+            this.queue.unshift(pendingPlannerPhaseError);
           } else if (plannerFailure) {
             // The synthetic phase-error route may itself fail (for example an
             // out-of-band notifier throws). Keep that evidence on the primary

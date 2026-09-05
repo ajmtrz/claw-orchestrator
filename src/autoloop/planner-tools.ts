@@ -48,6 +48,12 @@ export interface PlannerToolParseResult {
 
 const FENCE_RE = /```autoloop\s*\n([\s\S]*?)\n```/g;
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
 /**
  * Scan reply text for `autoloop` fenced JSON blocks. Returns parsed tool calls
  * plus a cleaned reply with the blocks removed (so we don't show raw JSON to
@@ -61,7 +67,7 @@ export function parsePlannerReply(reply: string): PlannerToolParseResult {
     const idx = blockIndex++;
     try {
       const parsed = JSON.parse(body.trim()) as PlannerToolCall;
-      if (typeof parsed?.tool !== 'string' || typeof parsed?.args !== 'object' || parsed.args === null) {
+      if (!isPlainObject(parsed) || typeof parsed.tool !== 'string' || !isPlainObject(parsed.args)) {
         parse_errors.push({ block_index: idx, error: 'block missing tool/args fields' });
         return ''; // strip even malformed blocks so user doesn't see raw JSON
       }
@@ -96,7 +102,7 @@ export interface SpawnSubagentsArgs {
 export interface PlannerToolEffects {
   /** Start Coder + Reviewer persistent sessions. */
   spawnSubagents: (args: SpawnSubagentsArgs) => Promise<void>;
-  /** Mutate in-memory push policy (key→rule object). Unknown keys ignored. */
+  /** Apply an already validated/canonical in-memory push-policy delta. */
   updatePushPolicy: (delta: Record<string, unknown>) => void;
   /**
    * Write content to <workspace>/<file> (plan.md or goal.json), then
@@ -133,6 +139,8 @@ const PUSH_POLICY_KEYS = new Set([
   'on_stall_30min',
   'on_decision_needed',
 ]);
+const UNSILENCEABLE_PUSH_POLICY_KEYS = new Set(['on_phase_error', 'on_decision_needed']);
+const PUSH_POLICY_RULE_FIELDS = new Set(['channel', 'level', 'silent']);
 
 function nonEmptyString(value: unknown, label: string): string {
   if (typeof value !== 'string' || !value.trim()) throw new Error(`${label} must be a non-empty string`);
@@ -177,16 +185,35 @@ function sanitizeDirectiveArgs(
   return directive;
 }
 
-function sanitizePushPolicyDelta(raw: Record<string, unknown>): Record<string, unknown> {
+function sanitizePushPolicyDelta(raw: Record<string, unknown>, blockedSilence: string[]): Record<string, unknown> {
   const delta: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(raw)) {
-    if (!PUSH_POLICY_KEYS.has(key) || typeof value !== 'object' || value === null || Array.isArray(value)) continue;
-    const input = value as Record<string, unknown>;
+    if (!PUSH_POLICY_KEYS.has(key)) throw new Error(`update_push_policy key '${key}' is not supported`);
+    if (!isPlainObject(value)) throw new Error(`update_push_policy ${key} must be a plain object`);
+    const input = value;
+    const unknownFields = Object.keys(input).filter((field) => !PUSH_POLICY_RULE_FIELDS.has(field));
+    if (unknownFields.length > 0) {
+      throw new Error(`update_push_policy ${key} has unknown field '${unknownFields[0]}'`);
+    }
     const rule: Record<string, unknown> = {};
-    if (typeof input.silent === 'boolean') rule.silent = input.silent;
-    if (typeof input.level === 'string' && VALID_PUSH_LEVELS.has(input.level as PushLevel)) rule.level = input.level;
-    if (typeof input.channel === 'string' && VALID_PUSH_CHANNELS.has(input.channel as PushChannel)) {
+    if ('channel' in input) {
+      if (typeof input.channel !== 'string' || !VALID_PUSH_CHANNELS.has(input.channel as PushChannel)) {
+        throw new Error(`update_push_policy ${key} channel '${String(input.channel)}' is not supported`);
+      }
       rule.channel = input.channel;
+    }
+    if ('level' in input) {
+      if (typeof input.level !== 'string' || !VALID_PUSH_LEVELS.has(input.level as PushLevel)) {
+        throw new Error(`update_push_policy ${key} level '${String(input.level)}' is not supported`);
+      }
+      rule.level = input.level;
+    }
+    if ('silent' in input) {
+      if (typeof input.silent !== 'boolean') {
+        throw new Error(`update_push_policy ${key} silent must be a boolean`);
+      }
+      if (input.silent && UNSILENCEABLE_PUSH_POLICY_KEYS.has(key)) blockedSilence.push(key);
+      else rule.silent = input.silent;
     }
     delta[key] = rule;
   }
@@ -198,7 +225,8 @@ function sanitizePushPolicyDelta(raw: Record<string, unknown>): Record<string, u
  * that may be persisted and applied. Unknown fields are deliberately dropped;
  * fields whose presence changes safety or semantics are rejected when invalid.
  */
-function sanitizePlannerToolCall(call: PlannerToolCall): PlannerToolCall {
+function sanitizePlannerToolCall(call: PlannerToolCall, blockedPolicySilence: string[] = []): PlannerToolCall {
+  if (!isPlainObject(call.args)) throw new Error(`${call.tool} args must be a plain object`);
   const raw = call.args;
   switch (call.tool) {
     case 'notify_user': {
@@ -243,11 +271,7 @@ function sanitizePlannerToolCall(call: PlannerToolCall): PlannerToolCall {
         if (value !== undefined) args[field] = value;
       }
       if (raw.initial_directive !== undefined) {
-        if (
-          typeof raw.initial_directive !== 'object' ||
-          raw.initial_directive === null ||
-          Array.isArray(raw.initial_directive)
-        ) {
+        if (!isPlainObject(raw.initial_directive)) {
           throw new Error('spawn_subagents initial_directive must be an object');
         }
         args.initial_directive = sanitizeDirectiveArgs(
@@ -270,7 +294,7 @@ function sanitizePlannerToolCall(call: PlannerToolCall): PlannerToolCall {
       return { tool: call.tool, args: reason === undefined ? {} : { reason } };
     }
     case 'update_push_policy':
-      return { tool: call.tool, args: sanitizePushPolicyDelta(raw) };
+      return { tool: call.tool, args: sanitizePushPolicyDelta(raw, blockedPolicySilence) };
     case 'write_plan': {
       const content = nonEmptyString(raw.content, 'write_plan content');
       const commitMessage = optionalString(raw.commit_message, 'write_plan commit_message');
@@ -300,20 +324,26 @@ function sanitizePlannerToolCall(call: PlannerToolCall): PlannerToolCall {
 export interface PlannerToolValidationResult {
   calls: PlannerToolCall[];
   errors: Array<{ tool: string; error: string }>;
+  blocked_policy_silence: string[];
 }
 
 /** Validate and sanitize the complete batch without performing any effect. */
 export function validatePlannerToolCalls(calls: readonly PlannerToolCall[]): PlannerToolValidationResult {
   const validated: PlannerToolCall[] = [];
   const errors: Array<{ tool: string; error: string }> = [];
+  const blockedPolicySilence: string[] = [];
   for (const call of calls) {
     try {
-      validated.push(sanitizePlannerToolCall(call));
+      validated.push(sanitizePlannerToolCall(call, blockedPolicySilence));
     } catch (error) {
       errors.push({ tool: call.tool, error: (error as Error).message });
     }
   }
-  return { calls: errors.length === 0 ? validated : [], errors };
+  return {
+    calls: errors.length === 0 ? validated : [],
+    errors,
+    blocked_policy_silence: errors.length === 0 ? blockedPolicySilence : [],
+  };
 }
 
 /**
