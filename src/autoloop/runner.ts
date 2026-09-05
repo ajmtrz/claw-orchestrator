@@ -40,6 +40,16 @@ interface PlannerOperationFailure extends Error {
   secondaryErrors?: Error[];
 }
 
+interface SenderContext {
+  readonly id: string;
+  pending: number;
+  settled: boolean;
+  failure?: unknown;
+  readonly promise: Promise<void>;
+  readonly resolve: () => void;
+  readonly reject: (error: unknown) => void;
+}
+
 const AUTOLOOP_OPERATION_ERROR_CODES = new Set<AutoloopOperationErrorCode>([
   'AUTOLOOP_EMPTY_REPLY',
   'AUTOLOOP_SESSION_NOT_CREATED',
@@ -116,6 +126,8 @@ export class AutoloopRunner extends EventEmitter {
   private draining = false;
   /** Shared completion for every sender that joins the active queue drain. */
   private drainPromise: Promise<void> | null = null;
+  /** Causal sender identity for queued and derived envelopes. */
+  private readonly messageSenders = new WeakMap<object, SenderContext>();
   private regressionStreak = 0;
   private rejectStreak = 0;
   /** Recent push events for dedup (5 min window). */
@@ -321,7 +333,9 @@ export class AutoloopRunner extends EventEmitter {
     this.state.status = 'terminated';
     this.state.status_reason = reason;
     this.state.pending_dispatch = null;
-    this.queue.length = 0;
+    for (const queued of this.queue.splice(0)) {
+      this.completeSenderMessage(this.messageSenders.get(queued));
+    }
     this.pausedBuffer.length = 0;
     this.stop();
     this.emit('state', this.state);
@@ -364,8 +378,66 @@ export class AutoloopRunner extends EventEmitter {
       await this.handleOne(env);
       return;
     }
-    this.queue.push(env);
-    await this.drain();
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
+    });
+    const sender: SenderContext = {
+      id: env.msg_id,
+      pending: 0,
+      settled: false,
+      promise,
+      resolve,
+      reject,
+    };
+    this.enqueueMessage(env, sender);
+    // Attach rejection handling before the drain can settle this sender. A
+    // failed drain stops at its causal boundary; a later sender then starts a
+    // fresh drain rather than inheriting the earlier failure.
+    const outcome = sender.promise.then(
+      () => ({ ok: true as const }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    while (!sender.settled) await this.drain();
+    const settled = await outcome;
+    if (!settled.ok) throw settled.error;
+  }
+
+  private enqueueMessage(env: AnyAutoloopMessage, sender?: SenderContext, front = false): void {
+    const liveSender = sender && !sender.settled ? sender : undefined;
+    if (liveSender) {
+      liveSender.pending += 1;
+      this.messageSenders.set(env, liveSender);
+    }
+    if (front) {
+      this.queue.unshift(env);
+    } else if (liveSender?.failure !== undefined) {
+      const firstOtherSender = this.queue.findIndex((queued) => this.messageSenders.get(queued) !== liveSender);
+      if (firstOtherSender < 0) this.queue.push(env);
+      else this.queue.splice(firstOtherSender, 0, env);
+    } else {
+      this.queue.push(env);
+    }
+  }
+
+  private failSender(sender: SenderContext | undefined, error: unknown): void {
+    if (!sender || sender.settled) return;
+    if (sender.failure && isPlannerOperationFailure(sender.failure)) {
+      preserveSecondaryPlannerFailure(sender.failure, error);
+    } else if (sender.failure === undefined) {
+      sender.failure = error;
+    }
+  }
+
+  private completeSenderMessage(sender: SenderContext | undefined): void {
+    if (!sender || sender.settled) return;
+    sender.pending -= 1;
+    if (sender.pending > 0) return;
+    sender.settled = true;
+    if (sender.failure !== undefined) sender.reject(sender.failure);
+    else sender.resolve();
   }
 
   /** External entry: user typed something to Planner. */
@@ -405,7 +477,14 @@ export class AutoloopRunner extends EventEmitter {
 
   /** Mark subagents spawned (called by S3's spawn_subagents tool handler). */
   markSubagentsSpawned(): void {
-    if (this.state.subagents_spawned) return;
+    if (
+      this.terminationStarted ||
+      this.state.status === 'terminated' ||
+      this.state.status === 'crashed' ||
+      this.state.subagents_spawned
+    ) {
+      return;
+    }
     this.recordActivity('lifecycle_transition');
     this.state.subagents_spawned = true;
     this.state.status = 'running';
@@ -448,8 +527,6 @@ export class AutoloopRunner extends EventEmitter {
   }
 
   private async drainUntilIdle(): Promise<void> {
-    let plannerFailure: PlannerOperationFailure | undefined;
-    let pendingPlannerPhaseError: AnyAutoloopMessage | undefined;
     const maxDepth = this.config.maxDispatchDepth ?? MAX_DISPATCH_DEPTH;
     let depth = 0;
     while (this.queue.length > 0) {
@@ -458,45 +535,40 @@ export class AutoloopRunner extends EventEmitter {
         const routingError = new AutoloopRoutingError(
           `dispatch depth exceeded ${maxDepth} at iter ${this.state.iter} (next='${next?.type ?? '?'}' to '${next?.to ?? '?'}') — likely message ping-pong; raise config.maxDispatchDepth for legitimately deep workflows`,
         );
-        if (plannerFailure) {
-          if (pendingPlannerPhaseError) {
-            const pendingIndex = this.queue.indexOf(pendingPlannerPhaseError);
-            if (pendingIndex >= 0) this.queue.splice(pendingIndex, 1);
-          }
-          preserveSecondaryPlannerFailure(plannerFailure, routingError);
-          break;
+        for (const queued of this.queue.splice(0)) {
+          const sender = this.messageSenders.get(queued);
+          this.failSender(sender, routingError);
+          this.completeSenderMessage(sender);
         }
-        throw routingError;
+        break;
       }
       const env = this.queue.shift();
       if (!env) break;
-      if (env === pendingPlannerPhaseError) pendingPlannerPhaseError = undefined;
+      const sender = this.messageSenders.get(env);
       try {
-        await this.handleOne(env);
+        await this.handleOne(env, sender);
       } catch (error) {
         if (env.to === 'planner' && isPlannerOperationFailure(error)) {
-          plannerFailure ??= error;
-          pendingPlannerPhaseError = Msg.phaseError(env.iter, {
+          this.failSender(sender, error);
+          const phaseError = Msg.phaseError(env.iter, {
             agent: 'planner',
             phase: 'planner_turn',
             code: error.code,
             error: error.message,
           });
-          this.queue.unshift(pendingPlannerPhaseError);
-        } else if (plannerFailure) {
-          // The synthetic phase-error route may itself fail (for example an
-          // out-of-band notifier throws). Keep that evidence on the primary
-          // typed failure, but never let it replace the caller-visible code.
-          preserveSecondaryPlannerFailure(plannerFailure, error);
+          this.enqueueMessage(phaseError, sender, true);
         } else {
-          throw error;
+          this.failSender(sender, error);
+          if (!sender) this.emit('error', error instanceof Error ? error : new Error(String(error)));
         }
+      } finally {
+        this.completeSenderMessage(sender);
       }
+      if (sender?.failure !== undefined && sender.settled) break;
     }
-    if (plannerFailure) throw plannerFailure;
   }
 
-  private async handleOne(env: AnyAutoloopMessage): Promise<void> {
+  private async handleOne(env: AnyAutoloopMessage, sender?: SenderContext): Promise<void> {
     // 'terminated' is the final state — once reached, no message of any kind is
     // processed (see events contract above). The terminate message itself still
     // runs because status only flips to 'terminated' while handling it.
@@ -505,7 +577,7 @@ export class AutoloopRunner extends EventEmitter {
 
     // Runner is the target for a small set of messages — handle them inline.
     if (env.to === 'runner') {
-      await this.handleRunnerInbox(env);
+      await this.handleRunnerInbox(env, sender);
       return;
     }
 
@@ -531,17 +603,18 @@ export class AutoloopRunner extends EventEmitter {
       return;
     }
     const replies = await this.config.dispatcher.deliver(env);
+    if (this.terminationStarted || ['terminated', 'crashed'].includes(this.state.status)) return;
     for (const r of replies) {
       validateMessage(r);
       // A dispatcher-generated deadline record is bookkeeping, not agent
       // progress. Letting it renew the lease would make a timeout extend the
       // run whose lack of progress caused it.
       if (r.type !== 'send_timeout') this.recordActivity('agent_progress');
-      this.queue.push(r);
+      this.enqueueMessage(r, sender);
     }
   }
 
-  private async handleRunnerInbox(env: AnyAutoloopMessage): Promise<void> {
+  private async handleRunnerInbox(env: AnyAutoloopMessage, sender?: SenderContext): Promise<void> {
     switch (env.type) {
       case 'iter_artifacts': {
         // Coder produced work for iter N; ask Reviewer to audit.
@@ -550,7 +623,7 @@ export class AutoloopRunner extends EventEmitter {
           ledger_path: this.config.ledger_dir,
           prior_metrics: this.state.metric_history.slice(-10),
         });
-        this.queue.push(req);
+        this.enqueueMessage(req, sender);
         return;
       }
       case 'review_verdict': {
@@ -582,20 +655,20 @@ export class AutoloopRunner extends EventEmitter {
           metric: v.metric,
           regression,
         });
-        this.queue.push(done);
+        this.enqueueMessage(done, sender);
         // A1: advance iter counter after a verdict is committed. The new iter
         // becomes addressable for follow-up directives, push events, and SSE.
         this.state.iter = env.iter + 1;
         this.emit('state', this.state);
         this.emit('iter_done', { iter: env.iter, verdict: v.decision, metric: v.metric });
         // Trigger policy-based push hooks.
-        if (this.regressionStreak >= 2) await this.firePolicyPush('on_metric_regression_2', env.iter);
-        if (this.rejectStreak >= 2) await this.firePolicyPush('on_reviewer_reject_2', env.iter);
+        if (this.regressionStreak >= 2) await this.firePolicyPush('on_metric_regression_2', env.iter, sender);
+        if (this.rejectStreak >= 2) await this.firePolicyPush('on_reviewer_reject_2', env.iter, sender);
         // The one success signal in the policy set. It stayed silent for its
         // whole existence because nothing could tell when the goal was met — a
         // Reviewer verdict is a reading of the Coder's report, not a measurement.
         // An acceptance contract is a measurement, so this fires on it.
-        if (v.accepted) await this.firePolicyPush('on_target_hit', env.iter);
+        if (v.accepted) await this.firePolicyPush('on_target_hit', env.iter, sender);
         return;
       }
       case 'phase_error': {
@@ -614,24 +687,26 @@ export class AutoloopRunner extends EventEmitter {
         }
         this.emit('state', this.state);
         this.emit('phase_error', p);
-        await this.firePolicyPush('on_phase_error', env.iter);
+        await this.firePolicyPush('on_phase_error', env.iter, sender);
         const circuit = this.config.phaseErrorCircuit ?? DEFAULT_PHASE_ERROR_CIRCUIT;
         if (this.state.consecutive_phase_errors >= circuit) {
           const detail = this.state.recent_phase_errors
             .map((e) => `${e.agent}/${e.phase}: ${e.error.slice(0, 160)}`)
             .join('\n');
-          this.queue.push(
+          this.enqueueMessage(
             Msg.pushUser(env.iter, {
               level: 'decision',
               summary: `phase-error circuit tripped (${this.state.consecutive_phase_errors} consecutive)`,
               detail,
               channel: 'both',
             }),
+            sender,
           );
-          this.queue.push(
+          this.enqueueMessage(
             Msg.terminate(env.iter, {
               reason: 'phase_error_circuit',
             }),
+            sender,
           );
         }
         return;
@@ -709,19 +784,24 @@ export class AutoloopRunner extends EventEmitter {
     await this.config.notifyUser(p.level, p.summary, p.detail, p.channel);
   }
 
-  private async firePolicyPush(rule: keyof typeof DEFAULT_PUSH_POLICY, iter: number): Promise<void> {
+  private async firePolicyPush(
+    rule: keyof typeof DEFAULT_PUSH_POLICY,
+    iter: number,
+    sender?: SenderContext,
+  ): Promise<void> {
     const policy = this.config.push_policy ?? DEFAULT_PUSH_POLICY;
     const r = policy[rule];
     if (!r || r.silent) return;
     const summary = `[${rule}] iter ${iter}`;
     // We synthesise a push_user envelope as if Planner had asked for it, so
     // dedup + push_log book-keeping go through the same path.
-    this.queue.push(
+    this.enqueueMessage(
       Msg.pushUser(iter, {
         level: r.level ?? 'info',
         summary,
         channel: r.channel ?? 'auto',
       }),
+      sender,
     );
     // When firePolicyPush is called from outside a running drain (e.g. the
     // stall-detector interval), the queued message would otherwise sit until

@@ -232,14 +232,38 @@ function savePersistedSessions(
   sessions: Map<string, PersistedSession>,
   logger?: Logger,
 ): { ok: true } | { ok: false; error: AutoloopAgentRegistryError } {
+  const tmp = PERSIST_FILE + '.tmp';
   try {
     fs.mkdirSync(PERSIST_DIR, { recursive: true });
     const arr = Array.from(sessions.values());
-    const tmp = PERSIST_FILE + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(arr, null, 2));
+    const fileFd = fs.openSync(tmp, 'r+');
+    try {
+      fs.fsyncSync(fileFd);
+    } finally {
+      fs.closeSync(fileFd);
+    }
     fs.renameSync(tmp, PERSIST_FILE);
+    if (process.platform === 'win32') {
+      (logger || createConsoleLogger('SessionManager')).warn(
+        'Shared session registry was replaced, but parent-directory fsync is unavailable on win32',
+      );
+    } else {
+      const directoryFd = fs.openSync(PERSIST_DIR, 'r');
+      try {
+        fs.fsyncSync(directoryFd);
+      } finally {
+        fs.closeSync(directoryFd);
+      }
+    }
     return { ok: true };
   } catch (err) {
+    try {
+      if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    } catch {
+      // Preserve the primary persistence error. A later locked write will
+      // replace the fixed-name temp file before attempting another rename.
+    }
     (logger || createConsoleLogger('SessionManager')).warn('Failed to persist sessions:', (err as Error).message);
     return {
       ok: false,
@@ -375,13 +399,7 @@ import {
   isRecoverableAgentOwnerInstanceId,
   validateAutoloopTimeoutConfig,
 } from './autoloop/types.js';
-import {
-  Msg as AutoloopMsg,
-  type PhaseErrorPayload,
-  type PushChannel,
-  type PushLevel,
-  type SendTimeoutPayload,
-} from './autoloop/messages.js';
+import { Msg as AutoloopMsg, type PushChannel, type PushLevel, type SendTimeoutPayload } from './autoloop/messages.js';
 import { appendPushLog, notifyUserFallbackChain } from './autoloop/notify.js';
 import { UltraappManager } from './ultraapp/manager.js';
 import { UltraappStore, defaultStoreRoot } from './ultraapp/store.js';
@@ -487,7 +505,7 @@ interface PreparedSendTimeoutMigrationAppend {
 
 class AutoloopChatStateError extends Error {
   constructor(
-    readonly code: 'AUTOLOOP_SEND_TIMEOUT' | 'AUTOLOOP_RUN_TERMINAL',
+    readonly code: 'AUTOLOOP_SEND_TIMEOUT' | 'AUTOLOOP_RUN_PAUSED' | 'AUTOLOOP_RUN_TERMINAL',
     message: string,
     readonly retryable: boolean,
     readonly pending_dispatch?: SendTimeoutPayload,
@@ -4005,31 +4023,21 @@ export class SessionManager implements AgentRuntimeProbe {
 
   private async _autoloopChatTransaction(runId: string, text: string): Promise<{ reply: string }> {
     const ctx = this._liveAutoloop(runId);
+    const chatEnvelope = AutoloopMsg.chat(ctx.runner.state.iter, { text });
     let reply = '';
-    let plannerFailure: AutoloopOperationError | undefined;
     const onReply = (...args: unknown[]) => {
       const t = args[0];
-      if (typeof t === 'string') reply = t;
-    };
-    const onPhaseError = (...args: unknown[]) => {
-      const payload = args[0] as PhaseErrorPayload | undefined;
-      if (payload?.agent !== 'planner' || !payload.code) return;
-      plannerFailure = new AutoloopOperationError(
-        payload.code,
-        typeof payload.error === 'string' ? payload.error : 'Planner returned no logical result',
-      );
+      const identity = args[1] as { message_id?: unknown } | undefined;
+      if (typeof t === 'string' && identity?.message_id === chatEnvelope.msg_id) reply = t;
     };
     ctx.dispatcher.on('planner_reply', onReply);
-    ctx.runner.on('phase_error', onPhaseError);
     try {
-      await ctx.runner.send(AutoloopMsg.chat(ctx.runner.state.iter, { text }));
-      if (plannerFailure) throw plannerFailure;
+      await ctx.runner.send(chatEnvelope);
     } finally {
       ctx.dispatcher.off('planner_reply', onReply);
-      ctx.runner.off('phase_error', onPhaseError);
     }
     const pending = ctx.runner.state.pending_dispatch;
-    if (!reply.trim() && pending?.agent === 'planner') {
+    if (!reply.trim() && pending?.agent === 'planner' && pending.message_id === chatEnvelope.msg_id) {
       throw new AutoloopChatStateError(
         'AUTOLOOP_SEND_TIMEOUT',
         `Planner send '${pending.dispatch_id}' reached its deadline and is awaiting explicit resume`,
@@ -4043,6 +4051,15 @@ export class SessionManager implements AgentRuntimeProbe {
         'AUTOLOOP_RUN_TERMINAL',
         `Autoloop run '${runId}' became ${ctx.runner.state.status} before Planner produced a reply`,
         false,
+        undefined,
+        ctx.runner.state.status_reason,
+      );
+    }
+    if (!reply.trim() && ctx.runner.state.status === 'paused') {
+      throw new AutoloopChatStateError(
+        'AUTOLOOP_RUN_PAUSED',
+        `Autoloop run '${runId}' is paused; Planner chat '${chatEnvelope.msg_id}' remains parked`,
+        true,
         undefined,
         ctx.runner.state.status_reason,
       );

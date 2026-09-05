@@ -198,6 +198,8 @@ process.env.CLAWO_WF_DIR = TEST_WF_DIR;
 
 const persistenceFsState = vi.hoisted(() => ({
   files: new Map<string, string>(),
+  descriptors: new Map<number, string>(),
+  nextDescriptor: 1_000_000,
 }));
 
 vi.mock('node:fs', async () => {
@@ -240,13 +242,27 @@ vi.mock('node:fs', async () => {
     if (isProtectedDataFile(p)) return;
     (actual.appendFileSync as (...a: unknown[]) => void)(p, ...rest);
   });
-  const openSync = vi.fn((p: unknown, ...rest: unknown[]) =>
-    (actual.openSync as (...a: unknown[]) => number)(p, ...rest),
-  );
+  const openSync = vi.fn((p: unknown, ...rest: unknown[]) => {
+    if (isProtectedDataFile(p)) {
+      const flags = String(rest[0] ?? 'r');
+      if (flags.includes('r') && !persistenceFsState.files.has(p)) throw missingFile(p);
+      const fd = persistenceFsState.nextDescriptor++;
+      persistenceFsState.descriptors.set(fd, p);
+      return fd;
+    }
+    return (actual.openSync as (...a: unknown[]) => number)(p, ...rest);
+  });
   const writeSync = vi.fn((fd: unknown, ...rest: unknown[]) =>
     (actual.writeSync as (...a: unknown[]) => number)(fd, ...rest),
   );
-  const fsyncSync = vi.fn((fd: number) => actual.fsyncSync(fd));
+  const fsyncSync = vi.fn((fd: number) => {
+    if (persistenceFsState.descriptors.has(fd)) return;
+    return actual.fsyncSync(fd);
+  });
+  const closeSync = vi.fn((fd: number) => {
+    if (persistenceFsState.descriptors.delete(fd)) return;
+    return actual.closeSync(fd);
+  });
   const mkdirSync = vi.fn((p: unknown, ...rest: unknown[]) => {
     return (actual.mkdirSync as (...a: unknown[]) => string | undefined)(p, ...rest);
   });
@@ -277,6 +293,7 @@ vi.mock('node:fs', async () => {
     openSync,
     writeSync,
     fsyncSync,
+    closeSync,
     mkdirSync,
     renameSync,
     unlinkSync,
@@ -310,7 +327,7 @@ vi.mock('node:fs', async () => {
 // Import AFTER mocking fs
 const { SessionManager } = await import('../session-manager.js');
 const { Msg: AutoloopMsg } = await import('../autoloop/messages.js');
-const { validatePlannerToolCalls } = await import('../autoloop/planner-tools.js');
+const { applyValidatedPlannerToolCalls, validatePlannerToolCalls } = await import('../autoloop/planner-tools.js');
 
 const SESSION_REGISTRY_FILE = path.join(os.homedir(), '.openclaw', 'claude-sessions.json');
 const SESSION_PID_FILE = path.join(os.homedir(), '.openclaw', 'session-pids.json');
@@ -384,6 +401,8 @@ describe('SessionManager', () => {
   beforeEach(() => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     persistenceFsState.files.clear();
+    persistenceFsState.descriptors.clear();
+    persistenceFsState.nextDescriptor = 1_000_000;
     mockSessions = [];
     createdConfigs = [];
     // Fresh run store per test. These cases use fixed run ids, and the store
@@ -3750,6 +3769,27 @@ describe('SessionManager', () => {
             expected: `${metadataLimit}-byte UTF-8 limit`,
           },
           {
+            label: 'terminate reason',
+            control: { tool: 'terminate', args: { reason: oversizedUtf8 } },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+          {
+            label: 'spawn initial directive goal',
+            control: {
+              tool: 'spawn_subagents',
+              args: { initial_directive: { goal: oversizedAscii } },
+            },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+          {
+            label: 'spawn initial directive constraint',
+            control: {
+              tool: 'spawn_subagents',
+              args: { initial_directive: { goal: 'ship', constraints: [oversizedUtf8] } },
+            },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+          {
             label: 'coder model',
             control: { tool: 'spawn_subagents', args: { coder_model: oversizedUtf8 } },
             expected: `${metadataLimit}-byte UTF-8 limit`,
@@ -4214,7 +4254,9 @@ describe('SessionManager', () => {
         const flush = vi.mocked(fs.fsyncSync);
         const flushImplementation = flush.getMockImplementation()!;
         flush.mockImplementation((fd) => {
-          order.push(openedTargets.get(fd) === ledgerDir ? 'directory-flushed' : 'control-flushed');
+          const target = openedTargets.get(fd);
+          if (target === decisionsPath) order.push('control-flushed');
+          if (target === ledgerDir) order.push('directory-flushed');
           return flushImplementation(fd);
         });
         const spawnImplementation = handle.dispatcher.spawnSubagents.bind(handle.dispatcher);
@@ -4228,7 +4270,7 @@ describe('SessionManager', () => {
           await expect(mgr.autoloopChat(runId, 'spawn after durable evidence')).resolves.toEqual({
             reply: 'Planner controls persisted: spawn_subagents',
           });
-          expect(order).toEqual(['control-flushed', 'directory-flushed', 'effect-started']);
+          expect(order.slice(0, 3)).toEqual(['control-flushed', 'directory-flushed', 'effect-started']);
         } finally {
           openFile.mockImplementation(openImplementation);
           flush.mockImplementation(flushImplementation);
@@ -4269,7 +4311,9 @@ describe('SessionManager', () => {
         const flush = vi.mocked(fs.fsyncSync);
         const flushImplementation = flush.getMockImplementation()!;
         flush.mockImplementation((fd) => {
-          order.push(openedTargets.get(fd) === ledgerDir ? 'directory-flushed' : 'control-flushed');
+          const target = openedTargets.get(fd);
+          if (target === decisionsPath) order.push('control-flushed');
+          if (target === ledgerDir) order.push('directory-flushed');
           return flushImplementation(fd);
         });
         const spawnImplementation = handle.dispatcher.spawnSubagents.bind(handle.dispatcher);
@@ -4283,7 +4327,7 @@ describe('SessionManager', () => {
           await expect(mgr.autoloopChat(runId, 'spawn after durable evidence')).resolves.toEqual({
             reply: 'Planner controls persisted: spawn_subagents',
           });
-          expect(order).toEqual(['control-flushed', 'directory-flushed', 'effect-started']);
+          expect(order.slice(0, 3)).toEqual(['control-flushed', 'directory-flushed', 'effect-started']);
         } finally {
           openFile.mockImplementation(openImplementation);
           flush.mockImplementation(flushImplementation);
@@ -4626,12 +4670,12 @@ describe('SessionManager', () => {
           event: { type: 'result', result: 'apply controls' },
         });
         const planPath = path.join(workspace, 'plan.md');
-        const writeFile = vi.mocked(fs.writeFileSync);
-        const writeImplementation = writeFile.getMockImplementation()!;
-        writeFile.mockImplementation(((file: unknown, ...args: unknown[]) => {
-          if (String(file) === planPath) throw new Error('operational plan write failed');
-          return (writeImplementation as (...values: unknown[]) => unknown)(file, ...args);
-        }) as typeof fs.writeFileSync);
+        const rename = vi.mocked(fs.renameSync);
+        const renameImplementation = rename.getMockImplementation()!;
+        rename.mockImplementation(((from: unknown, to: unknown) => {
+          if (String(to) === planPath) throw new Error('operational plan write failed');
+          return (renameImplementation as (...values: unknown[]) => unknown)(from, to);
+        }) as typeof fs.renameSync);
 
         try {
           await expect(mgr.autoloopChat(runId, 'apply both approved controls')).rejects.toMatchObject({
@@ -4657,7 +4701,7 @@ describe('SessionManager', () => {
             consecutive_phase_errors: 1,
           });
         } finally {
-          writeFile.mockImplementation(writeImplementation);
+          rename.mockImplementation(renameImplementation);
         }
       });
 
@@ -4715,13 +4759,13 @@ describe('SessionManager', () => {
               event: { type: 'result', result: 'validated control with operational failure' },
             });
             const planPath = path.join(workspace, 'plan.md');
-            const writeFile = vi.mocked(fs.writeFileSync);
-            const writeImplementation = writeFile.getMockImplementation()!;
-            writeFile.mockImplementation(((file: unknown, ...args: unknown[]) => {
-              if (String(file) === planPath) throw new Error('operational plan write failed');
-              return (writeImplementation as (...values: unknown[]) => unknown)(file, ...args);
-            }) as typeof fs.writeFileSync);
-            return () => writeFile.mockImplementation(writeImplementation);
+            const rename = vi.mocked(fs.renameSync);
+            const renameImplementation = rename.getMockImplementation()!;
+            rename.mockImplementation(((from: unknown, to: unknown) => {
+              if (String(to) === planPath) throw new Error('operational plan write failed');
+              return (renameImplementation as (...values: unknown[]) => unknown)(from, to);
+            }) as typeof fs.renameSync);
+            return () => rename.mockImplementation(renameImplementation);
           },
         },
         {
@@ -5072,6 +5116,18 @@ describe('SessionManager', () => {
           label: 'message identity',
           mutate: (payload) => {
             payload.message_id = 'tampered-message';
+          },
+        },
+        {
+          label: 'iteration identity',
+          mutate: (payload) => {
+            payload.iter = 99;
+          },
+        },
+        {
+          label: 'tools sequence only',
+          mutate: (payload) => {
+            payload.tools = ['write_plan'];
           },
         },
       ];
@@ -6123,11 +6179,11 @@ describe('SessionManager', () => {
             (mgr.workflowStatus(runId).nodes.main.data as any).state.pending_dispatch,
           ),
         };
-        const actualFs = await vi.importActual<typeof import('node:fs')>('node:fs');
         const auditOpen = vi.mocked((await import('node:fs')).openSync);
+        const openImplementation = auditOpen.getMockImplementation()!;
         auditOpen.mockImplementation(((file, flags, mode) => {
           if (String(file) === auditPath && flags === 'a') throw new Error('audit append unavailable');
-          return actualFs.openSync(file, flags, mode);
+          return openImplementation(file, flags, mode);
         }) as typeof fs.openSync);
 
         try {
@@ -6135,8 +6191,7 @@ describe('SessionManager', () => {
             resumeWithOverride(runId, { sendTimeoutMs: 700_000, pendingDispatchId: dispatchId }),
           ).rejects.toThrow('audit append unavailable');
         } finally {
-          auditOpen.mockImplementation(((file, flags, mode) =>
-            actualFs.openSync(file, flags, mode)) as typeof fs.openSync);
+          auditOpen.mockImplementation(openImplementation);
         }
 
         expect(mgr.getAutoloop(runId)).toBeUndefined();
@@ -6414,6 +6469,553 @@ describe('SessionManager', () => {
             expect(planner.sendCalls).toHaveLength(1);
           },
         );
+      });
+    });
+
+    describe('Task 3A round 11 recovery boundaries', () => {
+      it('returns the initiating chat reply when the same drain contains a later Planner turn', async () => {
+        const runId = 'planner-turn-bound-reply';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        let turn = 0;
+        mockSessions[0].sendImplementation = async () => {
+          turn += 1;
+          return {
+            text: `turn-bound reply ${turn}`,
+            event: { type: 'result', result: `turn-bound reply ${turn}` },
+          };
+        };
+        let followUp: Promise<void> | undefined;
+        handle.dispatcher.on('planner_reply', () => {
+          if (followUp) return;
+          followUp = handle.runner.send(AutoloopMsg.chat(0, { text: 'later internal Planner turn' }));
+        });
+
+        await expect(mgr.autoloopChat(runId, 'initiating user turn')).resolves.toEqual({
+          reply: 'turn-bound reply 1',
+        });
+        await expect(followUp).resolves.toBeUndefined();
+        expect(mockSessions[0].sendCalls).toHaveLength(2);
+      });
+
+      it('reports an ordinary paused chat as parked without consuming it', async () => {
+        const runId = 'planner-chat-ordinary-pause';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        await handle.runner.send(AutoloopMsg.pause(0, { reason: 'operator-review' }));
+
+        await expect(mgr.autoloopChat(runId, 'park this exact turn')).rejects.toMatchObject({
+          code: 'AUTOLOOP_RUN_PAUSED',
+          retryable: true,
+          pending_dispatch: undefined,
+          status_reason: 'operator-review',
+        });
+        expect(
+          (handle.runner as unknown as { pausedBuffer: Array<{ payload: { text?: string } }> }).pausedBuffer,
+        ).toEqual([expect.objectContaining({ payload: { text: 'park this exact turn' } })]);
+        expect(mockSessions[0].sendCalls).toHaveLength(0);
+      });
+
+      it('does not attribute an older send-timeout dispatch to a newly parked chat', async () => {
+        const runId = 'planner-chat-behind-timeout';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => {
+          throw Object.assign(new Error('Planner deadline'), { code: 'ETIMEDOUT' });
+        };
+        let originalPending: Record<string, unknown> | undefined;
+        try {
+          await mgr.autoloopChat(runId, 'the dispatch that times out');
+        } catch (error) {
+          originalPending = (error as { pending_dispatch?: Record<string, unknown> }).pending_dispatch;
+        }
+        expect(originalPending).toMatchObject({ agent: 'planner', message_type: 'chat' });
+
+        await expect(mgr.autoloopChat(runId, 'a distinct parked chat')).rejects.toMatchObject({
+          code: 'AUTOLOOP_RUN_PAUSED',
+          retryable: true,
+          pending_dispatch: undefined,
+        });
+        expect(handle.runner.state.pending_dispatch).toEqual(originalPending);
+        expect(mockSessions[0].sendCalls).toHaveLength(1);
+      });
+
+      it('isolates a failed Planner sender from a later queued sender', async () => {
+        const runId = 'planner-drain-sender-isolation';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        let releaseFirst!: () => void;
+        const firstGate = new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+        let markFirstEntered!: () => void;
+        const firstEntered = new Promise<void>((resolve) => {
+          markFirstEntered = resolve;
+        });
+        let turn = 0;
+        mockSessions[0].sendImplementation = async () => {
+          turn += 1;
+          if (turn === 1) {
+            markFirstEntered();
+            await firstGate;
+            return {
+              text: ['```autoloop', '{"tool":"notify_user","args":{}}', '```'].join('\n'),
+              event: { type: 'result', result: 'bad first turn' },
+            };
+          }
+          return { text: 'independent second reply', event: { type: 'result', result: 'independent second reply' } };
+        };
+
+        const first = handle.runner.send(AutoloopMsg.chat(0, { text: 'failing sender' }));
+        await firstEntered;
+        const second = handle.runner.send(AutoloopMsg.chat(0, { text: 'independent sender' }));
+        releaseFirst();
+
+        await expect(first).rejects.toMatchObject({ code: 'AUTOLOOP_CONTROL_MALFORMED' });
+        await expect(second).resolves.toBeUndefined();
+        expect(mockSessions[0].sendCalls).toHaveLength(2);
+      });
+
+      it.each([
+        { label: 'plain reply', output: 'late plain Planner success', control: false },
+        {
+          label: 'spawn control',
+          output: ['late spawn', '```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          control: true,
+        },
+      ])('fences a late Planner $label after pre-emptive termination', async ({ label, output, control }) => {
+        const runId = `planner-terminal-fence-${label.replace(' ', '-')}`;
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        let releaseTurn!: () => void;
+        let markTurnEntered!: () => void;
+        const turnEntered = new Promise<void>((resolve) => {
+          markTurnEntered = resolve;
+        });
+        const turnGate = new Promise<void>((resolve) => {
+          releaseTurn = resolve;
+        });
+        mockSessions[0].sendImplementation = async () => {
+          markTurnEntered();
+          await turnGate;
+          return { text: output, event: { type: 'result', result: output } };
+        };
+        let releasePlannerStop!: () => void;
+        let markPlannerStopEntered!: () => void;
+        const plannerStopEntered = new Promise<void>((resolve) => {
+          markPlannerStopEntered = resolve;
+        });
+        const plannerStopGate = new Promise<void>((resolve) => {
+          releasePlannerStop = resolve;
+        });
+        const stopImplementation = mgr.stopSession.bind(mgr);
+        const stop = vi.spyOn(mgr, 'stopSession').mockImplementation(async (name, options) => {
+          if (name === handle.dispatcher.sessionNames.planner) {
+            markPlannerStopEntered();
+            await plannerStopGate;
+          }
+          return await stopImplementation(name, options);
+        });
+        const replies: string[] = [];
+        handle.dispatcher.on('planner_reply', (reply: string) => replies.push(reply));
+
+        try {
+          const chat = mgr.autoloopChat(runId, 'turn racing terminal state');
+          await turnEntered;
+          const stopping = mgr.autoloopStop(runId, 'operator-terminal-fence');
+          await plannerStopEntered;
+          expect(handle.runner.state.status).toBe('terminated');
+          releaseTurn();
+
+          await expect(chat).rejects.toMatchObject({
+            code: 'AUTOLOOP_RUN_TERMINAL',
+            retryable: false,
+            status_reason: 'operator-terminal-fence',
+          });
+          releasePlannerStop();
+          await expect(stopping).resolves.toBe(true);
+          expect(replies).toEqual([]);
+          expect(handle.runner.state).toMatchObject({ status: 'terminated', subagents_spawned: false });
+          expect(mockSessions).toHaveLength(1);
+          const decisionsPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+          const decisions = fs
+            .readFileSync(decisionsPath, 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string });
+          expect(decisions.filter((row) => row.kind === 'planner_turn_control')).toHaveLength(0);
+          if (control) expect(decisions.filter((row) => row.kind === 'spawn_subagents')).toHaveLength(0);
+        } finally {
+          releasePlannerStop();
+          stop.mockRestore();
+        }
+      });
+
+      it('returns a structured internal failure when Planner reset omits force', async () => {
+        const runId = 'planner-reset-force-required';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+
+        await expect(mgr.getAutoloop(runId)!.dispatcher.resetAgent('planner')).resolves.toMatchObject({
+          ok: false,
+          code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+          agent: 'planner',
+          retryable: false,
+          message: expect.stringContaining('force=true'),
+        });
+      });
+
+      it.each(['coder', 'reviewer'] as const)(
+        'does not retain a fatal rejected %s send in replay history',
+        async (role) => {
+          const runId = `fatal-${role}-history-exclusion`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          await handle.dispatcher.spawnSubagents();
+          const roleIndex = role === 'coder' ? 1 : 2;
+          mockSessions[roleIndex].sendImplementation = async () => {
+            throw new Error(`${role} fatal turn`);
+          };
+          vi.spyOn(handle.dispatcher, 'resetAgent').mockResolvedValue({
+            ok: false,
+            code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+            agent: role,
+            previous_generation: 1,
+            message: `${role} cannot recover`,
+            retryable: false,
+          });
+
+          if (role === 'coder') {
+            await handle.runner.send(
+              AutoloopMsg.directive(0, {
+                goal: 'rejected fatal coder turn',
+                constraints: [],
+                success_criteria: [],
+                max_attempts: 1,
+              }),
+            );
+          } else {
+            await handle.runner.send(
+              AutoloopMsg.reviewRequest(0, {
+                iter: 0,
+                ledger_path: path.join(workspace, 'tasks', runId),
+                prior_metrics: [],
+              }),
+            );
+          }
+
+          expect(
+            (
+              handle.dispatcher as unknown as {
+                transcripts: Record<'coder' | 'reviewer', Array<{ who: string; text: string }>>;
+              }
+            ).transcripts[role],
+          ).toEqual([]);
+        },
+      );
+
+      it('preserves critical push-policy severity across an allowed partial update', async () => {
+        const runId = 'planner-critical-policy-partial-update';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: [
+            '```autoloop',
+            '{"tool":"update_push_policy","args":{"on_phase_error":{"channel":"wechat"}}}',
+            '```',
+          ].join('\n'),
+          event: { type: 'result', result: 'partial critical update' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'narrow only the channel')).resolves.toMatchObject({
+          reply: expect.stringContaining('update_push_policy'),
+        });
+        expect(handle.runner.config.push_policy?.on_phase_error).toEqual({ level: 'error', channel: 'wechat' });
+      });
+
+      it('rejects a weakening critical push-policy severity atomically', async () => {
+        const runId = 'planner-critical-policy-weakening';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const before = JSON.stringify(handle.runner.config.push_policy);
+        mockSessions[0].sendImplementation = async () => ({
+          text: [
+            '```autoloop',
+            '{"tool":"update_push_policy","args":{"on_decision_needed":{"level":"info"}}}',
+            '```',
+          ].join('\n'),
+          event: { type: 'result', result: 'weaken critical severity' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'reject the weakening update')).rejects.toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+        });
+        expect(JSON.stringify(handle.runner.config.push_policy)).toBe(before);
+      });
+
+      it('refuses a silence-only critical attempt even when natural-language text is present', async () => {
+        const runId = 'planner-critical-silence-with-text';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: [
+            'I silenced the critical notification.',
+            '```autoloop',
+            '{"tool":"update_push_policy","args":{"on_phase_error":{"silent":true}}}',
+            '```',
+          ].join('\n'),
+          event: { type: 'result', result: 'silence critical policy' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'do not accept prose as a control result')).rejects.toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+          retryable: false,
+        });
+      });
+
+      it('retains a valid non-weakening control beside a blocked critical silence attempt', async () => {
+        const runId = 'planner-critical-silence-mixed-batch';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: [
+            '```autoloop',
+            '{"tool":"update_push_policy","args":{"on_phase_error":{"silent":true}}}',
+            '```',
+            '```autoloop',
+            '{"tool":"update_push_policy","args":{"on_start":{"level":"warn"}}}',
+            '```',
+          ].join('\n'),
+          event: { type: 'result', result: 'mixed policy controls' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'apply only the valid policy control')).resolves.toMatchObject({
+          reply: expect.stringContaining('update_push_policy'),
+        });
+        expect(handle.runner.config.push_policy?.on_phase_error).toEqual({ level: 'error', channel: 'both' });
+        expect(handle.runner.config.push_policy?.on_start).toEqual({ level: 'warn' });
+      });
+
+      it('rejects an oversized artifact batch before materializing every large body', () => {
+        const body = 'x'.repeat(1_048_576);
+        const reads: number[] = [];
+        const controls = Array.from({ length: 8 }, (_, index) => {
+          const args: Record<string, unknown> = {};
+          Object.defineProperty(args, 'content', {
+            enumerable: true,
+            get: () => {
+              reads.push(index);
+              return body;
+            },
+          });
+          return { tool: 'write_plan' as const, args };
+        });
+
+        const validation = validatePlannerToolCalls(controls);
+
+        expect(validation.calls).toEqual([]);
+        expect(validation.errors[0]?.error).toContain('1114112-byte UTF-8 limit');
+        expect(reads).toEqual([0, 1]);
+      });
+
+      it('applies an already validated batch through the trusted path without a second boundary pass', async () => {
+        const validation = validatePlannerToolCalls([{ tool: 'notify_user', args: { summary: 'one effect' } }]);
+        const updatePushPolicy = vi.fn();
+
+        const result = await applyValidatedPlannerToolCalls(
+          validation,
+          {
+            spawnSubagents: async () => undefined,
+            updatePushPolicy,
+            writePlanFile: async () => undefined,
+          },
+          0,
+        );
+
+        expect(result.errors).toEqual([]);
+        expect(result.emitted_messages).toEqual([
+          expect.objectContaining({ type: 'push_user', payload: expect.objectContaining({ summary: 'one effect' }) }),
+        ]);
+        expect(updatePushPolicy).not.toHaveBeenCalled();
+      });
+
+      it('refuses a pre-planted plan symlink without touching its external target', async () => {
+        const runId = 'planner-plan-symlink-refusal';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        const external = path.join(TEST_WF_DIR, `${runId}-external.txt`);
+        fs.writeFileSync(external, 'external sentinel');
+        fs.symlinkSync(external, path.join(workspace, 'plan.md'));
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"write_plan","args":{"content":"# unsafe overwrite"}}', '```'].join('\n'),
+          event: { type: 'result', result: 'write through symlink' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'persist safely')).rejects.toMatchObject({
+          code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+        });
+        expect(fs.readFileSync(external, 'utf8')).toBe('external sentinel');
+        expect(fs.lstatSync(path.join(workspace, 'plan.md')).isSymbolicLink()).toBe(true);
+      });
+
+      it('materializes a regular goal atomically through a same-directory rename', async () => {
+        const runId = 'planner-goal-atomic-replace';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        const goalPath = path.join(workspace, 'goal.json');
+        fs.writeFileSync(goalPath, '{"old":true}');
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"write_goal","args":{"content":"{\\"new\\":true}"}}', '```'].join('\n'),
+          event: { type: 'result', result: 'replace goal atomically' },
+        });
+        const rename = vi.mocked(fs.renameSync);
+        const renameImplementation = rename.getMockImplementation()!;
+        const replacements: Array<{ from: string; to: string }> = [];
+        rename.mockImplementation(((from: unknown, to: unknown) => {
+          if (String(to) === goalPath) replacements.push({ from: String(from), to: String(to) });
+          return (renameImplementation as (...values: unknown[]) => unknown)(from, to);
+        }) as typeof fs.renameSync);
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'replace the goal')).resolves.toMatchObject({
+            reply: expect.stringContaining('write_goal'),
+          });
+          expect(fs.readFileSync(goalPath, 'utf8')).toBe('{"new":true}');
+          expect(replacements).toHaveLength(1);
+          expect(path.dirname(replacements[0].from)).toBe(workspace);
+          expect(replacements[0].to).toBe(goalPath);
+        } finally {
+          rename.mockImplementation(renameImplementation);
+        }
+      });
+
+      it('flushes the registry temp file, rename, and parent directory in order', () => {
+        const sessionName = 'durable-registry-order';
+        const generation = managerGeneration(sessionName, {
+          owner_instance_id: mgr.autoloopOwnerInstanceId,
+          session_id: 'durable-registry-session',
+        });
+        const tmpPath = `${SESSION_REGISTRY_FILE}.tmp`;
+        const registryDir = path.dirname(SESSION_REGISTRY_FILE);
+        const openedTargets = new Map<number, string>();
+        const order: string[] = [];
+        const openFile = vi.mocked(fs.openSync);
+        const openImplementation = openFile.getMockImplementation()!;
+        openFile.mockImplementation(((target: unknown, ...args: unknown[]) => {
+          const fd = (openImplementation as (...values: unknown[]) => number)(target, ...args);
+          openedTargets.set(fd, String(target));
+          return fd;
+        }) as typeof fs.openSync);
+        const flush = vi.mocked(fs.fsyncSync);
+        const flushImplementation = flush.getMockImplementation()!;
+        flush.mockImplementation((fd) => {
+          if (openedTargets.get(fd) === tmpPath) order.push('registry-file-flushed');
+          if (openedTargets.get(fd) === registryDir) order.push('registry-directory-flushed');
+          return flushImplementation(fd);
+        });
+        const rename = vi.mocked(fs.renameSync);
+        const renameImplementation = rename.getMockImplementation()!;
+        rename.mockImplementation(((from: unknown, to: unknown) => {
+          if (String(from) === tmpPath && String(to) === SESSION_REGISTRY_FILE) order.push('registry-renamed');
+          return (renameImplementation as (...values: unknown[]) => unknown)(from, to);
+        }) as typeof fs.renameSync);
+
+        try {
+          expect(mgr.reserveAgentGeneration(generation, '/tmp')).toBe(true);
+          expect(order).toEqual(['registry-file-flushed', 'registry-renamed', 'registry-directory-flushed']);
+        } finally {
+          openFile.mockImplementation(openImplementation);
+          flush.mockImplementation(flushImplementation);
+          rename.mockImplementation(renameImplementation);
+        }
+      });
+
+      it('fails closed when the registry temp-file flush fails before replacement', () => {
+        const sessionName = 'durable-registry-flush-failure';
+        const generation = managerGeneration(sessionName, {
+          owner_instance_id: mgr.autoloopOwnerInstanceId,
+          session_id: 'durable-registry-flush-session',
+        });
+        const tmpPath = `${SESSION_REGISTRY_FILE}.tmp`;
+        const flush = vi.mocked(fs.fsyncSync);
+        const flushImplementation = flush.getMockImplementation()!;
+        flush.mockImplementation((fd) => {
+          if (persistenceFsState.descriptors.get(fd) === tmpPath) throw new Error('registry temp flush failed');
+          return flushImplementation(fd);
+        });
+
+        try {
+          expect(() => mgr.reserveAgentGeneration(generation, '/tmp')).toThrow(
+            expect.objectContaining({ code: 'AUTOLOOP_AGENT_REGISTRY_PERSIST_FAILED' }),
+          );
+          expect(persistenceFsState.files.has(SESSION_REGISTRY_FILE)).toBe(false);
+        } finally {
+          flush.mockImplementation(flushImplementation);
+        }
+      });
+
+      it('fails reset closed when generation release evidence cannot be flushed', async () => {
+        const runId = 'generation-release-flush-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const generationPath = path.join(workspace, 'tasks', runId, 'agent-generations.jsonl');
+        const openedTargets = new Map<number, string>();
+        const openFile = vi.mocked(fs.openSync);
+        const openImplementation = openFile.getMockImplementation()!;
+        openFile.mockImplementation(((target: unknown, ...args: unknown[]) => {
+          const fd = (openImplementation as (...values: unknown[]) => number)(target, ...args);
+          openedTargets.set(fd, String(target));
+          return fd;
+        }) as typeof fs.openSync);
+        const flush = vi.mocked(fs.fsyncSync);
+        const flushImplementation = flush.getMockImplementation()!;
+        flush.mockImplementation((fd) => {
+          if (openedTargets.get(fd) === generationPath) throw new Error('generation evidence flush failed');
+          return flushImplementation(fd);
+        });
+
+        try {
+          await expect(handle.dispatcher.resetAgent('planner', { force: true })).resolves.toMatchObject({
+            ok: false,
+            code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+            message: expect.stringContaining('generation evidence flush failed'),
+          });
+        } finally {
+          openFile.mockImplementation(openImplementation);
+          flush.mockImplementation(flushImplementation);
+        }
+      });
+
+      it('keeps Planner reply listeners isolated across simultaneous runs', async () => {
+        const firstWorkspace = fs.mkdtempSync(path.join(TEST_WF_DIR, 'cross-run-first-'));
+        const secondWorkspace = fs.mkdtempSync(path.join(TEST_WF_DIR, 'cross-run-second-'));
+        await mgr.autoloopStart({ runId: 'cross-run-first', workspace: firstWorkspace });
+        await mgr.autoloopStart({ runId: 'cross-run-second', workspace: secondWorkspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: 'first run reply',
+          event: { type: 'result', result: 'first run reply' },
+        });
+        mockSessions[1].sendImplementation = async () => ({
+          text: 'second run reply',
+          event: { type: 'result', result: 'second run reply' },
+        });
+
+        await expect(
+          Promise.all([
+            mgr.autoloopChat('cross-run-first', 'first run turn'),
+            mgr.autoloopChat('cross-run-second', 'second run turn'),
+          ]),
+        ).resolves.toEqual([{ reply: 'first run reply' }, { reply: 'second run reply' }]);
       });
     });
 

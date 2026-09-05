@@ -141,6 +141,11 @@ const PUSH_POLICY_KEYS = new Set([
 ]);
 const UNSILENCEABLE_PUSH_POLICY_KEYS = new Set(['on_phase_error', 'on_decision_needed']);
 const PUSH_POLICY_RULE_FIELDS = new Set(['channel', 'level', 'silent']);
+const PUSH_LEVEL_STRENGTH: Record<PushLevel, number> = { info: 0, warn: 1, decision: 2, error: 3 };
+const MINIMUM_CRITICAL_PUSH_LEVEL: Readonly<Record<string, PushLevel>> = {
+  on_phase_error: 'error',
+  on_decision_needed: 'decision',
+};
 
 /** Maximum UTF-8 bytes accepted for one durable metadata string. */
 export const MAX_PLANNER_CONTROL_METADATA_BYTES = 8_192;
@@ -242,6 +247,10 @@ function sanitizePushPolicyDelta(raw: Record<string, unknown>, blockedSilence: s
     if ('level' in input) {
       if (typeof input.level !== 'string' || !VALID_PUSH_LEVELS.has(input.level as PushLevel)) {
         throw new Error(`update_push_policy ${key} level '${String(input.level)}' is not supported`);
+      }
+      const minimum = MINIMUM_CRITICAL_PUSH_LEVEL[key];
+      if (minimum && PUSH_LEVEL_STRENGTH[input.level as PushLevel] < PUSH_LEVEL_STRENGTH[minimum]) {
+        throw new Error(`update_push_policy ${key} level '${input.level}' weakens required level '${minimum}'`);
       }
       rule.level = input.level;
     }
@@ -402,6 +411,11 @@ export function validatePlannerToolCalls(calls: readonly PlannerToolCall[]): Pla
   const validated: PlannerToolCall[] = [];
   const errors: Array<{ tool: string; error: string }> = [];
   const blockedPolicySilence: string[] = [];
+  // Exact JSON-array accounting lets us reject an oversized batch as soon as
+  // the first overflowing row is known. At most the accepted prefix plus the
+  // current bounded row is retained; we never accumulate dozens of one-MiB
+  // artifact bodies only to discover the total ceiling at the end.
+  let normalizedBatchBytes = 2; // opening + closing brackets
   for (const call of calls) {
     try {
       const blockedBefore = blockedPolicySilence.length;
@@ -410,15 +424,35 @@ export function validatePlannerToolCalls(calls: readonly PlannerToolCall[]): Pla
         sanitized.tool === 'update_push_policy' &&
         blockedPolicySilence.length > blockedBefore &&
         Object.keys(sanitized.args).length === 0;
-      if (!isBlockedSilenceOnlyControl) validated.push(sanitized);
+      if (!isBlockedSilenceOnlyControl) {
+        const normalized = normalizePlannerControls([sanitized])[0];
+        const rowBytes = Buffer.byteLength(JSON.stringify(normalized), 'utf8');
+        const nextBytes = normalizedBatchBytes + (validated.length > 0 ? 1 : 0) + rowBytes;
+        if (nextBytes > MAX_PLANNER_CONTROL_BATCH_BYTES) {
+          return {
+            calls: [],
+            errors: [
+              {
+                tool: 'batch',
+                error: `Planner control batch exceeds the ${MAX_PLANNER_CONTROL_BATCH_BYTES}-byte UTF-8 limit`,
+              },
+            ],
+            blocked_policy_silence: [],
+          };
+        }
+        normalizedBatchBytes = nextBytes;
+        validated.push(normalized);
+      }
     } catch (error) {
       errors.push({ tool: call.tool, error: (error as Error).message });
     }
   }
   if (errors.length > 0) return { calls: [], errors, blocked_policy_silence: [] };
 
-  const normalized = normalizePlannerControls(validated);
-  const controlsJson = JSON.stringify(normalized);
+  // Keep an exact final check at the acceptance boundary even though the
+  // incremental accounting above is exact. This protects future changes to
+  // normalization from accidentally weakening the durable byte limit.
+  const controlsJson = JSON.stringify(validated);
   if (Buffer.byteLength(controlsJson, 'utf8') > MAX_PLANNER_CONTROL_BATCH_BYTES) {
     return {
       calls: [],
@@ -432,7 +466,7 @@ export function validatePlannerToolCalls(calls: readonly PlannerToolCall[]): Pla
     };
   }
   return {
-    calls: normalized,
+    calls: validated,
     errors: [],
     blocked_policy_silence: blockedPolicySilence,
     controls_json: controlsJson,
@@ -578,9 +612,29 @@ export async function applyPlannerToolCalls(
   fx: PlannerToolEffects,
   iter: number,
 ): Promise<PlannerToolHandlerResult> {
-  const emitted_messages: AnyAutoloopMessage[] = [];
   const validation = validatePlannerToolCalls(calls);
+  return await applyValidatedPlannerToolCalls(validation, fx, iter);
+}
+
+/**
+ * Trusted internal apply path for the exact result returned by
+ * `validatePlannerToolCalls`. The dispatcher already crossed the complete
+ * untrusted boundary before durable persistence, so validating and serializing
+ * the same MiB-scale batch a second time adds work without adding a fence.
+ */
+export async function applyValidatedPlannerToolCalls(
+  validation: PlannerToolValidationResult,
+  fx: PlannerToolEffects,
+  iter: number,
+): Promise<PlannerToolHandlerResult> {
+  const emitted_messages: AnyAutoloopMessage[] = [];
   if (validation.errors.length > 0) return { emitted_messages, errors: validation.errors };
+  if (validation.controls_json === undefined) {
+    return {
+      emitted_messages,
+      errors: [{ tool: 'batch', error: 'Planner controls were not validated before application' }],
+    };
+  }
   const errors: Array<{ tool: string; error: string }> = [];
   const prepared: PreparedPlannerToolCall[] = [];
 

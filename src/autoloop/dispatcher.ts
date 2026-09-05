@@ -36,6 +36,7 @@ import { type AnyAutoloopMessage, type AutoloopOperationErrorCode, Msg, type Sen
 import {
   AutoloopAgentReleaseOwnerError,
   DEFAULT_ACTIVITY_LEASE_MS,
+  DEFAULT_PUSH_POLICY,
   DEFAULT_SEND_TIMEOUT_MS,
   LEDGER_SCHEMA_VERSION,
   isRecoverableAgentOwnerInstanceId,
@@ -49,7 +50,7 @@ import {
 } from './types.js';
 
 import {
-  applyPlannerToolCalls,
+  applyValidatedPlannerToolCalls,
   parsePlannerReply,
   validatePlannerToolCalls,
   type PlannerToolCall,
@@ -448,6 +449,8 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   private plannerStarted = false;
   private coderStarted = false;
   private reviewerStarted = false;
+  /** Set synchronously when shutdown begins; no late turn may publish effects. */
+  private terminal = false;
   private plannerSystemPrompt: string;
   private coderSystemPrompt: string;
   private reviewerSystemPrompt: string;
@@ -582,7 +585,28 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       actor: 'dispatcher',
       payload: { ...generation },
     });
-    fs.appendFileSync(path.join(this.ledgerDir, 'agent-generations.jsonl'), `${line}\n`);
+    const generationsPath = path.join(this.ledgerDir, 'agent-generations.jsonl');
+    fs.appendFileSync(generationsPath, `${line}\n`);
+    this.flushDurableFile(generationsPath, 'agent generation ledger');
+  }
+
+  private flushDurableFile(filePath: string, label: string): void {
+    const fd = fs.openSync(filePath, 'r+');
+    try {
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    if (process.platform === 'win32') {
+      this.logger.warn?.(`[autoloop] ${label} was flushed, but parent-directory fsync is unavailable on win32`);
+      return;
+    }
+    const directoryFd = fs.openSync(path.dirname(filePath), 'r');
+    try {
+      fs.fsyncSync(directoryFd);
+    } finally {
+      fs.closeSync(directoryFd);
+    }
   }
 
   private conflict(code: AutoloopAgentConflictCode, role: AutoloopRoleName, detail: string): never {
@@ -651,6 +675,10 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       persistReleaseEvidence: () => {
         const current = exactCurrentGeneration();
         if (current.state === 'released') {
+          // A prior process may have appended this row and crashed (or thrown)
+          // before its durability barrier completed. Re-flush the authoritative
+          // ledger before allowing the registry tombstone to commit.
+          this.flushDurableFile(path.join(this.ledgerDir, 'agent-generations.jsonl'), 'agent generation ledger');
           onReleaseCommitted?.();
           return;
         }
@@ -839,19 +867,24 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     role: AutoloopRoleName,
     start: (generation: PhysicalAgentGeneration) => Promise<void>,
   ): Promise<void> {
+    if (this.terminal) return;
     if (this.roleStarted(role)) return;
     const operationKey = `${this.ownerInstanceId}\0${this.sessionNameFor(role)}`;
     const existing = AGENT_START_OPERATIONS.get(operationKey);
     if (existing) {
       await existing;
-      this.setRoleStarted(role, true);
+      if (!this.terminal) this.setRoleStarted(role, true);
       return;
     }
 
     const operation = (async () => {
       const prepared = await this.prepareGeneration(role);
+      if (this.terminal) {
+        if (!prepared.reuseLiveSession) await this.releaseGeneration(prepared.generation, true);
+        return;
+      }
       if (prepared.reuseLiveSession) {
-        this.setRoleStarted(role, true);
+        if (!this.terminal) this.setRoleStarted(role, true);
         return;
       }
 
@@ -859,6 +892,11 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       try {
         await start(prepared.generation);
         physicalStarted = true;
+        if (this.terminal) {
+          await this.config.manager.stopSession(prepared.generation.session_name);
+          await this.releaseGeneration(prepared.generation, true);
+          return;
+        }
         this.appendGenerationEvent('agent_generation_started', {
           ...prepared.generation,
           last_activity_at: this.now().toISOString(),
@@ -902,6 +940,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   }
 
   async shutdown(reason: string, opts: { purge?: boolean } = {}): Promise<void> {
+    this.terminal = true;
     if (!(reason === 'start-failed' && this.config.suppressFailedStartAudit)) {
       this.appendDecisionLog({
         kind: 'terminate',
@@ -925,6 +964,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   }
 
   async deliver(env: AnyAutoloopMessage): Promise<AnyAutoloopMessage[]> {
+    if (this.terminal) return [];
     const dispatchId = deriveDispatchId(this.config.runId, env);
     const existing = this.logicalDispatches.get(dispatchId);
     if (existing) return await existing;
@@ -1112,6 +1152,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
    * onSpawnSubagents).
    */
   async spawnSubagents(args: SpawnSubagentsArgs = {}): Promise<void> {
+    if (this.terminal) return;
     const nextCoderEngine = args.coder_engine ?? this.coderSelection.engine;
     const nextReviewerEngine = args.reviewer_engine ?? this.reviewerSelection.engine;
     const nextCoder: AutoloopRoleSelection = {
@@ -1158,7 +1199,9 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     this.reviewerSelection = nextReviewer;
     try {
       await this.ensureCoder();
+      if (this.terminal) throw new Error('Autoloop terminated while starting subagents');
       await this.ensureReviewer();
+      if (this.terminal) throw new Error('Autoloop terminated while starting subagents');
     } catch (err) {
       // Roll back only what THIS call started. Crucially, `<role>Started` may be
       // cleared only when the stop actually succeeded: SessionManager.startSession
@@ -1209,7 +1252,13 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     opts: { force?: boolean; eagerRestart?: boolean } = {},
   ): Promise<AutoloopResetResult> {
     if (agent === 'planner' && !opts.force) {
-      throw new Error('Refusing to reset Planner without force=true (would discard chat context)');
+      return {
+        ok: false,
+        code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+        agent,
+        message: 'Refusing to reset Planner without force=true (would discard chat context)',
+        retryable: false,
+      };
     }
     const name = agent === 'planner' ? this.plannerName : agent === 'coder' ? this.coderName : this.reviewerName;
     const previous = this.currentGeneration(agent);
@@ -1448,6 +1497,52 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     }
   }
 
+  /**
+   * Replace a Planner-owned control artifact without ever following an
+   * attacker-controlled destination. The temp file lives beside the target,
+   * is flushed before rename, and the directory entry is flushed on POSIX.
+   */
+  private writeControlFileAtomically(target: string, content: string): void {
+    let existing: fs.Stats | undefined;
+    try {
+      existing = fs.lstatSync(target);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    if (existing && !existing.isFile()) {
+      throw new Error(`Refusing to replace non-regular Planner control target '${target}'`);
+    }
+
+    const tempPath = path.join(path.dirname(target), `.${path.basename(target)}.${randomUUID()}.tmp`);
+    let renamed = false;
+    let fd: number | undefined;
+    try {
+      fd = fs.openSync(tempPath, 'wx', 0o600);
+      fs.writeFileSync(fd, content, { encoding: 'utf8' });
+      fs.fsyncSync(fd);
+      fs.closeSync(fd);
+      fd = undefined;
+      fs.renameSync(tempPath, target);
+      renamed = true;
+      this.syncCreatedControlFileDirectory(target);
+    } finally {
+      if (fd !== undefined) {
+        try {
+          fs.closeSync(fd);
+        } catch {
+          // Preserve the primary write/flush failure.
+        }
+      }
+      if (!renamed) {
+        try {
+          if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+        } catch {
+          // Preserve the primary materialization failure.
+        }
+      }
+    }
+  }
+
   private persistPlannerControls(
     env: AnyAutoloopMessage,
     dispatchId: string,
@@ -1660,6 +1755,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   }
 
   private async deliverToPlanner(env: AnyAutoloopMessage, dispatchId: string): Promise<AnyAutoloopMessage[]> {
+    if (this.terminal) return [];
     if (env.type !== 'chat' && env.type !== 'directive_ack' && env.type !== 'iter_done') {
       // Other types (push_user / pause / resume / terminate) are runner-only
       // or planner-emitted; they should never arrive *to* planner.
@@ -1667,6 +1763,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     }
 
     await this.ensurePlanner();
+    if (this.terminal) return [];
 
     // Compose the prompt fed into the Planner session. For S2 we only handle
     // user chat; iter_done / directive_ack are wired in S4.
@@ -1702,8 +1799,11 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     }
 
     if (result.recoverable_timeout) {
+      if (this.terminal) return [];
       return [Msg.sendTimeout(env.iter, result.recoverable_timeout)];
     }
+
+    if (this.terminal) return [];
 
     if (result.error) {
       this.logger.error?.(`[autoloop] planner send error: ${result.error}`);
@@ -1716,6 +1816,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     const generationLiveness = observedGeneration
       ? await this.runtimeProbe.inspect(observedGeneration.session_name, observedGeneration.session_id)
       : 'absent';
+    if (this.terminal) return [];
     const countersAfter = this.plannerTurnCounters();
     // AGY reports required-tool denial only through the authoritative success
     // counter while still returning non-empty text. Missing/non-finite AGY
@@ -1767,20 +1868,39 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     // persistence, comparison, and application. Raw Planner arguments never
     // cross the durable control boundary.
     const normalizedControls = validation.calls;
+    if (parsed.calls.length > 0 && normalizedControls.length === 0 && validation.blocked_policy_silence.length > 0) {
+      throw new AutoloopOperationError(
+        'AUTOLOOP_CONTROL_MALFORMED',
+        'Planner emitted only a prohibited critical policy-silence control',
+      );
+    }
     const effects: PlannerToolEffects = {
       spawnSubagents: async (args) => {
+        if (this.terminal) return;
         if (this.config.onSpawnSubagents) {
           await this.config.onSpawnSubagents(args);
+          if (this.terminal) return;
           await this.config.onSpawnSubagentsCommitted?.();
         } else {
           this.logger.warn?.('[autoloop] spawn_subagents called but no handler is installed');
         }
       },
       updatePushPolicy: (delta) => {
+        if (this.terminal) return;
         if (!this.config.pushPolicyRef) return;
         const applied: Record<string, unknown> = {};
         for (const [k, v] of Object.entries(delta)) {
-          const rule = { ...(v as Record<string, unknown>) };
+          const current = (this.config.pushPolicyRef as unknown as Record<string, Record<string, unknown>>)[k];
+          const baseline = (DEFAULT_PUSH_POLICY as unknown as Record<string, Record<string, unknown>>)[k];
+          const critical = k === 'on_phase_error' || k === 'on_decision_needed';
+          const rule = critical
+            ? { ...baseline, ...current, ...(v as Record<string, unknown>) }
+            : { ...(v as Record<string, unknown>) };
+          if (critical) {
+            delete rule.silent;
+            if (k === 'on_phase_error') rule.level = 'error';
+            if (k === 'on_decision_needed' && rule.level !== 'error') rule.level = 'decision';
+          }
           (this.config.pushPolicyRef as unknown as Record<string, unknown>)[k] = rule;
           applied[k] = rule;
         }
@@ -1798,7 +1918,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         // is the single legitimate authoring path. Best-effort git commit
         // keeps the ledger honest.
         const target = path.join(this.config.workspace, file);
-        fs.writeFileSync(target, content);
+        this.writeControlFileAtomically(target, content);
         await this.gitCommit(file, commitMessage ?? `autoloop: planner writes ${file}`);
       },
     };
@@ -1806,6 +1926,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     let persistedControl: PlannerControlEvidence | undefined;
     let expectedControl: PlannerTurnExpectation['expectedControl'];
     if (controlTools.length > 0) {
+      if (this.terminal) return [];
       const controlGeneration = observedGeneration ?? expectedGeneration;
       if (!controlGeneration) {
         throw new AutoloopOperationError(
@@ -1844,13 +1965,14 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       },
       { expectedGeneration, expectedControl },
     );
+    if (this.terminal) return [];
     // Persist and verify the complete Planner control claim before invoking
     // any control handler. A ledger failure must leave every control effect at
     // zero, even when the reply itself was a successful engine turn.
     // After iter_done(N) the run has advanced to iter N+1 in runner state;
     // any directive Planner emits in response targets the new iter.
     const nextIter = env.type === 'iter_done' ? env.iter + 1 : env.iter;
-    const handlerResult = await applyPlannerToolCalls(normalizedControls, effects, nextIter);
+    const handlerResult = await applyValidatedPlannerToolCalls(validation, effects, nextIter);
     for (const errEntry of handlerResult.errors) {
       this.logger.warn?.(`[autoloop] tool '${errEntry.tool}' failed: ${errEntry.error}`);
     }
@@ -1862,6 +1984,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
           .join('; ')}`,
       );
     }
+    if (this.terminal) return [];
     // Replay history is accepted-turn state. Commit both sides together only
     // after parse, validation, durable evidence, and all control application
     // have passed; rejected Planner output must not be replayed on retry.
@@ -1872,7 +1995,11 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       parsed.cleaned_reply ||
       (persistedControl ? `Planner controls persisted: ${persistedControl.tools.join(', ')}` : '');
     if (surfacedReply) {
-      this.emit('planner_reply', surfacedReply);
+      this.emit('planner_reply', surfacedReply, {
+        message_id: env.msg_id,
+        dispatch_id: dispatchId,
+        iter: env.iter,
+      });
       this.appendChatEntry({ who: 'planner', text: surfacedReply, ts: new Date().toISOString() });
     }
     // Auto-compact after each Planner turn if context is filling up.
@@ -1902,10 +2029,12 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   }
 
   private async deliverToCoder(env: AnyAutoloopMessage, dispatchId: string): Promise<AnyAutoloopMessage[]> {
+    if (this.terminal) return [];
     if (env.type !== 'directive') {
       throw new Error(`[autoloop] coder does not accept message type=${env.type}`);
     }
     await this.ensureCoder();
+    if (this.terminal) return [];
 
     // Compose directive prompt + write directive.json to ledger so Reviewer
     // and history can see exactly what the Coder was asked.
@@ -1966,10 +2095,10 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       this.pendingSendTimeout(env, 'coder', dispatchId),
     );
     if (result.recoverable_timeout) {
+      if (this.terminal) return [];
       return [Msg.sendTimeout(env.iter, result.recoverable_timeout)];
     }
-    this.recordTurn('coder', 'user', promptText);
-    this.recordTurn('coder', 'agent', (result.output ?? '').trim());
+    if (this.terminal) return [];
     // A3: subprocess died (recovery retry exhausted). Surface as phase_error
     // rather than silently masquerading as a "clarification request"; the
     // runner's circuit breaker can then trip after enough consecutive failures.
@@ -1988,6 +2117,8 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         }),
       ];
     }
+    this.recordTurn('coder', 'user', promptText);
+    this.recordTurn('coder', 'agent', (result.output ?? '').trim());
     const replyText = (result.output ?? '').trim();
     const parsed = parseAgentReply(replyText);
     this.emit('coder_reply', parsed.cleaned_reply);
@@ -2174,10 +2305,12 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   }
 
   private async deliverToReviewer(env: AnyAutoloopMessage, dispatchId: string): Promise<AnyAutoloopMessage[]> {
+    if (this.terminal) return [];
     if (env.type !== 'review_request') {
       throw new Error(`[autoloop] reviewer does not accept message type=${env.type}`);
     }
     await this.ensureReviewer();
+    if (this.terminal) return [];
     this.stageReviewSandbox(env.payload.iter);
 
     const promptText = [
@@ -2209,10 +2342,10 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       this.pendingSendTimeout(env, 'reviewer', dispatchId),
     );
     if (result.recoverable_timeout) {
+      if (this.terminal) return [];
       return [Msg.sendTimeout(env.iter, result.recoverable_timeout)];
     }
-    this.recordTurn('reviewer', 'user', promptText);
-    this.recordTurn('reviewer', 'agent', (result.output ?? '').trim());
+    if (this.terminal) return [];
     if (result.fatal) {
       this.appendDecisionLog({
         kind: 'phase_error',
@@ -2228,6 +2361,8 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         }),
       ];
     }
+    this.recordTurn('reviewer', 'user', promptText);
+    this.recordTurn('reviewer', 'agent', (result.output ?? '').trim());
     const replyText = (result.output ?? '').trim();
     const parsed = parseAgentReply(replyText);
     this.emit('reviewer_reply', parsed.cleaned_reply);
