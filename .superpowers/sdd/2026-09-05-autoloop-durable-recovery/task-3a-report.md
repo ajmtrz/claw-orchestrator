@@ -2,13 +2,15 @@
 
 ## Status
 
-Complete for the approved slice-A scope through review-fix round 2. The original
-implementation commit is `e590475757ba0814fec9e3af8b48f366f68ffbec`
+Complete for the approved slice-A scope through owner-audit correction round 3.
+The original implementation commit is `e590475757ba0814fec9e3af8b48f366f68ffbec`
 (`fix: reject false-success autoloop turns`). Review findings A1-A6 are resolved
 in `45484d970d4b0ceb2b73b8088d909a6df8555581`
 (`fix: harden Planner control and reset proofs`). Review-fix round 2 is in
 `90cf4a72fa42dc480612844aa79afc5557d74ee2`
-(`fix: close durable Planner recovery gaps`). No push was performed.
+(`fix: close durable Planner recovery gaps`). The owner-audit round-3 correction
+is `4d8f157248eee8f76072c514ac4a8bdd157f7cd0`
+(`fix: finish pending autoloop generation release`). No push was performed.
 
 ## Immutable inputs
 
@@ -351,3 +353,96 @@ with no build script`, caused by its nested npm invocation. No Ultraapp file
   only internal SessionManager/dispatcher behavior and evidence.
 - No unresolved Task 3A correctness concern remains. A fresh independent
   read-only review is still required by the parent workflow before advancement.
+
+## Owner-audit correction round 3
+
+### Inputs, ruling, and exact scope
+
+- Owner audit:
+  `.superpowers/sdd/2026-09-05-autoloop-durable-recovery/task-3a-owner-audit-round-3.md`
+  at SHA-256
+  `51683eb7973c716ee3e86dcb6f889d6e1df6cbbaad757a8fae8bef7439b846fe`.
+- The immutable instruction snapshot remained
+  `9cc0b00ab3be15fb2d932dc5b5047d4285969fdd949df504cd64e262c72b0850`
+  at the implementation commit boundary.
+- The finding is technically valid for repeated reset. The existing dispatcher
+  test mocked `releaseReservation()` and appended release evidence without
+  creating SessionManager's real durable `agentReleasePending` fence. With the
+  production registry transaction, a failure in the final tombstone persistence
+  leaves generation 1 released in the append-only ledger while the registry
+  still authoritatively fences generation 1 as release-pending.
+- Implementation commit:
+  `4d8f157248eee8f76072c514ac4a8bdd157f7cd0`
+  (`fix: finish pending autoloop generation release`). It changes exactly
+  `src/autoloop/dispatcher.ts` and `src/__tests__/session-manager.test.ts`.
+  This existing report is the only file in the separate evidence commit.
+
+### Correction and safety invariants
+
+- `resetAgent()` now retries `releaseGeneration()` for the exact previous
+  generation even when the ledger already records it as released. The retry is
+  still delegated to SessionManager's existing `releaseReservation()` operation;
+  there is no second release-state store or bypass.
+- SessionManager's exact generation/owner/session tuple, durable release-owner
+  fence, typed registry lock/storage failures, and idempotent completed-hook
+  tracking remain unchanged. A false compare-and-release remains a hard reset
+  failure, and registry exceptions are not converted into ownership approval.
+- Reset still proves runtime absence before the exact retry. `live` or `unknown`
+  liveness exits before any release call, so a possibly-live generation is never
+  released.
+- A completed tombstone is an idempotent no-op. A pending matching tombstone is
+  completed without appending a second `agent_generation_released` event.
+
+### Deterministic TDD evidence
+
+#### RED
+
+- Replaced the mocked post-release test with a real SessionManager integration
+  test. Its `renameSync` fault triggers only when the attempted registry snapshot
+  is the final reusable generation-1 tombstone; by then the pending fence and the
+  ledger release event both exist.
+- Command:
+  `npx vitest run src/__tests__/session-manager.test.ts -t 'finishes a real pending registry release exactly once before creating the next generation' --reporter=verbose`
+  -> 1 failed, 197 skipped. The authoritative registry remained
+  `agentGeneration=1, agentReleasePending=true`, generation 2 reservation and
+  physical startup were rejected, and the repeated reset returned `ok:false`
+  where the required result was reusable success.
+
+#### GREEN
+
+- The same focused command with `--reporter=dot --silent` -> 1 passed, 197
+  skipped.
+- Adjacent release/liveness safety set:
+  `npx vitest run src/__tests__/session-manager.test.ts -t 'finishes a real pending registry release exactly once before creating the next generation|keeps a prepared tombstone fenced when completion persistence fails, then finishes idempotently|keeps the Planner started flag when reset liveness is unknown|preserves Reviewer started state and its frozen prompt when exact-generation release fails' --reporter=dot --silent`
+  -> 4 passed, 194 skipped.
+- The production test proves all intermediate and terminal effects: generation 1
+  stays fenced before reconciliation; no generation-2 ledger row or second
+  physical session exists; repeated reset completes the exact pending release;
+  release evidence remains single; later chat creates exactly one live generation
+  2, one active named session, and no generation greater than 2.
+
+### Final verification after formatting
+
+- Focused Task 3A plus Task 2 regressions:
+  `npx vitest run src/__tests__/session-manager.test.ts src/__tests__/agy-planner-e2e.test.ts src/__tests__/autoloop-dispatcher.test.ts src/__tests__/autoloop-recovery.test.ts src/__tests__/autoloop-planner-tools.test.ts --reporter=dot --silent`
+  -> 5 files passed, 277 tests passed.
+- `npm run build` -> passed.
+- `npm run lint` -> passed.
+- `npm run format:check` -> passed.
+- `git diff --check` -> passed.
+- `npm run typecheck:tests` -> exit 2 with exactly 83 diagnostics, exactly the
+  established baseline. The only diagnostics in touched files remain the same
+  three pre-existing `session-manager.test.ts` diagnostics at lines 99, 3132,
+  and 3146; dispatcher and the new test block add zero diagnostics.
+- `timeout 180s npm test -- --reporter=dot --silent` completed in 64.80 seconds
+  -> 79 files passed, 1 failed; 1,666 tests passed, 1 failed. The sole failure
+  remains exactly the unchanged baseline in
+  `src/__tests__/ultraapp/host-strategy.test.ts`:
+  `hostBuild succeeds even with no build script`. No Ultraapp file changed.
+
+### Remaining workflow state
+
+- No Task 3B, outbox, runtime, Gateway, Ollama, or Ultraapp file was changed.
+- No push was performed.
+- A fresh independent read-only review of this final candidate remains required
+  by the parent workflow before Task 3A can advance.
