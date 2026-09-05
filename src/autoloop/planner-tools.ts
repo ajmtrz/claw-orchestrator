@@ -196,6 +196,7 @@ function sanitizePushPolicyDelta(raw: Record<string, unknown>, blockedSilence: s
       throw new Error(`update_push_policy ${key} has unknown field '${unknownFields[0]}'`);
     }
     const rule: Record<string, unknown> = {};
+    let prohibitedSilenceOnly = false;
     if ('channel' in input) {
       if (typeof input.channel !== 'string' || !VALID_PUSH_CHANNELS.has(input.channel as PushChannel)) {
         throw new Error(`update_push_policy ${key} channel '${String(input.channel)}' is not supported`);
@@ -212,10 +213,12 @@ function sanitizePushPolicyDelta(raw: Record<string, unknown>, blockedSilence: s
       if (typeof input.silent !== 'boolean') {
         throw new Error(`update_push_policy ${key} silent must be a boolean`);
       }
-      if (input.silent && UNSILENCEABLE_PUSH_POLICY_KEYS.has(key)) blockedSilence.push(key);
-      else rule.silent = input.silent;
+      if (input.silent && UNSILENCEABLE_PUSH_POLICY_KEYS.has(key)) {
+        blockedSilence.push(key);
+        prohibitedSilenceOnly = Object.keys(input).length === 1;
+      } else rule.silent = input.silent;
     }
-    delta[key] = rule;
+    if (!prohibitedSilenceOnly) delta[key] = rule;
   }
   return delta;
 }

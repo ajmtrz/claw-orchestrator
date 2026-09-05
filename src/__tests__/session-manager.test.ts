@@ -3820,6 +3820,61 @@ describe('SessionManager', () => {
         }
       });
 
+      it('crash-flushes the parent directory after a rejected turn already created the control file', async () => {
+        const runId = 'planner-control-flush-after-rejected-audit';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const ledgerDir = path.join(workspace, 'tasks', runId);
+        const decisionsPath = path.join(ledgerDir, 'decisions.jsonl');
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents"}', '```'].join('\n'),
+          event: { type: 'result', result: 'rejected control' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'reject this control')).rejects.toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+        });
+        expect(fs.existsSync(decisionsPath)).toBe(true);
+
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'spawn after prior audit' },
+        });
+        const order: string[] = [];
+        const openedTargets = new Map<number, string>();
+        const openFile = vi.mocked(fs.openSync);
+        const openImplementation = openFile.getMockImplementation()!;
+        openFile.mockImplementation(((target: unknown, ...args: unknown[]) => {
+          const fd = (openImplementation as (...values: unknown[]) => number)(target, ...args);
+          openedTargets.set(fd, String(target));
+          return fd;
+        }) as typeof fs.openSync);
+        const flush = vi.mocked(fs.fsyncSync);
+        const flushImplementation = flush.getMockImplementation()!;
+        flush.mockImplementation((fd) => {
+          order.push(openedTargets.get(fd) === ledgerDir ? 'directory-flushed' : 'control-flushed');
+          return flushImplementation(fd);
+        });
+        const spawnImplementation = handle.dispatcher.spawnSubagents.bind(handle.dispatcher);
+        const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents');
+        spawn.mockImplementation(async (args) => {
+          order.push('effect-started');
+          return await spawnImplementation(args);
+        });
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'spawn after durable evidence')).resolves.toEqual({
+            reply: 'Planner controls persisted: spawn_subagents',
+          });
+          expect(order).toEqual(['control-flushed', 'directory-flushed', 'effect-started']);
+        } finally {
+          openFile.mockImplementation(openImplementation);
+          flush.mockImplementation(flushImplementation);
+          spawn.mockRestore();
+        }
+      });
+
       it('fails closed when the required parent-directory durability step fails', async () => {
         const runId = 'planner-control-directory-flush-failure';
         const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
@@ -3859,6 +3914,116 @@ describe('SessionManager', () => {
             consecutive_phase_errors: 1,
           });
         } finally {
+          openFile.mockImplementation(openImplementation);
+          flush.mockImplementation(flushImplementation);
+          spawn.mockRestore();
+        }
+      });
+
+      it('fails closed when directory durability fails after a rejected audit created the control file', async () => {
+        const runId = 'planner-existing-control-directory-flush-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const ledgerDir = path.join(workspace, 'tasks', runId);
+        const decisionsPath = path.join(ledgerDir, 'decisions.jsonl');
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents"}', '```'].join('\n'),
+          event: { type: 'result', result: 'rejected control' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'reject this control')).rejects.toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+        });
+        expect(fs.existsSync(decisionsPath)).toBe(true);
+
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'directory flush must succeed' },
+        });
+        const openedTargets = new Map<number, string>();
+        const openFile = vi.mocked(fs.openSync);
+        const openImplementation = openFile.getMockImplementation()!;
+        openFile.mockImplementation(((target: unknown, ...args: unknown[]) => {
+          const fd = (openImplementation as (...values: unknown[]) => number)(target, ...args);
+          openedTargets.set(fd, String(target));
+          return fd;
+        }) as typeof fs.openSync);
+        const flush = vi.mocked(fs.fsyncSync);
+        const flushImplementation = flush.getMockImplementation()!;
+        flush.mockImplementation((fd) => {
+          if (openedTargets.get(fd) === ledgerDir) throw new Error('existing directory entry flush failed');
+          return flushImplementation(fd);
+        });
+        const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents');
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'require existing directory durability')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_NOT_PERSISTED',
+            retryable: true,
+          });
+          expect(spawn).not.toHaveBeenCalled();
+          expect(mockSessions).toHaveLength(1);
+          expect(handle.runner.state).toMatchObject({
+            status: 'planning',
+            subagents_spawned: false,
+            consecutive_phase_errors: 2,
+          });
+        } finally {
+          openFile.mockImplementation(openImplementation);
+          flush.mockImplementation(flushImplementation);
+          spawn.mockRestore();
+        }
+      });
+
+      it('flushes the control file without directory fsync and warns explicitly on win32', async () => {
+        const runId = 'planner-control-win32-durability';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        const warn = vi.fn();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (mgr as any).logger.warn = warn;
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const ledgerDir = path.join(workspace, 'tasks', runId);
+        const decisionsPath = path.join(ledgerDir, 'decisions.jsonl');
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'spawn on win32' },
+        });
+        const order: string[] = [];
+        const openedTargets = new Map<number, string>();
+        const openFile = vi.mocked(fs.openSync);
+        const openImplementation = openFile.getMockImplementation()!;
+        openFile.mockImplementation(((target: unknown, ...args: unknown[]) => {
+          const fd = (openImplementation as (...values: unknown[]) => number)(target, ...args);
+          openedTargets.set(fd, String(target));
+          return fd;
+        }) as typeof fs.openSync);
+        const flush = vi.mocked(fs.fsyncSync);
+        const flushImplementation = flush.getMockImplementation()!;
+        flush.mockImplementation((fd) => {
+          if (openedTargets.get(fd) === decisionsPath) order.push('control-flushed');
+          return flushImplementation(fd);
+        });
+        const spawnImplementation = handle.dispatcher.spawnSubagents.bind(handle.dispatcher);
+        const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents');
+        spawn.mockImplementation(async (args) => {
+          order.push('effect-started');
+          return await spawnImplementation(args);
+        });
+        const platform = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'spawn with Windows durability semantics')).resolves.toEqual({
+            reply: 'Planner controls persisted: spawn_subagents',
+          });
+          expect(order).toEqual(['control-flushed', 'effect-started']);
+          expect([...openedTargets.values()]).not.toContain(ledgerDir);
+          expect(warn).toHaveBeenCalledWith(
+            '[autoloop] parent-directory fsync is unavailable on win32; control file contents were flushed without a POSIX directory-entry guarantee',
+          );
+        } finally {
+          platform.mockRestore();
           openFile.mockImplementation(openImplementation);
           flush.mockImplementation(flushImplementation);
           spawn.mockRestore();
@@ -3942,23 +4107,81 @@ describe('SessionManager', () => {
           event: { type: 'result', result: 'spawn agents' },
         });
 
-        await expect(mgr.autoloopChat(runId, 'start the approved implementation')).resolves.toEqual({
-          reply: 'Planner controls persisted: spawn_subagents',
+        const order: string[] = [];
+        const spawnImplementation = handle.dispatcher.spawnSubagents.bind(handle.dispatcher);
+        const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents').mockImplementation(async (args) => {
+          order.push('spawn-start');
+          await spawnImplementation(args);
+          order.push('spawn-finish');
+        });
+        const markImplementation = handle.runner.markSubagentsSpawned.bind(handle.runner);
+        const mark = vi.spyOn(handle.runner, 'markSubagentsSpawned').mockImplementation(() => {
+          order.push('mark-committed');
+          markImplementation();
         });
 
-        const decisions = fs
-          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
-          .trim()
-          .split('\n')
-          .map((line) => JSON.parse(line) as { kind: string });
-        expect(decisions.filter((row) => row.kind === 'planner_turn_control')).toHaveLength(1);
-        expect(decisions.filter((row) => row.kind === 'spawn_subagents')).toHaveLength(1);
-        expect(mockSessions).toHaveLength(3);
-        expect(handle.runner.state).toMatchObject({
-          status: 'running',
-          iter: 0,
-          subagents_spawned: true,
+        try {
+          await expect(mgr.autoloopChat(runId, 'start the approved implementation')).resolves.toEqual({
+            reply: 'Planner controls persisted: spawn_subagents',
+          });
+
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string });
+          expect(decisions.filter((row) => row.kind === 'planner_turn_control')).toHaveLength(1);
+          expect(decisions.filter((row) => row.kind === 'spawn_subagents')).toHaveLength(1);
+          expect(order).toEqual(['spawn-start', 'spawn-finish', 'mark-committed']);
+          expect(mockSessions).toHaveLength(3);
+          expect(handle.runner.state).toMatchObject({
+            status: 'running',
+            iter: 0,
+            subagents_spawned: true,
+          });
+        } finally {
+          spawn.mockRestore();
+          mark.mockRestore();
+        }
+      });
+
+      it('keeps planning truth and does not mark a failed spawn as committed', async () => {
+        const runId = 'planner-spawn-fails-before-commit';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'spawn agents' },
         });
+        const order: string[] = [];
+        const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents').mockImplementation(async () => {
+          order.push('spawn-start');
+          throw new Error('spawn failed before completion');
+        });
+        const markImplementation = handle.runner.markSubagentsSpawned.bind(handle.runner);
+        const mark = vi.spyOn(handle.runner, 'markSubagentsSpawned').mockImplementation(() => {
+          order.push('mark-committed');
+          markImplementation();
+        });
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'start the approved implementation')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+            retryable: false,
+          });
+          expect(order).toEqual(['spawn-start']);
+          expect(mark).not.toHaveBeenCalled();
+          expect(mockSessions).toHaveLength(1);
+          expect(handle.runner.state).toMatchObject({
+            status: 'planning',
+            iter: 0,
+            subagents_spawned: false,
+          });
+        } finally {
+          spawn.mockRestore();
+          mark.mockRestore();
+        }
       });
 
       it('keeps a committed spawn marked when a later operational control fails', async () => {

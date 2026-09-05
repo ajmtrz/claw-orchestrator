@@ -1446,6 +1446,35 @@ describe('ClaudeAgentDispatcher — updatePushPolicy guard', () => {
       },
     });
   });
+
+  it.each(['on_phase_error', 'on_decision_needed'] as const)(
+    'omits a prohibited silence-only %s update without resetting the live rule',
+    async (key) => {
+      const policyRef: PushPolicy = JSON.parse(JSON.stringify(DEFAULT_PUSH_POLICY));
+      const policyBefore = JSON.stringify(policyRef);
+      const reply = [
+        '```autoloop',
+        JSON.stringify({ tool: 'update_push_policy', args: { [key]: { silent: true } } }),
+        '```',
+      ].join('\n');
+      const { dispatcher, ledgerDir } = makeDispatcher({ pushPolicyRef: policyRef }, { sendOutput: reply });
+
+      await dispatcher.deliver(Msg.chat(0, { text: 'do not silence critical policy' }));
+
+      expect(JSON.stringify(policyRef)).toBe(policyBefore);
+      const decisionText = fs.readFileSync(path.join(ledgerDir, 'decisions.jsonl'), 'utf-8');
+      const lines = decisionText
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as { kind: string; payload: Record<string, unknown> });
+      expect(lines.find((line) => line.kind === 'planner_turn_control')?.payload.controls).toEqual([
+        { tool: 'update_push_policy', args: {} },
+      ]);
+      expect(lines.find((line) => line.kind === 'policy_silence_blocked')?.payload).toEqual({ keys: [key] });
+      expect(lines.filter((line) => line.kind === 'update_push_policy')).toEqual([]);
+      expect(decisionText).not.toContain('"silent":true');
+    },
+  );
 });
 
 describe('ClaudeAgentDispatcher — stageReviewSandbox whitelist', () => {

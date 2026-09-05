@@ -1498,7 +1498,6 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       payload: { ...evidence },
     } satisfies DecisionLogEntry;
     const decisionsPath = path.join(this.ledgerDir, 'decisions.jsonl');
-    const controlFileMayBeCreated = !fs.existsSync(decisionsPath);
 
     try {
       fs.mkdirSync(this.ledgerDir, { recursive: true });
@@ -1510,7 +1509,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         // audit data. Flush the appended row before tail verification and
         // before any prepared control effect can begin.
         fs.fsyncSync(fd);
-        if (controlFileMayBeCreated) this.syncCreatedControlFileDirectory(decisionsPath);
+        this.syncCreatedControlFileDirectory(decisionsPath);
         let end = fs.fstatSync(fd).size;
         const byte = Buffer.allocUnsafe(1);
         while (end > 0) {
