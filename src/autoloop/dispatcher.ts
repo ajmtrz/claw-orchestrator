@@ -51,6 +51,7 @@ import {
 import {
   applyPlannerToolCalls,
   parsePlannerReply,
+  type PlannerToolCall,
   type PlannerToolEffects,
   type PlannerToolName,
   type SpawnSubagentsArgs,
@@ -177,7 +178,10 @@ interface SendMessageResult {
 type AutoloopOperationErrorCode =
   | 'AUTOLOOP_EMPTY_REPLY'
   | 'AUTOLOOP_SESSION_NOT_CREATED'
+  | 'AUTOLOOP_ENGINE_FAILURE'
   | 'AUTOLOOP_REQUIRED_TOOL_DENIED'
+  | 'AUTOLOOP_CONTROL_MALFORMED'
+  | 'AUTOLOOP_CONTROL_APPLICATION_FAILED'
   | 'AUTOLOOP_CONTROL_NOT_PERSISTED'
   | 'AUTOLOOP_RESET_POSTCONDITION_FAILED';
 
@@ -220,7 +224,8 @@ interface PlannerTurnResult {
 }
 
 interface PlannerTurnExpectation {
-  requireReply: boolean;
+  /** Preliminary engine/generation checks run before control parsing. */
+  requireLogicalResult?: boolean;
   expectedGeneration?: PhysicalAgentGeneration;
   expectedControl?: Omit<PlannerControlEvidence, 'control_id' | 'persisted_at'>;
 }
@@ -235,7 +240,28 @@ interface PlannerControlEvidence {
   owner_instance_id: string;
   session_id?: string;
   tools: PlannerToolName[];
+  controls: PlannerToolCall[];
   controls_sha256: string;
+}
+
+function plannerControlEvidenceMatches(
+  observed: PlannerControlEvidence | undefined,
+  expected: PlannerControlEvidence,
+): observed is PlannerControlEvidence {
+  return Boolean(
+    observed &&
+    observed.control_id === expected.control_id &&
+    observed.persisted_at === expected.persisted_at &&
+    observed.dispatch_id === expected.dispatch_id &&
+    observed.message_id === expected.message_id &&
+    observed.iter === expected.iter &&
+    observed.generation === expected.generation &&
+    observed.owner_instance_id === expected.owner_instance_id &&
+    observed.session_id === expected.session_id &&
+    observed.controls_sha256 === expected.controls_sha256 &&
+    JSON.stringify(observed.tools) === JSON.stringify(expected.tools) &&
+    JSON.stringify(observed.controls) === JSON.stringify(expected.controls),
+  );
 }
 
 function assertPlannerTurnSucceeded(result: PlannerTurnResult, expected: PlannerTurnExpectation): void {
@@ -273,7 +299,8 @@ function assertPlannerTurnSucceeded(result: PlannerTurnResult, expected: Planner
       persisted.owner_instance_id !== expectedControl.owner_instance_id ||
       persisted.session_id !== expectedControl.session_id ||
       persisted.controls_sha256 !== expectedControl.controls_sha256 ||
-      JSON.stringify(persisted.tools) !== JSON.stringify(expectedControl.tools)
+      JSON.stringify(persisted.tools) !== JSON.stringify(expectedControl.tools) ||
+      JSON.stringify(persisted.controls) !== JSON.stringify(expectedControl.controls)
     ) {
       throw new AutoloopOperationError(
         'AUTOLOOP_CONTROL_NOT_PERSISTED',
@@ -281,7 +308,8 @@ function assertPlannerTurnSucceeded(result: PlannerTurnResult, expected: Planner
       );
     }
   }
-  if (expected.requireReply && !result.reply.trim()) {
+  const hasVerifiedControl = expected.expectedControl !== undefined && result.persistedControl !== undefined;
+  if (expected.requireLogicalResult !== false && !result.reply.trim() && !hasVerifiedControl) {
     throw new AutoloopOperationError(
       'AUTOLOOP_EMPTY_REPLY',
       'Planner transport completed without a non-empty logical reply',
@@ -890,7 +918,32 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     const existing = this.logicalDispatches.get(dispatchId);
     if (existing) return await existing;
 
-    const pending = this.deliverOnce(env, dispatchId);
+    const pending = this.deliverOnce(env, dispatchId).catch((error: unknown) => {
+      if (error instanceof AutoloopOperationError) {
+        this.appendDecisionLog({
+          kind: 'phase_error',
+          actor: 'dispatcher',
+          payload: {
+            agent: env.to,
+            phase: `${env.to}_turn`,
+            code: error.code,
+            error: error.message,
+          },
+        });
+        if (error.code === 'AUTOLOOP_EMPTY_REPLY' && env.to === 'planner') {
+          const phaseError = Msg.phaseError(env.iter, {
+            agent: 'planner',
+            phase: 'planner_turn',
+            error: error.message,
+          });
+          // `code` remains an internal extension until Task 3B widens and maps
+          // the public HTTP/MCP phase-error schema.
+          (phaseError.payload as unknown as Record<string, unknown>).code = error.code;
+          return [phaseError];
+        }
+      }
+      throw error;
+    });
     this.logicalDispatches.set(dispatchId, pending);
     // Mark settled before trimming so eviction can tell an in-flight dispatch
     // from a finished one. A rejection settles too; `deliver` still rethrows it
@@ -1160,6 +1213,8 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     }
     const name = agent === 'planner' ? this.plannerName : agent === 'coder' ? this.coderName : this.reviewerName;
     const previous = this.currentGeneration(agent);
+    const priorStarted = this.roleStarted(agent);
+    const priorReviewerPrompt = this.reviewerSessionPrompt;
     this.appendDecisionLog({
       kind: 'reset_agent',
       actor: 'dispatcher',
@@ -1173,14 +1228,18 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       this.logger.warn?.(`[autoloop] resetAgent stop failed for ${name}: ${(err as Error).message}`);
     }
 
-    const failure = (detail: string, cause?: unknown): AutoloopResetResult => ({
-      ok: false,
-      code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
-      agent,
-      previous_generation: previous?.generation,
-      message: cause instanceof Error ? `${detail}: ${cause.message}` : detail,
-      retryable: true,
-    });
+    const failure = (detail: string, cause?: unknown): AutoloopResetResult => {
+      this.setRoleStarted(agent, priorStarted);
+      if (agent === 'reviewer') this.reviewerSessionPrompt = priorReviewerPrompt;
+      return {
+        ok: false,
+        code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+        agent,
+        previous_generation: previous?.generation,
+        message: cause instanceof Error ? `${detail}: ${cause.message}` : detail,
+        retryable: true,
+      };
+    };
 
     try {
       const stoppedLiveness = await this.runtimeProbe.inspect(name, previous?.session_id);
@@ -1192,14 +1251,21 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         );
       }
 
-      this.setRoleStarted(agent, false);
-      if (agent === 'reviewer') this.reviewerSessionPrompt = null;
       if (previous && previous.state !== 'released') await this.releaseGeneration(previous, false);
 
       const managerProbe = this.config.manager as SessionManager & {
+        probeAgentNameReusable?: (sessionName: string, released?: PhysicalAgentGeneration) => boolean;
         isAgentGenerationReleased?: (generation: PhysicalAgentGeneration) => boolean;
       };
-      if (previous && managerProbe.isAgentGenerationReleased) {
+      if (managerProbe.probeAgentNameReusable) {
+        if (!managerProbe.probeAgentNameReusable(name, previous)) {
+          return failure(
+            previous
+              ? `Autoloop session '${name}' retained generation ${previous.generation} after release`
+              : `Autoloop session '${name}' was not reusable after reset`,
+          );
+        }
+      } else if (previous && managerProbe.isAgentGenerationReleased) {
         if (!managerProbe.isAgentGenerationReleased(previous)) {
           return failure(`Autoloop session '${name}' retained generation ${previous.generation} after release`);
         }
@@ -1219,6 +1285,11 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
           return failure(`Autoloop session '${name}' could not roll back its replacement probe`);
         }
       }
+
+      // Only now may in-memory lifecycle state change: physical absence, exact
+      // release, and authoritative name reusability have all been proved.
+      this.setRoleStarted(agent, false);
+      if (agent === 'reviewer') this.reviewerSessionPrompt = null;
 
       let activeGeneration: number | undefined;
       if (opts.eagerRestart) {
@@ -1340,7 +1411,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     env: AnyAutoloopMessage,
     dispatchId: string,
     generation: PhysicalAgentGeneration,
-    tools: readonly PlannerToolName[],
+    controls: readonly PlannerToolCall[],
     controlsSha256: string,
   ): PlannerControlEvidence {
     const evidence: PlannerControlEvidence = {
@@ -1352,7 +1423,8 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       generation: generation.generation,
       owner_instance_id: generation.owner_instance_id,
       session_id: generation.session_id,
-      tools: [...tools],
+      tools: controls.map(({ tool }) => tool),
+      controls: controls.map(({ tool, args }) => ({ tool, args })),
       controls_sha256: controlsSha256,
     };
     const decision = {
@@ -1366,19 +1438,43 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     try {
       fs.mkdirSync(this.ledgerDir, { recursive: true });
       fs.appendFileSync(decisionsPath, `${JSON.stringify(decision)}\n`);
-      const found = fs
-        .readFileSync(decisionsPath, 'utf8')
-        .split('\n')
-        .filter(Boolean)
-        .some((line) => {
-          try {
-            const row = JSON.parse(line) as { kind?: unknown; payload?: { control_id?: unknown } };
-            return row.kind === 'planner_turn_control' && row.payload?.control_id === evidence.control_id;
-          } catch {
-            return false;
+      const fd = fs.openSync(decisionsPath, 'r');
+      let durableLine: string;
+      try {
+        let end = fs.fstatSync(fd).size;
+        const byte = Buffer.allocUnsafe(1);
+        while (end > 0) {
+          fs.readSync(fd, byte, 0, 1, end - 1);
+          if (byte[0] !== 0x0a && byte[0] !== 0x0d) break;
+          end--;
+        }
+        const chunks: Buffer[] = [];
+        let cursor = end;
+        while (cursor > 0) {
+          const start = Math.max(0, cursor - 8_192);
+          const chunk = Buffer.allocUnsafe(cursor - start);
+          fs.readSync(fd, chunk, 0, chunk.length, start);
+          const newline = chunk.lastIndexOf(0x0a);
+          if (newline >= 0) {
+            chunks.unshift(chunk.subarray(newline + 1));
+            break;
           }
-        });
-      if (!found) throw new Error('the appended control event was not readable');
+          chunks.unshift(chunk);
+          cursor = start;
+        }
+        durableLine = Buffer.concat(chunks).toString('utf8');
+      } finally {
+        fs.closeSync(fd);
+      }
+      const durableRow = JSON.parse(durableLine) as { kind?: unknown; payload?: unknown };
+      const durableEvidence =
+        durableRow.kind === 'planner_turn_control' && durableRow.payload && typeof durableRow.payload === 'object'
+          ? (durableRow.payload as PlannerControlEvidence)
+          : undefined;
+      if (!plannerControlEvidenceMatches(durableEvidence, evidence)) {
+        throw new Error('the appended control event did not match the durable tail');
+      }
+      return durableEvidence;
     } catch (error) {
       throw new AutoloopOperationError(
         'AUTOLOOP_CONTROL_NOT_PERSISTED',
@@ -1386,7 +1482,6 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         { cause: error },
       );
     }
-    return evidence;
   }
 
   /**
@@ -1545,11 +1640,20 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     const expectedGeneration = this.currentGeneration('planner');
     const countersBefore = this.plannerTurnCounters();
     const pendingTimeout = this.pendingSendTimeout(env, 'planner', dispatchId);
-    const result = await this.sendAttempt(
-      this.plannerName,
-      this.withRoleInstructions('planner', this.plannerSelection, this.plannerSystemPrompt, promptText),
-      pendingTimeout,
-    );
+    let result: SendMessageResult;
+    try {
+      result = await this.sendAttempt(
+        this.plannerName,
+        this.withRoleInstructions('planner', this.plannerSelection, this.plannerSystemPrompt, promptText),
+        pendingTimeout,
+      );
+    } catch (error) {
+      throw new AutoloopOperationError(
+        'AUTOLOOP_ENGINE_FAILURE',
+        `Planner engine transport failed: ${(error as Error).message}`,
+        { cause: error },
+      );
+    }
 
     if (result.recoverable_timeout) {
       return [Msg.sendTimeout(env.iter, result.recoverable_timeout)];
@@ -1558,6 +1662,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     if (result.error) {
       this.logger.error?.(`[autoloop] planner send error: ${result.error}`);
       this.emit('planner_error', new Error(result.error));
+      throw new AutoloopOperationError('AUTOLOOP_ENGINE_FAILURE', `Planner engine turn failed: ${result.error}`);
     }
 
     const replyText = (result.output ?? '').trim();
@@ -1567,16 +1672,13 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       : 'absent';
     const countersAfter = this.plannerTurnCounters();
     const requiredToolDenied = Boolean(
-      result.error ||
-      (countersBefore &&
-        countersAfter &&
-        countersAfter.turns > countersBefore.turns &&
-        countersAfter.turnsSucceeded <= countersBefore.turnsSucceeded),
+      countersBefore &&
+      countersAfter &&
+      (countersAfter.turns <= countersBefore.turns || countersAfter.turnsSucceeded <= countersBefore.turnsSucceeded),
     );
-    const requireReply = countersBefore !== undefined && countersAfter !== undefined;
     assertPlannerTurnSucceeded(
       { reply: replyText, generation: observedGeneration, generationLiveness, requiredToolDenied },
-      { requireReply, expectedGeneration },
+      { requireLogicalResult: false, expectedGeneration },
     );
 
     // Feed the transcript that engines without native conversation replay next
@@ -1590,6 +1692,12 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     const parsed = parsePlannerReply(replyText);
     if (parsed.parse_errors.length > 0) {
       this.logger.warn?.(`[autoloop] planner emitted ${parsed.parse_errors.length} malformed autoloop block(s)`);
+      throw new AutoloopOperationError(
+        'AUTOLOOP_CONTROL_MALFORMED',
+        `Planner emitted malformed control: ${parsed.parse_errors
+          .map(({ block_index, error }) => `block ${block_index}: ${error}`)
+          .join('; ')}`,
+      );
     }
     const effects: PlannerToolEffects = {
       spawnSubagents: async (args) => {
@@ -1661,34 +1769,6 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         await this.gitCommit(file, commitMessage ?? `autoloop: planner writes ${file}`);
       },
     };
-    // After iter_done(N) the run has advanced to iter N+1 in runner state;
-    // any directive Planner emits in response targets the new iter.
-    const nextIter = env.type === 'iter_done' ? env.iter + 1 : env.iter;
-    const handlerResult =
-      parsed.parse_errors.length > 0
-        ? {
-            emitted_messages: [],
-            errors: parsed.parse_errors.map(({ block_index, error }) => ({
-              tool: `autoloop block ${block_index}`,
-              error,
-            })),
-          }
-        : await applyPlannerToolCalls(parsed.calls, effects, nextIter);
-    for (const errEntry of handlerResult.errors) {
-      this.logger.warn?.(`[autoloop] tool '${errEntry.tool}' failed: ${errEntry.error}`);
-    }
-    if (handlerResult.errors.length > 0) {
-      assertPlannerTurnSucceeded(
-        {
-          reply: replyText,
-          generation: observedGeneration,
-          generationLiveness,
-          requiredToolDenied: true,
-        },
-        { requireReply, expectedGeneration },
-      );
-    }
-
     const controlTools = parsed.calls.map(({ tool }) => tool);
     let persistedControl: PlannerControlEvidence | undefined;
     let expectedControl: PlannerTurnExpectation['expectedControl'];
@@ -1709,25 +1789,48 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         owner_instance_id: controlGeneration.owner_instance_id,
         session_id: controlGeneration.session_id,
         tools: controlTools,
+        controls: parsed.calls,
         controls_sha256: controlsSha256,
       };
-      persistedControl = this.persistPlannerControls(env, dispatchId, controlGeneration, controlTools, controlsSha256);
+      persistedControl = this.persistPlannerControls(env, dispatchId, controlGeneration, parsed.calls, controlsSha256);
     }
     assertPlannerTurnSucceeded(
       {
-        reply: replyText,
+        reply: parsed.cleaned_reply,
         generation: observedGeneration,
         generationLiveness,
         persistedControl,
       },
-      { requireReply, expectedGeneration, expectedControl },
+      { expectedGeneration, expectedControl },
     );
+
+    // Persist and verify the complete Planner control claim before invoking
+    // any control handler. A ledger failure must leave every control effect at
+    // zero, even when the reply itself was a successful engine turn.
+    // After iter_done(N) the run has advanced to iter N+1 in runner state;
+    // any directive Planner emits in response targets the new iter.
+    const nextIter = env.type === 'iter_done' ? env.iter + 1 : env.iter;
+    const handlerResult = await applyPlannerToolCalls(parsed.calls, effects, nextIter);
+    for (const errEntry of handlerResult.errors) {
+      this.logger.warn?.(`[autoloop] tool '${errEntry.tool}' failed: ${errEntry.error}`);
+    }
+    if (handlerResult.errors.length > 0) {
+      throw new AutoloopOperationError(
+        'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+        `Planner control application failed: ${handlerResult.errors
+          .map(({ tool, error }) => `${tool}: ${error}`)
+          .join('; ')}`,
+      );
+    }
     await this.config.onPlannerTurnSucceeded?.(controlTools);
 
     // Emit cleaned reply (without raw JSON blocks) for the chat tool to surface.
-    if (parsed.cleaned_reply) {
-      this.emit('planner_reply', parsed.cleaned_reply);
-      this.appendChatEntry({ who: 'planner', text: parsed.cleaned_reply, ts: new Date().toISOString() });
+    const surfacedReply =
+      parsed.cleaned_reply ||
+      (persistedControl ? `Planner controls persisted: ${persistedControl.tools.join(', ')}` : '');
+    if (surfacedReply) {
+      this.emit('planner_reply', surfacedReply);
+      this.appendChatEntry({ who: 'planner', text: surfacedReply, ts: new Date().toISOString() });
     }
     // Auto-compact after each Planner turn if context is filling up.
     await this.maybeCompact('planner', this.plannerName);

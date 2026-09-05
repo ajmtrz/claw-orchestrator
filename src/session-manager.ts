@@ -355,7 +355,11 @@ import { isAgyConversationId } from './agy-conversation.js';
 import { Council } from './council.js';
 import { Fanout, type FanoutConfig, type FanoutSession, type FanoutAgentSpec } from './fanout.js';
 import { AutoloopRunner } from './autoloop/runner.js';
-import { ClaudeAgentDispatcher, type ClaudeAgentDispatcherConfig } from './autoloop/dispatcher.js';
+import {
+  AutoloopOperationError,
+  ClaudeAgentDispatcher,
+  type ClaudeAgentDispatcherConfig,
+} from './autoloop/dispatcher.js';
 import type {
   AgentReservationReleaseOptions,
   AgentRuntimeLiveness,
@@ -935,23 +939,43 @@ export class SessionManager implements AgentRuntimeProbe {
     return transaction.value;
   }
 
-  /** Prove that one exact generation is a released tombstone, not an occupied reservation. */
-  isAgentGenerationReleased(generation: PhysicalAgentGeneration): boolean {
+  /**
+   * Atomically prove that a physical name is reusable without reserving it.
+   * This is the same authoritative predicate `reserveAgentGeneration` uses,
+   * but it performs no registry write, so a failed probe cannot strand a new
+   * occupied reservation or a rollback-pending fence.
+   */
+  probeAgentNameReusable(sessionName: string, released?: PhysicalAgentGeneration): boolean {
+    if (this.sessions.has(sessionName) || this._pendingSessions.has(sessionName)) return false;
     const transaction = this._withAgentRegistryLock((authoritative) => {
-      const reservation = authoritative.get(generation.session_name);
+      const reservation = authoritative.get(sessionName);
+      if (!released) {
+        return {
+          value:
+            reservation === undefined ||
+            (reservation.agentGeneration === undefined &&
+              reservation.agentReleasePending !== true &&
+              reservation.agentReleasedGeneration !== undefined),
+        };
+      }
       return {
         value: Boolean(
           reservation &&
           reservation.agentGeneration === undefined &&
           reservation.agentReleasePending !== true &&
-          reservation.agentReleasedGeneration === generation.generation &&
-          reservation.agentReleasedOwnerInstanceId === generation.owner_instance_id &&
-          reservation.agentReleasedSessionId === generation.session_id,
+          reservation.agentReleasedGeneration === released.generation &&
+          reservation.agentReleasedOwnerInstanceId === released.owner_instance_id &&
+          reservation.agentReleasedSessionId === released.session_id,
         ),
       };
     });
     if (!transaction.ok) throw transaction.error;
     return transaction.value;
+  }
+
+  /** Backward-compatible exact-tombstone predicate. */
+  isAgentGenerationReleased(generation: PhysicalAgentGeneration): boolean {
+    return this.probeAgentNameReusable(generation.session_name, generation);
   }
 
   /** Inspect only runtime/session-registry facts for one physical name. */
@@ -3940,15 +3964,27 @@ export class SessionManager implements AgentRuntimeProbe {
   async autoloopChat(runId: string, text: string): Promise<{ reply: string }> {
     const ctx = this._liveAutoloop(runId);
     let reply = '';
+    let plannerFailure: AutoloopOperationError | undefined;
     const onReply = (...args: unknown[]) => {
       const t = args[0];
       if (typeof t === 'string') reply = t;
     };
+    const onPhaseError = (...args: unknown[]) => {
+      const payload = args[0] as { agent?: unknown; code?: unknown; error?: unknown } | undefined;
+      if (payload?.agent !== 'planner' || payload.code !== 'AUTOLOOP_EMPTY_REPLY') return;
+      plannerFailure = new AutoloopOperationError(
+        'AUTOLOOP_EMPTY_REPLY',
+        typeof payload.error === 'string' ? payload.error : 'Planner returned no logical result',
+      );
+    };
     ctx.dispatcher.on('planner_reply', onReply);
+    ctx.runner.on('phase_error', onPhaseError);
     try {
       await ctx.runner.send(AutoloopMsg.chat(ctx.runner.state.iter, { text }));
+      if (plannerFailure) throw plannerFailure;
     } finally {
       ctx.dispatcher.off('planner_reply', onReply);
+      ctx.runner.off('phase_error', onPhaseError);
     }
     return { reply };
   }

@@ -841,6 +841,40 @@ describe('SessionManager', () => {
       expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(true);
     });
 
+    it('probes exact released-generation reusability atomically and rejects owner or session mismatch', async () => {
+      const sessionName = 'autoloop-reset-probe-planner';
+      const generation = managerGeneration(sessionName);
+      expect(mgr.reserveAgentGeneration(generation, '/tmp')).toBe(true);
+      await expect(
+        mgr.releaseReservation(sessionName, generation.generation, {
+          expectedOwnerInstanceId: generation.owner_instance_id,
+          expectedSessionId: generation.session_id,
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+          beforeRelease: () => undefined,
+          persistReleaseEvidence: () => undefined,
+        }),
+      ).resolves.toBe(true);
+      const before = persistenceFsState.files.get(SESSION_REGISTRY_FILE);
+      const managerProbe = mgr as unknown as {
+        probeAgentNameReusable?: (name: string, released?: PhysicalAgentGeneration) => boolean;
+      };
+
+      expect(managerProbe.probeAgentNameReusable?.(sessionName, generation)).toBe(true);
+      expect(
+        managerProbe.probeAgentNameReusable?.(sessionName, {
+          ...generation,
+          owner_instance_id: 'wrong-owner',
+        }),
+      ).toBe(false);
+      expect(
+        managerProbe.probeAgentNameReusable?.(sessionName, {
+          ...generation,
+          session_id: 'wrong-session',
+        }),
+      ).toBe(false);
+      expect(persistenceFsState.files.get(SESSION_REGISTRY_FILE)).toBe(before);
+    });
+
     it('restores an uncommitted reservation when rollback persistence fails and permits a safe retry', async () => {
       const sessionName = 'autoloop-probe-uncommitted-rollback-save-failure-planner';
       const first = managerGeneration(sessionName);
@@ -3231,6 +3265,46 @@ describe('SessionManager', () => {
         });
       });
 
+      it('rejects an empty logical reply when optional turn counters are unavailable', async () => {
+        const runId = 'planner-empty-reply-no-counters';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: '   ',
+          event: { type: 'result', result: '   ' },
+        });
+        vi.spyOn(mgr, 'getStatus').mockImplementation(() => {
+          throw new Error('optional counters unavailable');
+        });
+
+        await expect(mgr.autoloopChat(runId, 'return a reply')).rejects.toMatchObject({
+          code: 'AUTOLOOP_EMPTY_REPLY',
+        });
+      });
+
+      it('surfaces a verified fences-only control as an unambiguous logical result', async () => {
+        const runId = 'planner-fences-only';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"update_push_policy","args":{"on_start":{"level":"info"}}}', '```'].join('\n'),
+          event: { type: 'result', result: 'control only' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'apply the approved policy')).resolves.toEqual({
+          reply: 'Planner controls persisted: update_push_policy',
+        });
+        const decisions = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: Record<string, unknown> });
+        expect(decisions.find((row) => row.kind === 'planner_turn_control')?.payload).toMatchObject({
+          tools: ['update_push_policy'],
+          controls: [{ tool: 'update_push_policy', args: { on_start: { level: 'info' } } }],
+        });
+      });
+
       it('rejects a Planner reply when its physical generation is absent after send', async () => {
         const runId = 'planner-session-absent';
         const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
@@ -3245,6 +3319,17 @@ describe('SessionManager', () => {
           status: 'planning',
           iter: 0,
           subagents_spawned: false,
+        });
+      });
+
+      it('rejects a Planner generation whose post-send liveness is unknown', async () => {
+        const runId = 'planner-session-unknown';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        vi.spyOn(mgr, 'inspect').mockResolvedValue('unknown');
+
+        await expect(mgr.autoloopChat(runId, 'return a reply')).rejects.toMatchObject({
+          code: 'AUTOLOOP_SESSION_NOT_CREATED',
         });
       });
 
@@ -3263,6 +3348,76 @@ describe('SessionManager', () => {
           iter: 0,
           subagents_spawned: false,
         });
+      });
+
+      it('classifies an engine result failure separately from a required-tool denial', async () => {
+        const runId = 'planner-engine-result-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: 'engine authentication failed',
+          event: { type: 'result', result: 'engine authentication failed', is_error: true },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'inspect before planning')).rejects.toMatchObject({
+          code: 'AUTOLOOP_ENGINE_FAILURE',
+          retryable: true,
+        });
+      });
+
+      it('wraps a thrown Planner transport failure in the engine failure taxonomy', async () => {
+        const runId = 'planner-transport-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => {
+          throw Object.assign(new Error('planner socket reset'), { code: 'ECONNRESET' });
+        };
+
+        await expect(mgr.autoloopChat(runId, 'inspect before planning')).rejects.toMatchObject({
+          code: 'AUTOLOOP_ENGINE_FAILURE',
+          retryable: true,
+        });
+      });
+
+      it('classifies malformed Planner control syntax without applying or persisting controls', async () => {
+        const runId = 'planner-control-malformed';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents"}', '```'].join('\n'),
+          event: { type: 'result', result: 'malformed control' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'start the implementation')).rejects.toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+          retryable: true,
+        });
+        expect(mockSessions).toHaveLength(1);
+        const decisions = fs.readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8');
+        expect(decisions).not.toContain('planner_turn_control');
+      });
+
+      it('classifies a persisted control handler failure separately from malformed control', async () => {
+        const runId = 'planner-control-application-failed';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"notify_user","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'invalid control arguments' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'notify me')).rejects.toMatchObject({
+          code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+          retryable: true,
+        });
+        const decisions = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { code?: string } });
+        expect(decisions.filter((row) => row.kind === 'phase_error').at(-1)?.payload.code).toBe(
+          'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+        );
       });
 
       it('rejects a claimed control with no matching persisted event without advancing phase', async () => {
@@ -3292,6 +3447,42 @@ describe('SessionManager', () => {
             iter: 0,
             subagents_spawned: false,
           });
+          expect(mockSessions).toHaveLength(1);
+        } finally {
+          appendFile.mockImplementation(appendImplementation);
+        }
+      });
+
+      it('rejects a same-id durable control whose persisted generation does not match the Planner turn', async () => {
+        const runId = 'planner-control-wrong-payload';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const planner = mockSessions[0];
+        planner.sendImplementation = async () => ({
+          text: ['starting agents', '```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'starting agents' },
+        });
+        const decisionsPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+        const appendFile = vi.mocked(fs.appendFileSync);
+        const appendImplementation = appendFile.getMockImplementation()!;
+        appendFile.mockImplementation(((file: unknown, data: unknown, ...args: unknown[]) => {
+          if (String(file) === decisionsPath && String(data).includes('"kind":"planner_turn_control"')) {
+            const row = JSON.parse(String(data)) as { payload: { generation: number } };
+            row.payload.generation = 999;
+            return (appendImplementation as (...values: unknown[]) => unknown)(
+              file,
+              `${JSON.stringify(row)}\n`,
+              ...args,
+            );
+          }
+          return (appendImplementation as (...values: unknown[]) => unknown)(file, data, ...args);
+        }) as typeof fs.appendFileSync);
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'start the approved implementation')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_NOT_PERSISTED',
+          });
+          expect(mockSessions).toHaveLength(1);
         } finally {
           appendFile.mockImplementation(appendImplementation);
         }
@@ -3344,6 +3535,111 @@ describe('SessionManager', () => {
         );
 
         await expect(mgr.autoloopResetAgent(runId, 'planner', { force: true })).resolves.toBe(false);
+      });
+
+      it('preserves Reviewer started state and its frozen prompt when exact-generation release fails', async () => {
+        const runId = 'reset-release-preserves-reviewer';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        await handle.dispatcher.spawnSubagents();
+        const roleState = handle.dispatcher as unknown as {
+          reviewerStarted: boolean;
+          reviewerSessionPrompt: string | null;
+        };
+        const priorPrompt = roleState.reviewerSessionPrompt;
+        vi.spyOn(mgr, 'releaseReservation').mockResolvedValue(false);
+
+        const result = await handle.dispatcher.resetAgent('reviewer');
+
+        expect(result).toMatchObject({ ok: false, code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED' });
+        expect(roleState.reviewerStarted).toBe(true);
+        expect(roleState.reviewerSessionPrompt).toBe(priorPrompt);
+      });
+
+      it('fails a production reusability probe without changing the released tombstone or Planner flag', async () => {
+        const runId = 'reset-probe-preserves-state';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const plannerName = handle.dispatcher.sessionNames.planner;
+        const roleState = handle.dispatcher as unknown as { plannerStarted: boolean };
+        const managerWithProbe = mgr as unknown as {
+          probeAgentNameReusable: (name: string, generation?: PhysicalAgentGeneration) => boolean;
+          persistedSessions: Map<string, Record<string, unknown>>;
+        };
+        managerWithProbe.probeAgentNameReusable = vi.fn(() => false);
+
+        const result = await handle.dispatcher.resetAgent('planner', { force: true });
+        const reservation = managerWithProbe.persistedSessions.get(plannerName);
+
+        expect(result).toMatchObject({ ok: false, code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED' });
+        expect(roleState.plannerStarted).toBe(true);
+        expect(reservation).toMatchObject({
+          agentGeneration: undefined,
+          agentReleasePending: undefined,
+          agentReleasedGeneration: 1,
+        });
+      });
+
+      it('restores the prior Planner started flag when eager restart fails', async () => {
+        const runId = 'reset-eager-restart-fails';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const roleState = handle.dispatcher as unknown as { plannerStarted: boolean };
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (mgr as any)._createSession = (): ISession => {
+          const mock = new MockSession();
+          mock.start = async () => {
+            throw new Error('replacement Planner failed to start');
+          };
+          mockSessions.push(mock);
+          return mock;
+        };
+
+        const result = await handle.dispatcher.resetAgent('planner', { force: true, eagerRestart: true });
+
+        expect(result).toMatchObject({ ok: false, code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED' });
+        expect(roleState.plannerStarted).toBe(true);
+      });
+
+      it('keeps the Planner started flag when reset liveness is unknown', async () => {
+        const runId = 'reset-liveness-unknown';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const roleState = handle.dispatcher as unknown as { plannerStarted: boolean };
+        vi.spyOn(mgr, 'inspect').mockResolvedValue('unknown');
+
+        const result = await handle.dispatcher.resetAgent('planner', { force: true });
+
+        expect(result).toMatchObject({ ok: false, code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED' });
+        expect(roleState.plannerStarted).toBe(true);
+      });
+
+      it('proves production name reuse and creates the next exact generation after reset', async () => {
+        const runId = 'reset-production-reuse';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+
+        await expect(handle.dispatcher.resetAgent('planner', { force: true })).resolves.toMatchObject({
+          ok: true,
+          previous_generation: 1,
+          reusable: true,
+        });
+        await expect(mgr.autoloopChat(runId, 'continue')).resolves.toMatchObject({ reply: expect.any(String) });
+
+        const generationRows = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { generation: number; state: string } });
+        expect(generationRows.at(-1)).toMatchObject({
+          kind: 'agent_generation_started',
+          payload: { generation: 2, state: 'live' },
+        });
       });
     });
 
