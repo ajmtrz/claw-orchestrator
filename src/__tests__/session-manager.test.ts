@@ -6981,27 +6981,95 @@ describe('SessionManager', () => {
       );
 
       it.each([
-        { key: 'on_phase_error' as const, level: 'error' as const },
-        { key: 'on_decision_needed' as const, level: 'decision' as const },
-      ])('emits a corrupted legacy silent=true $key rule at its critical floor', async ({ key, level }) => {
-        const runId = `planner-critical-policy-emission-${key}`;
-        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
-        await mgr.autoloopStart({ runId, workspace });
-        const handle = mgr.getAutoloop(runId)!;
-        handle.runner.config.push_policy![key] = { level, channel: 'both', silent: true };
-        const pushes: Array<{ level: string; summary: string; channel: string }> = [];
-        handle.runner.on('push', (payload: { level: string; summary: string; channel: string }) =>
-          pushes.push(payload),
-        );
+        {
+          key: 'on_phase_error' as const,
+          state: 'missing',
+          legacyRule: null,
+          expectedLevel: 'error',
+          expectedChannel: 'both',
+        },
+        {
+          key: 'on_decision_needed' as const,
+          state: 'missing',
+          legacyRule: null,
+          expectedLevel: 'decision',
+          expectedChannel: 'both',
+        },
+        {
+          key: 'on_phase_error' as const,
+          state: 'weak-info',
+          legacyRule: { level: 'info', channel: 'both' },
+          expectedLevel: 'error',
+          expectedChannel: 'both',
+        },
+        {
+          key: 'on_decision_needed' as const,
+          state: 'weak-warn',
+          legacyRule: { level: 'warn', channel: 'both' },
+          expectedLevel: 'decision',
+          expectedChannel: 'both',
+        },
+        ...(['wechat', 'webchat', 'email'] as const).flatMap((channel) => [
+          {
+            key: 'on_phase_error' as const,
+            state: `unsafe-${channel}`,
+            legacyRule: { level: 'error' as const, channel },
+            expectedLevel: 'error' as const,
+            expectedChannel: 'both' as const,
+          },
+          {
+            key: 'on_decision_needed' as const,
+            state: `unsafe-${channel}`,
+            legacyRule: { level: 'decision' as const, channel },
+            expectedLevel: 'decision' as const,
+            expectedChannel: 'both' as const,
+          },
+        ]),
+        {
+          key: 'on_phase_error' as const,
+          state: 'silent-partial',
+          legacyRule: { silent: true },
+          expectedLevel: 'error',
+          expectedChannel: 'both',
+        },
+        {
+          key: 'on_decision_needed' as const,
+          state: 'silent-partial',
+          legacyRule: { silent: true },
+          expectedLevel: 'decision',
+          expectedChannel: 'both',
+        },
+        {
+          key: 'on_decision_needed' as const,
+          state: 'stronger-error',
+          legacyRule: { level: 'error', channel: 'auto', silent: true },
+          expectedLevel: 'error',
+          expectedChannel: 'auto',
+        },
+      ])(
+        'emits a safe critical policy final emission for $key with a $state legacy rule',
+        async ({ key, state, legacyRule, expectedLevel, expectedChannel }) => {
+          const runId = `planner-critical-policy-emission-${key}-${state}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          const policy = handle.runner.config.push_policy as unknown as Record<string, unknown>;
+          if (legacyRule === null) delete policy[key];
+          else policy[key] = legacyRule;
+          const pushes: Array<{ level: string; summary: string; channel: string }> = [];
+          handle.runner.on('push', (payload: { level: string; summary: string; channel: string }) =>
+            pushes.push(payload),
+          );
 
-        await (
-          handle.runner as unknown as {
-            firePolicyPush(rule: typeof key, iter: number): Promise<void>;
-          }
-        ).firePolicyPush(key, 7);
+          await (
+            handle.runner as unknown as {
+              firePolicyPush(rule: typeof key, iter: number): Promise<void>;
+            }
+          ).firePolicyPush(key, 7);
 
-        expect(pushes).toEqual([{ level, summary: `[${key}] iter 7`, channel: 'both' }]);
-      });
+          expect(pushes).toEqual([{ level: expectedLevel, summary: `[${key}] iter 7`, channel: expectedChannel }]);
+        },
+      );
 
       it.each([
         {

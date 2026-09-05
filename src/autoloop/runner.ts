@@ -790,17 +790,26 @@ export class AutoloopRunner extends EventEmitter {
     sender?: SenderContext,
   ): Promise<void> {
     const policy = this.config.push_policy ?? DEFAULT_PUSH_POLICY;
-    const r = policy[rule];
     const critical = rule === 'on_phase_error' || rule === 'on_decision_needed';
+    const r = critical ? { ...DEFAULT_PUSH_POLICY[rule], ...policy[rule] } : policy[rule];
     if (!r || (r.silent && !critical)) return;
+    let level = r.level ?? 'info';
+    if (critical) {
+      if (rule === 'on_phase_error') level = 'error';
+      else if (level !== 'error') level = 'decision';
+    }
+    const channel =
+      critical && r.channel !== 'auto' && r.channel !== 'both'
+        ? (DEFAULT_PUSH_POLICY[rule].channel ?? 'auto')
+        : (r.channel ?? 'auto');
     const summary = `[${rule}] iter ${iter}`;
     // We synthesise a push_user envelope as if Planner had asked for it, so
     // dedup + push_log book-keeping go through the same path.
     this.enqueueMessage(
       Msg.pushUser(iter, {
-        level: r.level ?? 'info',
+        level,
         summary,
-        channel: r.channel ?? 'auto',
+        channel,
       }),
       sender,
     );
