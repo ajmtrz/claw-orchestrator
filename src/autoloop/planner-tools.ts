@@ -216,6 +216,9 @@ function sanitizeDirectiveArgs(
 ): NonNullable<SpawnSubagentsArgs['initial_directive']> {
   const directive: NonNullable<SpawnSubagentsArgs['initial_directive']> = {
     goal: nonEmptyString(raw.goal, `${label} goal`),
+    constraints: [],
+    success_criteria: [],
+    max_attempts: 1,
   };
   const constraints = optionalStringArray(raw.constraints, `${label} constraints`);
   const successCriteria = optionalStringArray(raw.success_criteria, `${label} success_criteria`);
@@ -295,7 +298,7 @@ function sanitizePlannerToolCall(call: PlannerToolCall, blockedPolicySilence: st
   switch (call.tool) {
     case 'notify_user': {
       const summary = nonEmptyString(raw.summary, 'notify_user summary');
-      const args: Record<string, unknown> = { summary };
+      const args: Record<string, unknown> = { summary, level: 'info', channel: 'auto' };
       if (raw.level !== undefined) {
         if (typeof raw.level !== 'string' || !VALID_PUSH_LEVELS.has(raw.level as PushLevel)) {
           throw new Error(`notify_user level '${String(raw.level)}' is not supported`);
@@ -348,20 +351,21 @@ function sanitizePlannerToolCall(call: PlannerToolCall, blockedPolicySilence: st
     case 'send_directive':
       return { tool: call.tool, args: sanitizeDirectiveArgs(raw, 'send_directive') };
     case 'pause_loop': {
-      const reason = raw.reason === undefined ? undefined : nonEmptyString(raw.reason, 'pause_loop reason');
-      return { tool: call.tool, args: reason === undefined ? {} : { reason } };
+      const reason = raw.reason === undefined ? 'planner-pause' : nonEmptyString(raw.reason, 'pause_loop reason');
+      return { tool: call.tool, args: { reason } };
     }
     case 'resume_loop':
       return { tool: call.tool, args: {} };
     case 'terminate': {
-      const reason = raw.reason === undefined ? undefined : nonEmptyString(raw.reason, 'terminate reason');
-      return { tool: call.tool, args: reason === undefined ? {} : { reason } };
+      const reason = raw.reason === undefined ? 'planner-terminate' : nonEmptyString(raw.reason, 'terminate reason');
+      return { tool: call.tool, args: { reason } };
     }
     case 'update_push_policy':
       return { tool: call.tool, args: sanitizePushPolicyDelta(raw, blockedPolicySilence) };
     case 'write_plan': {
       const content = boundedPlannerContent(raw.content, 'write_plan content');
-      const commitMessage = optionalString(raw.commit_message, 'write_plan commit_message');
+      const commitMessage =
+        raw.commit_message === undefined ? undefined : nonEmptyString(raw.commit_message, 'write_plan commit_message');
       return {
         tool: call.tool,
         args: commitMessage === undefined ? { content } : { content, commit_message: commitMessage },
@@ -374,7 +378,8 @@ function sanitizePlannerToolCall(call: PlannerToolCall, blockedPolicySilence: st
       } catch (error) {
         throw new Error(`write_goal content is not valid JSON: ${(error as Error).message}`);
       }
-      const commitMessage = optionalString(raw.commit_message, 'write_goal commit_message');
+      const commitMessage =
+        raw.commit_message === undefined ? undefined : nonEmptyString(raw.commit_message, 'write_goal commit_message');
       return {
         tool: call.tool,
         args: commitMessage === undefined ? { content } : { content, commit_message: commitMessage },
@@ -421,6 +426,17 @@ export function validatePlannerToolCalls(calls: readonly PlannerToolCall[]): Pla
           error: `Planner control batch exceeds the ${MAX_PLANNER_CONTROL_CALLS}-control limit`,
         },
       ],
+      blocked_policy_silence: [],
+    };
+  }
+  const nonFinalLifecycle = calls.findIndex(
+    ({ tool }, index) => (tool === 'pause_loop' || tool === 'terminate') && index !== calls.length - 1,
+  );
+  if (nonFinalLifecycle >= 0) {
+    const tool = calls[nonFinalLifecycle].tool;
+    return {
+      calls: [],
+      errors: [{ tool, error: `${tool} must be the final Planner control in its batch` }],
       blocked_policy_silence: [],
     };
   }

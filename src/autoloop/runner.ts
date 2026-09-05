@@ -791,7 +791,8 @@ export class AutoloopRunner extends EventEmitter {
   ): Promise<void> {
     const policy = this.config.push_policy ?? DEFAULT_PUSH_POLICY;
     const r = policy[rule];
-    if (!r || r.silent) return;
+    const critical = rule === 'on_phase_error' || rule === 'on_decision_needed';
+    if (!r || (r.silent && !critical)) return;
     const summary = `[${rule}] iter ${iter}`;
     // We synthesise a push_user envelope as if Planner had asked for it, so
     // dedup + push_log book-keeping go through the same path.

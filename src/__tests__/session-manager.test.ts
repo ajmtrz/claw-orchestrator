@@ -3102,6 +3102,45 @@ describe('SessionManager', () => {
   // ─── Autoloop role configuration ───────────────────────────────────
 
   describe('autoloop role configuration', () => {
+    it.each(['claude', 'codex', 'codex-app', 'gemini', 'agy', 'cursor', 'grok', 'opencode'] as const)(
+      'starts the %s Planner with an enforced read-only sandbox',
+      async (plannerEngine) => {
+        const runId = `readonly-planner-${plannerEngine}`;
+
+        await mgr.autoloopStart({ runId, workspace: '/tmp', plannerEngine });
+
+        expect(createdConfigs[0]).toMatchObject({
+          name: `autoloop-${runId}-planner`,
+          engine: plannerEngine,
+          permissionMode: plannerEngine === 'claude' ? 'plan' : 'manual',
+          sandboxMode: 'read-only',
+        });
+      },
+    );
+
+    it('starts a custom Planner with the same enforced read-only sandbox', async () => {
+      const plannerCustomEngine = {
+        name: 'readonly-custom',
+        bin: 'readonly-custom',
+        args: { permissionMode: '--permission-mode' },
+        permissionModes: { manual: 'plan' },
+      };
+
+      await mgr.autoloopStart({
+        runId: 'readonly-planner-custom',
+        workspace: '/tmp',
+        plannerEngine: 'custom',
+        plannerCustomEngine,
+      });
+
+      expect(createdConfigs[0]).toMatchObject({
+        engine: 'custom',
+        permissionMode: 'manual',
+        sandboxMode: 'read-only',
+        customEngine: plannerCustomEngine,
+      });
+    });
+
     it('passes independent role engines, models, and custom configs into dispatcher sessions', async () => {
       const coderCustomEngine = { name: 'coder-cli', bin: 'coder-cli', args: {} };
       await mgr.autoloopStart({
@@ -3861,8 +3900,9 @@ describe('SessionManager', () => {
 
         // One content allocation is shared by both the exact and +1-byte batch
         // checks. The literal component lengths make the JSON boundary exact:
-        // 1 MiB content + 45 bytes for write_plan, then three 16,441-byte
-        // notify additions and one 16,168-byte addition (including commas).
+        // 1 MiB content + the write_plan envelope, then three full notify
+        // envelopes and one shortened envelope. Canonical notify defaults are
+        // included in every normalized row before this byte limit is applied.
         const content = 'p'.repeat(contentLimit);
         const exactBatch: PlannerToolCall[] = [
           { tool: 'write_plan', args: { content } },
@@ -3872,7 +3912,7 @@ describe('SessionManager', () => {
           })),
           {
             tool: 'notify_user',
-            args: { summary: 's'.repeat(metadataLimit), detail: 'd'.repeat(7_919) },
+            args: { summary: 's'.repeat(metadataLimit), detail: 'd'.repeat(7_791) },
           },
         ];
         const exact = validatePlannerToolCalls(exactBatch);
@@ -6545,8 +6585,11 @@ describe('SessionManager', () => {
         const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
         await mgr.autoloopStart({ runId, workspace });
         const handle = mgr.getAutoloop(runId)!;
+        let plannerTurns = 0;
         mockSessions[0].sendImplementation = async () => {
-          throw Object.assign(new Error('Planner deadline'), { code: 'ETIMEDOUT' });
+          plannerTurns += 1;
+          if (plannerTurns === 1) throw Object.assign(new Error('Planner deadline'), { code: 'ETIMEDOUT' });
+          return { text: 'exact parked chat delivered', event: { type: 'result', result: 'delivered after resume' } };
         };
         let originalPending: Record<string, unknown> | undefined;
         try {
@@ -6563,6 +6606,36 @@ describe('SessionManager', () => {
         });
         expect(handle.runner.state.pending_dispatch).toEqual(originalPending);
         expect(mockSessions[0].sendCalls).toHaveLength(1);
+        const parked = (
+          handle.runner as unknown as {
+            pausedBuffer: Array<{ msg_id: string; type: string; payload: { text?: string } }>;
+          }
+        ).pausedBuffer;
+        expect(parked).toEqual([
+          expect.objectContaining({
+            msg_id: expect.stringMatching(/^m_/),
+            type: 'chat',
+            payload: { text: 'a distinct parked chat' },
+          }),
+        ]);
+        const parkedMessageId = parked[0].msg_id;
+        const deliveredEnvelopes: string[] = [];
+        handle.runner.on('message', (env: { msg_id?: string }) => {
+          if (env.msg_id === parkedMessageId) deliveredEnvelopes.push(env.msg_id);
+        });
+
+        await mgr.autoloopResume(runId, {
+          sendTimeoutMs: 700_000,
+          pendingDispatchId: String(originalPending?.dispatch_id),
+        });
+        await vi.waitFor(() => expect(mockSessions[0].sendCalls).toHaveLength(2));
+
+        expect(String(mockSessions[0].sendCalls[1].message)).toContain('a distinct parked chat');
+        expect((handle.runner as unknown as { pausedBuffer: Array<{ msg_id: string }> }).pausedBuffer).toEqual([]);
+        expect(deliveredEnvelopes).toEqual([parkedMessageId]);
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(mockSessions[0].sendCalls).toHaveLength(2);
+        expect(deliveredEnvelopes).toEqual([parkedMessageId]);
       });
 
       it('isolates a failed Planner sender from a later queued sender', async () => {
@@ -6773,10 +6846,116 @@ describe('SessionManager', () => {
         },
       );
 
-      it.each(['wechat', 'webchat', 'email'] as const)(
-        'rejects critical push-policy diversion to the $channel channel',
-        async (channel) => {
-          const runId = `planner-critical-policy-channel-${channel}`;
+      it.each(['coder', 'reviewer'] as const)(
+        'excludes a fatal %s one-shot after a real successful reset and failed retry',
+        async (role) => {
+          const runId = `real-reset-fatal-${role}-history-exclusion`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          let targetGenerationsStarted = 0;
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (mgr as any)._createSession = (_engine: string, config: SessionConfig): ISession => {
+            const mock = new MockSession();
+            if (config.name === `autoloop-${runId}-${role}`) {
+              targetGenerationsStarted += 1;
+              if (targetGenerationsStarted === 1) {
+                mock.sendImplementation = async () => {
+                  throw new Error(`${role} first generation failed`);
+                };
+              } else {
+                let replacementTurns = 0;
+                mock.sendImplementation = async () => {
+                  replacementTurns += 1;
+                  if (replacementTurns === 1) throw new Error(`${role} replacement retry failed`);
+                  return { text: `${role} later success`, event: { type: 'result', result: 'later success' } };
+                };
+              }
+            }
+            mockSessions.push(mock);
+            createdConfigs.push(config);
+            return mock;
+          };
+          await mgr.autoloopStart({
+            runId,
+            workspace,
+            ...(role === 'coder' ? { coderEngine: 'cursor' as const } : { reviewerEngine: 'cursor' as const }),
+          });
+          const handle = mgr.getAutoloop(runId)!;
+          await handle.dispatcher.spawnSubagents();
+          const rejectedMarker = role === 'coder' ? 'REAL_RESET_CODER_MUST_NOT_REPLAY' : '135791113';
+          const rejectedEnvelope =
+            role === 'coder'
+              ? AutoloopMsg.directive(0, {
+                  goal: rejectedMarker,
+                  constraints: [],
+                  success_criteria: [],
+                  max_attempts: 1,
+                })
+              : AutoloopMsg.reviewRequest(0, {
+                  iter: 0,
+                  ledger_path: path.join(workspace, 'tasks', runId),
+                  prior_metrics: [Number(rejectedMarker)],
+                });
+
+          const rejected = handle.dispatcher.deliver(rejectedEnvelope);
+          await vi.advanceTimersByTimeAsync(1_000);
+          await expect(rejected).resolves.toEqual([
+            expect.objectContaining({
+              type: 'phase_error',
+              payload: expect.objectContaining({ agent: role, code: 'AUTOLOOP_ENGINE_FAILURE' }),
+            }),
+          ]);
+
+          expect(targetGenerationsStarted).toBe(2);
+          expect(
+            (
+              handle.dispatcher as unknown as {
+                transcripts: Record<'coder' | 'reviewer', Array<{ who: string; text: string }>>;
+              }
+            ).transcripts[role],
+          ).toEqual([]);
+          const generations = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string; payload: { role?: string; generation?: number } });
+          expect(
+            generations.filter(
+              (row) =>
+                row.payload.role === role && row.kind === 'agent_generation_started' && row.payload.generation === 2,
+            ),
+          ).toHaveLength(1);
+
+          const acceptedEnvelope =
+            role === 'coder'
+              ? AutoloopMsg.directive(1, {
+                  goal: 'accepted coder turn',
+                  constraints: [],
+                  success_criteria: [],
+                  max_attempts: 1,
+                })
+              : AutoloopMsg.reviewRequest(1, {
+                  iter: 1,
+                  ledger_path: path.join(workspace, 'tasks', runId),
+                  prior_metrics: [2468],
+                });
+          await handle.dispatcher.deliver(acceptedEnvelope);
+          const replacementIndex = createdConfigs.map((config) => config.name).lastIndexOf(`autoloop-${runId}-${role}`);
+          const replacementSession = mockSessions[replacementIndex];
+          expect(String(replacementSession?.sendCalls.at(-1)?.message)).not.toContain(rejectedMarker);
+        },
+      );
+
+      it.each([
+        { key: 'on_phase_error' as const, channel: 'wechat' as const },
+        { key: 'on_phase_error' as const, channel: 'webchat' as const },
+        { key: 'on_phase_error' as const, channel: 'email' as const },
+        { key: 'on_decision_needed' as const, channel: 'wechat' as const },
+        { key: 'on_decision_needed' as const, channel: 'webchat' as const },
+        { key: 'on_decision_needed' as const, channel: 'email' as const },
+      ])(
+        'rejects $key diversion to the $channel channel with the fallback-chain diagnostic',
+        async ({ key, channel }) => {
+          const runId = `planner-critical-policy-channel-${key}-${channel}`;
           const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
           await mgr.autoloopStart({ runId, workspace });
           const handle = mgr.getAutoloop(runId)!;
@@ -6784,7 +6963,7 @@ describe('SessionManager', () => {
           mockSessions[0].sendImplementation = async () => ({
             text: [
               '```autoloop',
-              JSON.stringify({ tool: 'update_push_policy', args: { on_phase_error: { channel } } }),
+              JSON.stringify({ tool: 'update_push_policy', args: { [key]: { channel } } }),
               '```',
             ].join('\n'),
             event: { type: 'result', result: 'unsafe critical channel update' },
@@ -6793,10 +6972,74 @@ describe('SessionManager', () => {
           await expect(mgr.autoloopChat(runId, 'do not divert the critical channel')).rejects.toMatchObject({
             code: 'AUTOLOOP_CONTROL_MALFORMED',
             retryable: false,
+            message: expect.stringContaining(
+              `update_push_policy ${key} channel '${channel}' bypasses the required fallback chain`,
+            ),
           });
           expect(JSON.stringify(handle.runner.config.push_policy)).toBe(before);
         },
       );
+
+      it.each([
+        { key: 'on_phase_error' as const, level: 'error' as const },
+        { key: 'on_decision_needed' as const, level: 'decision' as const },
+      ])('emits a corrupted legacy silent=true $key rule at its critical floor', async ({ key, level }) => {
+        const runId = `planner-critical-policy-emission-${key}`;
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        handle.runner.config.push_policy![key] = { level, channel: 'both', silent: true };
+        const pushes: Array<{ level: string; summary: string; channel: string }> = [];
+        handle.runner.on('push', (payload: { level: string; summary: string; channel: string }) =>
+          pushes.push(payload),
+        );
+
+        await (
+          handle.runner as unknown as {
+            firePolicyPush(rule: typeof key, iter: number): Promise<void>;
+          }
+        ).firePolicyPush(key, 7);
+
+        expect(pushes).toEqual([{ level, summary: `[${key}] iter 7`, channel: 'both' }]);
+      });
+
+      it.each([
+        {
+          key: 'on_start' as const,
+          delta: { level: 'warn' as const },
+          expected: { level: 'warn', channel: 'wechat' },
+        },
+        {
+          key: 'on_iter_done_ok' as const,
+          delta: { channel: 'auto' as const },
+          expected: { channel: 'auto', silent: true },
+        },
+      ])('merges a noncritical $key PATCH with its current policy rule', async ({ key, delta, expected }) => {
+        const runId = `planner-noncritical-policy-patch-${key}`;
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', JSON.stringify({ tool: 'update_push_policy', args: { [key]: delta } }), '```'].join(
+            '\n',
+          ),
+          event: { type: 'result', result: 'partial noncritical update' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'patch only the supplied policy fields')).resolves.toMatchObject({
+          reply: expect.stringContaining('update_push_policy'),
+        });
+
+        expect(handle.runner.config.push_policy?.[key]).toEqual(expected);
+        const decisions = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { applied?: Record<string, unknown> } });
+        expect(decisions.find((row) => row.kind === 'update_push_policy')?.payload.applied).toEqual({
+          [key]: expected,
+        });
+      });
 
       it.each(['on_phase_error', 'on_decision_needed'] as const)(
         'repairs a legacy non-fallback $key channel during an allowed partial update',
@@ -6905,7 +7148,7 @@ describe('SessionManager', () => {
           reply: expect.stringContaining('update_push_policy'),
         });
         expect(handle.runner.config.push_policy?.on_phase_error).toEqual({ level: 'error', channel: 'both' });
-        expect(handle.runner.config.push_policy?.on_start).toEqual({ level: 'warn' });
+        expect(handle.runner.config.push_policy?.on_start).toEqual({ level: 'warn', channel: 'wechat' });
       });
 
       it('rejects an oversized artifact batch before materializing every large body', () => {
@@ -6951,6 +7194,131 @@ describe('SessionManager', () => {
         expect(updatePushPolicy).not.toHaveBeenCalled();
       });
 
+      it('materializes deterministic effect defaults in the canonical validated controls', () => {
+        const validation = validatePlannerToolCalls([
+          { tool: 'notify_user', args: { summary: 'default notification' } },
+          { tool: 'send_directive', args: { goal: 'default directive' } },
+          {
+            tool: 'spawn_subagents',
+            args: { initial_directive: { goal: 'default initial directive' } },
+          },
+        ]);
+
+        expect(validation.errors).toEqual([]);
+        expect(validation.calls).toEqual([
+          {
+            tool: 'notify_user',
+            args: { channel: 'auto', level: 'info', summary: 'default notification' },
+          },
+          {
+            tool: 'send_directive',
+            args: { constraints: [], goal: 'default directive', max_attempts: 1, success_criteria: [] },
+          },
+          {
+            tool: 'spawn_subagents',
+            args: {
+              initial_directive: {
+                constraints: [],
+                goal: 'default initial directive',
+                max_attempts: 1,
+                success_criteria: [],
+              },
+            },
+          },
+        ]);
+        expect(JSON.parse(validation.controls_json ?? 'null')).toEqual(validation.calls);
+      });
+
+      it.each(['pause_loop', 'terminate'] as const)(
+        'persists and applies the canonical omitted %s reason through Planner chat',
+        async (tool) => {
+          const runId = `planner-canonical-default-${tool}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          mockSessions[0].sendImplementation = async () => ({
+            text: ['```autoloop', JSON.stringify({ tool, args: {} }), '```'].join('\n'),
+            event: { type: 'result', result: 'default lifecycle reason' },
+          });
+
+          await expect(mgr.autoloopChat(runId, 'use the deterministic lifecycle default')).resolves.toEqual({
+            reply: `Planner controls persisted: ${tool}`,
+          });
+
+          const reason = tool === 'pause_loop' ? 'planner-pause' : 'planner-terminate';
+          expect(handle.runner.state).toMatchObject({
+            status: tool === 'pause_loop' ? 'paused' : 'terminated',
+            status_reason: reason,
+          });
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string; payload: { controls?: PlannerToolCall[] } });
+          expect(decisions.find((row) => row.kind === 'planner_turn_control')?.payload.controls).toEqual([
+            { tool, args: { reason } },
+          ]);
+        },
+      );
+
+      it.each(['pause_loop', 'terminate'] as const)(
+        'rejects a supplied blank %s reason at the complete Planner chat boundary',
+        async (tool) => {
+          const runId = `planner-blank-chat-reason-${tool}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          mockSessions[0].sendImplementation = async () => ({
+            text: ['```autoloop', JSON.stringify({ tool, args: { reason: '   ' } }), '```'].join('\n'),
+            event: { type: 'result', result: 'blank lifecycle reason' },
+          });
+
+          await expect(mgr.autoloopChat(runId, 'reject the blank reason')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_MALFORMED',
+            retryable: false,
+            message: expect.stringContaining(`${tool} reason must be a non-empty string`),
+          });
+          expect(handle.runner.state).toMatchObject({ status: 'planning', status_reason: null });
+          const decisionsPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+          const decisions = fs.existsSync(decisionsPath) ? fs.readFileSync(decisionsPath, 'utf8') : '';
+          expect(decisions).not.toContain('planner_turn_control');
+        },
+      );
+
+      it.each(['pause_loop', 'terminate'] as const)(
+        'rejects a non-final %s control before any later direct effect or durable control event',
+        async (tool) => {
+          const runId = `planner-lifecycle-order-${tool}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          const policyBefore = JSON.stringify(handle.runner.config.push_policy);
+          mockSessions[0].sendImplementation = async () => ({
+            text: [
+              '```autoloop',
+              JSON.stringify({ tool, args: {} }),
+              '```',
+              '```autoloop',
+              '{"tool":"update_push_policy","args":{"on_start":{"level":"warn"}}}',
+              '```',
+            ].join('\n'),
+            event: { type: 'result', result: 'invalid lifecycle ordering' },
+          });
+
+          await expect(mgr.autoloopChat(runId, 'reject effects after lifecycle control')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_MALFORMED',
+            retryable: false,
+            message: expect.stringContaining(`${tool} must be the final Planner control in its batch`),
+          });
+          expect(handle.runner.state).toMatchObject({ status: 'planning', status_reason: null });
+          expect(JSON.stringify(handle.runner.config.push_policy)).toBe(policyBefore);
+          const decisionsPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+          const decisions = fs.existsSync(decisionsPath) ? fs.readFileSync(decisionsPath, 'utf8') : '';
+          expect(decisions).not.toContain('planner_turn_control');
+          expect(decisions).not.toContain('update_push_policy');
+        },
+      );
+
       it.each(['pause_loop', 'terminate'] as const)(
         'rejects a supplied blank %s reason while preserving the omitted default',
         async (tool) => {
@@ -6980,6 +7348,27 @@ describe('SessionManager', () => {
           ]);
         },
       );
+
+      it.each([
+        { tool: 'write_plan' as const, file: 'plan.md', content: '# blank commit message' },
+        { tool: 'write_goal' as const, file: 'goal.json', content: '{"blank":true}' },
+      ])('rejects a blank $tool commit_message before writing $file', async ({ tool, file, content }) => {
+        const runId = `planner-blank-commit-${tool}`;
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        initializeGitWorkspace(workspace);
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', JSON.stringify({ tool, args: { content, commit_message: '   ' } }), '```'].join('\n'),
+          event: { type: 'result', result: 'blank commit message' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'reject the blank commit message')).rejects.toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+          retryable: false,
+          message: expect.stringContaining(`${tool} commit_message must be a non-empty string`),
+        });
+        expect(fs.existsSync(path.join(workspace, file))).toBe(false);
+      });
 
       it.each([
         { tool: 'write_plan' as const, file: 'plan.md' as const, content: '# must not be written' },
@@ -7091,24 +7480,74 @@ describe('SessionManager', () => {
         },
       );
 
-      it('refuses a pre-planted plan symlink without touching its external target', async () => {
-        const runId = 'planner-plan-symlink-refusal';
-        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
-        const external = path.join(TEST_WF_DIR, `${runId}-external.txt`);
-        fs.writeFileSync(external, 'external sentinel');
-        fs.symlinkSync(external, path.join(workspace, 'plan.md'));
-        await mgr.autoloopStart({ runId, workspace });
-        mockSessions[0].sendImplementation = async () => ({
-          text: ['```autoloop', '{"tool":"write_plan","args":{"content":"# unsafe overwrite"}}', '```'].join('\n'),
-          event: { type: 'result', result: 'write through symlink' },
-        });
+      it.each([
+        { tool: 'write_plan' as const, file: 'plan.md', content: '# unsafe overwrite' },
+        { tool: 'write_goal' as const, file: 'goal.json', content: '{"unsafe":true}' },
+      ])(
+        'refuses a pre-planted $file symlink without touching its external target',
+        async ({ tool, file, content }) => {
+          const runId = `planner-${tool}-symlink-refusal`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          const external = path.join(TEST_WF_DIR, `${runId}-external.txt`);
+          fs.writeFileSync(external, 'external sentinel');
+          fs.symlinkSync(external, path.join(workspace, file));
+          await mgr.autoloopStart({ runId, workspace });
+          mockSessions[0].sendImplementation = async () => ({
+            text: ['```autoloop', JSON.stringify({ tool, args: { content } }), '```'].join('\n'),
+            event: { type: 'result', result: 'write through symlink' },
+          });
 
-        await expect(mgr.autoloopChat(runId, 'persist safely')).rejects.toMatchObject({
-          code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
-        });
-        expect(fs.readFileSync(external, 'utf8')).toBe('external sentinel');
-        expect(fs.lstatSync(path.join(workspace, 'plan.md')).isSymbolicLink()).toBe(true);
-      });
+          await expect(mgr.autoloopChat(runId, 'persist safely')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+          });
+          expect(fs.readFileSync(external, 'utf8')).toBe('external sentinel');
+          expect(fs.lstatSync(path.join(workspace, file)).isSymbolicLink()).toBe(true);
+        },
+      );
+
+      it.each(['absent', 'staged'] as const)(
+        'restores the exact $prior Planner artifact index state after a failed commit',
+        async (prior) => {
+          const runId = `planner-index-restore-${prior}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          initializeGitWorkspace(workspace);
+          fs.writeFileSync(path.join(workspace, 'dirty.txt'), 'dirty baseline\n');
+          fs.writeFileSync(path.join(workspace, 'staged.txt'), 'staged baseline\n');
+          runGit(workspace, 'add', '--', 'dirty.txt', 'staged.txt');
+          runGit(workspace, 'commit', '--quiet', '-m', 'unrelated baselines');
+          fs.writeFileSync(path.join(workspace, 'dirty.txt'), 'unrelated unstaged change\n');
+          fs.writeFileSync(path.join(workspace, 'staged.txt'), 'unrelated staged change\n');
+          runGit(workspace, 'add', '--', 'staged.txt');
+          if (prior === 'staged') {
+            fs.writeFileSync(path.join(workspace, 'plan.md'), '# prior staged plan\n');
+            runGit(workspace, 'add', '--', 'plan.md');
+          }
+          const artifactIndexBefore = runGit(workspace, 'ls-files', '--stage', '--', 'plan.md');
+          const unrelatedIndexBefore = runGit(workspace, 'diff', '--cached', '--', 'staged.txt');
+          const unrelatedWorktreeBefore = runGit(workspace, 'diff', '--', 'dirty.txt');
+          const hook = path.join(workspace, '.git', 'hooks', 'pre-commit');
+          fs.writeFileSync(hook, '#!/bin/sh\necho intentional commit failure >&2\nexit 1\n');
+          fs.chmodSync(hook, 0o755);
+          await mgr.autoloopStart({ runId, workspace });
+          mockSessions[0].sendImplementation = async () => ({
+            text: ['```autoloop', '{"tool":"write_plan","args":{"content":"# replacement plan"}}', '```'].join('\n'),
+            event: { type: 'result', result: 'commit should fail' },
+          });
+
+          await expect(mgr.autoloopChat(runId, 'exercise exact index restoration')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+            message: expect.stringContaining('git commit failed for plan.md'),
+          });
+
+          expect(runGit(workspace, 'ls-files', '--stage', '--', 'plan.md')).toBe(artifactIndexBefore);
+          expect(runGit(workspace, 'diff', '--cached', '--', 'staged.txt')).toBe(unrelatedIndexBefore);
+          expect(runGit(workspace, 'diff', '--', 'dirty.txt')).toBe(unrelatedWorktreeBefore);
+          expect(fs.readFileSync(path.join(workspace, 'plan.md'), 'utf8')).toBe('# replacement plan');
+          expect(runGit(workspace, 'status', '--porcelain', '--', 'plan.md').trim()).toBe(
+            prior === 'absent' ? '?? plan.md' : 'AM plan.md',
+          );
+        },
+      );
 
       it('materializes a regular goal atomically through a same-directory rename', async () => {
         const runId = 'planner-goal-atomic-replace';

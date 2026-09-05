@@ -224,9 +224,9 @@ describe('applyPlannerToolCalls', () => {
     expect(calls).toEqual([]);
   });
 
-  it('pause_loop / resume_loop / terminate emit runner-targeted envelopes', async () => {
+  it('rejects a non-final lifecycle control atomically and emits valid final lifecycle controls', async () => {
     const { fx } = makeMockEffects();
-    const r = await applyPlannerToolCalls(
+    const invalid = await applyPlannerToolCalls(
       [
         { tool: 'pause_loop', args: { reason: 'rethink' } },
         { tool: 'resume_loop', args: {} },
@@ -235,7 +235,28 @@ describe('applyPlannerToolCalls', () => {
       fx,
       0,
     );
-    expect(r.emitted_messages.map((m: AnyAutoloopMessage) => m.type)).toEqual(['pause', 'resume', 'terminate']);
+    expect(invalid.emitted_messages).toEqual([]);
+    expect(invalid.errors).toEqual([
+      { tool: 'pause_loop', error: 'pause_loop must be the final Planner control in its batch' },
+    ]);
+
+    const pause = await applyPlannerToolCalls([{ tool: 'pause_loop', args: { reason: 'rethink' } }], fx, 0);
+    expect(pause.errors).toEqual([]);
+    expect(pause.emitted_messages.map((message: AnyAutoloopMessage) => message.type)).toEqual(['pause']);
+
+    const terminate = await applyPlannerToolCalls(
+      [
+        { tool: 'resume_loop', args: {} },
+        { tool: 'terminate', args: { reason: 'done' } },
+      ],
+      fx,
+      0,
+    );
+    expect(terminate.errors).toEqual([]);
+    expect(terminate.emitted_messages.map((message: AnyAutoloopMessage) => message.type)).toEqual([
+      'resume',
+      'terminate',
+    ]);
   });
 
   it('update_push_policy mutates via the effect', async () => {

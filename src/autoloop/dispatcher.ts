@@ -1727,8 +1727,8 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
           engine: this.plannerSelection.engine,
           model: this.roleModel('planner', this.plannerSelection),
           customEngine: this.plannerSelection.engine === 'custom' ? this.plannerSelection.customEngine : undefined,
-          permissionMode: this.plannerSelection.engine === 'claude' ? 'bypassPermissions' : 'manual',
-          sandboxMode: this.plannerSelection.engine === 'claude' ? undefined : 'read-only',
+          permissionMode: this.plannerSelection.engine === 'claude' ? 'plan' : 'manual',
+          sandboxMode: 'read-only',
           systemPrompt: this.plannerSystemPrompt,
           // Hard role boundary: Planner must NEVER author content files itself.
           // Its only writes are plan.md / goal.json via the write_plan /
@@ -1896,9 +1896,12 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
           const current = (this.config.pushPolicyRef as unknown as Record<string, Record<string, unknown>>)[k];
           const baseline = (DEFAULT_PUSH_POLICY as unknown as Record<string, Record<string, unknown>>)[k];
           const critical = k === 'on_phase_error' || k === 'on_decision_needed';
+          const patch = v as Record<string, unknown>;
           const rule = critical
-            ? { ...baseline, ...current, ...(v as Record<string, unknown>) }
-            : { ...(v as Record<string, unknown>) };
+            ? { ...baseline, ...current, ...patch }
+            : Object.keys(patch).length === 0
+              ? {}
+              : { ...current, ...patch };
           if (critical) {
             delete rule.silent;
             if (k === 'on_phase_error') rule.level = 'error';
@@ -2491,11 +2494,11 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   // ─── git helper for write_plan_committed / write_goal_committed ──────────
 
   private async gitCommit(filename: string, message: string): Promise<void> {
-    const run = (argv: string[]): Promise<{ code: number; out: string; err: string }> =>
+    const run = (argv: string[], input?: string): Promise<{ code: number; out: string; err: string }> =>
       new Promise((resolve) => {
         const child = spawn(argv[0], argv.slice(1), {
           cwd: this.config.workspace,
-          stdio: ['ignore', 'pipe', 'pipe'],
+          stdio: ['pipe', 'pipe', 'pipe'],
         });
         let out = '';
         let err = '';
@@ -2503,6 +2506,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         child.stderr?.on('data', (b) => (err += b.toString()));
         child.on('error', (e) => resolve({ code: 127, out: '', err: (e as Error).message }));
         child.on('exit', (code) => resolve({ code: code ?? 0, out, err }));
+        child.stdin?.end(input);
       });
 
     const detailFor = (result: { code: number; out: string; err: string }): string =>
@@ -2529,6 +2533,10 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       this.logger.info?.(`[autoloop] commit_${filename}: no changes to commit`);
       return;
     }
+    const priorIndex = await run(['git', 'ls-files', '--stage', '--', filename]);
+    if (priorIndex.code !== 0) {
+      throw new Error(`git ls-files failed for ${filename} (code=${priorIndex.code}): ${detailFor(priorIndex)}`);
+    }
     const add = await run(['git', 'add', '--', filename]);
     if (add.code !== 0) {
       throw new Error(`git add failed for ${filename} (code=${add.code}): ${detailFor(add)}`);
@@ -2536,11 +2544,19 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     const commit = await run(['git', 'commit', '--only', '-m', message, '--', filename]);
     if (commit.code !== 0) {
       const detail = detailFor(commit);
+      const removeCurrent = await run(['git', 'update-index', '--force-remove', '--', filename]);
+      let restoreError = removeCurrent.code === 0 ? '' : detailFor(removeCurrent);
+      if (!restoreError && priorIndex.out.length > 0) {
+        const restore = await run(['git', 'update-index', '--index-info'], priorIndex.out);
+        if (restore.code !== 0) restoreError = detailFor(restore);
+      }
       // Surface, don't just log: a silent commit failure leaves the file on disk
       // but uncommitted, so the next Coder iter sees inconsistent git state.
-      this.logger.error?.(`[autoloop] git commit failed for ${filename}: ${detail}`);
-      this.emit('planner_error', new Error(`git commit failed for ${filename}: ${detail}`));
-      throw new Error(`git commit failed for ${filename} (code=${commit.code}): ${detail}`);
+      const failure = `git commit failed for ${filename} (code=${commit.code}): ${detail}`;
+      const surfaced = restoreError ? `${failure}; index restoration failed: ${restoreError}` : failure;
+      this.logger.error?.(`[autoloop] ${surfaced}`);
+      this.emit('planner_error', new Error(surfaced));
+      throw new Error(surfaced);
     }
   }
 }
