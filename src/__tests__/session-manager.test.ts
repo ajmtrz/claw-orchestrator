@@ -296,9 +296,16 @@ function managerGeneration(
   };
 }
 
+function mockSharedPidFile(entries: Record<string, unknown>): void {
+  vi.mocked(fs.existsSync).mockReturnValueOnce(true);
+  vi.mocked(fs.readFileSync).mockReturnValueOnce(JSON.stringify(entries) as never);
+}
+
 interface ManagerReleaseOptions {
   expectedOwnerInstanceId?: string;
   expectedSessionId?: string;
+  releaseOwnerInstanceId?: string;
+  rollbackUncommittedReservation?: boolean;
   beforeRelease?: () => void;
   persistReleaseEvidence?: () => void;
 }
@@ -479,6 +486,151 @@ describe('SessionManager', () => {
   });
 
   describe('autoloop agent runtime probe', () => {
+    it('reports shared PID ownership by another live manager as live', async () => {
+      const sessionName = 'autoloop-probe-shared-live-planner';
+      mockSharedPidFile({
+        [sessionName]: {
+          pid: process.pid,
+          ownerPid: process.ppid,
+          since: '2026-09-05T10:00:00.000Z',
+        },
+      });
+
+      await expect(mgr.inspect(sessionName)).resolves.toBe('live');
+    });
+
+    it('keeps a dead owner live child unknown and reports absent only when both PIDs are dead', async () => {
+      const lingeringSessionName = 'autoloop-probe-shared-lingering-planner';
+      const deadSessionName = 'autoloop-probe-shared-dead-planner';
+      const deadOwnerPid = 2_000_000_000;
+      const deadChildPid = 2_000_000_001;
+      expect(() => process.kill(deadOwnerPid, 0)).toThrow();
+      expect(() => process.kill(deadChildPid, 0)).toThrow();
+      mockSharedPidFile({
+        [lingeringSessionName]: {
+          pid: process.pid,
+          ownerPid: deadOwnerPid,
+          since: '2026-09-05T10:00:00.000Z',
+        },
+      });
+      mockSharedPidFile({
+        [deadSessionName]: {
+          pid: deadChildPid,
+          ownerPid: deadOwnerPid,
+          since: '2026-09-05T10:00:00.000Z',
+        },
+      });
+
+      await expect(mgr.inspect(lingeringSessionName)).resolves.toBe('unknown');
+      await expect(mgr.inspect(deadSessionName)).resolves.toBe('absent');
+    });
+
+    it('requires the full generation owner and session tuple to release an active reservation', async () => {
+      const invalidOptions = [
+        { expectedSessionId: 'physical-session-1' },
+        { expectedOwnerInstanceId: 'owner-1' },
+        { expectedOwnerInstanceId: 'owner-wrong', expectedSessionId: 'physical-session-1' },
+        { expectedOwnerInstanceId: 'owner-1', expectedSessionId: 'physical-session-wrong' },
+      ];
+      let evidenceHookCount = 0;
+      const results: boolean[] = [];
+
+      for (const [index, tuple] of invalidOptions.entries()) {
+        const sessionName = `autoloop-probe-incomplete-tuple-${index}-planner`;
+        const generation = managerGeneration(sessionName);
+        expect(mgr.reserveAgentGeneration(generation, '/tmp')).toBe(true);
+        results.push(
+          await mgr.releaseReservation(sessionName, generation.generation, {
+            ...tuple,
+            beforeRelease: () => {
+              evidenceHookCount += 1;
+            },
+            persistReleaseEvidence: () => {
+              evidenceHookCount += 1;
+            },
+          } as ManagerReleaseOptions),
+        );
+      }
+
+      expect(results).toEqual([false, false, false, false]);
+      expect(evidenceHookCount).toBe(0);
+    });
+
+    it('rolls back an uncommitted generation without evidence and permits a replacement reservation', async () => {
+      const sessionName = 'autoloop-probe-uncommitted-rollback-planner';
+      const first = managerGeneration(sessionName);
+      const replacement = managerGeneration(sessionName, {
+        session_id: 'physical-session-replacement',
+        owner_instance_id: 'owner-replacement',
+      });
+      let evidenceHookCount = 0;
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      await expect(
+        mgr.releaseReservation(sessionName, first.generation, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          rollbackUncommittedReservation: true,
+          beforeRelease: () => {
+            evidenceHookCount += 1;
+          },
+          persistReleaseEvidence: () => {
+            evidenceHookCount += 1;
+          },
+        } as ManagerReleaseOptions),
+      ).resolves.toBe(true);
+
+      expect(evidenceHookCount).toBe(0);
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(true);
+    });
+
+    it('restores the prior released tombstone when an uncommitted replacement rolls back', async () => {
+      const sessionName = 'autoloop-probe-uncommitted-tombstone-planner';
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      reservations.set(sessionName, {
+        name: sessionName,
+        claudeSessionId: 'prior-session-id',
+        cwd: '/tmp',
+        originalCreated: '2026-09-05T09:00:00.000Z',
+        lastResumed: '2026-09-05T09:00:00.000Z',
+        lastActivity: Date.parse('2026-09-05T09:00:00.000Z'),
+        agentReleasedGeneration: 1,
+        agentReleasedOwnerInstanceId: 'prior-owner',
+        agentReleasedSessionId: 'prior-physical-session',
+      });
+      const uncommitted = managerGeneration(sessionName, {
+        generation: 2,
+        session_id: 'uncommitted-physical-session',
+        owner_instance_id: 'uncommitted-owner',
+      });
+      const replacement = managerGeneration(sessionName, {
+        generation: 2,
+        session_id: 'replacement-physical-session',
+        owner_instance_id: 'replacement-owner',
+      });
+
+      expect(mgr.reserveAgentGeneration(uncommitted, '/tmp')).toBe(true);
+      await expect(
+        mgr.releaseReservation(sessionName, uncommitted.generation, {
+          expectedOwnerInstanceId: uncommitted.owner_instance_id,
+          expectedSessionId: uncommitted.session_id,
+          rollbackUncommittedReservation: true,
+        } as ManagerReleaseOptions),
+      ).resolves.toBe(true);
+
+      expect(reservations.get(sessionName)).toMatchObject({
+        agentGeneration: undefined,
+        agentReleasedGeneration: 1,
+        agentReleasedOwnerInstanceId: 'prior-owner',
+        agentReleasedSessionId: 'prior-physical-session',
+      });
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(true);
+    });
+
     it('generation-fences release of a stale registry-only reservation', async () => {
       const sessionName = 'autoloop-probe-stale-planner';
       const first = managerGeneration(sessionName);
@@ -505,6 +657,7 @@ describe('SessionManager', () => {
         mgr.releaseReservation(sessionName, 1, {
           expectedOwnerInstanceId: first.owner_instance_id,
           expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: 'release-owner-1',
           beforeRelease: () => undefined,
           persistReleaseEvidence: () => {
             competingReservation = mgr.reserveAgentGeneration(replacement, '/tmp');
@@ -557,6 +710,7 @@ describe('SessionManager', () => {
         mgr.releaseReservation(sessionName, 1, {
           expectedOwnerInstanceId: first.owner_instance_id,
           expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: 'release-owner-1',
           beforeRelease: () => undefined,
           persistReleaseEvidence: () => {
             competingReservation = mgr.reserveAgentGeneration(replacement, '/tmp');
@@ -589,6 +743,8 @@ describe('SessionManager', () => {
 
       await expect(
         mgr.releaseReservation(sessionName, 0, {
+          expectedOwnerInstanceId: 'legacy-registry',
+          releaseOwnerInstanceId: 'release-owner-1',
           beforeRelease: () => {
             orphanEvidenceDurable = true;
           },
@@ -604,6 +760,42 @@ describe('SessionManager', () => {
       expect(releaseEvidenceDurable).toBe(true);
       expect(competingReservation).toBe(false);
       expect(mgr.reserveAgentGeneration(next, '/tmp')).toBe(true);
+    });
+
+    it('treats a released legacy tombstone retry as side-effect-free idempotent success', async () => {
+      const sessionName = 'autoloop-probe-released-legacy-planner';
+      const legacyTombstone = {
+        name: sessionName,
+        claudeSessionId: 'legacy-session-id',
+        cwd: '/tmp',
+        originalCreated: '2026-09-05T10:00:00.000Z',
+        lastResumed: '2026-09-05T10:00:00.000Z',
+        lastActivity: Date.parse('2026-09-05T10:00:00.000Z'),
+        agentReleasedGeneration: 0,
+      };
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      reservations.set(sessionName, legacyTombstone);
+      let evidenceHookCount = 0;
+
+      await expect(
+        mgr.releaseReservation(sessionName, 0, {
+          expectedOwnerInstanceId: 'arbitrary-owner-that-was-never-stored',
+          expectedSessionId: 'arbitrary-session-that-was-never-stored',
+          beforeRelease: () => {
+            evidenceHookCount += 1;
+          },
+          persistReleaseEvidence: () => {
+            evidenceHookCount += 1;
+          },
+        } as ManagerReleaseOptions),
+      ).resolves.toBe(true);
+
+      expect(evidenceHookCount).toBe(0);
+      expect(reservations.get(sessionName)).toEqual(legacyTombstone);
     });
 
     it('keeps the generation reservation when an engine has no resumable conversation id yet', async () => {
@@ -647,6 +839,9 @@ describe('SessionManager', () => {
       });
       await expect(
         mgr.releaseReservation(sessionName, first.generation, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: 'release-owner-1',
           beforeRelease: () => {
             orphanEvidenceCount += 1;
           },
@@ -655,12 +850,122 @@ describe('SessionManager', () => {
           },
         } as ManagerReleaseOptions),
       ).resolves.toBe(false);
-      expect(orphanEvidenceCount).toBe(1);
+      expect(orphanEvidenceCount).toBe(0);
       expect(releaseEvidenceCount).toBe(0);
       expect(reservations.get(sessionName)).toMatchObject({
         agentGeneration: first.generation,
         agentOwnerInstanceId: first.owner_instance_id,
       });
+    });
+
+    it('persists a single-winner release-owner fence before orphan evidence', async () => {
+      const sessionName = 'autoloop-probe-release-owner-planner';
+      const first = managerGeneration(sessionName);
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      let winnerHookCount = 0;
+      let competingHookCount = 0;
+      let competingRelease: Promise<boolean> | undefined;
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      await expect(
+        mgr.releaseReservation(sessionName, first.generation, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: 'release-owner-a',
+          beforeRelease: () => {
+            winnerHookCount += 1;
+            expect(reservations.get(sessionName)).toMatchObject({
+              agentReleasePending: true,
+              agentReleaseOwnerInstanceId: 'release-owner-a',
+            });
+            competingRelease = mgr.releaseReservation(sessionName, first.generation, {
+              expectedOwnerInstanceId: first.owner_instance_id,
+              expectedSessionId: first.session_id,
+              releaseOwnerInstanceId: 'release-owner-b',
+              beforeRelease: () => {
+                competingHookCount += 1;
+              },
+              persistReleaseEvidence: () => {
+                competingHookCount += 1;
+              },
+            } as ManagerReleaseOptions);
+          },
+          persistReleaseEvidence: () => {
+            winnerHookCount += 1;
+          },
+        } as ManagerReleaseOptions),
+      ).resolves.toBe(true);
+
+      await expect(competingRelease).resolves.toBe(false);
+      expect(winnerHookCount).toBe(2);
+      expect(competingHookCount).toBe(0);
+    });
+
+    it('keeps failed orphan evidence fenced for retry by the exact release owner', async () => {
+      const sessionName = 'autoloop-probe-release-retry-planner';
+      const first = managerGeneration(sessionName);
+      const replacement = managerGeneration(sessionName, {
+        generation: 2,
+        session_id: 'physical-session-2',
+        owner_instance_id: 'owner-2',
+      });
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      let failOrphanEvidence = true;
+      let winnerOrphanHookCount = 0;
+      let winnerReleaseHookCount = 0;
+      let competingHookCount = 0;
+      const winnerOptions: ManagerReleaseOptions = {
+        expectedOwnerInstanceId: first.owner_instance_id,
+        expectedSessionId: first.session_id,
+        releaseOwnerInstanceId: 'release-owner-a',
+        beforeRelease: () => {
+          winnerOrphanHookCount += 1;
+          if (failOrphanEvidence) {
+            failOrphanEvidence = false;
+            throw new Error('orphan evidence append failed');
+          }
+        },
+        persistReleaseEvidence: () => {
+          winnerReleaseHookCount += 1;
+        },
+      };
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      await expect(mgr.releaseReservation(sessionName, first.generation, winnerOptions)).rejects.toThrow(
+        'orphan evidence append failed',
+      );
+      expect(reservations.get(sessionName)).toMatchObject({
+        agentReleasePending: true,
+        agentReleaseOwnerInstanceId: 'release-owner-a',
+      });
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(false);
+
+      await expect(
+        mgr.releaseReservation(sessionName, first.generation, {
+          ...winnerOptions,
+          releaseOwnerInstanceId: 'release-owner-b',
+          beforeRelease: () => {
+            competingHookCount += 1;
+          },
+          persistReleaseEvidence: () => {
+            competingHookCount += 1;
+          },
+        }),
+      ).resolves.toBe(false);
+      await expect(mgr.releaseReservation(sessionName, first.generation, winnerOptions)).resolves.toBe(true);
+
+      expect(winnerOrphanHookCount).toBe(2);
+      expect(winnerReleaseHookCount).toBe(1);
+      expect(competingHookCount).toBe(0);
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(true);
     });
 
     it('keeps a prepared tombstone fenced when completion persistence fails, then finishes idempotently', async () => {
@@ -674,6 +979,7 @@ describe('SessionManager', () => {
       const options: ManagerReleaseOptions = {
         expectedOwnerInstanceId: first.owner_instance_id,
         expectedSessionId: first.session_id,
+        releaseOwnerInstanceId: 'release-owner-1',
         beforeRelease: () => undefined,
         persistReleaseEvidence: () => {
           releaseEvidenceCount = 1;

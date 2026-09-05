@@ -39,7 +39,11 @@ export type AgentRuntimeLiveness = 'live' | 'absent' | 'unknown';
 export interface AgentReservationReleaseOptions {
   expectedOwnerInstanceId?: string;
   expectedSessionId?: string;
-  /** Runs after tuple validation but before the registry enters release-pending state. */
+  /** Identifies the one runtime owner allowed to finish a pending release. */
+  releaseOwnerInstanceId?: string;
+  /** Restore a just-created reservation whose durable ledger append failed. */
+  rollbackUncommittedReservation?: boolean;
+  /** Runs only after the exact release-owner fence is durable. */
   beforeRelease?: () => void;
   /** Runs after the pending tombstone is durable and before the name becomes reusable. */
   persistReleaseEvidence?: () => void;

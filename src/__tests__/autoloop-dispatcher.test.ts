@@ -32,6 +32,8 @@ interface StubCalls {
 interface ReleaseReservationOptions {
   expectedOwnerInstanceId?: string;
   expectedSessionId?: string;
+  releaseOwnerInstanceId?: string;
+  rollbackUncommittedReservation?: boolean;
   beforeRelease?: () => void;
   persistReleaseEvidence?: () => void;
 }
@@ -54,7 +56,7 @@ function makeStubManager(
   let sendIndex = 0;
   const activeNames = new Set<string>();
   const reservations = new Map<string, PhysicalAgentGeneration>();
-  const pendingReleases = new Map<string, PhysicalAgentGeneration>();
+  const pendingReleases = new Map<string, { generation: PhysicalAgentGeneration; releaseOwnerInstanceId: string }>();
   const releasedGenerations = new Map<string, number>();
   const calls: StubCalls = {
     startSession: vi.fn(async (config: { name: string }) => {
@@ -87,40 +89,60 @@ function makeStubManager(
     }),
     releaseReservation: vi.fn(
       async (name: string, expectedGeneration: number, options: ReleaseReservationOptions = {}) => {
+        if (options.rollbackUncommittedReservation) {
+          const reservation = reservations.get(name);
+          if (
+            pendingReleases.has(name) ||
+            activeNames.has(name) ||
+            reservation?.generation !== expectedGeneration ||
+            options.expectedOwnerInstanceId === undefined ||
+            reservation.owner_instance_id !== options.expectedOwnerInstanceId ||
+            options.expectedSessionId === undefined ||
+            reservation.session_id !== options.expectedSessionId
+          ) {
+            return false;
+          }
+          reservations.delete(name);
+          return true;
+        }
         const pending = pendingReleases.get(name);
         if (pending) {
           if (
-            pending.generation !== expectedGeneration ||
-            (options.expectedOwnerInstanceId !== undefined &&
-              pending.owner_instance_id !== options.expectedOwnerInstanceId) ||
-            (options.expectedSessionId !== undefined && pending.session_id !== options.expectedSessionId)
+            pending.generation.generation !== expectedGeneration ||
+            pending.generation.owner_instance_id !== options.expectedOwnerInstanceId ||
+            pending.generation.session_id !== options.expectedSessionId ||
+            pending.releaseOwnerInstanceId !== options.releaseOwnerInstanceId
           ) {
             return false;
           }
         } else {
           if (releasedGenerations.get(name) === expectedGeneration) return true;
           const reservation = reservations.get(name);
-          if (
-            activeNames.has(name) ||
-            reservation?.generation !== expectedGeneration ||
-            (options.expectedOwnerInstanceId !== undefined &&
-              reservation.owner_instance_id !== options.expectedOwnerInstanceId) ||
-            (options.expectedSessionId !== undefined && reservation.session_id !== options.expectedSessionId)
-          ) {
-            return false;
+          if (activeNames.has(name) || !reservation || !options.releaseOwnerInstanceId) return false;
+          let target: PhysicalAgentGeneration;
+          if (expectedGeneration === 0) {
+            if (reservation.generation !== 0 || options.expectedOwnerInstanceId !== 'legacy-registry') return false;
+            target = {
+              ...reservation,
+              owner_instance_id: options.expectedOwnerInstanceId,
+              session_id: options.expectedSessionId,
+            };
+          } else {
+            if (
+              reservation.generation !== expectedGeneration ||
+              reservation.owner_instance_id !== options.expectedOwnerInstanceId ||
+              reservation.session_id !== options.expectedSessionId
+            ) {
+              return false;
+            }
+            target = reservation;
           }
-          options.beforeRelease?.();
-          pendingReleases.set(
-            name,
-            expectedGeneration === 0
-              ? {
-                  ...reservation,
-                  owner_instance_id: options.expectedOwnerInstanceId ?? 'legacy-registry',
-                  session_id: options.expectedSessionId,
-                }
-              : reservation,
-          );
+          pendingReleases.set(name, {
+            generation: target,
+            releaseOwnerInstanceId: options.releaseOwnerInstanceId,
+          });
         }
+        options.beforeRelease?.();
         if (!options.persistReleaseEvidence) return false;
         options.persistReleaseEvidence();
         reservations.delete(name);
@@ -323,6 +345,42 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
     ]);
   });
 
+  it('rolls back an uncommitted reservation when the reservation ledger append fails', async () => {
+    const { dispatcher, calls, ledgerDir, reservations } = makeDispatcher({
+      ownerInstanceId: 'owner-new',
+      now: () => new Date(AGENT_NOW),
+    });
+    const generationsPath = path.join(ledgerDir, 'agent-generations.jsonl');
+    const reserveAgentGeneration = calls.reserveAgentGeneration.getMockImplementation()!;
+    calls.reserveAgentGeneration.mockImplementationOnce((generation: PhysicalAgentGeneration) => {
+      const reserved = reserveAgentGeneration(generation);
+      fs.mkdirSync(generationsPath, { recursive: true });
+      return reserved;
+    });
+
+    await expect(dispatcher.init(state)).rejects.toThrow();
+    fs.rmSync(generationsPath, { recursive: true });
+
+    expect(calls.releaseReservation).toHaveBeenCalledWith(
+      'autoloop-r1-planner',
+      1,
+      expect.objectContaining({
+        expectedOwnerInstanceId: 'owner-new',
+        expectedSessionId: expect.any(String),
+        rollbackUncommittedReservation: true,
+      }),
+    );
+    expect(reservations.has('autoloop-r1-planner')).toBe(false);
+
+    const retry = new ClaudeAgentDispatcher({ ...dispatcher.config });
+    await retry.init(state);
+
+    expect(readGenerationEvents(ledgerDir).map((entry) => [entry.kind, entry.payload.generation])).toEqual([
+      ['agent_generation_reserved', 1],
+      ['agent_generation_started', 1],
+    ]);
+  });
+
   it('keeps a genuinely live conflicting owner as a typed hard stop', async () => {
     const { dispatcher, calls, ledgerDir, activeNames, reservations } = makeDispatcher({
       ownerInstanceId: 'owner-new',
@@ -424,6 +482,7 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
       expect.objectContaining({
         expectedOwnerInstanceId: current.owner_instance_id,
         expectedSessionId: current.session_id,
+        releaseOwnerInstanceId: 'owner-new',
         beforeRelease: expect.any(Function),
         persistReleaseEvidence: expect.any(Function),
       }),
@@ -488,6 +547,8 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
       legacy.session_name,
       0,
       expect.objectContaining({
+        expectedOwnerInstanceId: 'legacy-registry',
+        releaseOwnerInstanceId: 'owner-new',
         beforeRelease: expect.any(Function),
         persistReleaseEvidence: expect.any(Function),
       }),
@@ -528,22 +589,18 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
     const current = physicalGeneration('planner');
     appendGenerationEvent(ledgerDir, 'agent_generation_started', current);
     reservations.set(current.session_name, current);
-    let orphanCallbackRan = false;
+    let orphanCallbackProvided = false;
     calls.releaseReservation.mockImplementationOnce(
       async (_name, _generation, options: ReleaseReservationOptions = {}) => {
-        options.beforeRelease?.();
-        orphanCallbackRan = options.beforeRelease !== undefined;
+        orphanCallbackProvided = options.beforeRelease !== undefined;
         return false;
       },
     );
 
     await expect(dispatcher.init(state)).rejects.toMatchObject({ code: 'AUTOLOOP_AGENT_GENERATION_CONFLICT' });
 
-    expect(orphanCallbackRan).toBe(true);
-    expect(readGenerationEvents(ledgerDir).map((entry) => entry.kind)).toEqual([
-      'agent_generation_started',
-      'agent_generation_orphaned',
-    ]);
+    expect(orphanCallbackProvided).toBe(true);
+    expect(readGenerationEvents(ledgerDir).map((entry) => entry.kind)).toEqual(['agent_generation_started']);
     expect(calls.startSession).not.toHaveBeenCalled();
   });
 

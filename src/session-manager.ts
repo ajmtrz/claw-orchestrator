@@ -58,6 +58,8 @@ interface PersistedSession {
   agentSessionId?: string;
   /** Exact generation remains unavailable while its release evidence is persisted. */
   agentReleasePending?: boolean;
+  /** Runtime owner that won the durable compare-and-release fence. */
+  agentReleaseOwnerInstanceId?: string;
   /** Retained after release so a stale caller cannot reuse an older generation. */
   agentReleasedGeneration?: number;
   agentReleasedOwnerInstanceId?: string;
@@ -672,6 +674,7 @@ export class SessionManager implements AgentRuntimeProbe {
       agentOwnerInstanceId: generation.owner_instance_id,
       agentSessionId: generation.session_id,
       agentReleasePending: undefined,
+      agentReleaseOwnerInstanceId: undefined,
       agentReleasedGeneration: existing?.agentReleasedGeneration,
       agentReleasedOwnerInstanceId: existing?.agentReleasedOwnerInstanceId,
       agentReleasedSessionId: existing?.agentReleasedSessionId,
@@ -693,7 +696,50 @@ export class SessionManager implements AgentRuntimeProbe {
     if (reservation?.agentSessionId && sessionId && reservation.agentSessionId !== sessionId) {
       return 'unknown';
     }
-    return 'absent';
+    return this._inspectSharedPidEvidence(sessionName) ?? 'absent';
+  }
+
+  private _inspectSharedPidEvidence(sessionName: string): AgentRuntimeLiveness | undefined {
+    if (!fs.existsSync(SessionManager.PID_FILE)) return undefined;
+
+    let entries: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(SessionManager.PID_FILE, 'utf8')) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return 'unknown';
+      entries = parsed as Record<string, unknown>;
+    } catch {
+      return 'unknown';
+    }
+    if (!Object.prototype.hasOwnProperty.call(entries, sessionName)) return undefined;
+
+    const raw = entries[sessionName];
+    if (typeof raw === 'number') return 'unknown';
+    if (!raw || typeof raw !== 'object') return 'unknown';
+    const entry = raw as { pid?: unknown; ownerPid?: unknown };
+    if (
+      typeof entry.pid !== 'number' ||
+      !Number.isInteger(entry.pid) ||
+      entry.pid <= 0 ||
+      typeof entry.ownerPid !== 'number' ||
+      !Number.isInteger(entry.ownerPid) ||
+      entry.ownerPid <= 0
+    ) {
+      return 'unknown';
+    }
+
+    const ownerLiveness = this._probePidLiveness(entry.ownerPid);
+    if (ownerLiveness === 'live') return 'live';
+    if (ownerLiveness === 'unknown') return 'unknown';
+    return this._probePidLiveness(entry.pid) === 'absent' ? 'absent' : 'unknown';
+  }
+
+  private _probePidLiveness(pid: number): AgentRuntimeLiveness {
+    try {
+      process.kill(pid, 0);
+      return 'live';
+    } catch (err) {
+      return (err as { code?: string }).code === 'ESRCH' ? 'absent' : 'unknown';
+    }
   }
 
   /**
@@ -709,44 +755,75 @@ export class SessionManager implements AgentRuntimeProbe {
     const existing = this.persistedSessions.get(sessionName);
     if (!existing) return false;
 
-    const activeTupleMatches = (reservation: PersistedSession): boolean =>
-      reservation.agentGeneration === expectedGeneration &&
-      (options.expectedOwnerInstanceId === undefined ||
-        reservation.agentOwnerInstanceId === options.expectedOwnerInstanceId) &&
-      (options.expectedSessionId === undefined || reservation.agentSessionId === options.expectedSessionId);
-    const releasedTupleMatches = (reservation: PersistedSession): boolean =>
-      reservation.agentReleasedGeneration === expectedGeneration &&
-      (options.expectedOwnerInstanceId === undefined ||
-        reservation.agentReleasedOwnerInstanceId === undefined ||
-        reservation.agentReleasedOwnerInstanceId === options.expectedOwnerInstanceId) &&
-      (options.expectedSessionId === undefined ||
-        reservation.agentReleasedSessionId === undefined ||
-        reservation.agentReleasedSessionId === options.expectedSessionId);
-
-    let pending: PersistedSession;
-    if (existing.agentReleasePending) {
-      if (!activeTupleMatches(existing)) return false;
-      pending = existing;
-    } else if (existing.agentGeneration !== undefined) {
-      if (!activeTupleMatches(existing)) return false;
-      options.beforeRelease?.();
-      pending = { ...existing, agentReleasePending: true };
-      this.persistedSessions.set(sessionName, pending);
+    if (options.rollbackUncommittedReservation) {
+      if (
+        existing.agentReleasePending ||
+        existing.agentGeneration !== expectedGeneration ||
+        options.expectedOwnerInstanceId === undefined ||
+        existing.agentOwnerInstanceId !== options.expectedOwnerInstanceId ||
+        options.expectedSessionId === undefined ||
+        existing.agentSessionId !== options.expectedSessionId
+      ) {
+        return false;
+      }
+      if (existing.agentReleasedGeneration === undefined) {
+        this.persistedSessions.delete(sessionName);
+      } else {
+        this.persistedSessions.set(sessionName, {
+          ...existing,
+          agentGeneration: undefined,
+          agentOwnerInstanceId: undefined,
+          agentSessionId: undefined,
+          agentReleasePending: undefined,
+          agentReleaseOwnerInstanceId: undefined,
+        });
+      }
       if (!savePersistedSessions(this.persistedSessions, this.logger)) {
         this.persistedSessions.set(sessionName, existing);
         return false;
       }
-    } else if (existing.agentReleasedGeneration !== undefined) {
-      if (!releasedTupleMatches(existing)) return false;
-      if (!options.persistReleaseEvidence) return true;
-      options.beforeRelease?.();
+      return true;
+    }
+
+    if (
+      existing.agentGeneration === undefined &&
+      existing.agentReleasePending !== true &&
+      existing.agentReleasedGeneration !== undefined
+    ) {
+      if (existing.agentReleasedGeneration !== expectedGeneration) return false;
+      const hasFullReleasedTuple =
+        existing.agentReleasedOwnerInstanceId !== undefined && existing.agentReleasedSessionId !== undefined;
+      if (
+        hasFullReleasedTuple &&
+        (existing.agentReleasedOwnerInstanceId !== options.expectedOwnerInstanceId ||
+          existing.agentReleasedSessionId !== options.expectedSessionId)
+      ) {
+        return false;
+      }
+      return true;
+    }
+
+    const activeTupleMatches = (reservation: PersistedSession): boolean =>
+      reservation.agentGeneration === expectedGeneration &&
+      reservation.agentOwnerInstanceId === options.expectedOwnerInstanceId &&
+      reservation.agentSessionId === options.expectedSessionId;
+
+    let pending: PersistedSession;
+    if (existing.agentReleasePending) {
+      if (
+        !activeTupleMatches(existing) ||
+        options.releaseOwnerInstanceId === undefined ||
+        existing.agentReleaseOwnerInstanceId !== options.releaseOwnerInstanceId
+      ) {
+        return false;
+      }
+      pending = existing;
+    } else if (existing.agentGeneration !== undefined) {
+      if (!activeTupleMatches(existing) || !options.releaseOwnerInstanceId) return false;
       pending = {
         ...existing,
-        agentGeneration: expectedGeneration,
-        agentOwnerInstanceId:
-          existing.agentReleasedOwnerInstanceId ?? options.expectedOwnerInstanceId ?? 'released-reservation',
-        agentSessionId: existing.agentReleasedSessionId ?? options.expectedSessionId,
         agentReleasePending: true,
+        agentReleaseOwnerInstanceId: options.releaseOwnerInstanceId,
       };
       this.persistedSessions.set(sessionName, pending);
       if (!savePersistedSessions(this.persistedSessions, this.logger)) {
@@ -758,16 +835,14 @@ export class SessionManager implements AgentRuntimeProbe {
       // of being deleted, so a crash cannot expose its name between evidence
       // writes.
       if (expectedGeneration !== 0) return false;
-      if (options.expectedOwnerInstanceId !== undefined && options.expectedOwnerInstanceId !== 'legacy-registry') {
-        return false;
-      }
-      options.beforeRelease?.();
+      if (options.expectedOwnerInstanceId !== 'legacy-registry' || !options.releaseOwnerInstanceId) return false;
       pending = {
         ...existing,
         agentGeneration: 0,
-        agentOwnerInstanceId: options.expectedOwnerInstanceId ?? 'legacy-registry',
+        agentOwnerInstanceId: options.expectedOwnerInstanceId,
         agentSessionId: options.expectedSessionId,
         agentReleasePending: true,
+        agentReleaseOwnerInstanceId: options.releaseOwnerInstanceId,
       };
       this.persistedSessions.set(sessionName, pending);
       if (!savePersistedSessions(this.persistedSessions, this.logger)) {
@@ -776,6 +851,8 @@ export class SessionManager implements AgentRuntimeProbe {
       }
     }
 
+    options.beforeRelease?.();
+
     // Returning false without this hook deliberately leaves the durable
     // tombstone in place. A caller may retry with the evidence writer, but may
     // not make the physical name reusable without it.
@@ -783,13 +860,20 @@ export class SessionManager implements AgentRuntimeProbe {
     options.persistReleaseEvidence();
 
     const stillPending = this.persistedSessions.get(sessionName);
-    if (!stillPending?.agentReleasePending || !activeTupleMatches(stillPending)) return false;
+    if (
+      !stillPending?.agentReleasePending ||
+      !activeTupleMatches(stillPending) ||
+      stillPending.agentReleaseOwnerInstanceId !== options.releaseOwnerInstanceId
+    ) {
+      return false;
+    }
     const completed: PersistedSession = {
       ...stillPending,
       agentGeneration: undefined,
       agentOwnerInstanceId: undefined,
       agentSessionId: undefined,
       agentReleasePending: undefined,
+      agentReleaseOwnerInstanceId: undefined,
       agentReleasedGeneration: expectedGeneration,
       agentReleasedOwnerInstanceId: stillPending.agentOwnerInstanceId,
       agentReleasedSessionId: stillPending.agentSessionId,
@@ -2427,6 +2511,7 @@ export class SessionManager implements AgentRuntimeProbe {
       agentOwnerInstanceId: existing?.agentOwnerInstanceId,
       agentSessionId: existing?.agentSessionId,
       agentReleasePending: existing?.agentReleasePending,
+      agentReleaseOwnerInstanceId: existing?.agentReleaseOwnerInstanceId,
       agentReleasedGeneration: existing?.agentReleasedGeneration,
       agentReleasedOwnerInstanceId: existing?.agentReleasedOwnerInstanceId,
       agentReleasedSessionId: existing?.agentReleasedSessionId,

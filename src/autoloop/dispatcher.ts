@@ -476,6 +476,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     const released = await this.runtimeProbe.releaseReservation(generation.session_name, generation.generation, {
       expectedOwnerInstanceId: generation.owner_instance_id,
       expectedSessionId: generation.session_id,
+      releaseOwnerInstanceId: this.ownerInstanceId,
       beforeRelease: () => {
         const current = exactCurrentGeneration();
         if (orphaned && current.state !== 'orphaned' && current.state !== 'released') {
@@ -547,6 +548,8 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       state: 'orphaned',
     };
     const released = await this.runtimeProbe.releaseReservation(sessionName, 0, {
+      expectedOwnerInstanceId: legacy.owner_instance_id,
+      releaseOwnerInstanceId: this.ownerInstanceId,
       beforeRelease: () => {
         const current = this.currentGeneration(role);
         if (!current) this.appendGenerationEvent('agent_generation_orphaned', legacy);
@@ -638,7 +641,11 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     try {
       this.appendGenerationEvent('agent_generation_reserved', generation);
     } catch (err) {
-      await this.runtimeProbe.releaseReservation(generation.session_name, generation.generation);
+      await this.runtimeProbe.releaseReservation(generation.session_name, generation.generation, {
+        expectedOwnerInstanceId: generation.owner_instance_id,
+        expectedSessionId: generation.session_id,
+        rollbackUncommittedReservation: true,
+      });
       throw err;
     }
     return { generation, reuseLiveSession: false };
