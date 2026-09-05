@@ -3,7 +3,12 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { applyPlannerToolCalls, parsePlannerReply, type PlannerToolEffects } from '../autoloop/planner-tools.js';
+import {
+  applyPlannerToolCalls,
+  parsePlannerReply,
+  validatePlannerToolCalls,
+  type PlannerToolEffects,
+} from '../autoloop/planner-tools.js';
 import type { AnyAutoloopMessage } from '../autoloop/messages.js';
 
 function makeMockEffects(): {
@@ -269,6 +274,29 @@ describe('applyPlannerToolCalls', () => {
     expect(policyDelta.on_iter_done_ok).toEqual({ level: 'info', channel: 'wechat' });
   });
 
+  it('rejects a silence-only critical policy control at the shared validate/apply boundary', async () => {
+    const control = {
+      tool: 'update_push_policy' as const,
+      args: { on_phase_error: { silent: true } },
+    };
+
+    const validation = validatePlannerToolCalls([control]);
+    expect(validation.calls).toEqual([]);
+    expect(validation.errors).toEqual([
+      expect.objectContaining({
+        tool: 'update_push_policy',
+        error: expect.stringContaining('critical policy silence'),
+      }),
+    ]);
+
+    const { fx, calls, policyDelta } = makeMockEffects();
+    const applied = await applyPlannerToolCalls([control], fx, 0);
+    expect(applied.emitted_messages).toEqual([]);
+    expect(applied.errors).toEqual(validation.errors);
+    expect(calls).toEqual([]);
+    expect(policyDelta).toEqual({});
+  });
+
   it('records error for unknown tool names without throwing', async () => {
     const { fx } = makeMockEffects();
     const r = await applyPlannerToolCalls([{ tool: 'nonsense' as 'notify_user', args: {} }], fx, 0);
@@ -297,6 +325,35 @@ describe('applyPlannerToolCalls', () => {
     expect(writes[0].msg).toBe('first plan');
   });
 
+  it.each([
+    {
+      tool: 'write_plan' as const,
+      file: 'plan.md' as const,
+      content: '# Canonical plan',
+      commitMessage: 'autoloop: planner writes plan.md',
+    },
+    {
+      tool: 'write_goal' as const,
+      file: 'goal.json' as const,
+      content: '{"gates":[]}',
+      commitMessage: 'autoloop: planner writes goal.json',
+    },
+  ])(
+    'canonicalizes an omitted $tool commit_message before persistence and effect application',
+    async ({ tool, file, content, commitMessage }) => {
+      const control = { tool, args: { content } };
+      const validation = validatePlannerToolCalls([control]);
+      expect(validation.errors).toEqual([]);
+      expect(validation.calls).toEqual([{ tool, args: { commit_message: commitMessage, content } }]);
+      expect(JSON.parse(validation.controls_json ?? 'null')).toEqual(validation.calls);
+
+      const { fx, writes } = makeMockEffects();
+      const applied = await applyPlannerToolCalls([control], fx, 0);
+      expect(applied.errors).toEqual([]);
+      expect(writes).toEqual([{ file, content, msg: commitMessage }]);
+    },
+  );
+
   it('write_goal validates JSON before delegating to the effect', async () => {
     const { fx, writes } = makeMockEffects();
     const ok = await applyPlannerToolCalls(
@@ -312,6 +369,26 @@ describe('applyPlannerToolCalls', () => {
     expect(bad.errors).toHaveLength(1);
     expect(bad.errors[0].error).toMatch(/not valid JSON/);
     expect(writes).toHaveLength(1); // unchanged — bad call must not write
+  });
+
+  it.each([
+    { label: 'null', content: 'null' },
+    { label: 'array', content: '[]' },
+    { label: 'string', content: '"goal"' },
+    { label: 'number', content: '42' },
+    { label: 'boolean', content: 'true' },
+  ])('rejects a $label write_goal payload before any effect', async ({ content }) => {
+    const { fx, writes } = makeMockEffects();
+    const result = await applyPlannerToolCalls([{ tool: 'write_goal', args: { content } }], fx, 0);
+
+    expect(result.emitted_messages).toEqual([]);
+    expect(result.errors).toEqual([
+      expect.objectContaining({
+        tool: 'write_goal',
+        error: expect.stringContaining('plain JSON object'),
+      }),
+    ]);
+    expect(writes).toEqual([]);
   });
 
   it('write_plan rejects empty content (would erase plan.md)', async () => {

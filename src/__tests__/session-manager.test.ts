@@ -3912,7 +3912,7 @@ describe('SessionManager', () => {
           })),
           {
             tool: 'notify_user',
-            args: { summary: 's'.repeat(metadataLimit), detail: 'd'.repeat(7_791) },
+            args: { summary: 's'.repeat(metadataLimit), detail: 'd'.repeat(7_739) },
           },
         ];
         const exact = validatePlannerToolCalls(exactBatch);
@@ -4280,8 +4280,14 @@ describe('SessionManager', () => {
           .split('\n')
           .map((line) => JSON.parse(line) as { kind: string; payload: { controls?: PlannerToolCall[] } });
         expect(decisions.find((row) => row.kind === 'planner_turn_control')?.payload.controls).toEqual([
-          { tool: 'write_plan', args: { content: planContent } },
-          { tool: 'write_goal', args: { content: goalContent } },
+          {
+            tool: 'write_plan',
+            args: { commit_message: 'autoloop: planner writes plan.md', content: planContent },
+          },
+          {
+            tool: 'write_goal',
+            args: { commit_message: 'autoloop: planner writes goal.json', content: goalContent },
+          },
         ]);
       });
 
@@ -4745,7 +4751,13 @@ describe('SessionManager', () => {
             .map((line) => JSON.parse(line) as { kind: string; payload: Record<string, unknown> });
           expect(decisions.find((row) => row.kind === 'planner_turn_control')?.payload.controls).toEqual([
             { tool: 'spawn_subagents', args: {} },
-            { tool: 'write_plan', args: { content: '# Approved plan' } },
+            {
+              tool: 'write_plan',
+              args: {
+                content: '# Approved plan',
+                commit_message: 'autoloop: planner writes plan.md',
+              },
+            },
           ]);
           expect(decisions.filter((row) => row.kind === 'spawn_subagents')).toHaveLength(1);
           expect(mockSessions).toHaveLength(3);
@@ -6580,6 +6592,32 @@ describe('SessionManager', () => {
         ).toEqual([]);
       });
 
+      it('surfaces a resumed parked-chat delivery failure after its original sender already settled', async () => {
+        const runId = 'planner-resumed-parked-delivery-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        await handle.runner.send(AutoloopMsg.pause(0, { reason: 'operator-review' }));
+
+        await expect(mgr.autoloopChat(runId, 'park before failing on resume')).rejects.toMatchObject({
+          code: 'AUTOLOOP_RUN_PAUSED',
+          retryable: false,
+        });
+        const surfaced: Error[] = [];
+        handle.runner.on('error', (error: Error) => surfaced.push(error));
+        const delivery = vi
+          .spyOn(handle.dispatcher, 'deliver')
+          .mockRejectedValueOnce(new Error('resumed parked chat delivery failed'));
+
+        try {
+          await expect(handle.runner.send(AutoloopMsg.resume(0))).resolves.toBeUndefined();
+          expect(delivery).toHaveBeenCalledTimes(1);
+          expect(surfaced.map(({ message }) => message)).toEqual(['resumed parked chat delivery failed']);
+        } finally {
+          delivery.mockRestore();
+        }
+      });
+
       it('does not attribute an older send-timeout dispatch to a newly parked chat', async () => {
         const runId = 'planner-chat-behind-timeout';
         const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
@@ -7071,6 +7109,36 @@ describe('SessionManager', () => {
         },
       );
 
+      it('does not let an ordinary push deduplicate a mandatory critical policy emission', async () => {
+        const runId = 'planner-critical-policy-dedup-origin';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const pushes: Array<{ level: string; summary: string; channel: string }> = [];
+        handle.runner.on('push', (payload: { level: string; summary: string; channel: string }) =>
+          pushes.push(payload),
+        );
+
+        await handle.runner.send(
+          AutoloopMsg.pushUser(7, {
+            level: 'error',
+            summary: '[on_phase_error] iter 7',
+            channel: 'auto',
+          }),
+        );
+        await (
+          handle.runner as unknown as {
+            firePolicyPush(rule: 'on_phase_error', iter: number): Promise<void>;
+          }
+        ).firePolicyPush('on_phase_error', 7);
+
+        expect(pushes).toEqual([
+          { level: 'error', summary: '[on_phase_error] iter 7', channel: 'auto' },
+          { level: 'error', summary: '[on_phase_error] iter 7', channel: 'both' },
+        ]);
+        expect(handle.runner.state.push_log_count).toBe(2);
+      });
+
       it.each([
         {
           key: 'on_start' as const,
@@ -7270,6 +7338,8 @@ describe('SessionManager', () => {
             tool: 'spawn_subagents',
             args: { initial_directive: { goal: 'default initial directive' } },
           },
+          { tool: 'write_plan', args: { content: '# Canonical plan' } },
+          { tool: 'write_goal', args: { content: '{"gates":[]}' } },
         ]);
 
         expect(validation.errors).toEqual([]);
@@ -7293,8 +7363,156 @@ describe('SessionManager', () => {
               },
             },
           },
+          {
+            tool: 'write_plan',
+            args: { commit_message: 'autoloop: planner writes plan.md', content: '# Canonical plan' },
+          },
+          {
+            tool: 'write_goal',
+            args: { commit_message: 'autoloop: planner writes goal.json', content: '{"gates":[]}' },
+          },
         ]);
         expect(JSON.parse(validation.controls_json ?? 'null')).toEqual(validation.calls);
+      });
+
+      it('persists the same omitted defaults that real Planner chat emits and applies', async () => {
+        const runId = 'planner-durable-default-effect-equality';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const expectedControls: PlannerToolCall[] = [
+          {
+            tool: 'notify_user',
+            args: { channel: 'auto', level: 'info', summary: 'defaulted notification' },
+          },
+          {
+            tool: 'spawn_subagents',
+            args: {
+              initial_directive: {
+                constraints: [],
+                goal: 'defaulted initial directive',
+                max_attempts: 1,
+                success_criteria: [],
+              },
+            },
+          },
+          {
+            tool: 'send_directive',
+            args: {
+              constraints: [],
+              goal: 'defaulted follow-up directive',
+              max_attempts: 1,
+              success_criteria: [],
+            },
+          },
+        ];
+        let plannerTurn = 0;
+        mockSessions[0].sendImplementation = async () => {
+          plannerTurn += 1;
+          const text =
+            plannerTurn === 1
+              ? [
+                  '```autoloop',
+                  '{"tool":"notify_user","args":{"summary":"defaulted notification"}}',
+                  '```',
+                  '```autoloop',
+                  '{"tool":"spawn_subagents","args":{"initial_directive":{"goal":"defaulted initial directive"}}}',
+                  '```',
+                  '```autoloop',
+                  '{"tool":"send_directive","args":{"goal":"defaulted follow-up directive"}}',
+                  '```',
+                ].join('\n')
+              : 'follow-up acknowledgement';
+          return { text, event: { type: 'result', result: text } };
+        };
+        const pushes: Array<Record<string, unknown>> = [];
+        const directives: Array<Record<string, unknown>> = [];
+        handle.runner.on('push', (payload: Record<string, unknown>) => pushes.push(payload));
+        handle.runner.on('message', (message: { type?: string; from?: string; payload?: Record<string, unknown> }) => {
+          if (message.type === 'directive' && message.from === 'planner' && message.payload) {
+            directives.push(message.payload);
+          }
+        });
+        const spawnImplementation = handle.dispatcher.spawnSubagents.bind(handle.dispatcher);
+        let spawnEffect: unknown;
+        const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents').mockImplementation(async (args) => {
+          spawnEffect = JSON.parse(JSON.stringify(args));
+          await spawnImplementation(args);
+        });
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'apply every deterministic default')).resolves.toMatchObject({
+            reply: expect.stringContaining('notify_user'),
+          });
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string; payload: { controls?: PlannerToolCall[] } });
+          expect(decisions.find((row) => row.kind === 'planner_turn_control')?.payload.controls).toEqual(
+            expectedControls,
+          );
+          expect(spawnEffect).toEqual(expectedControls[1].args);
+          expect(pushes).toEqual([
+            { level: 'info', summary: 'defaulted notification', detail: undefined, channel: 'auto' },
+          ]);
+          expect(directives).toEqual([expectedControls[1].args.initial_directive, expectedControls[2].args]);
+        } finally {
+          spawn.mockRestore();
+        }
+      });
+
+      it('persists omitted artifact commit defaults identical to the real git effects', async () => {
+        const runId = 'planner-durable-artifact-commit-defaults';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        initializeGitWorkspace(workspace);
+        await mgr.autoloopStart({ runId, workspace });
+        const planContent = '# Durable default plan';
+        const goalContent = '{"gates":[]}';
+        mockSessions[0].sendImplementation = async () => ({
+          text: [
+            '```autoloop',
+            JSON.stringify({ tool: 'write_plan', args: { content: planContent } }),
+            '```',
+            '```autoloop',
+            JSON.stringify({ tool: 'write_goal', args: { content: goalContent } }),
+            '```',
+          ].join('\n'),
+          event: { type: 'result', result: 'persist artifact defaults' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'persist deterministic artifact defaults')).resolves.toMatchObject({
+          reply: expect.stringContaining('write_plan, write_goal'),
+        });
+
+        const expectedControls: PlannerToolCall[] = [
+          {
+            tool: 'write_plan',
+            args: {
+              commit_message: 'autoloop: planner writes plan.md',
+              content: planContent,
+            },
+          },
+          {
+            tool: 'write_goal',
+            args: {
+              commit_message: 'autoloop: planner writes goal.json',
+              content: goalContent,
+            },
+          },
+        ];
+        const decisions = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { controls?: PlannerToolCall[] } });
+        expect(decisions.find((row) => row.kind === 'planner_turn_control')?.payload.controls).toEqual(
+          expectedControls,
+        );
+        expect(runGit(workspace, 'log', '-2', '--format=%s').trim().split('\n')).toEqual([
+          String(expectedControls[1].args.commit_message),
+          String(expectedControls[0].args.commit_message),
+        ]);
       });
 
       it.each(['pause_loop', 'terminate'] as const)(

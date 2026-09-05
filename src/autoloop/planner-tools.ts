@@ -185,6 +185,10 @@ function boundedPlannerContent(value: unknown, label: 'write_plan content' | 'wr
   return nonEmptyString(value, label, MAX_PLANNER_CONTROL_CONTENT_BYTES);
 }
 
+function defaultArtifactCommitMessage(file: 'plan.md' | 'goal.json'): string {
+  return `autoloop: planner writes ${file}`;
+}
+
 function optionalString(value: unknown, label: string): string | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== 'string') throw new Error(`${label} must be a string`);
@@ -365,24 +369,30 @@ function sanitizePlannerToolCall(call: PlannerToolCall, blockedPolicySilence: st
     case 'write_plan': {
       const content = boundedPlannerContent(raw.content, 'write_plan content');
       const commitMessage =
-        raw.commit_message === undefined ? undefined : nonEmptyString(raw.commit_message, 'write_plan commit_message');
+        raw.commit_message === undefined
+          ? defaultArtifactCommitMessage('plan.md')
+          : nonEmptyString(raw.commit_message, 'write_plan commit_message');
       return {
         tool: call.tool,
-        args: commitMessage === undefined ? { content } : { content, commit_message: commitMessage },
+        args: { content, commit_message: commitMessage },
       };
     }
     case 'write_goal': {
       const content = boundedPlannerContent(raw.content, 'write_goal content');
+      let parsed: unknown;
       try {
-        JSON.parse(content);
+        parsed = JSON.parse(content);
       } catch (error) {
         throw new Error(`write_goal content is not valid JSON: ${(error as Error).message}`);
       }
+      if (!isPlainObject(parsed)) throw new Error('write_goal content must encode a plain JSON object');
       const commitMessage =
-        raw.commit_message === undefined ? undefined : nonEmptyString(raw.commit_message, 'write_goal commit_message');
+        raw.commit_message === undefined
+          ? defaultArtifactCommitMessage('goal.json')
+          : nonEmptyString(raw.commit_message, 'write_goal commit_message');
       return {
         tool: call.tool,
-        args: commitMessage === undefined ? { content } : { content, commit_message: commitMessage },
+        args: { content, commit_message: commitMessage },
       };
     }
     default:
@@ -480,6 +490,18 @@ export function validatePlannerToolCalls(calls: readonly PlannerToolCall[]): Pla
     }
   }
   if (errors.length > 0) return { calls: [], errors, blocked_policy_silence: [] };
+  if (validated.length === 0 && blockedPolicySilence.length > 0) {
+    return {
+      calls: [],
+      errors: [
+        {
+          tool: 'update_push_policy',
+          error: 'Planner control batch cannot contain only prohibited critical policy silence',
+        },
+      ],
+      blocked_policy_silence: blockedPolicySilence,
+    };
+  }
 
   // Keep an exact final check at the acceptance boundary even though the
   // incremental accounting above is exact. This protects future changes to

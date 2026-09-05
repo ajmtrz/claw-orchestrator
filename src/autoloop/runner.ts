@@ -132,6 +132,8 @@ export class AutoloopRunner extends EventEmitter {
   private rejectStreak = 0;
   /** Recent push events for dedup (5 min window). */
   private recentPushes: Array<{ key: string; ts: number }> = [];
+  /** Internal mandatory policy emissions must not collide with ordinary pushes. */
+  private readonly mandatoryPolicyPushes = new WeakSet<object>();
   private stallTimer: ReturnType<typeof setInterval> | null = null;
   private activityLeaseTimer: ReturnType<typeof setTimeout> | null = null;
   private hardDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
@@ -559,7 +561,7 @@ export class AutoloopRunner extends EventEmitter {
           this.enqueueMessage(phaseError, sender, true);
         } else {
           this.failSender(sender, error);
-          if (!sender) this.emit('error', error instanceof Error ? error : new Error(String(error)));
+          if (!sender || sender.settled) this.emit('error', error instanceof Error ? error : new Error(String(error)));
         }
       } finally {
         this.completeSenderMessage(sender);
@@ -774,10 +776,11 @@ export class AutoloopRunner extends EventEmitter {
     const p = env.payload;
     const key = `${p.level}:${p.summary}`;
     const now = Date.now();
+    const mandatoryPolicyPush = this.mandatoryPolicyPushes.has(env);
     // 5 min dedup
     this.recentPushes = this.recentPushes.filter((r) => now - r.ts < 5 * 60_000);
-    if (this.recentPushes.some((r) => r.key === key)) return;
-    this.recentPushes.push({ key, ts: now });
+    if (!mandatoryPolicyPush && this.recentPushes.some((r) => r.key === key)) return;
+    if (!mandatoryPolicyPush) this.recentPushes.push({ key, ts: now });
 
     this.state.push_log_count++;
     this.emit('push', { level: p.level, summary: p.summary, detail: p.detail, channel: p.channel });
@@ -805,14 +808,13 @@ export class AutoloopRunner extends EventEmitter {
     const summary = `[${rule}] iter ${iter}`;
     // We synthesise a push_user envelope as if Planner had asked for it, so
     // dedup + push_log book-keeping go through the same path.
-    this.enqueueMessage(
-      Msg.pushUser(iter, {
-        level,
-        summary,
-        channel,
-      }),
-      sender,
-    );
+    const message = Msg.pushUser(iter, {
+      level,
+      summary,
+      channel,
+    });
+    if (critical) this.mandatoryPolicyPushes.add(message);
+    this.enqueueMessage(message, sender);
     // When firePolicyPush is called from outside a running drain (e.g. the
     // stall-detector interval), the queued message would otherwise sit until
     // the next send(). Kick the drain — the re-entrancy guard makes this safe

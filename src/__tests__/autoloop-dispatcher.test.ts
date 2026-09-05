@@ -290,7 +290,7 @@ describe('Planner durable control content bounds', () => {
   const EXPECTED_MAX_PLANNER_CONTROL_CONTENT_BYTES = 1_048_576;
 
   function contentOfBytes(tool: 'write_plan' | 'write_goal', bytes: number): string {
-    return tool === 'write_goal' ? JSON.stringify('a'.repeat(bytes - 2)) : 'a'.repeat(bytes);
+    return tool === 'write_goal' ? JSON.stringify({ goal: 'a'.repeat(bytes - 11) }) : 'a'.repeat(bytes);
   }
 
   it.each(['write_plan', 'write_goal'] as const)('accepts %s content at the exact UTF-8 byte bound', (tool) => {
@@ -300,7 +300,15 @@ describe('Planner durable control content bounds', () => {
 
     expect(Buffer.byteLength(content, 'utf8')).toBe(EXPECTED_MAX_PLANNER_CONTROL_CONTENT_BYTES);
     expect(validation.errors).toEqual([]);
-    expect(validation.calls).toEqual([{ tool, args: { content } }]);
+    expect(validation.calls).toEqual([
+      {
+        tool,
+        args: {
+          content,
+          commit_message: `autoloop: planner writes ${tool === 'write_plan' ? 'plan.md' : 'goal.json'}`,
+        },
+      },
+    ]);
   });
 
   it.each(['write_plan', 'write_goal'] as const)('rejects %s content one UTF-8 byte over the bound', (tool) => {
@@ -1574,7 +1582,7 @@ describe('ClaudeAgentDispatcher — updatePushPolicy guard', () => {
   });
 
   it.each(['on_phase_error', 'on_decision_needed'] as const)(
-    'classifies a prohibited silence-only %s control as non-retryable malformed input and audits the refusal',
+    'classifies a prohibited silence-only %s control as non-retryable malformed input before durable persistence',
     async (key) => {
       const policyRef: PushPolicy = JSON.parse(JSON.stringify(DEFAULT_PUSH_POLICY));
       const policyBefore = JSON.stringify(policyRef);
@@ -1590,7 +1598,7 @@ describe('ClaudeAgentDispatcher — updatePushPolicy guard', () => {
       await expect(dispatcher.deliver(Msg.chat(0, { text: 'do not silence critical policy' }))).rejects.toMatchObject({
         code: 'AUTOLOOP_CONTROL_MALFORMED',
         retryable: false,
-        message: expect.stringContaining('only a prohibited critical policy-silence control'),
+        message: expect.stringContaining('cannot contain only prohibited critical policy silence'),
       });
 
       expect(JSON.stringify(policyRef)).toBe(policyBefore);
@@ -1600,7 +1608,7 @@ describe('ClaudeAgentDispatcher — updatePushPolicy guard', () => {
         .split('\n')
         .map((line) => JSON.parse(line) as { kind: string; payload: Record<string, unknown> });
       expect(lines.filter((line) => line.kind === 'planner_turn_control')).toEqual([]);
-      expect(lines.find((line) => line.kind === 'policy_silence_blocked')?.payload).toEqual({ keys: [key] });
+      expect(lines.filter((line) => line.kind === 'policy_silence_blocked')).toEqual([]);
       expect(lines.filter((line) => line.kind === 'update_push_policy')).toEqual([]);
       expect(decisionText).not.toContain('"silent":true');
       expect(surfacedReplies).toEqual([]);
