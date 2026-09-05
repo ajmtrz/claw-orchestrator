@@ -319,9 +319,10 @@ describe('AutoloopRunner', () => {
     // A decision-level push should be emitted before terminate.
     const decisionPush = pushes.find((p) => p.level === 'decision' && p.summary.includes('phase-error circuit'));
     expect(decisionPush).toBeDefined();
-    // An on_phase_error policy push fires for each error too.
+    // Every mandatory on_phase_error policy push fires; ordinary dedup must not
+    // collapse any of the three identical summaries.
     const errorPushes = pushes.filter((p) => p.summary.includes('on_phase_error'));
-    expect(errorPushes.length).toBeGreaterThanOrEqual(1); // dedup may collapse to 1
+    expect(errorPushes).toHaveLength(3);
     runner.stop();
   });
 

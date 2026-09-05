@@ -6592,7 +6592,7 @@ describe('SessionManager', () => {
         ).toEqual([]);
       });
 
-      it('surfaces a resumed parked-chat delivery failure after its original sender already settled', async () => {
+      it('contains a soft-resume parked Planner delivery failure without an error listener', async () => {
         const runId = 'planner-resumed-parked-delivery-failure';
         const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
         await mgr.autoloopStart({ runId, workspace });
@@ -6603,17 +6603,122 @@ describe('SessionManager', () => {
           code: 'AUTOLOOP_RUN_PAUSED',
           retryable: false,
         });
-        const surfaced: Error[] = [];
-        handle.runner.on('error', (error: Error) => surfaced.push(error));
+        const phaseErrors: PhaseErrorPayload[] = [];
+        const pushes: Array<{ summary: string }> = [];
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => unhandled.push(reason);
+        handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+        handle.runner.on('push', (payload: { summary: string }) => pushes.push(payload));
+        process.on('unhandledRejection', onUnhandled);
+        expect(handle.runner.listenerCount('error')).toBe(0);
         const delivery = vi
           .spyOn(handle.dispatcher, 'deliver')
           .mockRejectedValueOnce(new Error('resumed parked chat delivery failed'));
 
         try {
           await expect(handle.runner.send(AutoloopMsg.resume(0))).resolves.toBeUndefined();
+          await new Promise<void>((resolve) => nativeSetImmediate(resolve));
           expect(delivery).toHaveBeenCalledTimes(1);
-          expect(surfaced.map(({ message }) => message)).toEqual(['resumed parked chat delivery failed']);
+          expect(unhandled).toEqual([]);
+          expect(phaseErrors).toEqual([
+            {
+              agent: 'planner',
+              phase: 'planner_turn',
+              code: 'AUTOLOOP_ENGINE_FAILURE',
+              error: 'Planner engine transport failed: resumed parked chat delivery failed',
+            },
+          ]);
+          expect(pushes.map(({ summary }) => summary)).toEqual(['[on_phase_error] iter 0']);
+          expect(handle.runner.state).toMatchObject({
+            status: 'running',
+            consecutive_phase_errors: 1,
+            recent_phase_errors: [expect.objectContaining({ code: 'AUTOLOOP_ENGINE_FAILURE' })],
+            push_log_count: 1,
+          });
+          const pushRows = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'push_log.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { summary: string });
+          expect(pushRows).toEqual([expect.objectContaining({ summary: '[on_phase_error] iter 0' })]);
         } finally {
+          process.off('unhandledRejection', onUnhandled);
+          delivery.mockRestore();
+        }
+      });
+
+      it('contains a timeout-resume parked Planner delivery failure without an unhandled rejection', async () => {
+        const runId = 'planner-timeout-resumed-parked-delivery-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({
+          runId,
+          workspace,
+          sendTimeoutMs: 600_000,
+          activityLeaseMs: 1_800_000,
+          autoloopHardTimeoutMs: 86_400_000,
+        });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => {
+          mockSessions[0].sendImplementation = undefined;
+          throw new Error('Timeout waiting for response');
+        };
+        await expect(mgr.autoloopChat(runId, 'establish the timed-out Planner dispatch')).rejects.toMatchObject({
+          code: 'AUTOLOOP_SEND_TIMEOUT',
+          retryable: true,
+        });
+        const pending = handle.runner.state.pending_dispatch!;
+        await expect(mgr.autoloopChat(runId, 'park after the timed-out dispatch')).rejects.toMatchObject({
+          code: 'AUTOLOOP_RUN_PAUSED',
+          retryable: false,
+        });
+
+        const phaseErrors: PhaseErrorPayload[] = [];
+        const pushes: Array<{ summary: string }> = [];
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => unhandled.push(reason);
+        handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+        handle.runner.on('push', (payload: { summary: string }) => pushes.push(payload));
+        process.on('unhandledRejection', onUnhandled);
+        expect(handle.runner.listenerCount('error')).toBe(0);
+        const delivery = vi
+          .spyOn(handle.dispatcher, 'deliver')
+          .mockRejectedValueOnce(new Error('timeout-resumed parked chat delivery failed'));
+
+        try {
+          await expect(
+            mgr.autoloopResume(runId, {
+              sendTimeoutMs: 700_000,
+              pendingDispatchId: pending.dispatch_id,
+            }),
+          ).resolves.toMatchObject({ status: 'running', pending_dispatch: null });
+          await vi.waitFor(() => expect(handle.runner.state.push_log_count).toBe(1));
+          await new Promise<void>((resolve) => nativeSetImmediate(resolve));
+
+          expect(delivery).toHaveBeenCalledTimes(1);
+          expect(unhandled).toEqual([]);
+          expect(phaseErrors).toEqual([
+            {
+              agent: 'planner',
+              phase: 'planner_turn',
+              code: 'AUTOLOOP_ENGINE_FAILURE',
+              error: 'Planner engine transport failed: timeout-resumed parked chat delivery failed',
+            },
+          ]);
+          expect(pushes.map(({ summary }) => summary)).toEqual(['[on_phase_error] iter 0']);
+          expect(handle.runner.state).toMatchObject({
+            status: 'running',
+            consecutive_phase_errors: 1,
+            recent_phase_errors: [expect.objectContaining({ code: 'AUTOLOOP_ENGINE_FAILURE' })],
+            push_log_count: 1,
+          });
+          const pushRows = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'push_log.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { summary: string });
+          expect(pushRows).toEqual([expect.objectContaining({ summary: '[on_phase_error] iter 0' })]);
+        } finally {
+          process.off('unhandledRejection', onUnhandled);
           delivery.mockRestore();
         }
       });

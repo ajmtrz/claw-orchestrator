@@ -70,6 +70,18 @@ function isPlannerOperationFailure(error: unknown): error is PlannerOperationFai
   );
 }
 
+function normalisePlannerOperationFailure(error: unknown): PlannerOperationFailure {
+  if (isPlannerOperationFailure(error)) return error;
+  const cause = error instanceof Error ? error : new Error(String(error));
+  const failure = new Error(`Planner engine transport failed: ${cause.message}`, {
+    cause,
+  }) as PlannerOperationFailure & { retryable: true };
+  failure.name = 'AutoloopOperationError';
+  failure.code = 'AUTOLOOP_ENGINE_FAILURE';
+  failure.retryable = true;
+  return failure;
+}
+
 function preserveSecondaryPlannerFailure(primary: PlannerOperationFailure, secondary: unknown): void {
   const error = secondary instanceof Error ? secondary : new Error(String(secondary));
   (primary.secondaryErrors ??= []).push(error);
@@ -550,13 +562,14 @@ export class AutoloopRunner extends EventEmitter {
       try {
         await this.handleOne(env, sender);
       } catch (error) {
-        if (env.to === 'planner' && isPlannerOperationFailure(error)) {
-          this.failSender(sender, error);
+        if (env.to === 'planner') {
+          const plannerFailure = normalisePlannerOperationFailure(error);
+          this.failSender(sender, plannerFailure);
           const phaseError = Msg.phaseError(env.iter, {
             agent: 'planner',
             phase: 'planner_turn',
-            code: error.code,
-            error: error.message,
+            code: plannerFailure.code,
+            error: plannerFailure.message,
           });
           this.enqueueMessage(phaseError, sender, true);
         } else {
