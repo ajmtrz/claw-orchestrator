@@ -32,7 +32,7 @@ import { capturePatch, changedFilesSince } from '../verify/baseline.js';
 import { runContract } from '../verify/runner.js';
 import { writeEvidence } from '../verify/evidence.js';
 import type { AcceptanceContract } from '../verify/contract.js';
-import { type AnyAutoloopMessage, Msg, type SendTimeoutPayload } from './messages.js';
+import { type AnyAutoloopMessage, type AutoloopOperationErrorCode, Msg, type SendTimeoutPayload } from './messages.js';
 import {
   AutoloopAgentReleaseOwnerError,
   DEFAULT_ACTIVITY_LEASE_MS,
@@ -175,16 +175,6 @@ interface SendMessageResult {
   recoverable_timeout?: SendTimeoutPayload;
 }
 
-type AutoloopOperationErrorCode =
-  | 'AUTOLOOP_EMPTY_REPLY'
-  | 'AUTOLOOP_SESSION_NOT_CREATED'
-  | 'AUTOLOOP_ENGINE_FAILURE'
-  | 'AUTOLOOP_REQUIRED_TOOL_DENIED'
-  | 'AUTOLOOP_CONTROL_MALFORMED'
-  | 'AUTOLOOP_CONTROL_APPLICATION_FAILED'
-  | 'AUTOLOOP_CONTROL_NOT_PERSISTED'
-  | 'AUTOLOOP_RESET_POSTCONDITION_FAILED';
-
 export class AutoloopOperationError extends Error {
   readonly retryable = true;
 
@@ -242,6 +232,23 @@ interface PlannerControlEvidence {
   tools: PlannerToolName[];
   controls: PlannerToolCall[];
   controls_sha256: string;
+}
+
+function normalizePlannerControlValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(normalizePlannerControlValue);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .map(([key, entry]) => [key, normalizePlannerControlValue(entry)]),
+  );
+}
+
+function normalizePlannerControls(controls: readonly PlannerToolCall[]): PlannerToolCall[] {
+  return controls.map(({ tool, args }) => ({
+    tool,
+    args: normalizePlannerControlValue(args) as Record<string, unknown>,
+  }));
 }
 
 function plannerControlEvidenceMatches(
@@ -607,7 +614,11 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     };
   }
 
-  private async releaseGeneration(generation: PhysicalAgentGeneration, orphaned: boolean): Promise<void> {
+  private async releaseGeneration(
+    generation: PhysicalAgentGeneration,
+    orphaned: boolean,
+    onReleaseCommitted?: () => void,
+  ): Promise<void> {
     const exactCurrentGeneration = (): PhysicalAgentGeneration => {
       const current = this.currentGeneration(generation.role);
       if (
@@ -643,7 +654,10 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       },
       persistReleaseEvidence: () => {
         const current = exactCurrentGeneration();
-        if (current.state === 'released') return;
+        if (current.state === 'released') {
+          onReleaseCommitted?.();
+          return;
+        }
         if (orphaned && current.state !== 'orphaned') {
           this.conflict(
             'AUTOLOOP_AGENT_GENERATION_CONFLICT',
@@ -656,6 +670,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
           last_activity_at: observedAt,
           state: 'released',
         });
+        onReleaseCommitted?.();
       },
     });
     if (!released) {
@@ -934,11 +949,9 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
           const phaseError = Msg.phaseError(env.iter, {
             agent: 'planner',
             phase: 'planner_turn',
+            code: error.code,
             error: error.message,
           });
-          // `code` remains an internal extension until Task 3B widens and maps
-          // the public HTTP/MCP phase-error schema.
-          (phaseError.payload as unknown as Record<string, unknown>).code = error.code;
           return [phaseError];
         }
       }
@@ -1215,6 +1228,11 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     const previous = this.currentGeneration(agent);
     const priorStarted = this.roleStarted(agent);
     const priorReviewerPrompt = this.reviewerSessionPrompt;
+    let previousGenerationReleased = previous?.state === 'released';
+    if (previousGenerationReleased) {
+      this.setRoleStarted(agent, false);
+      if (agent === 'reviewer') this.reviewerSessionPrompt = null;
+    }
     this.appendDecisionLog({
       kind: 'reset_agent',
       actor: 'dispatcher',
@@ -1229,8 +1247,10 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     }
 
     const failure = (detail: string, cause?: unknown): AutoloopResetResult => {
-      this.setRoleStarted(agent, priorStarted);
-      if (agent === 'reviewer') this.reviewerSessionPrompt = priorReviewerPrompt;
+      if (!previousGenerationReleased) {
+        this.setRoleStarted(agent, priorStarted);
+        if (agent === 'reviewer') this.reviewerSessionPrompt = priorReviewerPrompt;
+      }
       return {
         ok: false,
         code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
@@ -1251,7 +1271,13 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         );
       }
 
-      if (previous && previous.state !== 'released') await this.releaseGeneration(previous, false);
+      if (previous && previous.state !== 'released') {
+        await this.releaseGeneration(previous, false, () => {
+          previousGenerationReleased = true;
+          this.setRoleStarted(agent, false);
+          if (agent === 'reviewer') this.reviewerSessionPrompt = null;
+        });
+      }
 
       const managerProbe = this.config.manager as SessionManager & {
         probeAgentNameReusable?: (sessionName: string, released?: PhysicalAgentGeneration) => boolean;
@@ -1286,8 +1312,8 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         }
       }
 
-      // Only now may in-memory lifecycle state change: physical absence, exact
-      // release, and authoritative name reusability have all been proved.
+      // With no durable prior generation, authoritative name reusability is
+      // the first point at which the legacy in-memory flag can be cleared.
       this.setRoleStarted(agent, false);
       if (agent === 'reviewer') this.reviewerSessionPrompt = null;
 
@@ -1769,7 +1795,8 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         await this.gitCommit(file, commitMessage ?? `autoloop: planner writes ${file}`);
       },
     };
-    const controlTools = parsed.calls.map(({ tool }) => tool);
+    const normalizedControls = normalizePlannerControls(parsed.calls);
+    const controlTools = normalizedControls.map(({ tool }) => tool);
     let persistedControl: PlannerControlEvidence | undefined;
     let expectedControl: PlannerTurnExpectation['expectedControl'];
     if (controlTools.length > 0) {
@@ -1780,7 +1807,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
           'Planner control could not be bound to a physical generation',
         );
       }
-      const controlsSha256 = createHash('sha256').update(JSON.stringify(parsed.calls)).digest('hex');
+      const controlsSha256 = createHash('sha256').update(JSON.stringify(normalizedControls)).digest('hex');
       expectedControl = {
         dispatch_id: dispatchId,
         message_id: env.msg_id,
@@ -1789,10 +1816,16 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         owner_instance_id: controlGeneration.owner_instance_id,
         session_id: controlGeneration.session_id,
         tools: controlTools,
-        controls: parsed.calls,
+        controls: normalizedControls,
         controls_sha256: controlsSha256,
       };
-      persistedControl = this.persistPlannerControls(env, dispatchId, controlGeneration, parsed.calls, controlsSha256);
+      persistedControl = this.persistPlannerControls(
+        env,
+        dispatchId,
+        controlGeneration,
+        normalizedControls,
+        controlsSha256,
+      );
     }
     assertPlannerTurnSucceeded(
       {
@@ -1810,7 +1843,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     // After iter_done(N) the run has advanced to iter N+1 in runner state;
     // any directive Planner emits in response targets the new iter.
     const nextIter = env.type === 'iter_done' ? env.iter + 1 : env.iter;
-    const handlerResult = await applyPlannerToolCalls(parsed.calls, effects, nextIter);
+    const handlerResult = await applyPlannerToolCalls(normalizedControls, effects, nextIter);
     for (const errEntry of handlerResult.errors) {
       this.logger.warn?.(`[autoloop] tool '${errEntry.tool}' failed: ${errEntry.error}`);
     }

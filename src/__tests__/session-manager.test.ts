@@ -21,6 +21,7 @@ import type {
   EffortLevel,
 } from '../types.js';
 import type { AgentReservationReleaseOptions, PhysicalAgentGeneration } from '../autoloop/types.js';
+import type { PhaseErrorPayload } from '../autoloop/messages.js';
 
 // ─── Mock ISession ──────────────────────────────────────────────────────────
 
@@ -3254,14 +3255,25 @@ describe('SessionManager', () => {
           text: '   ',
           event: { type: 'result', result: '   ' },
         });
+        const phaseErrors: PhaseErrorPayload[] = [];
+        handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
 
         await expect(mgr.autoloopChat(runId, 'return a reply')).rejects.toMatchObject({
           code: 'AUTOLOOP_EMPTY_REPLY',
         });
+        expect(phaseErrors).toEqual([
+          {
+            agent: 'planner',
+            phase: 'planner_turn',
+            code: 'AUTOLOOP_EMPTY_REPLY',
+            error: 'Planner transport completed without a non-empty logical reply',
+          },
+        ]);
         expect(handle.runner.state).toMatchObject({
           status: 'planning',
           iter: 0,
           subagents_spawned: false,
+          consecutive_phase_errors: 1,
         });
       });
 
@@ -3302,6 +3314,46 @@ describe('SessionManager', () => {
         expect(decisions.find((row) => row.kind === 'planner_turn_control')?.payload).toMatchObject({
           tools: ['update_push_policy'],
           controls: [{ tool: 'update_push_policy', args: { on_start: { level: 'info' } } }],
+        });
+      });
+
+      it('normalizes Planner control property order before digest, persistence, comparison, and application', async () => {
+        const runId = 'planner-control-semantic-order';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: [
+            '```autoloop',
+            '{"args":{"on_start":{"level":"info","channel":"auto"},"on_iter_done_ok":{"level":"warn","channel":"both"}},"tool":"update_push_policy"}',
+            '```',
+          ].join('\n'),
+          event: { type: 'result', result: 'control only' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'apply the approved policy')).resolves.toEqual({
+          reply: 'Planner controls persisted: update_push_policy',
+        });
+        const decisions = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: Record<string, unknown> });
+        expect(decisions.find((row) => row.kind === 'planner_turn_control')?.payload).toMatchObject({
+          controls: [
+            {
+              tool: 'update_push_policy',
+              args: {
+                on_iter_done_ok: { channel: 'both', level: 'warn' },
+                on_start: { channel: 'auto', level: 'info' },
+              },
+            },
+          ],
+          controls_sha256: '3f044aad5fc0d2583e26bb8f235c0b8a7ce53f35c0d500e947a7bb3fb4b055f4',
+        });
+        expect(handle.runner.config.push_policy).toMatchObject({
+          on_iter_done_ok: { channel: 'both', level: 'warn' },
+          on_start: { channel: 'auto', level: 'info' },
         });
       });
 
@@ -3420,6 +3472,28 @@ describe('SessionManager', () => {
         );
       });
 
+      it('rejects an empty Planner success even when phase-error event plumbing drops the code', async () => {
+        const runId = 'planner-empty-reply-lost-event';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: '',
+          event: { type: 'result', result: '' },
+        });
+        const originalEmit = handle.runner.emit;
+        vi.spyOn(handle.runner, 'emit').mockImplementation(function (eventName, ...args) {
+          if (eventName === 'phase_error') return false;
+          return originalEmit.call(handle.runner, eventName, ...args);
+        });
+
+        await expect(mgr.autoloopChat(runId, 'return a reply')).rejects.toMatchObject({
+          code: 'AUTOLOOP_EMPTY_REPLY',
+          retryable: true,
+        });
+        expect(handle.runner.state.consecutive_phase_errors).toBe(1);
+      });
+
       it('rejects a claimed control with no matching persisted event without advancing phase', async () => {
         const runId = 'planner-control-not-persisted';
         const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
@@ -3487,6 +3561,92 @@ describe('SessionManager', () => {
           appendFile.mockImplementation(appendImplementation);
         }
       });
+
+      const durableControlCorruptions: Array<{
+        label: string;
+        mutate: (payload: Record<string, unknown>) => void;
+      }> = [
+        {
+          label: 'complete controls',
+          mutate: (payload) => {
+            payload.controls = [{ tool: 'spawn_subagents', args: { coder_model: 'tampered-model' } }];
+          },
+        },
+        {
+          label: 'controls digest',
+          mutate: (payload) => {
+            payload.controls_sha256 = '0'.repeat(64);
+          },
+        },
+        {
+          label: 'owner identity',
+          mutate: (payload) => {
+            payload.owner_instance_id = 'session-manager:999999:00000000-0000-4000-8000-000000000000';
+          },
+        },
+        {
+          label: 'session identity',
+          mutate: (payload) => {
+            payload.session_id = '00000000-0000-4000-8000-000000000000';
+          },
+        },
+        {
+          label: 'dispatch identity',
+          mutate: (payload) => {
+            payload.dispatch_id = 'tampered-dispatch';
+          },
+        },
+        {
+          label: 'message identity',
+          mutate: (payload) => {
+            payload.message_id = 'tampered-message';
+          },
+        },
+      ];
+
+      it.each(durableControlCorruptions)(
+        'rejects durable Planner control corruption in $label before effects',
+        async ({ label, mutate }) => {
+          const runId = `planner-control-corrupt-${label.replaceAll(' ', '-')}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          mockSessions[0].sendImplementation = async () => ({
+            text: ['starting agents', '```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+            event: { type: 'result', result: 'starting agents' },
+          });
+          const decisionsPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+          const appendFile = vi.mocked(fs.appendFileSync);
+          const appendImplementation = appendFile.getMockImplementation()!;
+          appendFile.mockImplementation(((file: unknown, data: unknown, ...args: unknown[]) => {
+            if (String(file) === decisionsPath && String(data).includes('"kind":"planner_turn_control"')) {
+              const row = JSON.parse(String(data)) as { payload: Record<string, unknown> };
+              mutate(row.payload);
+              return (appendImplementation as (...values: unknown[]) => unknown)(
+                file,
+                `${JSON.stringify(row)}\n`,
+                ...args,
+              );
+            }
+            return (appendImplementation as (...values: unknown[]) => unknown)(file, data, ...args);
+          }) as typeof fs.appendFileSync);
+
+          try {
+            await expect(mgr.autoloopChat(runId, 'start the approved implementation')).rejects.toMatchObject({
+              code: 'AUTOLOOP_CONTROL_NOT_PERSISTED',
+              retryable: true,
+            });
+            expect(mockSessions).toHaveLength(1);
+            expect(handle.runner.state).toMatchObject({
+              status: 'planning',
+              iter: 0,
+              subagents_spawned: false,
+            });
+          } finally {
+            appendFile.mockImplementation(appendImplementation);
+          }
+        },
+      );
 
       it('returns a structured reset failure when the exact reservation remains occupied', async () => {
         const runId = 'reset-reservation-occupied';
@@ -3557,7 +3717,52 @@ describe('SessionManager', () => {
         expect(roleState.reviewerSessionPrompt).toBe(priorPrompt);
       });
 
-      it('fails a production reusability probe without changing the released tombstone or Planner flag', async () => {
+      it('does not resurrect an exact generation when registry finalization fails after durable release', async () => {
+        const runId = 'reset-release-evidence-then-registry-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const roleState = handle.dispatcher as unknown as { plannerStarted: boolean };
+        vi.spyOn(mgr, 'releaseReservation').mockImplementationOnce(
+          async (_name, _generation, options: AgentReservationReleaseOptions) => {
+            options.beforeRelease?.();
+            options.persistReleaseEvidence?.();
+            throw new Error('registry finalization failed after release evidence');
+          },
+        );
+
+        await expect(handle.dispatcher.resetAgent('planner', { force: true })).resolves.toMatchObject({
+          ok: false,
+          code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+          previous_generation: 1,
+        });
+        expect(roleState.plannerStarted).toBe(false);
+        let generationRows = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { generation: number; state: string } });
+        expect(generationRows.at(-1)).toMatchObject({
+          kind: 'agent_generation_released',
+          payload: { generation: 1, state: 'released' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'continue after registry recovery')).resolves.toMatchObject({
+          reply: expect.any(String),
+        });
+        expect(roleState.plannerStarted).toBe(true);
+        generationRows = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { generation: number; state: string } });
+        expect(generationRows.at(-1)).toMatchObject({
+          kind: 'agent_generation_started',
+          payload: { generation: 2, state: 'live' },
+        });
+      });
+
+      it('fails a post-release reusability probe without resurrecting the released Planner generation', async () => {
         const runId = 'reset-probe-preserves-state';
         const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
         await mgr.autoloopStart({ runId, workspace });
@@ -3574,15 +3779,37 @@ describe('SessionManager', () => {
         const reservation = managerWithProbe.persistedSessions.get(plannerName);
 
         expect(result).toMatchObject({ ok: false, code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED' });
-        expect(roleState.plannerStarted).toBe(true);
         expect(reservation).toMatchObject({
           agentGeneration: undefined,
           agentReleasePending: undefined,
           agentReleasedGeneration: 1,
         });
+        expect(roleState.plannerStarted).toBe(false);
       });
 
-      it('restores the prior Planner started flag when eager restart fails', async () => {
+      it('clears released Reviewer state and its frozen prompt when a post-release probe fails', async () => {
+        const runId = 'reset-reviewer-post-release-probe';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        await handle.dispatcher.spawnSubagents();
+        const roleState = handle.dispatcher as unknown as {
+          reviewerStarted: boolean;
+          reviewerSessionPrompt: string | null;
+        };
+        const managerWithProbe = mgr as unknown as {
+          probeAgentNameReusable: (name: string, generation?: PhysicalAgentGeneration) => boolean;
+        };
+        managerWithProbe.probeAgentNameReusable = vi.fn(() => false);
+
+        const result = await handle.dispatcher.resetAgent('reviewer');
+
+        expect(result).toMatchObject({ ok: false, code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED' });
+        expect(roleState.reviewerStarted).toBe(false);
+        expect(roleState.reviewerSessionPrompt).toBeNull();
+      });
+
+      it('leaves a failed eager replacement released and permits a later exact-generation recovery', async () => {
         const runId = 'reset-eager-restart-fails';
         const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
         await mgr.autoloopStart({ runId, workspace });
@@ -3601,7 +3828,31 @@ describe('SessionManager', () => {
         const result = await handle.dispatcher.resetAgent('planner', { force: true, eagerRestart: true });
 
         expect(result).toMatchObject({ ok: false, code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED' });
+        expect(roleState.plannerStarted).toBe(false);
+        let generationRows = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { generation: number; state: string } });
+        expect(generationRows.at(-1)).toMatchObject({
+          kind: 'agent_generation_released',
+          payload: { generation: 2, state: 'released' },
+        });
+
+        patchCreateSession(mgr);
+        await expect(mgr.autoloopChat(runId, 'continue after replacement recovery')).resolves.toMatchObject({
+          reply: expect.any(String),
+        });
         expect(roleState.plannerStarted).toBe(true);
+        generationRows = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { generation: number; state: string } });
+        expect(generationRows.at(-1)).toMatchObject({
+          kind: 'agent_generation_started',
+          payload: { generation: 3, state: 'live' },
+        });
       });
 
       it('keeps the Planner started flag when reset liveness is unknown', async () => {
@@ -3632,6 +3883,79 @@ describe('SessionManager', () => {
         await expect(mgr.autoloopChat(runId, 'continue')).resolves.toMatchObject({ reply: expect.any(String) });
 
         const generationRows = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { generation: number; state: string } });
+        expect(generationRows.at(-1)).toMatchObject({
+          kind: 'agent_generation_started',
+          payload: { generation: 2, state: 'live' },
+        });
+      });
+
+      it('returns the live replacement generation after a successful eager reset', async () => {
+        const runId = 'reset-eager-restart-success';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+
+        await expect(
+          handle.dispatcher.resetAgent('planner', { force: true, eagerRestart: true }),
+        ).resolves.toMatchObject({
+          ok: true,
+          previous_generation: 1,
+          active_generation: 2,
+          reusable: true,
+        });
+        await expect(mgr.inspect(handle.dispatcher.sessionNames.planner)).resolves.toBe('live');
+        const generationRows = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { generation: number; state: string } });
+        expect(generationRows.at(-1)).toMatchObject({
+          kind: 'agent_generation_started',
+          payload: { generation: 2, state: 'live' },
+        });
+      });
+
+      it('retains an unproven eager replacement without duplicate startup and recovers when it proves live', async () => {
+        const runId = 'reset-eager-restart-liveness-unknown';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const roleState = handle.dispatcher as unknown as { plannerStarted: boolean };
+        const inspect = vi
+          .spyOn(mgr, 'inspect')
+          .mockResolvedValueOnce('absent')
+          .mockResolvedValueOnce('absent')
+          .mockResolvedValueOnce('unknown');
+
+        await expect(
+          handle.dispatcher.resetAgent('planner', { force: true, eagerRestart: true }),
+        ).resolves.toMatchObject({
+          ok: false,
+          code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+          previous_generation: 1,
+        });
+        expect(roleState.plannerStarted).toBe(true);
+        expect(mockSessions).toHaveLength(2);
+        let generationRows = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { generation: number; state: string } });
+        expect(generationRows.at(-1)).toMatchObject({
+          kind: 'agent_generation_started',
+          payload: { generation: 2, state: 'live' },
+        });
+
+        inspect.mockResolvedValue('live');
+        await expect(mgr.autoloopChat(runId, 'continue on the retained replacement')).resolves.toMatchObject({
+          reply: expect.any(String),
+        });
+        expect(mockSessions).toHaveLength(2);
+        generationRows = fs
           .readFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), 'utf8')
           .trim()
           .split('\n')
@@ -4106,7 +4430,17 @@ describe('SessionManager', () => {
             planner.sendImplementation = undefined;
             throw new Error('Timeout waiting for response');
           };
-          await mgr.autoloopChat(runId, 'one logical send that reaches its deadline');
+          await expect(mgr.autoloopChat(runId, 'one logical send that reaches its deadline')).rejects.toMatchObject({
+            code: 'AUTOLOOP_SEND_TIMEOUT',
+            retryable: true,
+            pending_dispatch: {
+              status: 'awaiting_resume',
+              agent: 'planner',
+              message_type: 'chat',
+              timeout_ms: 600_000,
+              dispatch_id: expect.stringMatching(/^dispatch_[a-f0-9]{64}$/),
+            },
+          });
 
           expect(planner.sendCalls).toHaveLength(1);
           expect(planner.sendCalls[0].options?.timeout).toBe(600_000);
@@ -4260,7 +4594,11 @@ describe('SessionManager', () => {
             }
 
             rejectSend(new Error('Timeout waiting for response'));
-            await chat;
+            await expect(chat).rejects.toMatchObject({
+              code: 'AUTOLOOP_RUN_TERMINAL',
+              retryable: false,
+              status_reason: terminalCause === 'hard timeout' ? 'hard_timeout_exceeded' : 'operator-stop-during-send',
+            });
 
             expect(handle.runner.state).toMatchObject({
               status: 'terminated',

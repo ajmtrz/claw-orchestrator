@@ -375,7 +375,13 @@ import {
   isRecoverableAgentOwnerInstanceId,
   validateAutoloopTimeoutConfig,
 } from './autoloop/types.js';
-import { Msg as AutoloopMsg, type PushChannel, type PushLevel, type SendTimeoutPayload } from './autoloop/messages.js';
+import {
+  Msg as AutoloopMsg,
+  type PhaseErrorPayload,
+  type PushChannel,
+  type PushLevel,
+  type SendTimeoutPayload,
+} from './autoloop/messages.js';
 import { appendPushLog, notifyUserFallbackChain } from './autoloop/notify.js';
 import { UltraappManager } from './ultraapp/manager.js';
 import { UltraappStore, defaultStoreRoot } from './ultraapp/store.js';
@@ -477,6 +483,19 @@ interface StoredAutoloopResumeContext {
 interface PreparedSendTimeoutMigrationAppend {
   fd: number;
   line: string;
+}
+
+class AutoloopChatStateError extends Error {
+  constructor(
+    readonly code: 'AUTOLOOP_SEND_TIMEOUT' | 'AUTOLOOP_RUN_TERMINAL',
+    message: string,
+    readonly retryable: boolean,
+    readonly pending_dispatch?: SendTimeoutPayload,
+    readonly status_reason?: string | null,
+  ) {
+    super(message);
+    this.name = 'AutoloopChatStateError';
+  }
 }
 
 function isSendTimeoutPayload(value: unknown): value is SendTimeoutPayload {
@@ -3970,10 +3989,10 @@ export class SessionManager implements AgentRuntimeProbe {
       if (typeof t === 'string') reply = t;
     };
     const onPhaseError = (...args: unknown[]) => {
-      const payload = args[0] as { agent?: unknown; code?: unknown; error?: unknown } | undefined;
-      if (payload?.agent !== 'planner' || payload.code !== 'AUTOLOOP_EMPTY_REPLY') return;
+      const payload = args[0] as PhaseErrorPayload | undefined;
+      if (payload?.agent !== 'planner' || !payload.code) return;
       plannerFailure = new AutoloopOperationError(
-        'AUTOLOOP_EMPTY_REPLY',
+        payload.code,
         typeof payload.error === 'string' ? payload.error : 'Planner returned no logical result',
       );
     };
@@ -3985,6 +4004,31 @@ export class SessionManager implements AgentRuntimeProbe {
     } finally {
       ctx.dispatcher.off('planner_reply', onReply);
       ctx.runner.off('phase_error', onPhaseError);
+    }
+    const pending = ctx.runner.state.pending_dispatch;
+    if (!reply.trim() && pending?.agent === 'planner') {
+      throw new AutoloopChatStateError(
+        'AUTOLOOP_SEND_TIMEOUT',
+        `Planner send '${pending.dispatch_id}' reached its deadline and is awaiting explicit resume`,
+        true,
+        { ...pending },
+        ctx.runner.state.status_reason,
+      );
+    }
+    if (!reply.trim() && (ctx.runner.state.status === 'terminated' || ctx.runner.state.status === 'crashed')) {
+      throw new AutoloopChatStateError(
+        'AUTOLOOP_RUN_TERMINAL',
+        `Autoloop run '${runId}' became ${ctx.runner.state.status} before Planner produced a reply`,
+        false,
+        undefined,
+        ctx.runner.state.status_reason,
+      );
+    }
+    if (!reply.trim()) {
+      throw new AutoloopOperationError(
+        'AUTOLOOP_EMPTY_REPLY',
+        'Planner transport completed without a non-empty logical reply',
+      );
     }
     return { reply };
   }

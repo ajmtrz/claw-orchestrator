@@ -95,6 +95,16 @@ export interface TerminatePayload {
   reason: string;
 }
 
+export type AutoloopOperationErrorCode =
+  | 'AUTOLOOP_EMPTY_REPLY'
+  | 'AUTOLOOP_SESSION_NOT_CREATED'
+  | 'AUTOLOOP_ENGINE_FAILURE'
+  | 'AUTOLOOP_REQUIRED_TOOL_DENIED'
+  | 'AUTOLOOP_CONTROL_MALFORMED'
+  | 'AUTOLOOP_CONTROL_APPLICATION_FAILED'
+  | 'AUTOLOOP_CONTROL_NOT_PERSISTED'
+  | 'AUTOLOOP_RESET_POSTCONDITION_FAILED';
+
 /**
  * Surfaced when an agent subprocess dies, a phase-bound side effect fails
  * (e.g., git commit), or any other unrecoverable per-iter error needs to
@@ -105,6 +115,8 @@ export interface TerminatePayload {
 export interface PhaseErrorPayload {
   agent: 'planner' | 'coder' | 'reviewer';
   phase: string;
+  /** Stable internal classification. Public HTTP/MCP mapping is handled separately. */
+  code?: AutoloopOperationErrorCode;
   error: string;
 }
 
