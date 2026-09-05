@@ -2,7 +2,7 @@
 
 ## Status
 
-Complete for the approved slice-A scope through owner-audit correction round 3.
+Complete for the approved slice-A scope through final-review correction round 4.
 The original implementation commit is `e590475757ba0814fec9e3af8b48f366f68ffbec`
 (`fix: reject false-success autoloop turns`). Review findings A1-A6 are resolved
 in `45484d970d4b0ceb2b73b8088d909a6df8555581`
@@ -10,7 +10,9 @@ in `45484d970d4b0ceb2b73b8088d909a6df8555581`
 `90cf4a72fa42dc480612844aa79afc5557d74ee2`
 (`fix: close durable Planner recovery gaps`). The owner-audit round-3 correction
 is `4d8f157248eee8f76072c514ac4a8bdd157f7cd0`
-(`fix: finish pending autoloop generation release`). No push was performed.
+(`fix: finish pending autoloop generation release`). Final-review round 4 is
+`2ef58c0a680030ce5925c3f5e1f2bfc4a7626eae`
+(`fix: make Planner control delivery failure-atomic`). No push was performed.
 
 ## Immutable inputs
 
@@ -446,3 +448,118 @@ with no build script`, caused by its nested npm invocation. No Ultraapp file
 - No push was performed.
 - A fresh independent read-only review of this final candidate remains required
   by the parent workflow before Task 3A can advance.
+
+## Final-review correction round 4
+
+### Inputs, commit, and exact scope
+
+- Adjudicated findings:
+  `.superpowers/sdd/2026-09-05-autoloop-durable-recovery/task-3a-review-round-4-findings.md`
+  at SHA-256
+  `c9b53a930841497a773908250986e42899cde9b0f924a7b8dbb8b7802083ea13`.
+- The immutable instruction snapshot remained
+  `9cc0b00ab3be15fb2d932dc5b5047d4285969fdd949df504cd64e262c72b0850`
+  at the implementation commit boundary.
+- Implementation commit:
+  `2ef58c0a680030ce5925c3f5e1f2bfc4a7626eae`
+  (`fix: make Planner control delivery failure-atomic`).
+- The implementation commit changes exactly the five allowed files:
+  `src/autoloop/dispatcher.ts`, `src/autoloop/planner-tools.ts`,
+  `src/autoloop/runner.ts`, `src/session-manager.ts`, and
+  `src/__tests__/session-manager.test.ts` (594 insertions, 155 deletions).
+  This report is the only file in the separate evidence commit. No Task 3B,
+  Ultraapp, runtime, Gateway, or Ollama file was modified.
+
+### Technical rulings and implementation
+
+- **C1:** AGY is the adapter whose usable non-empty denial is intentionally
+  represented only by `turnsSucceeded`. Missing or non-finite before/after AGY
+  counters now fail closed as `AUTOLOOP_REQUIRED_TOOL_DENIED` before control
+  persistence or application. Other engines retain their existing
+  `SendResult.error`/`is_error` and transport classifications. Pure empty output
+  retains `AUTOLOOP_EMPTY_REPLY` precedence.
+- **C2:** `applyPlannerToolCalls()` now prepares and validates the complete
+  deterministic batch before invoking any prepared closure. Any validation
+  error returns zero control messages and performs zero direct effects. A fully
+  valid batch still applies in original order; unexpected operational errors
+  retain the existing ordered partial-delivery behavior assigned to Task 5.
+- **C3:** The SessionManager runner transition is now wired to
+  `onSpawnSubagentsCommitted`, called immediately after the durably verified
+  `spawn_subagents` effect returns. `markSubagentsSpawned()` remains idempotent.
+  A prevalidation/spawn failure never marks state, while a later operational
+  control failure leaves already-created Coder/Reviewer sessions truthfully
+  represented by `subagents_spawned=true` and `status=running`.
+- **C4:** Direct `dispatcher.deliver()` compatibility is preserved: empty
+  Planner output remains a typed `phase_error` envelope and the other typed
+  operation failures remain direct rejections. When Runner dispatches a Planner
+  turn, it converts every thrown typed operation failure into the normal queued
+  `phase_error` envelope, drains the policy/circuit path once, then rethrows the
+  original typed failure. Decision evidence, Runner counters, emitted event,
+  policy hook, and caller-visible code are therefore aligned without duplicate
+  accounting.
+- **C5:** A real SessionManager registry regression now enters the crash window
+  with durable generation-1 release evidence and a pending registry tombstone,
+  then calls `autoloopChat()` directly. Chat completes that exact release before
+  starting one generation-2 Planner, with one release row, one reservation, one
+  physical start, and no generation greater than 2.
+
+### Explicit RED evidence
+
+- New C1-C4 regressions were run before production changes with:
+  `npx vitest run src/__tests__/session-manager.test.ts -t 'fails closed before persisting a fenced control|prevalidates the complete Planner control batch|marks a durably verified successful spawn|keeps a committed spawn marked|routes .* through exactly one typed Runner phase-error path|finishes a real pending registry release on direct chat' --reporter=verbose`
+  -> 8 failed, 2 passed, 198 skipped. The unavailable-counter turn wrongly
+  resolved and spawned; the later-invalid batch created a spawn decision and
+  sessions; a committed spawn followed by an operational write failure remained
+  `planning/subagents_spawned=false`; and five non-empty typed failure classes
+  emitted zero Runner phase errors and left the circuit count at zero. The two
+  positive controls were the already-correct simple spawn and direct-chat
+  pending-release paths.
+- C5 received an explicit mutation proof before production correction: removing
+  only the existing pending-release completion/retry block and running
+  `npx vitest run src/__tests__/session-manager.test.ts -t 'finishes a real pending registry release on direct chat before starting exactly one successor' --reporter=verbose`
+  -> 1 failed, 207 skipped with
+  `AUTOLOOP_AGENT_GENERATION_CONFLICT` while reserving generation 2. The block
+  was restored immediately; the test then proves the public chat path rather
+  than a repeated-reset helper path.
+- The initial five-file cross-contract gate exposed nine regressions in direct
+  dispatcher compatibility (six direct empty-envelope cases and three
+  non-empty non-AGY fake-manager cases). This evidence rejected an overbroad
+  conversion/counter rule. Restoring the narrow direct empty envelope and
+  limiting unavailable-counter denial to AGY resolved the gate without changing
+  the direct-dispatcher or AGY tests.
+
+### GREEN and final verification
+
+- Focused round-4 regressions:
+  `npx vitest run src/__tests__/session-manager.test.ts -t 'fails closed before persisting a fenced AGY control|prevalidates the complete Planner control batch|marks a durably verified successful spawn|keeps a committed spawn marked|routes .* through exactly one typed Runner phase-error path|finishes a real pending registry release on direct chat' --reporter=dot --silent`
+  -> 11 passed, 198 skipped. The C1 cases cover both unavailable and non-finite
+  AGY counter evidence.
+- Direct dispatcher plus real AGY compatibility:
+  `npx vitest run src/__tests__/autoloop-dispatcher.test.ts src/__tests__/agy-planner-e2e.test.ts --reporter=dot --silent`
+  -> 2 files passed, 48 tests passed.
+- Final focused Task 3A plus Task 2 regression gate:
+  `npx vitest run src/__tests__/session-manager.test.ts src/__tests__/agy-planner-e2e.test.ts src/__tests__/autoloop-dispatcher.test.ts src/__tests__/autoloop-recovery.test.ts src/__tests__/autoloop-planner-tools.test.ts --reporter=dot --silent`
+  -> 5 files passed, 288 tests passed.
+- `npm run build` -> passed.
+- `npm run lint` -> passed.
+- `npm run format:check` -> passed.
+- `git diff --check` -> passed.
+- `npm run typecheck:tests` -> exit 2 with exactly 83 diagnostics, exactly the
+  established baseline. The only diagnostics in touched files remain the same
+  three pre-existing `session-manager.test.ts` diagnostics at lines 99, 3132,
+  and 3146; all touched production files and all new test blocks add zero
+  diagnostics.
+- `timeout 180s npm test -- --reporter=dot --silent` completed in 64.84 seconds
+  -> 79 files passed, 1 failed; 1,677 tests passed, 1 failed. The sole failure
+  remains exactly the unchanged baseline in
+  `src/__tests__/ultraapp/host-strategy.test.ts`:
+  `hostBuild succeeds even with no build script`. No Ultraapp file changed.
+
+### Remaining workflow state
+
+- Task 5 still owns durable replay/rollback after a valid persisted batch has
+  begun applying operational effects.
+- Task 3B still owns public HTTP/MCP error/reset mapping and asynchronous
+  embedded-chat terminal recording.
+- No unresolved Task 3A implementation concern remains. A fresh final
+  independent read-only review is required before advancement.
