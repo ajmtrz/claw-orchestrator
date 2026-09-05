@@ -121,6 +121,201 @@ interface PreparedPlannerToolCall {
   apply: () => Promise<AnyAutoloopMessage[]> | AnyAutoloopMessage[];
 }
 
+const VALID_PUSH_LEVELS = new Set<PushLevel>(['info', 'warn', 'decision', 'error']);
+const VALID_PUSH_CHANNELS = new Set<PushChannel>(['auto', 'wechat', 'webchat', 'both', 'email']);
+const PUSH_POLICY_KEYS = new Set([
+  'on_start',
+  'on_iter_done_ok',
+  'on_target_hit',
+  'on_metric_regression_2',
+  'on_reviewer_reject_2',
+  'on_phase_error',
+  'on_stall_30min',
+  'on_decision_needed',
+]);
+
+function nonEmptyString(value: unknown, label: string): string {
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`${label} must be a non-empty string`);
+  return value;
+}
+
+function optionalString(value: unknown, label: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string') throw new Error(`${label} must be a string`);
+  return value;
+}
+
+function optionalStringArray(value: unknown, label: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || !value.every((entry) => typeof entry === 'string')) {
+    throw new Error(`${label} must be an array of strings`);
+  }
+  return [...value];
+}
+
+function optionalPositiveInteger(value: unknown, label: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || (value as number) <= 0) {
+    throw new Error(`${label} must be a positive integer`);
+  }
+  return value as number;
+}
+
+function sanitizeDirectiveArgs(
+  raw: Record<string, unknown>,
+  label: 'spawn_subagents initial_directive' | 'send_directive',
+): NonNullable<SpawnSubagentsArgs['initial_directive']> {
+  const directive: NonNullable<SpawnSubagentsArgs['initial_directive']> = {
+    goal: nonEmptyString(raw.goal, `${label} goal`),
+  };
+  const constraints = optionalStringArray(raw.constraints, `${label} constraints`);
+  const successCriteria = optionalStringArray(raw.success_criteria, `${label} success_criteria`);
+  const maxAttempts = optionalPositiveInteger(raw.max_attempts, `${label} max_attempts`);
+  if (constraints !== undefined) directive.constraints = constraints;
+  if (successCriteria !== undefined) directive.success_criteria = successCriteria;
+  if (maxAttempts !== undefined) directive.max_attempts = maxAttempts;
+  return directive;
+}
+
+function sanitizePushPolicyDelta(raw: Record<string, unknown>): Record<string, unknown> {
+  const delta: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (!PUSH_POLICY_KEYS.has(key) || typeof value !== 'object' || value === null || Array.isArray(value)) continue;
+    const input = value as Record<string, unknown>;
+    const rule: Record<string, unknown> = {};
+    if (typeof input.silent === 'boolean') rule.silent = input.silent;
+    if (typeof input.level === 'string' && VALID_PUSH_LEVELS.has(input.level as PushLevel)) rule.level = input.level;
+    if (typeof input.channel === 'string' && VALID_PUSH_CHANNELS.has(input.channel as PushChannel)) {
+      rule.channel = input.channel;
+    }
+    delta[key] = rule;
+  }
+  return delta;
+}
+
+/**
+ * Validate one Planner control and return the exact allowlisted representation
+ * that may be persisted and applied. Unknown fields are deliberately dropped;
+ * fields whose presence changes safety or semantics are rejected when invalid.
+ */
+function sanitizePlannerToolCall(call: PlannerToolCall): PlannerToolCall {
+  const raw = call.args;
+  switch (call.tool) {
+    case 'notify_user': {
+      const summary = nonEmptyString(raw.summary, 'notify_user summary');
+      const args: Record<string, unknown> = { summary };
+      if (raw.level !== undefined) {
+        if (typeof raw.level !== 'string' || !VALID_PUSH_LEVELS.has(raw.level as PushLevel)) {
+          throw new Error(`notify_user level '${String(raw.level)}' is not supported`);
+        }
+        args.level = raw.level;
+      }
+      const detail = optionalString(raw.detail, 'notify_user detail');
+      if (detail !== undefined) args.detail = detail;
+      if (raw.channel !== undefined) {
+        if (typeof raw.channel !== 'string' || !VALID_PUSH_CHANNELS.has(raw.channel as PushChannel)) {
+          throw new Error(`notify_user channel '${String(raw.channel)}' is not supported`);
+        }
+        args.channel = raw.channel;
+      }
+      return { tool: call.tool, args };
+    }
+    case 'spawn_subagents': {
+      if (
+        'coder_custom_engine' in raw ||
+        'reviewer_custom_engine' in raw ||
+        'coderCustomEngine' in raw ||
+        'reviewerCustomEngine' in raw ||
+        'customEngine' in raw
+      ) {
+        throw new Error('spawn_subagents cannot include custom engine config; configure it at autoloop_start');
+      }
+      const args: Record<string, unknown> = {};
+      for (const field of ['coder_engine', 'reviewer_engine'] as const) {
+        const value = raw[field];
+        if (value !== undefined && (typeof value !== 'string' || !ENGINE_TYPES.includes(value as EngineType))) {
+          throw new Error(`spawn_subagents ${field} has unknown engine '${String(value)}'`);
+        }
+        if (value !== undefined) args[field] = value;
+      }
+      for (const field of ['coder_model', 'reviewer_model'] as const) {
+        const value = optionalString(raw[field], `spawn_subagents ${field}`);
+        if (value !== undefined) args[field] = value;
+      }
+      if (raw.initial_directive !== undefined) {
+        if (
+          typeof raw.initial_directive !== 'object' ||
+          raw.initial_directive === null ||
+          Array.isArray(raw.initial_directive)
+        ) {
+          throw new Error('spawn_subagents initial_directive must be an object');
+        }
+        args.initial_directive = sanitizeDirectiveArgs(
+          raw.initial_directive as Record<string, unknown>,
+          'spawn_subagents initial_directive',
+        );
+      }
+      return { tool: call.tool, args };
+    }
+    case 'send_directive':
+      return { tool: call.tool, args: sanitizeDirectiveArgs(raw, 'send_directive') };
+    case 'pause_loop': {
+      const reason = optionalString(raw.reason, 'pause_loop reason');
+      return { tool: call.tool, args: reason === undefined ? {} : { reason } };
+    }
+    case 'resume_loop':
+      return { tool: call.tool, args: {} };
+    case 'terminate': {
+      const reason = optionalString(raw.reason, 'terminate reason');
+      return { tool: call.tool, args: reason === undefined ? {} : { reason } };
+    }
+    case 'update_push_policy':
+      return { tool: call.tool, args: sanitizePushPolicyDelta(raw) };
+    case 'write_plan': {
+      const content = nonEmptyString(raw.content, 'write_plan content');
+      const commitMessage = optionalString(raw.commit_message, 'write_plan commit_message');
+      return {
+        tool: call.tool,
+        args: commitMessage === undefined ? { content } : { content, commit_message: commitMessage },
+      };
+    }
+    case 'write_goal': {
+      const content = nonEmptyString(raw.content, 'write_goal content');
+      try {
+        JSON.parse(content);
+      } catch (error) {
+        throw new Error(`write_goal content is not valid JSON: ${(error as Error).message}`);
+      }
+      const commitMessage = optionalString(raw.commit_message, 'write_goal commit_message');
+      return {
+        tool: call.tool,
+        args: commitMessage === undefined ? { content } : { content, commit_message: commitMessage },
+      };
+    }
+    default:
+      throw new Error(`unknown planner tool: ${call.tool as string}`);
+  }
+}
+
+export interface PlannerToolValidationResult {
+  calls: PlannerToolCall[];
+  errors: Array<{ tool: string; error: string }>;
+}
+
+/** Validate and sanitize the complete batch without performing any effect. */
+export function validatePlannerToolCalls(calls: readonly PlannerToolCall[]): PlannerToolValidationResult {
+  const validated: PlannerToolCall[] = [];
+  const errors: Array<{ tool: string; error: string }> = [];
+  for (const call of calls) {
+    try {
+      validated.push(sanitizePlannerToolCall(call));
+    } catch (error) {
+      errors.push({ tool: call.tool, error: (error as Error).message });
+    }
+  }
+  return { calls: errors.length === 0 ? validated : [], errors };
+}
+
 /**
  * Validate one deterministic control and prepare (but do not execute) its
  * effect. The caller prepares the complete batch before invoking any returned
@@ -131,11 +326,10 @@ function preparePlannerToolCall(call: PlannerToolCall, fx: PlannerToolEffects, i
     case 'notify_user': {
       const { level, summary, detail, channel } = call.args as {
         level?: PushLevel;
-        summary?: string;
+        summary: string;
         detail?: string;
         channel?: PushChannel;
       };
-      if (!summary) throw new Error('notify_user requires `summary`');
       return {
         tool: call.tool,
         apply: () => [
@@ -150,35 +344,13 @@ function preparePlannerToolCall(call: PlannerToolCall, fx: PlannerToolEffects, i
     }
     case 'spawn_subagents': {
       const raw = call.args;
-      if (
-        'coder_custom_engine' in raw ||
-        'reviewer_custom_engine' in raw ||
-        'coderCustomEngine' in raw ||
-        'reviewerCustomEngine' in raw ||
-        'customEngine' in raw
-      ) {
-        throw new Error('spawn_subagents cannot include custom engine config; configure it at autoloop_start');
-      }
-      for (const field of ['coder_engine', 'reviewer_engine'] as const) {
-        const value = raw[field];
-        if (value !== undefined && (typeof value !== 'string' || !ENGINE_TYPES.includes(value as EngineType))) {
-          throw new Error(`spawn_subagents ${field} has unknown engine '${String(value)}'`);
-        }
-      }
-      for (const field of ['coder_model', 'reviewer_model'] as const) {
-        const value = raw[field];
-        if (value !== undefined && typeof value !== 'string') {
-          throw new Error(`spawn_subagents ${field} must be a string`);
-        }
-      }
       const args: SpawnSubagentsArgs = {};
       if (raw.coder_engine !== undefined) args.coder_engine = raw.coder_engine as EngineType;
       if (raw.coder_model !== undefined) args.coder_model = raw.coder_model as string;
       if (raw.reviewer_engine !== undefined) args.reviewer_engine = raw.reviewer_engine as EngineType;
       if (raw.reviewer_model !== undefined) args.reviewer_model = raw.reviewer_model as string;
-      if (raw.initial_directive !== undefined) {
+      if (raw.initial_directive !== undefined)
         args.initial_directive = raw.initial_directive as SpawnSubagentsArgs['initial_directive'];
-      }
       return {
         tool: call.tool,
         apply: async () => {
@@ -199,12 +371,11 @@ function preparePlannerToolCall(call: PlannerToolCall, fx: PlannerToolEffects, i
     }
     case 'send_directive': {
       const { goal, constraints, success_criteria, max_attempts } = call.args as {
-        goal?: string;
+        goal: string;
         constraints?: string[];
         success_criteria?: string[];
         max_attempts?: number;
       };
-      if (!goal) throw new Error('send_directive requires `goal`');
       return {
         tool: call.tool,
         apply: () => [
@@ -246,10 +417,7 @@ function preparePlannerToolCall(call: PlannerToolCall, fx: PlannerToolEffects, i
         },
       };
     case 'write_plan': {
-      const { content, commit_message } = call.args as { content?: string; commit_message?: string };
-      if (typeof content !== 'string' || !content.trim()) {
-        throw new Error('write_plan requires non-empty `content` (full plan.md body)');
-      }
+      const { content, commit_message } = call.args as { content: string; commit_message?: string };
       return {
         tool: call.tool,
         apply: async () => {
@@ -259,15 +427,7 @@ function preparePlannerToolCall(call: PlannerToolCall, fx: PlannerToolEffects, i
       };
     }
     case 'write_goal': {
-      const { content, commit_message } = call.args as { content?: string; commit_message?: string };
-      if (typeof content !== 'string' || !content.trim()) {
-        throw new Error('write_goal requires non-empty `content` (full goal.json body)');
-      }
-      try {
-        JSON.parse(content);
-      } catch (e) {
-        throw new Error(`write_goal content is not valid JSON: ${(e as Error).message}`);
-      }
+      const { content, commit_message } = call.args as { content: string; commit_message?: string };
       return {
         tool: call.tool,
         apply: async () => {
@@ -296,18 +456,12 @@ export async function applyPlannerToolCalls(
   iter: number,
 ): Promise<PlannerToolHandlerResult> {
   const emitted_messages: AnyAutoloopMessage[] = [];
+  const validation = validatePlannerToolCalls(calls);
+  if (validation.errors.length > 0) return { emitted_messages, errors: validation.errors };
   const errors: Array<{ tool: string; error: string }> = [];
   const prepared: PreparedPlannerToolCall[] = [];
 
-  for (const call of calls) {
-    try {
-      prepared.push(preparePlannerToolCall(call, fx, iter));
-    } catch (err) {
-      errors.push({ tool: call.tool, error: (err as Error).message });
-    }
-  }
-
-  if (errors.length > 0) return { emitted_messages, errors };
+  for (const call of validation.calls) prepared.push(preparePlannerToolCall(call, fx, iter));
 
   for (const control of prepared) {
     try {

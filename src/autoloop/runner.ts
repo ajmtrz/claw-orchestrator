@@ -37,13 +37,32 @@ const DEFAULT_STALL_CHECK_MS = 30_000;
 
 interface PlannerOperationFailure extends Error {
   code: AutoloopOperationErrorCode;
-  retryable: true;
+  secondaryErrors?: Error[];
 }
+
+const AUTOLOOP_OPERATION_ERROR_CODES = new Set<AutoloopOperationErrorCode>([
+  'AUTOLOOP_EMPTY_REPLY',
+  'AUTOLOOP_SESSION_NOT_CREATED',
+  'AUTOLOOP_ENGINE_FAILURE',
+  'AUTOLOOP_REQUIRED_TOOL_DENIED',
+  'AUTOLOOP_CONTROL_MALFORMED',
+  'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+  'AUTOLOOP_CONTROL_NOT_PERSISTED',
+  'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+]);
 
 function isPlannerOperationFailure(error: unknown): error is PlannerOperationFailure {
   if (!(error instanceof Error) || error.name !== 'AutoloopOperationError') return false;
-  const candidate = error as Error & { code?: unknown; retryable?: unknown };
-  return typeof candidate.code === 'string' && candidate.retryable === true;
+  const candidate = error as Error & { code?: unknown };
+  return (
+    typeof candidate.code === 'string' &&
+    AUTOLOOP_OPERATION_ERROR_CODES.has(candidate.code as AutoloopOperationErrorCode)
+  );
+}
+
+function preserveSecondaryPlannerFailure(primary: PlannerOperationFailure, secondary: unknown): void {
+  const error = secondary instanceof Error ? secondary : new Error(String(secondary));
+  (primary.secondaryErrors ??= []).push(error);
 }
 
 /**
@@ -404,16 +423,24 @@ export class AutoloopRunner extends EventEmitter {
         try {
           await this.handleOne(env);
         } catch (error) {
-          if (env.to !== 'planner' || !isPlannerOperationFailure(error)) throw error;
-          plannerFailure ??= error;
-          this.queue.unshift(
-            Msg.phaseError(env.iter, {
-              agent: 'planner',
-              phase: 'planner_turn',
-              code: error.code,
-              error: error.message,
-            }),
-          );
+          if (env.to === 'planner' && isPlannerOperationFailure(error)) {
+            plannerFailure ??= error;
+            this.queue.unshift(
+              Msg.phaseError(env.iter, {
+                agent: 'planner',
+                phase: 'planner_turn',
+                code: error.code,
+                error: error.message,
+              }),
+            );
+          } else if (plannerFailure) {
+            // The synthetic phase-error route may itself fail (for example an
+            // out-of-band notifier throws). Keep that evidence on the primary
+            // typed failure, but never let it replace the caller-visible code.
+            preserveSecondaryPlannerFailure(plannerFailure, error);
+          } else {
+            throw error;
+          }
         }
       }
     } finally {
@@ -532,6 +559,7 @@ export class AutoloopRunner extends EventEmitter {
           ts: env.ts,
           agent: p.agent,
           phase: p.phase,
+          code: p.code,
           error: p.error,
         });
         if (this.state.recent_phase_errors.length > 5) {

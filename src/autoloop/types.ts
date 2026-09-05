@@ -2,7 +2,13 @@
  * Runner-level types for autoloop (three-agent architecture).
  */
 
-import type { AnyAutoloopMessage, PushChannel, PushLevel, SendTimeoutPayload } from './messages.js';
+import type {
+  AnyAutoloopMessage,
+  AutoloopOperationErrorCode,
+  PushChannel,
+  PushLevel,
+  SendTimeoutPayload,
+} from './messages.js';
 
 export type AutoloopStatus = 'planning' | 'running' | 'paused' | 'terminated' | 'crashed';
 
@@ -158,7 +164,13 @@ export interface AutoloopState {
    */
   consecutive_phase_errors: number;
   /** Recent (≤ 3) phase_error payloads kept around for circuit-trip push detail. */
-  recent_phase_errors: Array<{ ts: string; agent: string; phase: string; error: string }>;
+  recent_phase_errors: Array<{
+    ts: string;
+    agent: string;
+    phase: string;
+    code?: AutoloopOperationErrorCode;
+    error: string;
+  }>;
   /** Recent metric history (most-recent last, capped at MAX_METRIC_HISTORY). */
   metric_history: number[];
   /** ms since epoch of the last handled message; used by stall detector. */

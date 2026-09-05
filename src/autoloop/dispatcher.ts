@@ -51,6 +51,7 @@ import {
 import {
   applyPlannerToolCalls,
   parsePlannerReply,
+  validatePlannerToolCalls,
   type PlannerToolCall,
   type PlannerToolEffects,
   type PlannerToolName,
@@ -171,12 +172,27 @@ interface SendMessageResult {
   error?: string;
   /** Set when even the recovery retry failed — caller surfaces as phase_error. */
   fatal?: boolean;
+  /** Stable classification when a typed recovery failure made the send fatal. */
+  code?: AutoloopOperationErrorCode;
   /** Genuine send deadlines pause for an explicit resume instead of retrying. */
   recoverable_timeout?: SendTimeoutPayload;
 }
 
+const AUTOLOOP_OPERATION_RETRYABILITY = {
+  AUTOLOOP_EMPTY_REPLY: true,
+  AUTOLOOP_SESSION_NOT_CREATED: true,
+  AUTOLOOP_ENGINE_FAILURE: true,
+  AUTOLOOP_REQUIRED_TOOL_DENIED: true,
+  AUTOLOOP_CONTROL_MALFORMED: false,
+  AUTOLOOP_CONTROL_APPLICATION_FAILED: false,
+  AUTOLOOP_CONTROL_NOT_PERSISTED: true,
+  AUTOLOOP_RESET_POSTCONDITION_FAILED: false,
+} as const satisfies Record<AutoloopOperationErrorCode, boolean>;
+
 export class AutoloopOperationError extends Error {
-  readonly retryable = true;
+  readonly retryable: boolean;
+  /** Failures encountered while routing this error; never replace its public identity. */
+  readonly secondaryErrors: Error[] = [];
 
   constructor(
     readonly code: AutoloopOperationErrorCode,
@@ -185,6 +201,7 @@ export class AutoloopOperationError extends Error {
   ) {
     super(message, options);
     this.name = 'AutoloopOperationError';
+    this.retryable = AUTOLOOP_OPERATION_RETRYABILITY[code];
   }
 }
 
@@ -202,7 +219,7 @@ export type AutoloopResetResult =
       agent: AutoloopRoleName;
       previous_generation?: number;
       message: string;
-      retryable: true;
+      retryable: false;
     };
 
 interface PlannerTurnResult {
@@ -1262,7 +1279,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         agent,
         previous_generation: previous?.generation,
         message: cause instanceof Error ? `${detail}: ${cause.message}` : detail,
-        retryable: true,
+        retryable: false,
       };
     };
 
@@ -1409,7 +1426,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     } catch (err) {
       this.logger.warn?.(`[autoloop] ${agent} send threw, attempting reset+retry: ${(err as Error).message}`);
       const reset = await this.resetAgent(agent, { eagerRestart: true });
-      if (!reset.ok) return { output: '', error: reset.message, fatal: true };
+      if (!reset.ok) return { output: '', error: reset.message, fatal: true, code: reset.code };
       // Let the freshly-restarted subprocess settle before retrying — an
       // immediate retry routinely hits the same transient failure (e.g. the
       // old socket still in TIME_WAIT → ECONNREFUSED). Small jitter avoids
@@ -1476,6 +1493,10 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       const fd = fs.openSync(decisionsPath, 'r');
       let durableLine: string;
       try {
+        // The control intent is a commit boundary, not ordinary best-effort
+        // audit data. Flush the appended row before tail verification and
+        // before any prepared control effect can begin.
+        fs.fsyncSync(fd);
         let end = fs.fstatSync(fd).size;
         const byte = Buffer.allocUnsafe(1);
         while (end > 0) {
@@ -1721,12 +1742,6 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       { requireLogicalResult: false, expectedGeneration },
     );
 
-    // Feed the transcript that engines without native conversation replay next
-    // turn. Recorded AFTER the send so the current message isn't duplicated in
-    // its own history block.
-    this.recordTurn('planner', 'user', promptText);
-    this.recordTurn('planner', 'agent', replyText);
-
     // S3: parse autoloop-fenced tool calls out of the reply, apply effects,
     // and bubble emitted messages back into the runner queue.
     const parsed = parsePlannerReply(replyText);
@@ -1739,6 +1754,19 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
           .join('; ')}`,
       );
     }
+    const validation = validatePlannerToolCalls(parsed.calls);
+    if (validation.errors.length > 0) {
+      throw new AutoloopOperationError(
+        'AUTOLOOP_CONTROL_MALFORMED',
+        `Planner emitted invalid control: ${validation.errors
+          .map(({ tool, error }) => `${tool}: ${error}`)
+          .join('; ')}`,
+      );
+    }
+    // This allowlisted batch is the sole source for canonicalization, digest,
+    // persistence, comparison, and application. Raw Planner arguments never
+    // cross the durable control boundary.
+    const normalizedControls = normalizePlannerControls(validation.calls);
     const effects: PlannerToolEffects = {
       spawnSubagents: async (args) => {
         if (this.config.onSpawnSubagents) {
@@ -1810,7 +1838,6 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         await this.gitCommit(file, commitMessage ?? `autoloop: planner writes ${file}`);
       },
     };
-    const normalizedControls = normalizePlannerControls(parsed.calls);
     const controlTools = normalizedControls.map(({ tool }) => tool);
     let persistedControl: PlannerControlEvidence | undefined;
     let expectedControl: PlannerTurnExpectation['expectedControl'];
@@ -1870,6 +1897,11 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
           .join('; ')}`,
       );
     }
+    // Replay history is accepted-turn state. Commit both sides together only
+    // after parse, validation, durable evidence, and all control application
+    // have passed; rejected Planner output must not be replayed on retry.
+    this.recordTurn('planner', 'user', promptText);
+    this.recordTurn('planner', 'agent', replyText);
     // Emit cleaned reply (without raw JSON blocks) for the chat tool to surface.
     const surfacedReply =
       parsed.cleaned_reply ||
@@ -1980,12 +2012,13 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       this.appendDecisionLog({
         kind: 'phase_error',
         actor: 'dispatcher',
-        payload: { agent: 'coder', phase: 'send', error: result.error ?? 'unknown' },
+        payload: { agent: 'coder', phase: 'send', code: result.code, error: result.error ?? 'unknown' },
       });
       return [
         Msg.phaseError(env.iter, {
           agent: 'coder',
           phase: 'send',
+          code: result.code,
           error: result.error ?? 'unknown send failure',
         }),
       ];
@@ -2219,12 +2252,13 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       this.appendDecisionLog({
         kind: 'phase_error',
         actor: 'dispatcher',
-        payload: { agent: 'reviewer', phase: 'send', error: result.error ?? 'unknown' },
+        payload: { agent: 'reviewer', phase: 'send', code: result.code, error: result.error ?? 'unknown' },
       });
       return [
         Msg.phaseError(env.payload.iter, {
           agent: 'reviewer',
           phase: 'send',
+          code: result.code,
           error: result.error ?? 'unknown send failure',
         }),
       ];

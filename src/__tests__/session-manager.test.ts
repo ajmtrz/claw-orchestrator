@@ -245,6 +245,7 @@ vi.mock('node:fs', async () => {
   const writeSync = vi.fn((fd: unknown, ...rest: unknown[]) =>
     (actual.writeSync as (...a: unknown[]) => number)(fd, ...rest),
   );
+  const fsyncSync = vi.fn((fd: number) => actual.fsyncSync(fd));
   const mkdirSync = vi.fn((p: unknown, ...rest: unknown[]) => {
     return (actual.mkdirSync as (...a: unknown[]) => string | undefined)(p, ...rest);
   });
@@ -274,6 +275,7 @@ vi.mock('node:fs', async () => {
     appendFileSync,
     openSync,
     writeSync,
+    fsyncSync,
     mkdirSync,
     renameSync,
     unlinkSync,
@@ -3485,15 +3487,15 @@ describe('SessionManager', () => {
 
         await expect(mgr.autoloopChat(runId, 'start the implementation')).rejects.toMatchObject({
           code: 'AUTOLOOP_CONTROL_MALFORMED',
-          retryable: true,
+          retryable: false,
         });
         expect(mockSessions).toHaveLength(1);
         const decisions = fs.readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8');
         expect(decisions).not.toContain('planner_turn_control');
       });
 
-      it('classifies a persisted control handler failure separately from malformed control', async () => {
-        const runId = 'planner-control-application-failed';
+      it('classifies invalid Planner control arguments as malformed before persistence', async () => {
+        const runId = 'planner-control-invalid-arguments';
         const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
         await mgr.autoloopStart({ runId, workspace });
         mockSessions[0].sendImplementation = async () => ({
@@ -3502,24 +3504,26 @@ describe('SessionManager', () => {
         });
 
         await expect(mgr.autoloopChat(runId, 'notify me')).rejects.toMatchObject({
-          code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
-          retryable: true,
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+          retryable: false,
         });
         const decisions = fs
           .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
           .trim()
           .split('\n')
           .map((line) => JSON.parse(line) as { kind: string; payload: { code?: string } });
+        expect(decisions.filter((row) => row.kind === 'planner_turn_control')).toEqual([]);
         expect(decisions.filter((row) => row.kind === 'phase_error').at(-1)?.payload.code).toBe(
-          'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+          'AUTOLOOP_CONTROL_MALFORMED',
         );
       });
 
-      it('prevalidates the complete Planner control batch before applying an earlier spawn', async () => {
+      it('rejects and sanitizes the complete control batch before persisting or applying an earlier spawn', async () => {
         const runId = 'planner-batch-prevalidation';
         const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
         await mgr.autoloopStart({ runId, workspace });
         const handle = mgr.getAutoloop(runId)!;
+        const secretMarker = 'R5_REJECTED_CUSTOM_ENGINE_SECRET';
         const pushes: Array<{ summary: string }> = [];
         handle.runner.on('push', (payload: { summary: string }) => pushes.push(payload));
         mockSessions[0].sendImplementation = async () => ({
@@ -3528,27 +3532,27 @@ describe('SessionManager', () => {
             '{"tool":"spawn_subagents","args":{}}',
             '```',
             '```autoloop',
-            '{"tool":"notify_user","args":{}}',
+            JSON.stringify({
+              tool: 'spawn_subagents',
+              args: { coder_custom_engine: { env: { TOKEN: secretMarker } } },
+            }),
             '```',
           ].join('\n'),
           event: { type: 'result', result: 'apply controls' },
         });
 
         await expect(mgr.autoloopChat(runId, 'apply the complete control batch')).rejects.toMatchObject({
-          code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
-          retryable: true,
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+          retryable: false,
         });
 
-        const decisions = fs
-          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+        const decisionText = fs.readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8');
+        const decisions = decisionText
           .trim()
           .split('\n')
           .map((line) => JSON.parse(line) as { kind: string; payload: Record<string, unknown> });
-        expect(decisions.filter((row) => row.kind === 'planner_turn_control')).toHaveLength(1);
-        expect(decisions.find((row) => row.kind === 'planner_turn_control')?.payload.controls).toEqual([
-          { tool: 'spawn_subagents', args: {} },
-          { tool: 'notify_user', args: {} },
-        ]);
+        expect(decisionText).not.toContain(secretMarker);
+        expect(decisions.filter((row) => row.kind === 'planner_turn_control')).toEqual([]);
         expect(decisions.filter((row) => row.kind === 'spawn_subagents')).toEqual([]);
         expect(mockSessions).toHaveLength(1);
         expect(pushes.map(({ summary }) => summary)).toEqual(['[on_phase_error] iter 0']);
@@ -3558,6 +3562,228 @@ describe('SessionManager', () => {
           subagents_spawned: false,
           push_log_count: 1,
         });
+      });
+
+      const invalidNestedPlannerControls: Array<{ label: string; control: Record<string, unknown> }> = [
+        {
+          label: 'spawn initial_directive goal',
+          control: { tool: 'spawn_subagents', args: { initial_directive: { goal: '   ' } } },
+        },
+        {
+          label: 'spawn initial_directive constraints',
+          control: {
+            tool: 'spawn_subagents',
+            args: { initial_directive: { goal: 'ship', constraints: ['safe', 7] } },
+          },
+        },
+        {
+          label: 'spawn initial_directive success criteria',
+          control: {
+            tool: 'spawn_subagents',
+            args: { initial_directive: { goal: 'ship', success_criteria: ['green', false] } },
+          },
+        },
+        {
+          label: 'spawn initial_directive max attempts',
+          control: {
+            tool: 'spawn_subagents',
+            args: { initial_directive: { goal: 'ship', max_attempts: 0 } },
+          },
+        },
+        {
+          label: 'send_directive string arrays',
+          control: { tool: 'send_directive', args: { goal: 'ship', constraints: ['safe', null] } },
+        },
+        {
+          label: 'send_directive positive integer max attempts',
+          control: { tool: 'send_directive', args: { goal: 'ship', max_attempts: 1.5 } },
+        },
+        {
+          label: 'notify_user level',
+          control: { tool: 'notify_user', args: { summary: 'status', level: 'debug' } },
+        },
+        {
+          label: 'notify_user channel',
+          control: { tool: 'notify_user', args: { summary: 'status', channel: 'sms' } },
+        },
+      ];
+
+      it.each(invalidNestedPlannerControls)(
+        'rejects invalid $label before control persistence or effects',
+        async ({ label, control }) => {
+          const runId = `planner-invalid-${label.replaceAll(' ', '-').replaceAll('_', '-')}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          const pushes: Array<{ summary: string }> = [];
+          handle.runner.on('push', (payload: { summary: string }) => pushes.push(payload));
+          mockSessions[0].sendImplementation = async () => ({
+            text: ['```autoloop', JSON.stringify(control), '```'].join('\n'),
+            event: { type: 'result', result: 'invalid nested control' },
+          });
+
+          await expect(mgr.autoloopChat(runId, 'apply invalid control')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_MALFORMED',
+            retryable: false,
+          });
+
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string });
+          expect(decisions.filter((row) => row.kind === 'planner_turn_control')).toEqual([]);
+          expect(decisions.filter((row) => row.kind === 'spawn_subagents')).toEqual([]);
+          expect(mockSessions).toHaveLength(1);
+          expect(pushes.map(({ summary }) => summary)).toEqual(['[on_phase_error] iter 0']);
+        },
+      );
+
+      it('persists and applies only allowlisted arguments from an accepted Planner control', async () => {
+        const runId = 'planner-control-allowlist';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const secretMarker = 'R5_IGNORED_CONTROL_SECRET';
+        const pushes: Array<{ level: string; summary: string; detail?: string; channel: string }> = [];
+        handle.runner.on('push', (payload: { level: string; summary: string; detail?: string; channel: string }) =>
+          pushes.push(payload),
+        );
+        mockSessions[0].sendImplementation = async () => ({
+          text: [
+            '```autoloop',
+            JSON.stringify({
+              tool: 'notify_user',
+              args: {
+                level: 'info',
+                summary: 'allowlisted status',
+                channel: 'auto',
+                ignored: { token: secretMarker },
+              },
+            }),
+            '```',
+          ].join('\n'),
+          event: { type: 'result', result: 'accepted sanitized control' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'apply sanitized control')).resolves.toEqual({
+          reply: 'Planner controls persisted: notify_user',
+        });
+
+        const decisionText = fs.readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8');
+        const decisions = decisionText
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: Record<string, unknown> });
+        expect(decisionText).not.toContain(secretMarker);
+        expect(decisions.find((row) => row.kind === 'planner_turn_control')?.payload.controls).toEqual([
+          {
+            tool: 'notify_user',
+            args: { channel: 'auto', level: 'info', summary: 'allowlisted status' },
+          },
+        ]);
+        expect(pushes).toEqual([{ level: 'info', summary: 'allowlisted status', detail: undefined, channel: 'auto' }]);
+      });
+
+      it('crash-flushes an accepted control row before applying its first effect', async () => {
+        const runId = 'planner-control-flush-order';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'spawn after flush' },
+        });
+        const order: string[] = [];
+        const flush = vi.mocked(fs.fsyncSync);
+        const flushImplementation = flush.getMockImplementation()!;
+        flush.mockImplementation((fd) => {
+          order.push('control-flushed');
+          return flushImplementation(fd);
+        });
+        const spawnImplementation = handle.dispatcher.spawnSubagents.bind(handle.dispatcher);
+        const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents');
+        spawn.mockImplementation(async (args) => {
+          order.push('effect-started');
+          return await spawnImplementation(args);
+        });
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'spawn after durable evidence')).resolves.toEqual({
+            reply: 'Planner controls persisted: spawn_subagents',
+          });
+          expect(order).toEqual(['control-flushed', 'effect-started']);
+        } finally {
+          flush.mockImplementation(flushImplementation);
+          spawn.mockRestore();
+        }
+      });
+
+      it('fails closed when crash-flushing an accepted control row fails', async () => {
+        const runId = 'planner-control-flush-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'flush must succeed' },
+        });
+        const flush = vi.mocked(fs.fsyncSync);
+        const flushImplementation = flush.getMockImplementation()!;
+        flush.mockImplementation(() => {
+          throw new Error('stable-storage flush failed');
+        });
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'require a durable control row')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_NOT_PERSISTED',
+            retryable: true,
+          });
+          expect(mockSessions).toHaveLength(1);
+          expect(handle.runner.state).toMatchObject({
+            status: 'planning',
+            subagents_spawned: false,
+            consecutive_phase_errors: 1,
+          });
+        } finally {
+          flush.mockImplementation(flushImplementation);
+        }
+      });
+
+      it('records only accepted Planner turns in replay history for non-native engines', async () => {
+        const runId = 'planner-replay-accepted-only';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace, plannerEngine: 'gemini' });
+        const planner = mockSessions[0];
+        const rejectedMarker = 'R5_REJECTED_HISTORY_MARKER';
+        const acceptedUserMarker = 'R5_ACCEPTED_USER_MARKER';
+        const acceptedAgentMarker = 'R5_ACCEPTED_AGENT_MARKER';
+        let turn = 0;
+        planner.sendImplementation = async () => {
+          turn += 1;
+          if (turn === 1) {
+            return {
+              text: [rejectedMarker, '```autoloop', '{"tool":"spawn_subagents"}', '```'].join('\n'),
+              event: { type: 'result', result: 'rejected control' },
+            };
+          }
+          return {
+            text: turn === 2 ? acceptedAgentMarker : 'third accepted reply',
+            event: { type: 'result', result: 'accepted turn' },
+          };
+        };
+
+        await expect(mgr.autoloopChat(runId, 'R5_REJECTED_USER_MARKER')).rejects.toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+        });
+        await expect(mgr.autoloopChat(runId, acceptedUserMarker)).resolves.toEqual({ reply: acceptedAgentMarker });
+        expect(String(planner.sendCalls[1].message)).not.toContain(rejectedMarker);
+
+        await expect(mgr.autoloopChat(runId, 'third user turn')).resolves.toEqual({ reply: 'third accepted reply' });
+        const thirdPrompt = String(planner.sendCalls[2].message);
+        expect(thirdPrompt).not.toContain(rejectedMarker);
+        expect(thirdPrompt.match(new RegExp(acceptedUserMarker, 'g'))).toHaveLength(1);
+        expect(thirdPrompt.match(new RegExp(acceptedAgentMarker, 'g'))).toHaveLength(1);
       });
 
       it('marks a durably verified successful spawn at its committed effect boundary', async () => {
@@ -3616,7 +3842,7 @@ describe('SessionManager', () => {
         try {
           await expect(mgr.autoloopChat(runId, 'apply both approved controls')).rejects.toMatchObject({
             code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
-            retryable: true,
+            retryable: false,
           });
 
           const decisions = fs
@@ -3644,11 +3870,13 @@ describe('SessionManager', () => {
       const runnerMediatedPlannerFailures: Array<{
         label: string;
         code: NonNullable<PhaseErrorPayload['code']>;
-        configure: () => void;
+        retryable: boolean;
+        configure: (context: { runId: string; workspace: string }) => void | (() => void);
       }> = [
         {
           label: 'missing live generation',
           code: 'AUTOLOOP_SESSION_NOT_CREATED',
+          retryable: true,
           configure: () => {
             vi.spyOn(mgr, 'inspect').mockResolvedValue('absent');
           },
@@ -3656,6 +3884,7 @@ describe('SessionManager', () => {
         {
           label: 'engine result failure',
           code: 'AUTOLOOP_ENGINE_FAILURE',
+          retryable: true,
           configure: () => {
             mockSessions[0].sendImplementation = async () => ({
               text: 'engine authentication failed',
@@ -3666,6 +3895,7 @@ describe('SessionManager', () => {
         {
           label: 'required tool denial',
           code: 'AUTOLOOP_REQUIRED_TOOL_DENIED',
+          retryable: true,
           configure: () => {
             mockSessions[0].turnsSucceededOverride = 0;
           },
@@ -3673,6 +3903,7 @@ describe('SessionManager', () => {
         {
           label: 'malformed control',
           code: 'AUTOLOOP_CONTROL_MALFORMED',
+          retryable: false,
           configure: () => {
             mockSessions[0].sendImplementation = async () => ({
               text: ['```autoloop', '{"tool":"spawn_subagents"}', '```'].join('\n'),
@@ -3683,42 +3914,111 @@ describe('SessionManager', () => {
         {
           label: 'control application failure',
           code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
-          configure: () => {
+          retryable: false,
+          configure: ({ workspace }) => {
             mockSessions[0].sendImplementation = async () => ({
-              text: ['```autoloop', '{"tool":"notify_user","args":{}}', '```'].join('\n'),
-              event: { type: 'result', result: 'invalid control arguments' },
+              text: ['```autoloop', '{"tool":"write_plan","args":{"content":"# Validated plan"}}', '```'].join('\n'),
+              event: { type: 'result', result: 'validated control with operational failure' },
             });
+            const planPath = path.join(workspace, 'plan.md');
+            const writeFile = vi.mocked(fs.writeFileSync);
+            const writeImplementation = writeFile.getMockImplementation()!;
+            writeFile.mockImplementation(((file: unknown, ...args: unknown[]) => {
+              if (String(file) === planPath) throw new Error('operational plan write failed');
+              return (writeImplementation as (...values: unknown[]) => unknown)(file, ...args);
+            }) as typeof fs.writeFileSync);
+            return () => writeFile.mockImplementation(writeImplementation);
+          },
+        },
+        {
+          label: 'control persistence failure',
+          code: 'AUTOLOOP_CONTROL_NOT_PERSISTED',
+          retryable: true,
+          configure: ({ runId, workspace }) => {
+            mockSessions[0].sendImplementation = async () => ({
+              text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+              event: { type: 'result', result: 'control persistence must commit' },
+            });
+            const decisionsPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+            const appendFile = vi.mocked(fs.appendFileSync);
+            const appendImplementation = appendFile.getMockImplementation()!;
+            appendFile.mockImplementation(((file: unknown, data: unknown, ...args: unknown[]) => {
+              if (String(file) === decisionsPath && String(data).includes('"kind":"planner_turn_control"')) return;
+              return (appendImplementation as (...values: unknown[]) => unknown)(file, data, ...args);
+            }) as typeof fs.appendFileSync);
+            return () => appendFile.mockImplementation(appendImplementation);
           },
         },
       ];
 
       it.each(runnerMediatedPlannerFailures)(
         'routes $label through exactly one typed Runner phase-error path',
-        async ({ label, code, configure }) => {
+        async ({ label, code, retryable, configure }) => {
           const runId = `planner-runner-phase-error-${label.replaceAll(' ', '-')}`;
           const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
           await mgr.autoloopStart({ runId, workspace });
           const handle = mgr.getAutoloop(runId)!;
-          configure();
+          const cleanup = configure({ runId, workspace });
           const phaseErrors: PhaseErrorPayload[] = [];
           handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
 
-          await expect(mgr.autoloopChat(runId, 'exercise the typed Planner failure')).rejects.toMatchObject({
-            code,
-            retryable: true,
-          });
+          try {
+            await expect(mgr.autoloopChat(runId, 'exercise the typed Planner failure')).rejects.toMatchObject({
+              code,
+              retryable,
+            });
 
-          expect(phaseErrors).toHaveLength(1);
-          expect(phaseErrors[0]).toMatchObject({ agent: 'planner', phase: 'planner_turn', code });
-          expect(handle.runner.state.consecutive_phase_errors).toBe(1);
-          const decisions = fs
-            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
-            .trim()
-            .split('\n')
-            .map((line) => JSON.parse(line) as { kind: string; payload: { code?: string } });
-          expect(decisions.filter((row) => row.kind === 'phase_error' && row.payload.code === code)).toHaveLength(1);
+            expect(phaseErrors).toHaveLength(1);
+            expect(phaseErrors[0]).toMatchObject({ agent: 'planner', phase: 'planner_turn', code });
+            expect(handle.runner.state).toMatchObject({
+              consecutive_phase_errors: 1,
+              recent_phase_errors: [expect.objectContaining({ agent: 'planner', phase: 'planner_turn', code })],
+            });
+            const decisions = fs
+              .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+              .trim()
+              .split('\n')
+              .map((line) => JSON.parse(line) as { kind: string; payload: { code?: string } });
+            expect(decisions.filter((row) => row.kind === 'phase_error' && row.payload.code === code)).toHaveLength(1);
+          } finally {
+            cleanup?.();
+          }
         },
       );
+
+      it('preserves the original typed Planner failure when its synthetic phase-error drain also fails', async () => {
+        const runId = 'planner-original-error-survives-secondary-drain-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents"}', '```'].join('\n'),
+          event: { type: 'result', result: 'invalid control' },
+        });
+        handle.runner.config.notifyUser = async () => {
+          throw new Error('secondary notification transport failed');
+        };
+        const phaseErrors: PhaseErrorPayload[] = [];
+        handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+
+        let caught: unknown;
+        try {
+          await mgr.autoloopChat(runId, 'exercise post-catch failure');
+        } catch (error) {
+          caught = error;
+        }
+
+        expect(caught).toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+          retryable: false,
+          secondaryErrors: [expect.objectContaining({ message: 'secondary notification transport failed' })],
+        });
+        expect(phaseErrors).toHaveLength(1);
+        expect(handle.runner.state).toMatchObject({
+          consecutive_phase_errors: 1,
+          recent_phase_errors: [expect.objectContaining({ code: 'AUTOLOOP_CONTROL_MALFORMED' })],
+        });
+      });
 
       it('rejects an empty Planner success even when phase-error event plumbing drops the code', async () => {
         const runId = 'planner-empty-reply-lost-event';
@@ -3740,6 +4040,9 @@ describe('SessionManager', () => {
           retryable: true,
         });
         expect(handle.runner.state.consecutive_phase_errors).toBe(1);
+        expect(handle.runner.state.recent_phase_errors).toEqual([
+          expect.objectContaining({ code: 'AUTOLOOP_EMPTY_REPLY' }),
+        ]);
       });
 
       it('rejects a claimed control with no matching persisted event without advancing phase', async () => {
@@ -3944,6 +4247,82 @@ describe('SessionManager', () => {
 
         await expect(mgr.autoloopResetAgent(runId, 'planner', { force: true })).resolves.toBe(false);
       });
+
+      it.each(['coder', 'reviewer'] as const)(
+        'carries a typed reset postcondition failure through the %s fatal send path without retrying',
+        async (role) => {
+          const runId = `reset-code-${role}-fatal-send`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          await handle.dispatcher.spawnSubagents();
+          const roleIndex = role === 'coder' ? 1 : 2;
+          mockSessions[roleIndex].sendImplementation = async () => {
+            throw new Error(`${role} subprocess failed`);
+          };
+          const reset = vi.spyOn(handle.dispatcher, 'resetAgent').mockResolvedValue({
+            ok: false,
+            code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+            agent: role,
+            previous_generation: 1,
+            message: `${role} reset could not prove reuse`,
+            retryable: false,
+          });
+          const phaseErrors: PhaseErrorPayload[] = [];
+          const phaseEnvelopes: PhaseErrorPayload[] = [];
+          handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+          handle.runner.on('message', (env: { type?: string; payload?: PhaseErrorPayload }) => {
+            if (env.type === 'phase_error' && env.payload) phaseEnvelopes.push(env.payload);
+          });
+
+          if (role === 'coder') {
+            await handle.runner.send(
+              AutoloopMsg.directive(0, {
+                goal: 'exercise coder fatal recovery',
+                constraints: [],
+                success_criteria: [],
+                max_attempts: 1,
+              }),
+            );
+          } else {
+            await handle.runner.send(
+              AutoloopMsg.reviewRequest(0, {
+                iter: 0,
+                ledger_path: path.join(workspace, 'tasks', runId),
+                prior_metrics: [],
+              }),
+            );
+          }
+
+          expect(mockSessions[roleIndex].sendCalls).toHaveLength(1);
+          expect(reset).toHaveBeenCalledTimes(1);
+          expect(phaseErrors).toEqual([
+            {
+              agent: role,
+              phase: 'send',
+              code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+              error: `${role} reset could not prove reuse`,
+            },
+          ]);
+          expect(phaseEnvelopes).toEqual(phaseErrors);
+          expect(handle.runner.state.recent_phase_errors).toEqual([
+            expect.objectContaining({ agent: role, phase: 'send', code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED' }),
+          ]);
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string; payload: { agent?: string; code?: string } });
+          expect(
+            decisions.filter(
+              (row) =>
+                row.kind === 'phase_error' &&
+                row.payload.agent === role &&
+                row.payload.code === 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+            ),
+          ).toHaveLength(1);
+        },
+      );
 
       it('preserves Reviewer started state and its frozen prompt when exact-generation release fails', async () => {
         const runId = 'reset-release-preserves-reviewer';
