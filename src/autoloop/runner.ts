@@ -414,9 +414,14 @@ export class AutoloopRunner extends EventEmitter {
       while (this.queue.length > 0) {
         if (depth++ > maxDepth) {
           const next = this.queue[0];
-          throw new AutoloopRoutingError(
+          const routingError = new AutoloopRoutingError(
             `dispatch depth exceeded ${maxDepth} at iter ${this.state.iter} (next='${next?.type ?? '?'}' to '${next?.to ?? '?'}') — likely message ping-pong; raise config.maxDispatchDepth for legitimately deep workflows`,
           );
+          if (plannerFailure) {
+            preserveSecondaryPlannerFailure(plannerFailure, routingError);
+            break;
+          }
+          throw routingError;
         }
         const env = this.queue.shift();
         if (!env) break;

@@ -4020,6 +4020,62 @@ describe('SessionManager', () => {
         });
       });
 
+      it('preserves the original typed Planner failure when max dispatch depth stops its synthetic phase-error', async () => {
+        const runId = 'planner-original-error-survives-max-dispatch-depth';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        handle.runner.config.maxDispatchDepth = 0;
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents"}', '```'].join('\n'),
+          event: { type: 'result', result: 'invalid control' },
+        });
+        const phaseErrors: PhaseErrorPayload[] = [];
+        handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+
+        let caught: unknown;
+        try {
+          await mgr.autoloopChat(runId, 'exercise max-depth after typed Planner failure');
+        } catch (error) {
+          caught = error;
+        }
+
+        expect(caught).toMatchObject({
+          name: 'AutoloopOperationError',
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+          retryable: false,
+          secondaryErrors: [
+            expect.objectContaining({
+              name: 'AutoloopRoutingError',
+              message: expect.stringContaining("dispatch depth exceeded 0 at iter 0 (next='phase_error' to 'runner')"),
+            }),
+          ],
+        });
+        expect(phaseErrors).toEqual([]);
+        expect(handle.runner.state.consecutive_phase_errors).toBe(0);
+      });
+
+      it('keeps max dispatch depth as the primary error without a pending Planner failure', async () => {
+        const runId = 'planner-max-dispatch-depth-without-pending-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        handle.runner.config.maxDispatchDepth = 0;
+        mockSessions[0].sendImplementation = async () => ({
+          text: [
+            '```autoloop',
+            '{"tool":"notify_user","args":{"level":"info","summary":"queued push","channel":"auto"}}',
+            '```',
+          ].join('\n'),
+          event: { type: 'result', result: 'valid queued control' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'exercise ordinary max-depth guard')).rejects.toMatchObject({
+          name: 'AutoloopRoutingError',
+          message: expect.stringContaining("dispatch depth exceeded 0 at iter 0 (next='push_user' to 'user')"),
+        });
+      });
+
       it('rejects an empty Planner success even when phase-error event plumbing drops the code', async () => {
         const runId = 'planner-empty-reply-lost-event';
         const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
