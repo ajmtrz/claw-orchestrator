@@ -12,7 +12,13 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { ClaudeAgentDispatcher } from '../autoloop/dispatcher.js';
-import { parsePlannerReply, validatePlannerToolCalls } from '../autoloop/planner-tools.js';
+import {
+  applyPlannerToolCalls,
+  parsePlannerReply,
+  type PlannerToolCall,
+  type PlannerToolEffects,
+  validatePlannerToolCalls,
+} from '../autoloop/planner-tools.js';
 import { AutoloopRunner } from '../autoloop/runner.js';
 import { type AnyAutoloopMessage, Msg } from '../autoloop/messages.js';
 import type { SessionManager } from '../session-manager.js';
@@ -248,6 +254,118 @@ describe('Planner control argument shape', () => {
     expect(validation.errors).toEqual([
       expect.objectContaining({ tool: 'resume_loop', error: expect.stringContaining('plain object') }),
     ]);
+  });
+});
+
+describe('Planner control batch application', () => {
+  it('stops after a failed spawn without applying later file, policy, or message effects', async () => {
+    const effects: PlannerToolEffects = {
+      spawnSubagents: vi.fn(async () => {
+        throw new Error('spawn failed before completion');
+      }),
+      updatePushPolicy: vi.fn(),
+      writePlanFile: vi.fn(async () => undefined),
+    };
+    const controls: PlannerToolCall[] = [
+      { tool: 'spawn_subagents', args: {} },
+      { tool: 'write_plan', args: { content: '# Must not be written' } },
+      { tool: 'write_goal', args: { content: '{"goal":"must not be written"}' } },
+      { tool: 'update_push_policy', args: { on_start: { level: 'warn' } } },
+      { tool: 'notify_user', args: { summary: 'must not be emitted' } },
+    ];
+
+    const result = await applyPlannerToolCalls(controls, effects, 0);
+
+    expect(result).toEqual({
+      emitted_messages: [],
+      errors: [{ tool: 'spawn_subagents', error: 'spawn failed before completion' }],
+    });
+    expect(effects.spawnSubagents).toHaveBeenCalledTimes(1);
+    expect(effects.writePlanFile).not.toHaveBeenCalled();
+    expect(effects.updatePushPolicy).not.toHaveBeenCalled();
+  });
+});
+
+describe('Planner durable control content bounds', () => {
+  const EXPECTED_MAX_PLANNER_CONTROL_CONTENT_BYTES = 1_048_576;
+
+  function contentOfBytes(tool: 'write_plan' | 'write_goal', bytes: number): string {
+    return tool === 'write_goal' ? JSON.stringify('a'.repeat(bytes - 2)) : 'a'.repeat(bytes);
+  }
+
+  it.each(['write_plan', 'write_goal'] as const)('accepts %s content at the exact UTF-8 byte bound', (tool) => {
+    const content = contentOfBytes(tool, EXPECTED_MAX_PLANNER_CONTROL_CONTENT_BYTES);
+
+    const validation = validatePlannerToolCalls([{ tool, args: { content } }]);
+
+    expect(Buffer.byteLength(content, 'utf8')).toBe(EXPECTED_MAX_PLANNER_CONTROL_CONTENT_BYTES);
+    expect(validation.errors).toEqual([]);
+    expect(validation.calls).toEqual([{ tool, args: { content } }]);
+  });
+
+  it.each(['write_plan', 'write_goal'] as const)('rejects %s content one UTF-8 byte over the bound', (tool) => {
+    const content = contentOfBytes(tool, EXPECTED_MAX_PLANNER_CONTROL_CONTENT_BYTES + 1);
+
+    const validation = validatePlannerToolCalls([{ tool, args: { content } }]);
+
+    expect(Buffer.byteLength(content, 'utf8')).toBe(EXPECTED_MAX_PLANNER_CONTROL_CONTENT_BYTES + 1);
+    expect(validation.errors).toEqual([
+      {
+        tool,
+        error: `${tool} content exceeds the ${EXPECTED_MAX_PLANNER_CONTROL_CONTENT_BYTES}-byte UTF-8 limit`,
+      },
+    ]);
+    expect(validation.calls).toEqual([]);
+  });
+
+  it.each(['write_plan', 'write_goal'] as const)(
+    'counts multibyte %s content in UTF-8 bytes instead of UTF-16 code units',
+    (tool) => {
+      const jsonOverhead = tool === 'write_goal' ? 2 : 0;
+      const value = 'é'.repeat(Math.floor((EXPECTED_MAX_PLANNER_CONTROL_CONTENT_BYTES - jsonOverhead) / 2) + 1);
+      const content = tool === 'write_goal' ? JSON.stringify(value) : value;
+
+      const validation = validatePlannerToolCalls([{ tool, args: { content } }]);
+
+      expect(content.length).toBeLessThan(EXPECTED_MAX_PLANNER_CONTROL_CONTENT_BYTES);
+      expect(Buffer.byteLength(content, 'utf8')).toBeGreaterThan(EXPECTED_MAX_PLANNER_CONTROL_CONTENT_BYTES);
+      expect(validation.errors).toEqual([
+        {
+          tool,
+          error: `${tool} content exceeds the ${EXPECTED_MAX_PLANNER_CONTROL_CONTENT_BYTES}-byte UTF-8 limit`,
+        },
+      ]);
+      expect(validation.calls).toEqual([]);
+    },
+  );
+
+  it('prevalidates an oversized mixed batch before applying any effect or emitting any message', async () => {
+    const effects: PlannerToolEffects = {
+      spawnSubagents: vi.fn(async () => undefined),
+      updatePushPolicy: vi.fn(),
+      writePlanFile: vi.fn(async () => undefined),
+    };
+    const oversizedGoal = contentOfBytes('write_goal', EXPECTED_MAX_PLANNER_CONTROL_CONTENT_BYTES + 1);
+    const controls: PlannerToolCall[] = [
+      { tool: 'update_push_policy', args: { on_start: { level: 'warn' } } },
+      { tool: 'write_goal', args: { content: oversizedGoal } },
+      { tool: 'notify_user', args: { summary: 'must not be emitted' } },
+    ];
+
+    const result = await applyPlannerToolCalls(controls, effects, 0);
+
+    expect(result).toEqual({
+      emitted_messages: [],
+      errors: [
+        {
+          tool: 'write_goal',
+          error: `write_goal content exceeds the ${EXPECTED_MAX_PLANNER_CONTROL_CONTENT_BYTES}-byte UTF-8 limit`,
+        },
+      ],
+    });
+    expect(effects.spawnSubagents).not.toHaveBeenCalled();
+    expect(effects.updatePushPolicy).not.toHaveBeenCalled();
+    expect(effects.writePlanFile).not.toHaveBeenCalled();
   });
 });
 
@@ -830,7 +948,7 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
 
 describe('ClaudeAgentDispatcher — role engine configuration', () => {
   it('keeps the legacy Claude model defaults when no role overrides are provided', async () => {
-    const { dispatcher, calls } = makeDispatcher();
+    const { dispatcher, calls } = makeDispatcher({}, { sendOutput: 'Planner reply' });
 
     await dispatcher.deliver(Msg.chat(0, { text: 'hello' }));
     await dispatcher.spawnSubagents();
@@ -841,11 +959,14 @@ describe('ClaudeAgentDispatcher — role engine configuration', () => {
   });
 
   it('uses each non-Claude engine without injecting a Claude model default', async () => {
-    const { dispatcher, calls } = makeDispatcher({
-      plannerEngine: 'codex',
-      coderEngine: 'gemini',
-      reviewerEngine: 'opencode',
-    });
+    const { dispatcher, calls } = makeDispatcher(
+      {
+        plannerEngine: 'codex',
+        coderEngine: 'gemini',
+        reviewerEngine: 'opencode',
+      },
+      { sendOutput: 'Planner reply' },
+    );
 
     await dispatcher.deliver(Msg.chat(0, { text: 'hello' }));
     await dispatcher.spawnSubagents();
@@ -862,7 +983,7 @@ describe('ClaudeAgentDispatcher — role engine configuration', () => {
   });
 
   it('delivers the Planner protocol in-band and starts non-Claude Planners read-only', async () => {
-    const { dispatcher, calls } = makeDispatcher({ plannerEngine: 'codex' });
+    const { dispatcher, calls } = makeDispatcher({ plannerEngine: 'codex' }, { sendOutput: 'Planner reply' });
 
     await dispatcher.deliver(Msg.chat(0, { text: 'inspect this repository' }));
 
@@ -934,17 +1055,20 @@ describe('ClaudeAgentDispatcher — role engine configuration', () => {
     };
     const coderCustomEngine = { name: 'coder-cli', bin: 'coder-cli', args: {} };
     const reviewerCustomEngine = { name: 'reviewer-cli', bin: 'reviewer-cli', args: {} };
-    const { dispatcher, calls } = makeDispatcher({
-      plannerEngine: 'custom',
-      plannerModel: 'planner-model',
-      plannerCustomEngine,
-      coderEngine: 'custom',
-      coderModel: 'coder-model',
-      coderCustomEngine,
-      reviewerEngine: 'custom',
-      reviewerModel: 'reviewer-model',
-      reviewerCustomEngine,
-    });
+    const { dispatcher, calls } = makeDispatcher(
+      {
+        plannerEngine: 'custom',
+        plannerModel: 'planner-model',
+        plannerCustomEngine,
+        coderEngine: 'custom',
+        coderModel: 'coder-model',
+        coderCustomEngine,
+        reviewerEngine: 'custom',
+        reviewerModel: 'reviewer-model',
+        reviewerCustomEngine,
+      },
+      { sendOutput: 'Planner reply' },
+    );
 
     await dispatcher.deliver(Msg.chat(0, { text: 'hello' }));
     await dispatcher.spawnSubagents();
@@ -1090,6 +1214,16 @@ describe('ClaudeAgentDispatcher — frozen reviewer memory', () => {
 });
 
 describe('ClaudeAgentDispatcher — phase_error surfacing', () => {
+  it('throws the retryable typed error when a Planner transport returns an empty logical reply', async () => {
+    const { dispatcher } = makeDispatcher({}, { sendOutput: '   ' });
+
+    await expect(dispatcher.deliver(Msg.chat(0, { text: 'return a reply' }))).rejects.toMatchObject({
+      name: 'AutoloopOperationError',
+      code: 'AUTOLOOP_EMPTY_REPLY',
+      retryable: true,
+    });
+  });
+
   it('returns a phase_error envelope (not a fake directive_ack) when Coder send fails twice', async () => {
     vi.useFakeTimers();
     const { dispatcher } = makeDispatcher({}, { sendThrows: 2 });
@@ -1196,7 +1330,7 @@ describe('ClaudeAgentDispatcher — recoverable send timeout and dispatch identi
     const deliveryB = dispatcher.deliver(duplicate);
     await vi.waitFor(() => expect(calls.sendMessage).toHaveBeenCalledTimes(1));
 
-    resolveSend({ output: '', error: undefined });
+    resolveSend({ output: 'coalesced Planner reply', error: undefined });
     await Promise.all([deliveryA, deliveryB]);
     await dispatcher.deliver(duplicate);
     expect(calls.sendMessage).toHaveBeenCalledTimes(1);
@@ -1207,7 +1341,7 @@ describe('ClaudeAgentDispatcher — recoverable send timeout and dispatch identi
 
   it('bounds the retained dispatch cache while still coalescing a recent re-delivery', async () => {
     const { dispatcher, calls } = makeDispatcher();
-    calls.sendMessage.mockResolvedValue({ output: '', error: undefined });
+    calls.sendMessage.mockResolvedValue({ output: 'Planner reply', error: undefined });
     const retained = dispatcher as unknown as { logicalDispatches: Map<string, unknown> };
 
     const recent = fixedIdentity(Msg.chat(1, { text: 'recent turn' }), 'logical-recent');
@@ -1448,7 +1582,7 @@ describe('ClaudeAgentDispatcher — updatePushPolicy guard', () => {
   });
 
   it.each(['on_phase_error', 'on_decision_needed'] as const)(
-    'omits a prohibited silence-only %s update without resetting the live rule',
+    'rejects a prohibited silence-only %s update without claiming a successful empty control',
     async (key) => {
       const policyRef: PushPolicy = JSON.parse(JSON.stringify(DEFAULT_PUSH_POLICY));
       const policyBefore = JSON.stringify(policyRef);
@@ -1458,8 +1592,13 @@ describe('ClaudeAgentDispatcher — updatePushPolicy guard', () => {
         '```',
       ].join('\n');
       const { dispatcher, ledgerDir } = makeDispatcher({ pushPolicyRef: policyRef }, { sendOutput: reply });
+      const surfacedReplies: string[] = [];
+      dispatcher.on('planner_reply', (surfacedReply) => surfacedReplies.push(String(surfacedReply)));
 
-      await dispatcher.deliver(Msg.chat(0, { text: 'do not silence critical policy' }));
+      await expect(dispatcher.deliver(Msg.chat(0, { text: 'do not silence critical policy' }))).rejects.toMatchObject({
+        code: 'AUTOLOOP_EMPTY_REPLY',
+        retryable: true,
+      });
 
       expect(JSON.stringify(policyRef)).toBe(policyBefore);
       const decisionText = fs.readFileSync(path.join(ledgerDir, 'decisions.jsonl'), 'utf-8');
@@ -1467,12 +1606,41 @@ describe('ClaudeAgentDispatcher — updatePushPolicy guard', () => {
         .trim()
         .split('\n')
         .map((line) => JSON.parse(line) as { kind: string; payload: Record<string, unknown> });
-      expect(lines.find((line) => line.kind === 'planner_turn_control')?.payload.controls).toEqual([
-        { tool: 'update_push_policy', args: {} },
-      ]);
+      expect(lines.filter((line) => line.kind === 'planner_turn_control')).toEqual([]);
       expect(lines.find((line) => line.kind === 'policy_silence_blocked')?.payload).toEqual({ keys: [key] });
       expect(lines.filter((line) => line.kind === 'update_push_policy')).toEqual([]);
       expect(decisionText).not.toContain('"silent":true');
+      expect(surfacedReplies).toEqual([]);
+    },
+  );
+
+  it.each(['on_phase_error', 'on_decision_needed'] as const)(
+    'persists and applies an explicit empty %s rule without a silence-blocked audit',
+    async (key) => {
+      const policyRef: PushPolicy = JSON.parse(JSON.stringify(DEFAULT_PUSH_POLICY));
+      const reply = ['```autoloop', JSON.stringify({ tool: 'update_push_policy', args: { [key]: {} } }), '```'].join(
+        '\n',
+      );
+      const { dispatcher, ledgerDir } = makeDispatcher({ pushPolicyRef: policyRef }, { sendOutput: reply });
+      const surfacedReplies: string[] = [];
+      dispatcher.on('planner_reply', (surfacedReply) => surfacedReplies.push(String(surfacedReply)));
+
+      await expect(dispatcher.deliver(Msg.chat(0, { text: 'reset the critical policy rule' }))).resolves.toEqual([]);
+
+      expect(policyRef[key]).toEqual({});
+      const lines = fs
+        .readFileSync(path.join(ledgerDir, 'decisions.jsonl'), 'utf-8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as { kind: string; payload: Record<string, unknown> });
+      expect(lines.find((line) => line.kind === 'planner_turn_control')?.payload.controls).toEqual([
+        { tool: 'update_push_policy', args: { [key]: {} } },
+      ]);
+      expect(lines.find((line) => line.kind === 'update_push_policy')?.payload).toEqual({
+        applied: { [key]: {} },
+      });
+      expect(lines.filter((line) => line.kind === 'policy_silence_blocked')).toEqual([]);
+      expect(surfacedReplies).toEqual(['Planner controls persisted: update_push_policy']);
     },
   );
 });

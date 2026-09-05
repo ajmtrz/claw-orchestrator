@@ -955,20 +955,6 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
             error: error.message,
           },
         });
-        // Preserve the established direct-dispatch compatibility contract for
-        // an empty Planner result. Runner-mediated callers process this typed
-        // envelope through the same phase-error accounting as thrown Planner
-        // operation failures.
-        if (error.code === 'AUTOLOOP_EMPTY_REPLY' && env.to === 'planner') {
-          return [
-            Msg.phaseError(env.iter, {
-              agent: 'planner',
-              phase: 'planner_turn',
-              code: error.code,
-              error: error.message,
-            }),
-          ];
-        }
       }
       throw error;
     });
@@ -1502,7 +1488,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     try {
       fs.mkdirSync(this.ledgerDir, { recursive: true });
       fs.appendFileSync(decisionsPath, `${JSON.stringify(decision)}\n`);
-      const fd = fs.openSync(decisionsPath, 'r');
+      const fd = fs.openSync(decisionsPath, 'r+');
       let durableLine: string;
       try {
         // The control intent is a commit boundary, not ordinary best-effort
@@ -1525,13 +1511,13 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
           fs.readSync(fd, chunk, 0, chunk.length, start);
           const newline = chunk.lastIndexOf(0x0a);
           if (newline >= 0) {
-            chunks.unshift(chunk.subarray(newline + 1));
+            chunks.push(chunk.subarray(newline + 1));
             break;
           }
-          chunks.unshift(chunk);
+          chunks.push(chunk);
           cursor = start;
         }
-        durableLine = Buffer.concat(chunks).toString('utf8');
+        durableLine = Buffer.concat(chunks.reverse()).toString('utf8');
       } finally {
         fs.closeSync(fd);
       }
@@ -1776,6 +1762,16 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
           .join('; ')}`,
       );
     }
+    if (validation.blocked_policy_silence.length > 0) {
+      for (const key of validation.blocked_policy_silence) {
+        this.logger.warn?.(`[autoloop] refused to set silent=true on critical policy key ${key}`);
+      }
+      this.appendDecisionLog({
+        kind: 'policy_silence_blocked',
+        actor: 'planner',
+        payload: { keys: validation.blocked_policy_silence },
+      });
+    }
     // This allowlisted batch is the sole source for canonicalization, digest,
     // persistence, comparison, and application. Raw Planner arguments never
     // cross the durable control boundary.
@@ -1855,17 +1851,6 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       },
       { expectedGeneration, expectedControl },
     );
-    if (validation.blocked_policy_silence.length > 0) {
-      for (const key of validation.blocked_policy_silence) {
-        this.logger.warn?.(`[autoloop] refused to set silent=true on critical policy key ${key}`);
-      }
-      this.appendDecisionLog({
-        kind: 'policy_silence_blocked',
-        actor: 'planner',
-        payload: { keys: validation.blocked_policy_silence },
-      });
-    }
-
     // Persist and verify the complete Planner control claim before invoking
     // any control handler. A ledger failure must leave every control effect at
     // zero, even when the reply itself was a successful engine turn.

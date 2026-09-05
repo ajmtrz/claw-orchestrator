@@ -3992,17 +3992,23 @@ describe('SessionManager', () => {
         });
         const order: string[] = [];
         const openedTargets = new Map<number, string>();
+        const openedFlags = new Map<number, unknown>();
+        const controlFlushFlags: unknown[] = [];
         const openFile = vi.mocked(fs.openSync);
         const openImplementation = openFile.getMockImplementation()!;
         openFile.mockImplementation(((target: unknown, ...args: unknown[]) => {
           const fd = (openImplementation as (...values: unknown[]) => number)(target, ...args);
           openedTargets.set(fd, String(target));
+          openedFlags.set(fd, args[0]);
           return fd;
         }) as typeof fs.openSync);
         const flush = vi.mocked(fs.fsyncSync);
         const flushImplementation = flush.getMockImplementation()!;
         flush.mockImplementation((fd) => {
-          if (openedTargets.get(fd) === decisionsPath) order.push('control-flushed');
+          if (openedTargets.get(fd) === decisionsPath) {
+            order.push('control-flushed');
+            controlFlushFlags.push(openedFlags.get(fd));
+          }
           return flushImplementation(fd);
         });
         const spawnImplementation = handle.dispatcher.spawnSubagents.bind(handle.dispatcher);
@@ -4019,6 +4025,7 @@ describe('SessionManager', () => {
           });
           expect(order).toEqual(['control-flushed', 'effect-started']);
           expect([...openedTargets.values()]).not.toContain(ledgerDir);
+          expect(controlFlushFlags).toEqual(['r+']);
           expect(warn).toHaveBeenCalledWith(
             '[autoloop] parent-directory fsync is unavailable on win32; control file contents were flushed without a POSIX directory-entry guarantee',
           );
@@ -4386,6 +4393,46 @@ describe('SessionManager', () => {
         expect(handle.runner.state).toMatchObject({
           consecutive_phase_errors: 1,
           recent_phase_errors: [expect.objectContaining({ code: 'AUTOLOOP_CONTROL_MALFORMED' })],
+        });
+      });
+
+      it('keeps an empty Planner reply primary without recording agent progress when notification fails', async () => {
+        const runId = 'planner-empty-reply-survives-secondary-notification-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: '   ',
+          event: { type: 'result', result: '   ' },
+        });
+        handle.runner.config.notifyUser = async () => {
+          throw new Error('secondary empty-reply notification failed');
+        };
+        const activity = vi.spyOn(handle.runner, 'recordActivity');
+        const phaseErrors: PhaseErrorPayload[] = [];
+        handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+
+        let caught: unknown;
+        try {
+          await mgr.autoloopChat(runId, 'return a reply');
+        } catch (error) {
+          caught = error;
+        }
+
+        expect(caught).toMatchObject({
+          name: 'AutoloopOperationError',
+          code: 'AUTOLOOP_EMPTY_REPLY',
+          retryable: true,
+          secondaryErrors: [expect.objectContaining({ message: 'secondary empty-reply notification failed' })],
+        });
+        expect(activity.mock.calls.map(([kind]) => kind)).toEqual(['queue_message_accepted']);
+        expect(phaseErrors).toEqual([
+          expect.objectContaining({ agent: 'planner', phase: 'planner_turn', code: 'AUTOLOOP_EMPTY_REPLY' }),
+        ]);
+        expect(handle.runner.state).toMatchObject({
+          status: 'planning',
+          consecutive_phase_errors: 1,
+          recent_phase_errors: [expect.objectContaining({ code: 'AUTOLOOP_EMPTY_REPLY' })],
         });
       });
 

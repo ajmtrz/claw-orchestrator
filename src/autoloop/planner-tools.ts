@@ -142,9 +142,25 @@ const PUSH_POLICY_KEYS = new Set([
 const UNSILENCEABLE_PUSH_POLICY_KEYS = new Set(['on_phase_error', 'on_decision_needed']);
 const PUSH_POLICY_RULE_FIELDS = new Set(['channel', 'level', 'silent']);
 
+/**
+ * Maximum UTF-8 bytes accepted for one durable write_plan/write_goal payload.
+ * Planner controls are synchronously appended, fsynced, and tail-verified, so
+ * this 1 MiB ceiling bounds event-loop blocking while leaving ample room for
+ * legitimate planning artifacts.
+ */
+export const MAX_PLANNER_CONTROL_CONTENT_BYTES = 1_048_576;
+
 function nonEmptyString(value: unknown, label: string): string {
   if (typeof value !== 'string' || !value.trim()) throw new Error(`${label} must be a non-empty string`);
   return value;
+}
+
+function boundedPlannerContent(value: unknown, label: 'write_plan content' | 'write_goal content'): string {
+  const content = nonEmptyString(value, label);
+  if (Buffer.byteLength(content, 'utf8') > MAX_PLANNER_CONTROL_CONTENT_BYTES) {
+    throw new Error(`${label} exceeds the ${MAX_PLANNER_CONTROL_CONTENT_BYTES}-byte UTF-8 limit`);
+  }
+  return content;
 }
 
 function optionalString(value: unknown, label: string): string | undefined {
@@ -299,7 +315,7 @@ function sanitizePlannerToolCall(call: PlannerToolCall, blockedPolicySilence: st
     case 'update_push_policy':
       return { tool: call.tool, args: sanitizePushPolicyDelta(raw, blockedPolicySilence) };
     case 'write_plan': {
-      const content = nonEmptyString(raw.content, 'write_plan content');
+      const content = boundedPlannerContent(raw.content, 'write_plan content');
       const commitMessage = optionalString(raw.commit_message, 'write_plan commit_message');
       return {
         tool: call.tool,
@@ -307,7 +323,7 @@ function sanitizePlannerToolCall(call: PlannerToolCall, blockedPolicySilence: st
       };
     }
     case 'write_goal': {
-      const content = nonEmptyString(raw.content, 'write_goal content');
+      const content = boundedPlannerContent(raw.content, 'write_goal content');
       try {
         JSON.parse(content);
       } catch (error) {
@@ -337,7 +353,13 @@ export function validatePlannerToolCalls(calls: readonly PlannerToolCall[]): Pla
   const blockedPolicySilence: string[] = [];
   for (const call of calls) {
     try {
-      validated.push(sanitizePlannerToolCall(call, blockedPolicySilence));
+      const blockedBefore = blockedPolicySilence.length;
+      const sanitized = sanitizePlannerToolCall(call, blockedPolicySilence);
+      const isBlockedSilenceOnlyControl =
+        sanitized.tool === 'update_push_policy' &&
+        blockedPolicySilence.length > blockedBefore &&
+        Object.keys(sanitized.args).length === 0;
+      if (!isBlockedSilenceOnlyControl) validated.push(sanitized);
     } catch (error) {
       errors.push({ tool: call.tool, error: (error as Error).message });
     }
@@ -501,6 +523,7 @@ export async function applyPlannerToolCalls(
       emitted_messages.push(...(await control.apply()));
     } catch (err) {
       errors.push({ tool: control.tool, error: (err as Error).message });
+      break;
     }
   }
 
