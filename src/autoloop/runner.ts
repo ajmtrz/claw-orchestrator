@@ -11,7 +11,13 @@
  */
 
 import { EventEmitter } from 'node:events';
-import { type AnyAutoloopMessage, AutoloopRoutingError, Msg, validateMessage } from './messages.js';
+import {
+  type AnyAutoloopMessage,
+  type AutoloopOperationErrorCode,
+  AutoloopRoutingError,
+  Msg,
+  validateMessage,
+} from './messages.js';
 import {
   DEFAULT_PUSH_POLICY,
   MAX_METRIC_HISTORY,
@@ -28,6 +34,17 @@ const MAX_PAUSED_BUFFER = 1000;
 const DEFAULT_PHASE_ERROR_CIRCUIT = 3;
 const DEFAULT_STALL_MS = 30 * 60_000;
 const DEFAULT_STALL_CHECK_MS = 30_000;
+
+interface PlannerOperationFailure extends Error {
+  code: AutoloopOperationErrorCode;
+  retryable: true;
+}
+
+function isPlannerOperationFailure(error: unknown): error is PlannerOperationFailure {
+  if (!(error instanceof Error) || error.name !== 'AutoloopOperationError') return false;
+  const candidate = error as Error & { code?: unknown; retryable?: unknown };
+  return typeof candidate.code === 'string' && candidate.retryable === true;
+}
 
 /**
  * The single allow-list for activity-lease renewal. These values describe
@@ -371,6 +388,7 @@ export class AutoloopRunner extends EventEmitter {
   private async drain(): Promise<void> {
     if (this.draining) return; // a previous send() is already draining; new items will be picked up
     this.draining = true;
+    let plannerFailure: PlannerOperationFailure | undefined;
     try {
       const maxDepth = this.config.maxDispatchDepth ?? MAX_DISPATCH_DEPTH;
       let depth = 0;
@@ -383,11 +401,25 @@ export class AutoloopRunner extends EventEmitter {
         }
         const env = this.queue.shift();
         if (!env) break;
-        await this.handleOne(env);
+        try {
+          await this.handleOne(env);
+        } catch (error) {
+          if (env.to !== 'planner' || !isPlannerOperationFailure(error)) throw error;
+          plannerFailure ??= error;
+          this.queue.unshift(
+            Msg.phaseError(env.iter, {
+              agent: 'planner',
+              phase: 'planner_turn',
+              code: error.code,
+              error: error.message,
+            }),
+          );
+        }
       }
     } finally {
       this.draining = false;
     }
+    if (plannerFailure) throw plannerFailure;
   }
 
   private async handleOne(env: AnyAutoloopMessage): Promise<void> {

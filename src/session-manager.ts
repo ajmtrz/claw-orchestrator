@@ -3825,9 +3825,7 @@ export class SessionManager implements AgentRuntimeProbe {
         this.logger.info?.(`[autoloop/${runId}] spawn_subagents starting Coder + Reviewer sessions`);
         await dispatcherRef?.spawnSubagents(args);
       },
-      onPlannerTurnSucceeded: (controls) => {
-        if (controls.includes('spawn_subagents')) runnerRef?.markSubagentsSpawned();
-      },
+      onSpawnSubagentsCommitted: () => runnerRef?.markSubagentsSpawned(),
       onRoleSelectionChanged: async (selection) => {
         // Used to write a row into a private append-only registry file. The run
         // record is the registry now, so this just refreshes the published

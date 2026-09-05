@@ -141,13 +141,13 @@ export interface ClaudeAgentDispatcherConfig {
   pushPolicyRef?: PushPolicy;
   /** Called when Planner emits spawn_subagents. S4 implements; S3 records the intent. */
   onSpawnSubagents?: (args: SpawnSubagentsArgs) => Promise<void>;
+  /** Called exactly after the durably verified spawn effect commits. */
+  onSpawnSubagentsCommitted?: () => Promise<void> | void;
   /** Persist the effective non-secret role selection after a successful spawn. */
   onRoleSelectionChanged?: (selection: {
     coder: { engine: EngineType; model?: string };
     reviewer: { engine: EngineType; model?: string };
   }) => Promise<void> | void;
-  /** Apply runner phase changes only after the complete Planner turn contract is proven. */
-  onPlannerTurnSucceeded?: (controls: readonly PlannerToolName[]) => Promise<void> | void;
 }
 
 function resolveConfigByName(filename: string): string {
@@ -945,14 +945,19 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
             error: error.message,
           },
         });
+        // Preserve the established direct-dispatch compatibility contract for
+        // an empty Planner result. Runner-mediated callers process this typed
+        // envelope through the same phase-error accounting as thrown Planner
+        // operation failures.
         if (error.code === 'AUTOLOOP_EMPTY_REPLY' && env.to === 'planner') {
-          const phaseError = Msg.phaseError(env.iter, {
-            agent: 'planner',
-            phase: 'planner_turn',
-            code: error.code,
-            error: error.message,
-          });
-          return [phaseError];
+          return [
+            Msg.phaseError(env.iter, {
+              agent: 'planner',
+              phase: 'planner_turn',
+              code: error.code,
+              error: error.message,
+            }),
+          ];
         }
       }
       throw error;
@@ -1701,11 +1706,16 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       ? await this.runtimeProbe.inspect(observedGeneration.session_name, observedGeneration.session_id)
       : 'absent';
     const countersAfter = this.plannerTurnCounters();
-    const requiredToolDenied = Boolean(
-      countersBefore &&
-      countersAfter &&
-      (countersAfter.turns <= countersBefore.turns || countersAfter.turnsSucceeded <= countersBefore.turnsSucceeded),
-    );
+    // AGY reports required-tool denial only through the authoritative success
+    // counter while still returning non-empty text. Missing/non-finite AGY
+    // snapshots therefore cannot prove success. Other engines expose failure
+    // in SendResult.error/is_error and retain that result/transport taxonomy.
+    const counterEvidenceUnavailable = !countersBefore || !countersAfter;
+    const requiredToolDenied =
+      replyText.length > 0 &&
+      (counterEvidenceUnavailable
+        ? this.plannerSelection.engine === 'agy'
+        : countersAfter.turns <= countersBefore.turns || countersAfter.turnsSucceeded <= countersBefore.turnsSucceeded);
     assertPlannerTurnSucceeded(
       { reply: replyText, generation: observedGeneration, generationLiveness, requiredToolDenied },
       { requireLogicalResult: false, expectedGeneration },
@@ -1733,6 +1743,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       spawnSubagents: async (args) => {
         if (this.config.onSpawnSubagents) {
           await this.config.onSpawnSubagents(args);
+          await this.config.onSpawnSubagentsCommitted?.();
         } else {
           this.logger.warn?.('[autoloop] spawn_subagents called but no handler is installed');
         }
@@ -1859,8 +1870,6 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
           .join('; ')}`,
       );
     }
-    await this.config.onPlannerTurnSucceeded?.(controlTools);
-
     // Emit cleaned reply (without raw JSON blocks) for the chat tool to surface.
     const surfacedReply =
       parsed.cleaned_reply ||
