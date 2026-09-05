@@ -34,9 +34,11 @@ import { writeEvidence } from '../verify/evidence.js';
 import type { AcceptanceContract } from '../verify/contract.js';
 import { type AnyAutoloopMessage, Msg, type SendTimeoutPayload } from './messages.js';
 import {
+  AutoloopAgentReleaseOwnerError,
   DEFAULT_ACTIVITY_LEASE_MS,
   DEFAULT_SEND_TIMEOUT_MS,
   LEDGER_SCHEMA_VERSION,
+  isRecoverableAgentOwnerInstanceId,
   validateAutoloopTimeoutConfig,
   type AgentRuntimeProbe,
   type AgentDispatcher,
@@ -356,8 +358,11 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       customEngine: config.reviewerCustomEngine,
     };
     this.runtimeProbe = config.runtimeProbe ?? config.manager;
-    this.ownerInstanceId =
-      config.ownerInstanceId ?? config.manager.autoloopOwnerInstanceId ?? `dispatcher:${config.runId}`;
+    const ownerInstanceId = config.ownerInstanceId ?? config.manager.autoloopOwnerInstanceId;
+    if (!ownerInstanceId || !isRecoverableAgentOwnerInstanceId(ownerInstanceId)) {
+      throw new AutoloopAgentReleaseOwnerError(ownerInstanceId ?? 'missing');
+    }
+    this.ownerInstanceId = ownerInstanceId;
     this.now = config.now ?? (() => new Date());
     this.agentLeaseMs = config.agentLeaseMs ?? DEFAULT_ACTIVITY_LEASE_MS;
     this.ledgerDir = path.join(config.workspace, 'tasks', config.runId);

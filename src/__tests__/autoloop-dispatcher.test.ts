@@ -23,6 +23,8 @@ import type {
 } from '../autoloop/types.js';
 import { DEFAULT_PUSH_POLICY, LEDGER_SCHEMA_VERSION } from '../autoloop/types.js';
 
+const TEST_OWNER_INSTANCE_ID = `session-manager:${process.pid}:00000000-0000-4000-8000-000000000001`;
+
 interface StubCalls {
   startSession: ReturnType<typeof vi.fn>;
   sendMessage: ReturnType<typeof vi.fn>;
@@ -169,6 +171,7 @@ function makeStubManager(
     compactSession: vi.fn(async () => undefined),
   };
   const manager = {
+    autoloopOwnerInstanceId: TEST_OWNER_INSTANCE_ID,
     startSession: calls.startSession,
     sendMessage: calls.sendMessage,
     stopSession: calls.stopSession,
@@ -309,9 +312,18 @@ function readGenerationEvents(ledgerDir: string): AgentGenerationEvent[] {
 describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
   const state = {} as AutoloopState;
 
+  it('rejects an opaque dispatcher owner before it can be used as a release claimant', () => {
+    expect(() => makeDispatcher({ ownerInstanceId: 'opaque-dispatcher-owner' })).toThrow(
+      expect.objectContaining({
+        code: 'AUTOLOOP_AGENT_RELEASE_OWNER_INVALID',
+        retryable: false,
+      }),
+    );
+  });
+
   it('persists a generation reservation before creating the physical session', async () => {
     const { dispatcher, calls, ledgerDir } = makeDispatcher({
-      ownerInstanceId: 'owner-new',
+      ownerInstanceId: TEST_OWNER_INSTANCE_ID,
       now: () => new Date(AGENT_NOW),
       agentLeaseMs: 60_000,
     });
@@ -323,7 +335,7 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
             role: 'planner',
             generation: 1,
             session_name: config.name,
-            owner_instance_id: 'owner-new',
+            owner_instance_id: TEST_OWNER_INSTANCE_ID,
             created_at: AGENT_NOW,
             lease_expires_at: '2026-09-05T12:01:00.000Z',
             state: 'stale',
@@ -343,7 +355,7 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
 
   it('rolls back an uncommitted reservation when the reservation ledger append fails', async () => {
     const { dispatcher, calls, ledgerDir, reservations } = makeDispatcher({
-      ownerInstanceId: 'owner-new',
+      ownerInstanceId: TEST_OWNER_INSTANCE_ID,
       now: () => new Date(AGENT_NOW),
     });
     const generationsPath = path.join(ledgerDir, 'agent-generations.jsonl');
@@ -361,7 +373,7 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
       'autoloop-r1-planner',
       1,
       expect.objectContaining({
-        expectedOwnerInstanceId: 'owner-new',
+        expectedOwnerInstanceId: TEST_OWNER_INSTANCE_ID,
         expectedSessionId: expect.any(String),
         rollbackUncommittedReservation: true,
       }),
@@ -379,7 +391,7 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
 
   it('surfaces a typed rollback postcondition failure when append and rollback persistence both fail', async () => {
     const { dispatcher, calls, ledgerDir, reservations } = makeDispatcher({
-      ownerInstanceId: 'owner-new',
+      ownerInstanceId: TEST_OWNER_INSTANCE_ID,
       now: () => new Date(AGENT_NOW),
     });
     const generationsPath = path.join(ledgerDir, 'agent-generations.jsonl');
@@ -416,9 +428,71 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
     expect(readGenerationEvents(ledgerDir)).toEqual([]);
   });
 
+  it('retains the append cause and rollback context when rollback release throws', async () => {
+    const { dispatcher, calls, ledgerDir, reservations } = makeDispatcher({
+      ownerInstanceId: TEST_OWNER_INSTANCE_ID,
+      now: () => new Date(AGENT_NOW),
+    });
+    const generationsPath = path.join(ledgerDir, 'agent-generations.jsonl');
+    const reserveAgentGeneration = calls.reserveAgentGeneration.getMockImplementation()!;
+    calls.reserveAgentGeneration.mockImplementationOnce((generation: PhysicalAgentGeneration) => {
+      const reserved = reserveAgentGeneration(generation);
+      fs.mkdirSync(generationsPath, { recursive: true });
+      return reserved;
+    });
+    const releaseReservation = calls.releaseReservation.getMockImplementation()!;
+    calls.releaseReservation.mockImplementation(
+      async (name: string, generation: number, options: AgentReservationReleaseOptions) => {
+        if (options.rollbackUncommittedReservation) {
+          throw Object.assign(new Error('rollback registry unavailable'), {
+            code: 'AUTOLOOP_AGENT_REGISTRY_PERSIST_FAILED',
+          });
+        }
+        return await releaseReservation(name, generation, options);
+      },
+    );
+
+    let failure: unknown;
+    try {
+      await dispatcher.init(state);
+    } catch (err) {
+      failure = err;
+    }
+    fs.rmSync(generationsPath, { recursive: true });
+
+    expect(failure).toMatchObject({
+      name: 'AutoloopAgentConflictError',
+      code: 'AUTOLOOP_AGENT_ROLLBACK_POSTCONDITION_FAILED',
+      cause: expect.objectContaining({ code: 'EISDIR' }),
+    });
+    expect((failure as Error).message).toContain('rollback failed with rollback registry unavailable');
+    expect(reservations.has('autoloop-r1-planner')).toBe(true);
+    expect(calls.startSession).not.toHaveBeenCalled();
+  });
+
+  it('propagates registry operational failure instead of reporting a generation conflict', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({
+      ownerInstanceId: TEST_OWNER_INSTANCE_ID,
+      now: () => new Date(AGENT_NOW),
+    });
+    calls.reserveAgentGeneration.mockImplementationOnce(() => {
+      throw Object.assign(new Error('shared registry lock unavailable'), {
+        code: 'AUTOLOOP_AGENT_REGISTRY_LOCK_CONTENDED',
+        retryable: true,
+      });
+    });
+
+    await expect(dispatcher.init(state)).rejects.toMatchObject({
+      code: 'AUTOLOOP_AGENT_REGISTRY_LOCK_CONTENDED',
+      retryable: true,
+    });
+    expect(readGenerationEvents(ledgerDir)).toEqual([]);
+    expect(calls.startSession).not.toHaveBeenCalled();
+  });
+
   it('keeps a genuinely live conflicting owner as a typed hard stop', async () => {
     const { dispatcher, calls, ledgerDir, activeNames, reservations } = makeDispatcher({
-      ownerInstanceId: 'owner-new',
+      ownerInstanceId: TEST_OWNER_INSTANCE_ID,
       now: () => new Date(AGENT_NOW),
     });
     const current = physicalGeneration('planner');
@@ -433,7 +507,7 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
 
   it('keeps unknown runtime liveness as a typed hard stop', async () => {
     const { dispatcher, calls, ledgerDir, reservations } = makeDispatcher({
-      ownerInstanceId: 'owner-new',
+      ownerInstanceId: TEST_OWNER_INSTANCE_ID,
       now: () => new Date(AGENT_NOW),
     });
     const current = physicalGeneration('planner');
@@ -448,7 +522,7 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
 
   it('does not reclaim an absent owner until its lease has expired', async () => {
     const { dispatcher, calls, ledgerDir, reservations } = makeDispatcher({
-      ownerInstanceId: 'owner-new',
+      ownerInstanceId: TEST_OWNER_INSTANCE_ID,
       now: () => new Date(AGENT_NOW),
     });
     const current = physicalGeneration('planner', {
@@ -464,7 +538,7 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
 
   it('reclaims an expired dead owner and appends orphan and release evidence before name reuse', async () => {
     const { dispatcher, calls, ledgerDir, reservations } = makeDispatcher({
-      ownerInstanceId: 'owner-new',
+      ownerInstanceId: TEST_OWNER_INSTANCE_ID,
       now: () => new Date(AGENT_NOW),
       agentLeaseMs: 60_000,
     });
@@ -519,7 +593,7 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
       expect.objectContaining({
         expectedOwnerInstanceId: current.owner_instance_id,
         expectedSessionId: current.session_id,
-        releaseOwnerInstanceId: 'owner-new',
+        releaseOwnerInstanceId: TEST_OWNER_INSTANCE_ID,
         beforeRelease: expect.any(Function),
         persistReleaseEvidence: expect.any(Function),
       }),
@@ -533,12 +607,12 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
       'agent_generation_started',
     ]);
     expect(events.map((entry) => entry.payload.generation)).toEqual([1, 1, 1, 2, 2]);
-    expect(events[3].payload).toMatchObject({ owner_instance_id: 'owner-new', state: 'stale' });
+    expect(events[3].payload).toMatchObject({ owner_instance_id: TEST_OWNER_INSTANCE_ID, state: 'stale' });
   });
 
   it('reclaims a stale registry-only legacy reservation before generation one starts', async () => {
     const { dispatcher, calls, ledgerDir, reservations } = makeDispatcher({
-      ownerInstanceId: 'owner-new',
+      ownerInstanceId: TEST_OWNER_INSTANCE_ID,
       now: () => new Date(AGENT_NOW),
     });
     const legacy = physicalGeneration('planner', {
@@ -587,7 +661,7 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
       0,
       expect.objectContaining({
         expectedOwnerInstanceId: 'legacy-registry',
-        releaseOwnerInstanceId: 'owner-new',
+        releaseOwnerInstanceId: TEST_OWNER_INSTANCE_ID,
         beforeRelease: expect.any(Function),
         persistReleaseEvidence: expect.any(Function),
       }),
@@ -602,7 +676,7 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
 
   it('rejects cleanup when the runtime reservation no longer matches the durable generation', async () => {
     const { dispatcher, calls, ledgerDir, reservations } = makeDispatcher({
-      ownerInstanceId: 'owner-new',
+      ownerInstanceId: TEST_OWNER_INSTANCE_ID,
       now: () => new Date(AGENT_NOW),
     });
     const durable = physicalGeneration('planner');
@@ -622,7 +696,7 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
 
   it('does not append release evidence when the registry cannot durably prepare the release', async () => {
     const { dispatcher, calls, ledgerDir, reservations } = makeDispatcher({
-      ownerInstanceId: 'owner-new',
+      ownerInstanceId: TEST_OWNER_INSTANCE_ID,
       now: () => new Date(AGENT_NOW),
     });
     const current = physicalGeneration('planner');
@@ -648,7 +722,7 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
 
   it('retries a crash after registry preparation without duplicate evidence or a skipped generation', async () => {
     const { dispatcher, calls, ledgerDir, reservations } = makeDispatcher({
-      ownerInstanceId: 'owner-new',
+      ownerInstanceId: TEST_OWNER_INSTANCE_ID,
       now: () => new Date(AGENT_NOW),
     });
     const current = physicalGeneration('planner');
@@ -694,7 +768,7 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
 
   it('coalesces two concurrent recoverers into one compare-and-release and one replacement', async () => {
     const { dispatcher, calls, ledgerDir, reservations } = makeDispatcher({
-      ownerInstanceId: 'owner-new',
+      ownerInstanceId: TEST_OWNER_INSTANCE_ID,
       now: () => new Date(AGENT_NOW),
     });
     const competingDispatcher = new ClaudeAgentDispatcher({ ...dispatcher.config });

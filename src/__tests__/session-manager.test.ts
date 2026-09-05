@@ -575,6 +575,39 @@ describe('SessionManager', () => {
       expect([rollback, normal, empty, incompleteRollback, incompleteNormal]).toHaveLength(5);
     });
 
+    it('rejects an opaque release owner before it can persist a pending fence', async () => {
+      const sessionName = 'autoloop-probe-opaque-release-owner-planner';
+      const first = managerGeneration(sessionName);
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      let evidenceHookCount = 0;
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      const before = structuredClone(reservations.get(sessionName));
+      await expect(
+        mgr.releaseReservation(sessionName, first.generation, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: 'opaque-owner',
+          beforeRelease: () => {
+            evidenceHookCount += 1;
+          },
+          persistReleaseEvidence: () => {
+            evidenceHookCount += 1;
+          },
+        }),
+      ).rejects.toMatchObject({
+        code: 'AUTOLOOP_AGENT_RELEASE_OWNER_INVALID',
+        retryable: false,
+      });
+
+      expect(reservations.get(sessionName)).toEqual(before);
+      expect(evidenceHookCount).toBe(0);
+    });
+
     it('reports shared PID ownership by another live manager as live', async () => {
       const sessionName = 'autoloop-probe-shared-live-planner';
       mockSharedPidFile({
@@ -658,6 +691,79 @@ describe('SessionManager', () => {
       }
     });
 
+    it('fails closed when the shared session registry is corrupt, unreadable, or not an array', () => {
+      const existingName = 'autoloop-probe-authority-existing-planner';
+      const attemptedName = 'autoloop-probe-authority-attempted-planner';
+      const existing = managerGeneration(existingName);
+      const attempted = managerGeneration(attemptedName);
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+
+      expect(mgr.reserveAgentGeneration(existing, '/tmp')).toBe(true);
+      const inMemoryBefore = structuredClone(Array.from(reservations.entries()));
+
+      for (const invalidAuthority of ['{', JSON.stringify({ entries: [] })]) {
+        persistenceFsState.files.set(SESSION_REGISTRY_FILE, invalidAuthority);
+
+        expect(() => mgr.reserveAgentGeneration(attempted, '/tmp')).toThrow(
+          expect.objectContaining({
+            code: 'AUTOLOOP_AGENT_REGISTRY_CORRUPT',
+            retryable: false,
+          }),
+        );
+        expect(persistenceFsState.files.get(SESSION_REGISTRY_FILE)).toBe(invalidAuthority);
+        expect(Array.from(reservations.entries())).toEqual(inMemoryBefore);
+      }
+
+      const validAuthority = JSON.stringify(Array.from(reservations.values()));
+      persistenceFsState.files.set(SESSION_REGISTRY_FILE, validAuthority);
+      const readFile = vi.mocked(fs.readFileSync).getMockImplementation()!;
+      vi.mocked(fs.readFileSync).mockImplementationOnce(((file: string, ...args: unknown[]) => {
+        if (file === SESSION_REGISTRY_FILE) {
+          throw Object.assign(new Error('registry read denied'), { code: 'EACCES' });
+        }
+        return (readFile as unknown as (file: string, ...rest: unknown[]) => unknown)(file, ...args);
+      }) as typeof fs.readFileSync);
+
+      expect(() => mgr.reserveAgentGeneration(attempted, '/tmp')).toThrow(
+        expect.objectContaining({
+          code: 'AUTOLOOP_AGENT_REGISTRY_READ_FAILED',
+          retryable: true,
+        }),
+      );
+      expect(persistenceFsState.files.get(SESSION_REGISTRY_FILE)).toBe(validAuthority);
+      expect(Array.from(reservations.entries())).toEqual(inMemoryBefore);
+    });
+
+    it("keeps one name's unflushed resume metadata when another name enters registry CAS", async () => {
+      const firstName = 'autoloop-probe-unflushed-first-planner';
+      const secondName = 'autoloop-probe-unflushed-second-planner';
+      const first = managerGeneration(firstName);
+      const second = managerGeneration(secondName, {
+        session_id: 'physical-session-2',
+        owner_instance_id: 'owner-2',
+      });
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      await mgr.startSession({ name: firstName, cwd: '/tmp' }, first);
+      const unflushedResumeId = reservations.get(firstName)?.claudeSessionId;
+      expect(unflushedResumeId).toMatch(/^mock-session-/);
+      expect(
+        JSON.parse(persistenceFsState.files.get(SESSION_REGISTRY_FILE)!) as Array<Record<string, unknown>>,
+      ).toEqual(expect.arrayContaining([expect.objectContaining({ name: firstName, claudeSessionId: '' })]));
+
+      expect(mgr.reserveAgentGeneration(second, '/tmp')).toBe(true);
+      expect(reservations.get(firstName)?.claudeSessionId).toBe(unflushedResumeId);
+    });
+
     it('requires the full generation owner and session tuple to release an active reservation', async () => {
       const invalidOptions = [
         { expectedSessionId: 'physical-session-1' },
@@ -684,6 +790,7 @@ describe('SessionManager', () => {
             generation.generation,
             uncheckedReleaseOptions({
               ...tuple,
+              releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
               beforeRelease: () => {
                 evidenceHookCount += 1;
               },
@@ -757,7 +864,9 @@ describe('SessionManager', () => {
         throw new Error('rollback registry rename failed');
       });
 
-      await expect(mgr.releaseReservation(sessionName, first.generation, rollbackOptions)).resolves.toBe(false);
+      await expect(mgr.releaseReservation(sessionName, first.generation, rollbackOptions)).rejects.toMatchObject({
+        code: 'AUTOLOOP_AGENT_REGISTRY_PERSIST_FAILED',
+      });
       expect(reservations.get(sessionName)).toEqual(before);
       expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(false);
 
@@ -830,7 +939,7 @@ describe('SessionManager', () => {
         mgr.releaseReservation(sessionName, 2, {
           expectedOwnerInstanceId: first.owner_instance_id,
           expectedSessionId: first.session_id,
-          releaseOwnerInstanceId: 'release-owner-mismatch',
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
           beforeRelease: () => {
             mismatchedOrphan = true;
           },
@@ -843,7 +952,7 @@ describe('SessionManager', () => {
         mgr.releaseReservation(sessionName, 1, {
           expectedOwnerInstanceId: first.owner_instance_id,
           expectedSessionId: first.session_id,
-          releaseOwnerInstanceId: 'release-owner-1',
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
           beforeRelease: () => undefined,
           persistReleaseEvidence: () => {
             competingReservation = mgr.reserveAgentGeneration(replacement, '/tmp');
@@ -883,7 +992,7 @@ describe('SessionManager', () => {
       const releaseOptions: ManagerReleaseOptions = {
         expectedOwnerInstanceId: first.owner_instance_id,
         expectedSessionId: first.session_id,
-        releaseOwnerInstanceId: 'release-owner-1',
+        releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
       };
 
       await expect(mgr.inspect(sessionName, first.session_id)).resolves.toBe('unknown');
@@ -901,7 +1010,7 @@ describe('SessionManager', () => {
         mgr.releaseReservation(sessionName, 1, {
           expectedOwnerInstanceId: first.owner_instance_id,
           expectedSessionId: first.session_id,
-          releaseOwnerInstanceId: 'release-owner-1',
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
           beforeRelease: () => undefined,
           persistReleaseEvidence: () => {
             competingReservation = mgr.reserveAgentGeneration(replacement, '/tmp');
@@ -937,7 +1046,7 @@ describe('SessionManager', () => {
         mgr.releaseReservation(sessionName, 0, {
           expectedOwnerInstanceId: 'legacy-registry',
           expectedSessionId: undefined,
-          releaseOwnerInstanceId: 'release-owner-1',
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
           beforeRelease: () => {
             orphanEvidenceDurable = true;
           },
@@ -979,7 +1088,7 @@ describe('SessionManager', () => {
         mgr.releaseReservation(sessionName, 0, {
           expectedOwnerInstanceId: 'arbitrary-owner-that-was-never-stored',
           expectedSessionId: 'arbitrary-session-that-was-never-stored',
-          releaseOwnerInstanceId: 'release-owner-idempotent-retry',
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
           beforeRelease: () => {
             evidenceHookCount += 1;
           },
@@ -1057,7 +1166,7 @@ describe('SessionManager', () => {
           mgr.releaseReservation(testCase.name, testCase.generation, {
             expectedOwnerInstanceId: testCase.expectedOwnerInstanceId,
             expectedSessionId: testCase.expectedSessionId,
-            releaseOwnerInstanceId: 'release-owner-must-not-run',
+            releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
             beforeRelease: () => {
               evidenceHookCount += 1;
             },
@@ -1066,6 +1175,74 @@ describe('SessionManager', () => {
             },
           } as ManagerReleaseOptions),
         ).resolves.toBe(false);
+        expect(reservations.get(testCase.name)).toEqual(before);
+      }
+      expect(evidenceHookCount).toBe(0);
+    });
+
+    it('accepts matching modern full-tuple, owner-only, and session-only tombstone retries without hooks', async () => {
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      const baseTombstone = {
+        claudeSessionId: 'released-session-id',
+        cwd: '/tmp',
+        originalCreated: '2026-09-05T10:00:00.000Z',
+        lastResumed: '2026-09-05T10:00:00.000Z',
+        lastActivity: Date.parse('2026-09-05T10:00:00.000Z'),
+        agentReleasedGeneration: 1,
+      };
+      const cases = [
+        {
+          name: 'released-matching-full-tuple',
+          stored: {
+            agentReleasedOwnerInstanceId: 'stored-owner',
+            agentReleasedSessionId: 'stored-session',
+          },
+          expectedOwnerInstanceId: 'stored-owner',
+          expectedSessionId: 'stored-session',
+        },
+        {
+          name: 'released-matching-owner-only',
+          stored: { agentReleasedOwnerInstanceId: 'stored-owner' },
+          expectedOwnerInstanceId: 'stored-owner',
+          expectedSessionId: undefined,
+        },
+        {
+          name: 'released-matching-session-only',
+          stored: { agentReleasedSessionId: 'stored-session' },
+          expectedOwnerInstanceId: 'unused-owner',
+          expectedSessionId: 'stored-session',
+        },
+      ];
+      let evidenceHookCount = 0;
+
+      for (const testCase of cases) {
+        reservations.set(testCase.name, {
+          ...baseTombstone,
+          name: testCase.name,
+          ...testCase.stored,
+        });
+      }
+      persistManagerRegistry(mgr);
+
+      for (const testCase of cases) {
+        const before = structuredClone(reservations.get(testCase.name));
+        await expect(
+          mgr.releaseReservation(testCase.name, 1, {
+            expectedOwnerInstanceId: testCase.expectedOwnerInstanceId,
+            expectedSessionId: testCase.expectedSessionId,
+            releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+            beforeRelease: () => {
+              evidenceHookCount += 1;
+            },
+            persistReleaseEvidence: () => {
+              evidenceHookCount += 1;
+            },
+          }),
+        ).resolves.toBe(true);
         expect(reservations.get(testCase.name)).toEqual(before);
       }
       expect(evidenceHookCount).toBe(0);
@@ -1089,7 +1266,7 @@ describe('SessionManager', () => {
       });
     });
 
-    it('rolls back reservation changes when the atomic registry write fails', async () => {
+    it('distinguishes registry lock and persistence failures from ownership rejection', async () => {
       const sessionName = 'autoloop-probe-persist-failure-planner';
       const first = managerGeneration(sessionName);
       const reservations = (
@@ -1098,10 +1275,30 @@ describe('SessionManager', () => {
         }
       ).persistedSessions;
 
+      const openFile = vi.mocked(fs.openSync).getMockImplementation()!;
+      vi.mocked(fs.openSync).mockImplementationOnce(((file: string, ...args: unknown[]) => {
+        if (file.endsWith('/claude-sessions.json.lock')) {
+          throw Object.assign(new Error('registry lock unavailable'), { code: 'EACCES' });
+        }
+        return (openFile as unknown as (file: string, ...rest: unknown[]) => number)(file, ...args);
+      }) as typeof fs.openSync);
+      expect(() => mgr.reserveAgentGeneration(first, '/tmp')).toThrow(
+        expect.objectContaining({
+          code: 'AUTOLOOP_AGENT_REGISTRY_LOCK_CONTENDED',
+          retryable: true,
+        }),
+      );
+      expect(reservations.has(sessionName)).toBe(false);
+
       vi.mocked(fs.renameSync).mockImplementationOnce(() => {
         throw new Error('registry rename failed');
       });
-      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(false);
+      expect(() => mgr.reserveAgentGeneration(first, '/tmp')).toThrow(
+        expect.objectContaining({
+          code: 'AUTOLOOP_AGENT_REGISTRY_PERSIST_FAILED',
+          retryable: true,
+        }),
+      );
       expect(reservations.has(sessionName)).toBe(false);
 
       expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
@@ -1114,7 +1311,7 @@ describe('SessionManager', () => {
         mgr.releaseReservation(sessionName, first.generation, {
           expectedOwnerInstanceId: first.owner_instance_id,
           expectedSessionId: first.session_id,
-          releaseOwnerInstanceId: 'release-owner-1',
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
           beforeRelease: () => {
             orphanEvidenceCount += 1;
           },
@@ -1122,7 +1319,10 @@ describe('SessionManager', () => {
             releaseEvidenceCount += 1;
           },
         } as ManagerReleaseOptions),
-      ).resolves.toBe(false);
+      ).rejects.toMatchObject({
+        code: 'AUTOLOOP_AGENT_REGISTRY_PERSIST_FAILED',
+        retryable: true,
+      });
       expect(orphanEvidenceCount).toBe(0);
       expect(releaseEvidenceCount).toBe(0);
       expect(reservations.get(sessionName)).toMatchObject({
@@ -1148,17 +1348,17 @@ describe('SessionManager', () => {
         mgr.releaseReservation(sessionName, first.generation, {
           expectedOwnerInstanceId: first.owner_instance_id,
           expectedSessionId: first.session_id,
-          releaseOwnerInstanceId: 'release-owner-a',
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
           beforeRelease: () => {
             winnerHookCount += 1;
             expect(reservations.get(sessionName)).toMatchObject({
               agentReleasePending: true,
-              agentReleaseOwnerInstanceId: 'release-owner-a',
+              agentReleaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
             });
             competingRelease = mgr.releaseReservation(sessionName, first.generation, {
               expectedOwnerInstanceId: first.owner_instance_id,
               expectedSessionId: first.session_id,
-              releaseOwnerInstanceId: 'release-owner-b',
+              releaseOwnerInstanceId: `session-manager:${process.pid}:00000000-0000-4000-8000-000000000002`,
               beforeRelease: () => {
                 competingHookCount += 1;
               },
@@ -1200,7 +1400,7 @@ describe('SessionManager', () => {
         mgr.releaseReservation(sessionName, first.generation, {
           expectedOwnerInstanceId: first.owner_instance_id,
           expectedSessionId: 'wrong-physical-session',
-          releaseOwnerInstanceId: 'release-owner-wrong-tuple',
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
           beforeRelease: () => {
             evidenceHookCount += 1;
           },
@@ -1217,7 +1417,7 @@ describe('SessionManager', () => {
         mgr.releaseReservation(sessionName, first.generation, {
           expectedOwnerInstanceId: first.owner_instance_id,
           expectedSessionId: first.session_id,
-          releaseOwnerInstanceId: 'release-owner-first-claimant',
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
           beforeRelease: () => {
             evidenceHookCount += 1;
           },
@@ -1286,6 +1486,95 @@ describe('SessionManager', () => {
       }
     });
 
+    it('keeps the release owner live when shutdown starts inside an evidence hook', async () => {
+      const sessionName = 'autoloop-probe-mid-hook-shutdown-planner';
+      const first = managerGeneration(sessionName);
+      const successor = createManager();
+      let shutdown: Promise<void> | undefined;
+      let competingRelease: Promise<boolean> | undefined;
+      let priorEvidenceCount = 0;
+      let successorEvidenceCount = 0;
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      try {
+        await expect(
+          mgr.releaseReservation(sessionName, first.generation, {
+            expectedOwnerInstanceId: first.owner_instance_id,
+            expectedSessionId: first.session_id,
+            releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+            beforeRelease: () => {
+              priorEvidenceCount += 1;
+              shutdown = mgr.shutdown();
+              competingRelease = successor.releaseReservation(sessionName, first.generation, {
+                expectedOwnerInstanceId: first.owner_instance_id,
+                expectedSessionId: first.session_id,
+                releaseOwnerInstanceId: successor.autoloopOwnerInstanceId,
+                beforeRelease: () => {
+                  successorEvidenceCount += 1;
+                },
+                persistReleaseEvidence: () => {
+                  successorEvidenceCount += 1;
+                },
+              });
+            },
+            persistReleaseEvidence: () => {
+              priorEvidenceCount += 1;
+            },
+          }),
+        ).resolves.toBe(true);
+
+        await expect(competingRelease).resolves.toBe(false);
+        await shutdown;
+        expect(priorEvidenceCount).toBe(2);
+        expect(successorEvidenceCount).toBe(0);
+      } finally {
+        await successor.shutdown();
+      }
+    });
+
+    it('keeps the release owner live from durable claim through queued evidence hooks', async () => {
+      const sessionName = 'autoloop-probe-pre-hook-shutdown-planner';
+      const first = managerGeneration(sessionName);
+      const successor = createManager();
+      let priorEvidenceCount = 0;
+      let successorEvidenceCount = 0;
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      try {
+        const release = mgr.releaseReservation(sessionName, first.generation, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+          beforeRelease: () => {
+            priorEvidenceCount += 1;
+          },
+          persistReleaseEvidence: () => {
+            priorEvidenceCount += 1;
+          },
+        });
+        const shutdown = mgr.shutdown();
+        const competingRelease = successor.releaseReservation(sessionName, first.generation, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: successor.autoloopOwnerInstanceId,
+          beforeRelease: () => {
+            successorEvidenceCount += 1;
+          },
+          persistReleaseEvidence: () => {
+            successorEvidenceCount += 1;
+          },
+        });
+
+        await expect(release).resolves.toBe(true);
+        await expect(competingRelease).resolves.toBe(false);
+        await shutdown;
+        expect(priorEvidenceCount).toBe(2);
+        expect(successorEvidenceCount).toBe(0);
+      } finally {
+        await successor.shutdown();
+      }
+    });
+
     it('keeps a pending release fenced when the prior release owner is indeterminate', async () => {
       const sessionName = 'autoloop-probe-unknown-release-owner-planner';
       const first = managerGeneration(sessionName);
@@ -1327,7 +1616,49 @@ describe('SessionManager', () => {
       }
     });
 
-    it('uses the shared registry as CAS authority so stale managers run one writer and preserve a successor', async () => {
+    it('takes over a well-formed pending release whose prior owner PID is dead', async () => {
+      const sessionName = 'autoloop-probe-dead-release-owner-planner';
+      const first = managerGeneration(sessionName);
+      const deadOwnerPid = 2_000_000_000;
+      const deadOwnerInstanceId = `session-manager:${deadOwnerPid}:00000000-0000-4000-8000-000000000003`;
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      let evidenceHookCount = 0;
+
+      expect(() => process.kill(deadOwnerPid, 0)).toThrow();
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      reservations.set(sessionName, {
+        ...reservations.get(sessionName),
+        agentReleasePending: true,
+        agentReleaseOwnerInstanceId: deadOwnerInstanceId,
+      });
+      persistManagerRegistry(mgr);
+
+      const claimant = createManager();
+      try {
+        await expect(
+          claimant.releaseReservation(sessionName, first.generation, {
+            expectedOwnerInstanceId: first.owner_instance_id,
+            expectedSessionId: first.session_id,
+            releaseOwnerInstanceId: claimant.autoloopOwnerInstanceId,
+            beforeRelease: () => {
+              evidenceHookCount += 1;
+            },
+            persistReleaseEvidence: () => {
+              evidenceHookCount += 1;
+            },
+          }),
+        ).resolves.toBe(true);
+        expect(evidenceHookCount).toBe(2);
+      } finally {
+        await claimant.shutdown();
+      }
+    });
+
+    it('uses shared disk CAS across same-process managers so one writer wins and a successor survives', async () => {
       const sessionName = 'autoloop-probe-cross-manager-cas-planner';
       const first = managerGeneration(sessionName);
       const successorGeneration = managerGeneration(sessionName, {
@@ -1414,7 +1745,7 @@ describe('SessionManager', () => {
       const winnerOptions: ManagerReleaseOptions = {
         expectedOwnerInstanceId: first.owner_instance_id,
         expectedSessionId: first.session_id,
-        releaseOwnerInstanceId: 'release-owner-a',
+        releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
         beforeRelease: () => {
           winnerOrphanHookCount += 1;
           if (failOrphanEvidence) {
@@ -1433,14 +1764,14 @@ describe('SessionManager', () => {
       );
       expect(reservations.get(sessionName)).toMatchObject({
         agentReleasePending: true,
-        agentReleaseOwnerInstanceId: 'release-owner-a',
+        agentReleaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
       });
       expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(false);
 
       await expect(
         mgr.releaseReservation(sessionName, first.generation, {
           ...winnerOptions,
-          releaseOwnerInstanceId: 'release-owner-b',
+          releaseOwnerInstanceId: `session-manager:${process.pid}:00000000-0000-4000-8000-000000000002`,
           beforeRelease: () => {
             competingHookCount += 1;
           },
@@ -1468,12 +1799,15 @@ describe('SessionManager', () => {
       const options: ManagerReleaseOptions = {
         expectedOwnerInstanceId: first.owner_instance_id,
         expectedSessionId: first.session_id,
-        releaseOwnerInstanceId: 'release-owner-1',
-        beforeRelease: () => undefined,
+        releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+        beforeRelease: () => {
+          beforeEvidenceCount += 1;
+        },
         persistReleaseEvidence: () => {
-          releaseEvidenceCount = 1;
+          releaseEvidenceCount += 1;
         },
       };
+      let beforeEvidenceCount = 0;
       let releaseEvidenceCount = 0;
 
       expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
@@ -1483,11 +1817,15 @@ describe('SessionManager', () => {
         .mockImplementationOnce(() => {
           throw new Error('registry rename failed');
         });
-      await expect(mgr.releaseReservation(sessionName, 1, options)).resolves.toBe(false);
+      await expect(mgr.releaseReservation(sessionName, 1, options)).rejects.toMatchObject({
+        code: 'AUTOLOOP_AGENT_REGISTRY_PERSIST_FAILED',
+      });
+      expect(beforeEvidenceCount).toBe(1);
       expect(releaseEvidenceCount).toBe(1);
       expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(false);
       await expect(mgr.releaseReservation(sessionName, 1, options)).resolves.toBe(true);
       await expect(mgr.releaseReservation(sessionName, 1, options)).resolves.toBe(true);
+      expect(beforeEvidenceCount).toBe(1);
       expect(releaseEvidenceCount).toBe(1);
       expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(true);
     });
@@ -2281,6 +2619,25 @@ describe('SessionManager', () => {
       await mgr.shutdown();
       // Second shutdown should not throw
       await mgr.shutdown();
+    });
+
+    it('cancels a pending debounced registry write before returning', async () => {
+      await mgr.startSession({ name: 'debounced-shutdown', cwd: '/tmp' });
+      const internals = mgr as unknown as {
+        _persistRegistrySnapshot(): boolean;
+      };
+      const persist = internals._persistRegistrySnapshot.bind(mgr);
+      let writesAfterSessionStart = 0;
+      internals._persistRegistrySnapshot = () => {
+        writesAfterSessionStart += 1;
+        return persist();
+      };
+
+      await mgr.shutdown();
+      expect(writesAfterSessionStart).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(writesAfterSessionStart).toBe(1);
     });
   });
 

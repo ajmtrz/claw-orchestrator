@@ -124,46 +124,155 @@ function mergeRegistrySnapshot(
   return merged;
 }
 
-function loadPersistedSessions(): Map<string, PersistedSession> {
-  try {
-    if (!fs.existsSync(PERSIST_FILE)) return new Map();
-    const raw = fs.readFileSync(PERSIST_FILE, 'utf8');
-    const arr: PersistedSession[] = JSON.parse(raw);
-    const now = Date.now();
-    // A durable generation fence cannot expire merely because its ordinary
-    // resumable-session metadata is old. Recovery must explicitly release it.
-    const valid = arr.filter((s) => hasAgentFence(s) || now - s.lastActivity < PERSIST_DISK_TTL_MS);
-    return new Map(valid.map((s) => [s.name, s]));
-  } catch {
-    return new Map();
+/**
+ * Refresh the local registry from disk without discarding metadata whose
+ * debounced write is still pending. Local metadata is reusable only while the
+ * exact authoritative fence is unchanged; a successor fence or authoritative
+ * deletion always wins.
+ */
+function mergeRegistryView(
+  authoritative: Map<string, PersistedSession>,
+  local: Map<string, PersistedSession>,
+): Map<string, PersistedSession> {
+  const merged = new Map(authoritative);
+  for (const [name, localSession] of local) {
+    const authoritativeSession = authoritative.get(name);
+    if (!authoritativeSession) {
+      if (!hasAgentFence(localSession)) merged.set(name, localSession);
+      continue;
+    }
+    if (!sameAgentFence(authoritativeSession, localSession)) continue;
+
+    const withLocalMetadata: PersistedSession = { ...authoritativeSession, ...localSession };
+    const mutableFence = withLocalMetadata as unknown as Record<string, unknown>;
+    for (const field of AGENT_FENCE_FIELDS) {
+      const value = authoritativeSession[field];
+      if (value === undefined) delete mutableFence[field];
+      else mutableFence[field] = value;
+    }
+    merged.set(name, withLocalMetadata);
+  }
+  return merged;
+}
+
+export type AutoloopAgentRegistryErrorCode =
+  | 'AUTOLOOP_AGENT_REGISTRY_CORRUPT'
+  | 'AUTOLOOP_AGENT_REGISTRY_READ_FAILED'
+  | 'AUTOLOOP_AGENT_REGISTRY_LOCK_CONTENDED'
+  | 'AUTOLOOP_AGENT_REGISTRY_PERSIST_FAILED';
+
+export class AutoloopAgentRegistryError extends Error {
+  readonly code: AutoloopAgentRegistryErrorCode;
+  readonly retryable: boolean;
+
+  constructor(code: AutoloopAgentRegistryErrorCode, message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'AutoloopAgentRegistryError';
+    this.code = code;
+    this.retryable = code !== 'AUTOLOOP_AGENT_REGISTRY_CORRUPT';
   }
 }
 
+function loadPersistedSessions(): Map<string, PersistedSession> {
+  if (!fs.existsSync(PERSIST_FILE)) return new Map();
+
+  let raw: string;
+  try {
+    raw = fs.readFileSync(PERSIST_FILE, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return new Map();
+    throw new AutoloopAgentRegistryError(
+      'AUTOLOOP_AGENT_REGISTRY_READ_FAILED',
+      `Failed to read the shared session registry: ${(err as Error).message}`,
+      { cause: err },
+    );
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new AutoloopAgentRegistryError(
+      'AUTOLOOP_AGENT_REGISTRY_CORRUPT',
+      `The shared session registry contains malformed JSON: ${(err as Error).message}`,
+      { cause: err },
+    );
+  }
+  if (!Array.isArray(parsed)) {
+    throw new AutoloopAgentRegistryError(
+      'AUTOLOOP_AGENT_REGISTRY_CORRUPT',
+      'The shared session registry root must be an array',
+    );
+  }
+  if (
+    parsed.some(
+      (entry) =>
+        !entry ||
+        typeof entry !== 'object' ||
+        typeof (entry as Partial<PersistedSession>).name !== 'string' ||
+        typeof (entry as Partial<PersistedSession>).lastActivity !== 'number',
+    )
+  ) {
+    throw new AutoloopAgentRegistryError(
+      'AUTOLOOP_AGENT_REGISTRY_CORRUPT',
+      'The shared session registry contains an invalid session entry',
+    );
+  }
+
+  const arr = parsed as PersistedSession[];
+  const now = Date.now();
+  // A durable generation fence cannot expire merely because its ordinary
+  // resumable-session metadata is old. Recovery must explicitly release it.
+  const valid = arr.filter((session) => hasAgentFence(session) || now - session.lastActivity < PERSIST_DISK_TTL_MS);
+  return new Map(valid.map((session) => [session.name, session]));
+}
+
 // Atomic write used only while PERSIST_LOCK_FILE is held.
-function savePersistedSessions(sessions: Map<string, PersistedSession>, logger?: Logger): boolean {
+function savePersistedSessions(
+  sessions: Map<string, PersistedSession>,
+  logger?: Logger,
+): { ok: true } | { ok: false; error: AutoloopAgentRegistryError } {
   try {
     fs.mkdirSync(PERSIST_DIR, { recursive: true });
     const arr = Array.from(sessions.values());
     const tmp = PERSIST_FILE + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(arr, null, 2));
     fs.renameSync(tmp, PERSIST_FILE);
-    return true;
+    return { ok: true };
   } catch (err) {
     (logger || createConsoleLogger('SessionManager')).warn('Failed to persist sessions:', (err as Error).message);
-    return false;
+    return {
+      ok: false,
+      error: new AutoloopAgentRegistryError(
+        'AUTOLOOP_AGENT_REGISTRY_PERSIST_FAILED',
+        `Failed to persist the shared session registry: ${(err as Error).message}`,
+        { cause: err },
+      ),
+    };
   }
 }
 
+interface DebouncedCallback {
+  (): void;
+  cancel(): void;
+}
+
 // Debounce helper — coalesces rapid writes into one
-function makeDebounced(fn: () => void, ms: number): () => void {
+function makeDebounced(fn: () => void, ms: number): DebouncedCallback {
   let timer: ReturnType<typeof setTimeout> | null = null;
-  return () => {
+  const debounced = (() => {
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => {
       timer = null;
       fn();
     }, ms);
+  }) as DebouncedCallback;
+  debounced.cancel = () => {
+    if (!timer) return;
+    clearTimeout(timer);
+    timer = null;
   };
+  return debounced;
 }
 
 import { type Logger, createConsoleLogger } from './logger.js';
@@ -255,7 +364,13 @@ import type {
   PhysicalAgentGeneration,
   PushPolicy,
 } from './autoloop/types.js';
-import { DEFAULT_PUSH_POLICY, DEFAULT_SEND_TIMEOUT_MS, validateAutoloopTimeoutConfig } from './autoloop/types.js';
+import {
+  AutoloopAgentReleaseOwnerError,
+  DEFAULT_PUSH_POLICY,
+  DEFAULT_SEND_TIMEOUT_MS,
+  isRecoverableAgentOwnerInstanceId,
+  validateAutoloopTimeoutConfig,
+} from './autoloop/types.js';
 import { Msg as AutoloopMsg, type PushChannel, type PushLevel, type SendTimeoutPayload } from './autoloop/messages.js';
 import { appendPushLog, notifyUserFallbackChain } from './autoloop/notify.js';
 import { UltraappManager } from './ultraapp/manager.js';
@@ -561,12 +676,17 @@ export class SessionManager implements AgentRuntimeProbe {
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
   private pluginConfig: PluginConfig;
   private persistedSessions: Map<string, PersistedSession>;
-  private _debouncedSave: () => void;
+  private _debouncedSave: DebouncedCallback;
   private _proxyServer: http.Server | null = null;
   private _proxyPort: number | null = null;
   /** In-flight proxy startup, so concurrent callers share one server. */
   private _proxyStartPromise: Promise<number | null> | null = null;
   private _activePids = new Map<string, number>();
+  private _agentReleasesInFlight = 0;
+  private _agentReleaseWaiters: Array<() => void> = [];
+  private _agentReleaseOperations = new Map<string, Promise<boolean>>();
+  private _completedBeforeReleaseHooks = new Set<string>();
+  private _completedReleaseEvidenceHooks = new Set<string>();
   private _circuitBreaker = new CircuitBreaker();
   private _inbox = new InboxManager();
   /** cwd → detected language, so the manifest probe runs once per directory. */
@@ -667,26 +787,44 @@ export class SessionManager implements AgentRuntimeProbe {
       value: T;
       updatedSessions?: Map<string, PersistedSession>;
     },
-  ): { ok: true; value: T } | { ok: false } {
+  ): { ok: true; value: T } | { ok: false; error: AutoloopAgentRegistryError } {
+    const localBefore = new Map(this.persistedSessions);
     let visibleSessions: Map<string, PersistedSession> | undefined;
-    const locked = withFileLock(
-      PERSIST_LOCK_FILE,
-      () => {
-        const authoritative = loadPersistedSessions();
-        const result = operation(authoritative);
-        const updated = result.updatedSessions;
-        if (updated && !savePersistedSessions(updated, this.logger)) {
-          visibleSessions = authoritative;
-          return { persisted: false, value: result.value };
-        }
-        visibleSessions = updated ?? authoritative;
-        return { persisted: true, value: result.value };
-      },
-      { createParent: true },
-    );
-    if (!locked.ok) return { ok: false };
-    this._syncPersistedSessions(visibleSessions!);
-    if (!locked.value.persisted) return { ok: false };
+    let locked: ReturnType<typeof withFileLock<{ persistError?: AutoloopAgentRegistryError; value: T }>>;
+    try {
+      locked = withFileLock(
+        PERSIST_LOCK_FILE,
+        () => {
+          const authoritative = loadPersistedSessions();
+          const result = operation(authoritative);
+          const updated = result.updatedSessions;
+          if (updated) {
+            const persisted = savePersistedSessions(updated, this.logger);
+            if (!persisted.ok) {
+              visibleSessions = authoritative;
+              return { persistError: persisted.error, value: result.value };
+            }
+          }
+          visibleSessions = updated ?? authoritative;
+          return { value: result.value };
+        },
+        { createParent: true },
+      );
+    } catch (err) {
+      if (err instanceof AutoloopAgentRegistryError) return { ok: false, error: err };
+      throw err;
+    }
+    if (!locked.ok) {
+      return {
+        ok: false,
+        error: new AutoloopAgentRegistryError(
+          'AUTOLOOP_AGENT_REGISTRY_LOCK_CONTENDED',
+          `Could not enter the shared session registry lock: ${locked.error}`,
+        ),
+      };
+    }
+    this._syncPersistedSessions(mergeRegistryView(visibleSessions!, localBefore));
+    if (locked.value.persistError) return { ok: false, error: locked.value.persistError };
     return { ok: true, value: locked.value.value };
   }
 
@@ -696,7 +834,37 @@ export class SessionManager implements AgentRuntimeProbe {
       value: true,
       updatedSessions: mergeRegistrySnapshot(authoritative, desired),
     }));
-    return transaction.ok && transaction.value;
+    if (!transaction.ok) {
+      this.logger.warn('Failed to persist sessions:', transaction.error.message);
+      return false;
+    }
+    return transaction.value;
+  }
+
+  private _finishAgentRelease(): void {
+    this._agentReleasesInFlight -= 1;
+    if (this._agentReleasesInFlight !== 0) return;
+    const waiters = this._agentReleaseWaiters.splice(0);
+    for (const resolve of waiters) resolve();
+  }
+
+  private async _waitForAgentReleases(): Promise<void> {
+    if (this._agentReleasesInFlight === 0) return;
+    await new Promise<void>((resolve) => this._agentReleaseWaiters.push(resolve));
+  }
+
+  private _agentReleaseOperationKey(
+    sessionName: string,
+    expectedGeneration: number,
+    options: Exclude<AgentReservationReleaseOptions, { rollbackUncommittedReservation: true }>,
+  ): string {
+    return [
+      sessionName,
+      expectedGeneration,
+      options.expectedOwnerInstanceId,
+      options.expectedSessionId ?? '',
+      options.releaseOwnerInstanceId,
+    ].join('\0');
   }
 
   /**
@@ -761,7 +929,8 @@ export class SessionManager implements AgentRuntimeProbe {
       });
       return { value: true, updatedSessions };
     });
-    return transaction.ok && transaction.value;
+    if (!transaction.ok) throw transaction.error;
+    return transaction.value;
   }
 
   /** Inspect only runtime/session-registry facts for one physical name. */
@@ -853,6 +1022,9 @@ export class SessionManager implements AgentRuntimeProbe {
     expectedGeneration: number,
     options: AgentReservationReleaseOptions,
   ): Promise<boolean> {
+    if (!options.rollbackUncommittedReservation && !isRecoverableAgentOwnerInstanceId(options.releaseOwnerInstanceId)) {
+      throw new AutoloopAgentReleaseOwnerError(options.releaseOwnerInstanceId);
+    }
     if (this.sessions.has(sessionName) || this._pendingSessions.has(sessionName)) return false;
 
     if (options.rollbackUncommittedReservation) {
@@ -884,8 +1056,13 @@ export class SessionManager implements AgentRuntimeProbe {
         }
         return { value: true, updatedSessions };
       });
-      return rollback.ok && rollback.value;
+      if (!rollback.ok) throw rollback.error;
+      return rollback.value;
     }
+
+    const releaseOperationKey = this._agentReleaseOperationKey(sessionName, expectedGeneration, options);
+    const activeRelease = this._agentReleaseOperations.get(releaseOperationKey);
+    if (activeRelease) return await activeRelease;
 
     const activeTupleMatches = (reservation: PersistedSession): boolean =>
       reservation.agentGeneration === expectedGeneration &&
@@ -966,41 +1143,68 @@ export class SessionManager implements AgentRuntimeProbe {
       });
       return { value: 'claimed' as const, updatedSessions };
     });
-    if (!claim.ok || claim.value === 'rejected') return false;
+    if (!claim.ok) throw claim.error;
+    if (claim.value === 'rejected') return false;
     if (claim.value === 'idempotent') return true;
 
-    options.beforeRelease?.();
+    const releaseOperation = Promise.resolve().then(() => {
+      this._agentReleasesInFlight += 1;
+      try {
+        if (options.beforeRelease && !this._completedBeforeReleaseHooks.has(releaseOperationKey)) {
+          options.beforeRelease();
+          this._completedBeforeReleaseHooks.add(releaseOperationKey);
+        }
 
-    // Returning false without this hook deliberately leaves the durable
-    // tombstone in place. A caller may retry with the evidence writer, but may
-    // not make the physical name reusable without it.
-    if (!options.persistReleaseEvidence) return false;
-    options.persistReleaseEvidence();
+        // Returning false without this hook deliberately leaves the durable
+        // tombstone in place. A caller may retry with the evidence writer, but may
+        // not make the physical name reusable without it.
+        if (!options.persistReleaseEvidence) return false;
+        if (!this._completedReleaseEvidenceHooks.has(releaseOperationKey)) {
+          options.persistReleaseEvidence();
+          this._completedReleaseEvidenceHooks.add(releaseOperationKey);
+        }
 
-    const completion = this._withAgentRegistryLock((authoritative) => {
-      const stillPending = authoritative.get(sessionName);
-      if (
-        !stillPending?.agentReleasePending ||
-        !activeTupleMatches(stillPending) ||
-        stillPending.agentReleaseOwnerInstanceId !== options.releaseOwnerInstanceId
-      ) {
-        return { value: false };
+        const completion = this._withAgentRegistryLock((authoritative) => {
+          const stillPending = authoritative.get(sessionName);
+          if (
+            !stillPending?.agentReleasePending ||
+            !activeTupleMatches(stillPending) ||
+            stillPending.agentReleaseOwnerInstanceId !== options.releaseOwnerInstanceId
+          ) {
+            return { value: false };
+          }
+          const updatedSessions = new Map(authoritative);
+          updatedSessions.set(sessionName, {
+            ...stillPending,
+            agentGeneration: undefined,
+            agentOwnerInstanceId: undefined,
+            agentSessionId: undefined,
+            agentReleasePending: undefined,
+            agentReleaseOwnerInstanceId: undefined,
+            agentReleasedGeneration: expectedGeneration,
+            agentReleasedOwnerInstanceId: stillPending.agentOwnerInstanceId,
+            agentReleasedSessionId: stillPending.agentSessionId,
+          });
+          return { value: true, updatedSessions };
+        });
+        if (!completion.ok) throw completion.error;
+        if (completion.value) {
+          this._completedBeforeReleaseHooks.delete(releaseOperationKey);
+          this._completedReleaseEvidenceHooks.delete(releaseOperationKey);
+        }
+        return completion.value;
+      } finally {
+        this._finishAgentRelease();
       }
-      const updatedSessions = new Map(authoritative);
-      updatedSessions.set(sessionName, {
-        ...stillPending,
-        agentGeneration: undefined,
-        agentOwnerInstanceId: undefined,
-        agentSessionId: undefined,
-        agentReleasePending: undefined,
-        agentReleaseOwnerInstanceId: undefined,
-        agentReleasedGeneration: expectedGeneration,
-        agentReleasedOwnerInstanceId: stillPending.agentOwnerInstanceId,
-        agentReleasedSessionId: stillPending.agentSessionId,
-      });
-      return { value: true, updatedSessions };
     });
-    return completion.ok && completion.value;
+    this._agentReleaseOperations.set(releaseOperationKey, releaseOperation);
+    try {
+      return await releaseOperation;
+    } finally {
+      if (this._agentReleaseOperations.get(releaseOperationKey) === releaseOperation) {
+        this._agentReleaseOperations.delete(releaseOperationKey);
+      }
+    }
   }
 
   async startSession(
@@ -2089,6 +2293,8 @@ export class SessionManager implements AgentRuntimeProbe {
       this._proxyServer = null;
       this._proxyPort = null;
     }
+    await this._waitForAgentReleases();
+    this._debouncedSave.cancel();
     // Persist final state (TTL-expired sessions already removed by cleanup)
     this._persistRegistrySnapshot();
     SessionManager.liveAutoloopOwnerInstanceIds.delete(this.autoloopOwnerInstanceId);

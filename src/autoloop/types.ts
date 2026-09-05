@@ -35,6 +35,25 @@ export interface PhysicalAgentGeneration {
 
 export type AgentRuntimeLiveness = 'live' | 'absent' | 'unknown';
 
+const RECOVERABLE_AGENT_OWNER_PATTERN = /^session-manager:(\d+):[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+
+export function isRecoverableAgentOwnerInstanceId(value: string): boolean {
+  const match = RECOVERABLE_AGENT_OWNER_PATTERN.exec(value);
+  if (!match) return false;
+  const ownerPid = Number(match[1]);
+  return Number.isSafeInteger(ownerPid) && ownerPid > 0;
+}
+
+export class AutoloopAgentReleaseOwnerError extends Error {
+  readonly code = 'AUTOLOOP_AGENT_RELEASE_OWNER_INVALID' as const;
+  readonly retryable = false;
+
+  constructor(ownerInstanceId: string) {
+    super(`Autoloop release owner '${ownerInstanceId}' is not a recoverable SessionManager identity`);
+    this.name = 'AutoloopAgentReleaseOwnerError';
+  }
+}
+
 /** Durable evidence hooks run while the exact runtime generation remains fenced. */
 export type AgentReservationReleaseOptions =
   | {
