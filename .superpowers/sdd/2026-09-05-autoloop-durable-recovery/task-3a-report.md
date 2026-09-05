@@ -2,11 +2,13 @@
 
 ## Status
 
-Complete for the approved slice-A scope and review-fix round 1. The original
+Complete for the approved slice-A scope through review-fix round 2. The original
 implementation commit is `e590475757ba0814fec9e3af8b48f366f68ffbec`
 (`fix: reject false-success autoloop turns`). Review findings A1-A6 are resolved
 in `45484d970d4b0ceb2b73b8088d909a6df8555581`
-(`fix: harden Planner control and reset proofs`). No push was performed.
+(`fix: harden Planner control and reset proofs`). Review-fix round 2 is in
+`90cf4a72fa42dc480612844aa79afc5557d74ee2`
+(`fix: close durable Planner recovery gaps`). No push was performed.
 
 ## Immutable inputs
 
@@ -208,3 +210,144 @@ with no build script`, caused by its nested npm invocation. No Ultraapp file
   unchanged Ultraapp nested-`npm` baseline in
   `src/__tests__/ultraapp/host-strategy.test.ts`: `hostBuild succeeds even with
   no build script`. No Ultraapp file was modified.
+
+## Review-fix round 2
+
+### Inputs, commit, and exact scope
+
+- Independently consolidated findings:
+  `.superpowers/sdd/2026-09-05-autoloop-durable-recovery/task-3a-review-round-2-findings.md`
+  at SHA-256
+  `1e8a3efb3de6cddd35c0b5a5e4d37e6042cb89c3a762901c4bc781c99dc946a9`.
+- The immutable instruction snapshot remained
+  `9cc0b00ab3be15fb2d932dc5b5047d4285969fdd949df504cd64e262c72b0850`
+  at the final stage boundary.
+- Implementation commit:
+  `90cf4a72fa42dc480612844aa79afc5557d74ee2`
+  (`fix: close durable Planner recovery gaps`).
+- The implementation commit changes exactly four tracked files:
+  `src/autoloop/dispatcher.ts`, `src/autoloop/messages.ts`,
+  `src/session-manager.ts`, and `src/__tests__/session-manager.test.ts`.
+  This existing report is the fifth and only other tracked file in the round-2
+  range. The forbidden `src/__tests__/agy-planner-e2e.test.ts`, all Task 3B
+  HTTP/MCP files, and all Ultraapp files remain unchanged.
+
+### Technical rulings and implementation
+
+- **B1:** In-memory ownership now changes at the exact durable release callback,
+  including the case where registry finalization throws after the release
+  tombstone is durable. Failures before that callback restore the prior started
+  flag and frozen Reviewer prompt; failures after it never resurrect the old
+  generation. Failed eager startup leaves its replacement durably released and
+  permits the next exact generation. Unknown post-start liveness conservatively
+  retains the new live-ledger generation and started flag, preventing duplicate
+  startup until a later probe proves it live.
+- **B2:** Planner control values are recursively canonicalized once with stable
+  code-unit key ordering while array order is preserved. The same normalized
+  complete controls feed tool extraction, SHA-256, persistence, comparison, and
+  application, eliminating source-property-order false rejection.
+- **B3 (partially rejected after regression validation):** The inference that
+  every typed Planner failure must be converted inside `dispatcher.deliver()`
+  was broader than the approved design and broke the established direct
+  dispatcher rejection contract proven by the unchanged AGY test. Direct
+  callers therefore continue to receive distinct thrown
+  `AutoloopOperationError` values. The existing empty-reply runner route now
+  carries its code through typed `PhaseErrorPayload` with no cast, while every
+  typed thrown error still records exact-code decision evidence.
+  `SessionManager.autoloopChat()` consumes typed routed errors and has a final
+  non-empty guard, so lost event plumbing cannot return `{ reply: "" }`.
+- Genuine Planner send deadlines are not relabeled as empty replies:
+  `autoloopChat()` rejects with `AUTOLOOP_SEND_TIMEOUT`, `retryable: true`, and
+  the exact `pending_dispatch`; a terminal race rejects with
+  `AUTOLOOP_RUN_TERMINAL`, `retryable: false`, and the exact terminal reason.
+  This preserves Task 2 timeout identity and state while closing empty success.
+- **B4:** Deterministic corruption cases cover complete controls, digest,
+  owner, session, dispatch, and message identity. Every case rejects before
+  `spawn_subagents`, leaves only the Planner session, and preserves planning at
+  iteration zero. The existing full evidence comparator was retained.
+- **B5:** Deterministic coverage proves successful eager replacement returns
+  live generation 2, failed eager startup releases generation 2 and later
+  creates generation 3, and unknown replacement liveness retains generation 2
+  without a second startup before later safe reuse. The routed empty-reply test
+  also proves the exact typed phase-error payload and circuit increment.
+
+### Explicit RED evidence
+
+- B1 post-release/eager state:
+  `npx vitest run src/__tests__/session-manager.test.ts -t 'post-release|failed eager replacement' --reporter=verbose`
+  -> 3 failed, 201 skipped; released Planner/Reviewer flags were restored and
+  failed eager replacement claimed the old started state.
+- B1 exact commit boundary:
+  `npx vitest run src/__tests__/session-manager.test.ts -t 'registry finalization fails after durable release' --reporter=verbose`
+  -> 1 failed, 204 skipped; a durable generation-1 tombstone followed by a
+  registry-finalization exception restored `plannerStarted: true`.
+- B2 semantic ordering:
+  `npx vitest run src/__tests__/session-manager.test.ts -t 'normalizes Planner control property order' --reporter=verbose`
+  -> 1 failed, 203 skipped with `AUTOLOOP_CONTROL_NOT_PERSISTED` for a valid
+  args-before-tool control.
+- B3 fail-closed exploration:
+  `npx vitest run src/__tests__/session-manager.test.ts -t 'typed Planner phase-error|phase-error event plumbing drops' --reporter=verbose`
+  -> 7 failed, 1 passed, 196 skipped. The valid failure was the swallowed-code
+  case resolving `{ reply: "" }`; the six circuit assertions for directly
+  thrown non-empty codes were removed after the compatibility ruling above.
+- B4 mutation proof: with the complete-control/digest and identity checks
+  temporarily removed from both durable comparators,
+  `npx vitest run src/__tests__/session-manager.test.ts -t 'rejects durable Planner control corruption' --reporter=dot --silent`
+  -> 6 failed, 198 skipped because every tampered row wrongly resolved and
+  applied effects. The comparator was restored immediately.
+- B5 mutation proof: with the successful replacement generation deliberately
+  misreported and unknown-liveness ownership deliberately cleared,
+  `npx vitest run src/__tests__/session-manager.test.ts -t 'successful eager reset|unproven eager replacement' --reporter=verbose`
+  -> 2 failed, 202 skipped. The mutation was restored immediately.
+- Cross-contract regression RED:
+  `npx vitest run src/__tests__/session-manager.test.ts src/__tests__/agy-planner-e2e.test.ts src/__tests__/autoloop-dispatcher.test.ts src/__tests__/autoloop-recovery.test.ts src/__tests__/autoloop-planner-tools.test.ts --reporter=dot --silent`
+  -> 3 files passed, 2 failed; 280 tests passed, 4 failed. One failure exposed
+  the overbroad direct-dispatch conversion and three exposed empty-reply
+  relabeling of recoverable/terminal timeout outcomes. The final design split
+  above resolved all four without changing the AGY test.
+
+### GREEN and final verification
+
+- B1/reset boundary set:
+  `npx vitest run src/__tests__/session-manager.test.ts -t 'registry finalization fails after durable release|post-release|failed eager replacement|successful eager reset|unproven eager replacement' --reporter=dot --silent`
+  -> 6 passed, 192 skipped.
+- B2 semantic control:
+  `npx vitest run src/__tests__/session-manager.test.ts -t 'normalizes Planner control property order' --reporter=dot --silent`
+  -> 1 passed, 197 skipped.
+- B3 routed/lost empty reply:
+  `npx vitest run src/__tests__/session-manager.test.ts -t 'rejects transport success with an empty logical reply|phase-error event plumbing drops the code' --reporter=dot --silent`
+  -> 2 passed, 196 skipped.
+- Direct dispatcher compatibility:
+  `npx vitest run src/__tests__/agy-planner-e2e.test.ts --reporter=dot --silent`
+  -> 1 passed.
+- Task 2 timeout contract plus fail-closed chat outcome:
+  `npx vitest run src/__tests__/session-manager.test.ts -t 'Autoloop timeout resilience integration' --reporter=dot --silent`
+  -> 4 passed, 194 skipped.
+- B4 corruption set:
+  `npx vitest run src/__tests__/session-manager.test.ts -t 'rejects durable Planner control corruption' --reporter=dot --silent`
+  -> 6 passed, 192 skipped.
+- Final focused Task 3A plus Task 2 regression set:
+  `npx vitest run src/__tests__/session-manager.test.ts src/__tests__/agy-planner-e2e.test.ts src/__tests__/autoloop-dispatcher.test.ts src/__tests__/autoloop-recovery.test.ts src/__tests__/autoloop-planner-tools.test.ts --reporter=dot --silent`
+  -> 5 files passed, 277 tests passed.
+- `npm run build` -> passed.
+- `npm run lint` -> passed.
+- `npm run format:check` -> passed.
+- `git diff --check` -> passed.
+- `npm run typecheck:tests` -> exit 2 with exactly 83 diagnostics, exactly the
+  established baseline. The only diagnostics in touched files are the same
+  three pre-existing `session-manager.test.ts` diagnostics at lines 99, 3132,
+  and 3146; production files and all new test blocks add zero diagnostics.
+- `timeout 180s npm test -- --reporter=dot --silent` completed in 64.78 seconds
+  -> 79 files passed, 1 failed; 1,666 tests passed, 1 failed. The sole failure
+  is exactly the unchanged baseline in
+  `src/__tests__/ultraapp/host-strategy.test.ts`:
+  `hostBuild succeeds even with no build script`. No Ultraapp file changed.
+
+### Deferred ownership and remaining concern
+
+- Full idempotent replay after a persisted intent begins applying effects
+  remains Task 5 durable-outbox work.
+- Public HTTP/MCP error and timeout mapping remains Task 3B; this round changes
+  only internal SessionManager/dispatcher behavior and evidence.
+- No unresolved Task 3A correctness concern remains. A fresh independent
+  read-only review is still required by the parent workflow before advancement.
