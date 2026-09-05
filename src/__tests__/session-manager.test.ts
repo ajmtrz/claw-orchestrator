@@ -309,6 +309,7 @@ const { Msg: AutoloopMsg } = await import('../autoloop/messages.js');
 
 const SESSION_REGISTRY_FILE = path.join(os.homedir(), '.openclaw', 'claude-sessions.json');
 const SESSION_PID_FILE = path.join(os.homedir(), '.openclaw', 'session-pids.json');
+const nativeSetImmediate = setImmediate;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -1582,6 +1583,7 @@ describe('SessionManager', () => {
       let priorEvidenceCount = 0;
       let successorEvidenceCount = 0;
       let startQueuedRelease: (() => void) | undefined;
+      let queuedReleaseStarted = false;
       let resolveQueuedRelease!: (value: boolean) => void;
       let rejectQueuedRelease!: (reason?: unknown) => void;
       const queuedRelease = new Promise<boolean>((resolve, reject) => {
@@ -1594,6 +1596,8 @@ describe('SessionManager', () => {
       const resolveSpy = vi.spyOn(Promise, 'resolve').mockImplementationOnce((() => ({
         then: (runRelease: () => boolean) => {
           startQueuedRelease = () => {
+            if (queuedReleaseStarted) return;
+            queuedReleaseStarted = true;
             try {
               resolveQueuedRelease(runRelease());
             } catch (err) {
@@ -1651,6 +1655,8 @@ describe('SessionManager', () => {
         await shutdown;
         expect(priorEvidenceCount).toBe(2);
       } finally {
+        startQueuedRelease?.();
+        await Promise.allSettled([release, shutdown]);
         await successor.shutdown();
       }
     });
@@ -2745,6 +2751,64 @@ describe('SessionManager', () => {
         expect(reservation).toMatchObject({ agentReleasedGeneration: 1 });
         expect(reservation).not.toHaveProperty('agentGeneration');
         expect(reservation).not.toHaveProperty('agentReleasePending');
+      }
+    });
+
+    it('keeps release admission open until natural Autoloop termination finishes dispatcher teardown', async () => {
+      const runId = 'shutdown-overlapping-natural-autoloop-termination';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      fs.mkdirSync(workspace, { recursive: true });
+      await mgr.autoloopStart({ runId, workspace });
+      const handle = mgr.getAutoloop(runId)!;
+      await handle.dispatcher.spawnSubagents();
+
+      const originalDispatcherShutdown = handle.dispatcher.shutdown.bind(handle.dispatcher);
+      let signalTeardownStarted!: () => void;
+      const teardownStarted = new Promise<void>((resolve) => {
+        signalTeardownStarted = resolve;
+      });
+      let allowTeardown!: () => void;
+      const teardownBarrier = new Promise<void>((resolve) => {
+        allowTeardown = resolve;
+      });
+      handle.dispatcher.shutdown = async (reason, options) => {
+        signalTeardownStarted();
+        await teardownBarrier;
+        await originalDispatcherShutdown(reason, options);
+      };
+
+      let naturalTermination: Promise<boolean> | undefined;
+      let managerShutdown: Promise<void> | undefined;
+      try {
+        naturalTermination = mgr.autoloopStop(runId, 'natural-test-termination');
+        await teardownStarted;
+
+        let managerShutdownSettled = false;
+        managerShutdown = mgr.shutdown().then(() => {
+          managerShutdownSettled = true;
+        });
+        await new Promise<void>((resolve) => nativeSetImmediate(resolve));
+
+        expect(managerShutdownSettled).toBe(false);
+
+        allowTeardown();
+        await expect(naturalTermination).resolves.toBe(true);
+        await managerShutdown;
+
+        const reservations = (
+          mgr as unknown as {
+            persistedSessions: Map<string, Record<string, unknown>>;
+          }
+        ).persistedSessions;
+        for (const role of ['planner', 'coder', 'reviewer']) {
+          const reservation = reservations.get(`autoloop-${runId}-${role}`);
+          expect(reservation).toMatchObject({ agentReleasedGeneration: 1 });
+          expect(reservation).not.toHaveProperty('agentGeneration');
+          expect(reservation).not.toHaveProperty('agentReleasePending');
+        }
+      } finally {
+        allowTeardown();
+        await Promise.allSettled([naturalTermination, managerShutdown].filter((value) => value !== undefined));
       }
     });
 

@@ -273,6 +273,13 @@ export class AutoloopRunner extends EventEmitter {
   private terminate(reason: string, timeoutEvent?: AutoloopTimeoutEvent): Promise<void> {
     if (this.terminationStarted) return this.terminationPromise ?? Promise.resolve();
     this.terminationStarted = true;
+    // Publish terminal status only after the completion promise exists. State
+    // listeners use this promise to distinguish "termination started" from
+    // dispatcher teardown actually finishing.
+    this.terminationPromise = Promise.resolve().then(async () => {
+      await this.config.dispatcher.shutdown?.(reason);
+      this.emit('terminated', reason);
+    });
     this.state.status = 'terminated';
     this.state.status_reason = reason;
     this.state.pending_dispatch = null;
@@ -281,10 +288,12 @@ export class AutoloopRunner extends EventEmitter {
     this.stop();
     this.emit('state', this.state);
     if (timeoutEvent) this.emit('timeout', timeoutEvent);
-    this.terminationPromise = (async () => {
-      await this.config.dispatcher.shutdown?.(reason);
-      this.emit('terminated', reason);
-    })();
+    return this.terminationPromise;
+  }
+
+  /** Completion of the dispatcher teardown begun by a terminal state change. */
+  waitForTermination(): Promise<void> {
+    if (!this.terminationPromise) throw new Error('Autoloop termination has not started');
     return this.terminationPromise;
   }
 

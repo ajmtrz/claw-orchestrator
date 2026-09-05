@@ -3650,16 +3650,33 @@ export class SessionManager implements AgentRuntimeProbe {
         on(event: string, fn: () => void): void;
         off(event: string, fn: () => void): void;
         stop(): void;
+        waitForTermination(): Promise<void>;
       };
       const done = (): boolean => runner.state.status === 'terminated' || runner.state.status === 'crashed';
-      if (done()) return resolve();
+      const finishNaturalExit = (): void => {
+        if (runner.state.status === 'crashed') {
+          resolve();
+          return;
+        }
+        // `terminated` is published when teardown starts. Keep the kernel node
+        // live until the runner's dispatcher shutdown has actually settled so
+        // SessionManager shutdown cannot close release admission too early.
+        void runner.waitForTermination().then(resolve, resolve);
+      };
+      if (done()) {
+        finishNaturalExit();
+        return;
+      }
       let settling = false;
       const check = (): void => {
         if ((!done() && !signal.aborted) || settling) return;
         settling = true;
         runner.off('state', check);
         clearInterval(poll);
-        if (!signal.aborted) return resolve();
+        if (!signal.aborted) {
+          finishNaturalExit();
+          return;
+        }
         // Cancelling a run has to tear the loop down the way a stop does.
         // Without this the three persistent agents keep running and their
         // session names stay claimed, so the run cannot be restarted — the
