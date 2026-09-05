@@ -1538,51 +1538,43 @@ describe('AutoloopRunner — recoverable dispatcher timeout state', () => {
 });
 
 describe('ClaudeAgentDispatcher — updatePushPolicy guard', () => {
-  it('persists and applies the same canonical policy while auditing blocked critical silence', async () => {
+  it('rejects an atomic policy batch that weakens required decision severity without persisting controls or effects', async () => {
     const policyRef: PushPolicy = JSON.parse(JSON.stringify(DEFAULT_PUSH_POLICY));
+    const policyBefore = JSON.stringify(policyRef);
     const reply = `OK
 \`\`\`autoloop
 {"tool": "update_push_policy", "args": {"on_phase_error": {"silent": true, "channel": "email"}, "on_decision_needed": {"silent": true, "level": "warn"}, "on_target_hit": {"silent": true}}}
 \`\`\`
 `;
     const { dispatcher, ledgerDir } = makeDispatcher({ pushPolicyRef: policyRef }, { sendOutput: reply });
-    await dispatcher.deliver(Msg.chat(0, { text: 'hi' }));
+    const surfacedReplies: string[] = [];
+    dispatcher.on('planner_reply', (surfacedReply) => surfacedReplies.push(String(surfacedReply)));
 
-    expect(policyRef.on_phase_error).toEqual({ channel: 'email' });
-    expect(policyRef.on_decision_needed).toEqual({ level: 'warn' });
-    expect(policyRef.on_target_hit).toEqual({ silent: true });
+    await expect(dispatcher.deliver(Msg.chat(0, { text: 'weaken the critical policy' }))).rejects.toMatchObject({
+      code: 'AUTOLOOP_CONTROL_MALFORMED',
+      retryable: false,
+      message: expect.stringContaining("on_decision_needed level 'warn' weakens required level 'decision'"),
+    });
+
+    expect(JSON.stringify(policyRef)).toBe(policyBefore);
 
     const decisionsPath = path.join(ledgerDir, 'decisions.jsonl');
-    expect(fs.existsSync(decisionsPath)).toBe(true);
-    const lines = fs
-      .readFileSync(decisionsPath, 'utf-8')
-      .trim()
-      .split('\n')
-      .map((l) => JSON.parse(l));
-    expect(lines.find((line) => line.kind === 'planner_turn_control')?.payload.controls).toEqual([
-      {
-        tool: 'update_push_policy',
-        args: {
-          on_decision_needed: { level: 'warn' },
-          on_phase_error: { channel: 'email' },
-          on_target_hit: { silent: true },
-        },
-      },
-    ]);
-    expect(lines.find((line) => line.kind === 'policy_silence_blocked')?.payload).toEqual({
-      keys: ['on_phase_error', 'on_decision_needed'],
-    });
-    expect(lines.find((line) => line.kind === 'update_push_policy')?.payload).toEqual({
-      applied: {
-        on_decision_needed: { level: 'warn' },
-        on_phase_error: { channel: 'email' },
-        on_target_hit: { silent: true },
-      },
-    });
+    const lines = fs.existsSync(decisionsPath)
+      ? fs
+          .readFileSync(decisionsPath, 'utf-8')
+          .trim()
+          .split('\n')
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as { kind: string; payload: Record<string, unknown> })
+      : [];
+    expect(lines.filter((line) => line.kind === 'planner_turn_control')).toEqual([]);
+    expect(lines.filter((line) => line.kind === 'update_push_policy')).toEqual([]);
+    expect(lines.filter((line) => line.kind === 'policy_silence_blocked')).toEqual([]);
+    expect(surfacedReplies).toEqual([]);
   });
 
   it.each(['on_phase_error', 'on_decision_needed'] as const)(
-    'rejects a prohibited silence-only %s update without claiming a successful empty control',
+    'classifies a prohibited silence-only %s control as non-retryable malformed input and audits the refusal',
     async (key) => {
       const policyRef: PushPolicy = JSON.parse(JSON.stringify(DEFAULT_PUSH_POLICY));
       const policyBefore = JSON.stringify(policyRef);
@@ -1596,8 +1588,9 @@ describe('ClaudeAgentDispatcher — updatePushPolicy guard', () => {
       dispatcher.on('planner_reply', (surfacedReply) => surfacedReplies.push(String(surfacedReply)));
 
       await expect(dispatcher.deliver(Msg.chat(0, { text: 'do not silence critical policy' }))).rejects.toMatchObject({
-        code: 'AUTOLOOP_EMPTY_REPLY',
-        retryable: true,
+        code: 'AUTOLOOP_CONTROL_MALFORMED',
+        retryable: false,
+        message: expect.stringContaining('only a prohibited critical policy-silence control'),
       });
 
       expect(JSON.stringify(policyRef)).toBe(policyBefore);
@@ -1615,9 +1608,11 @@ describe('ClaudeAgentDispatcher — updatePushPolicy guard', () => {
   );
 
   it.each(['on_phase_error', 'on_decision_needed'] as const)(
-    'persists and applies an explicit empty %s rule without a silence-blocked audit',
+    'retains the mandatory minimum for an explicit empty %s rule without a silence-blocked audit',
     async (key) => {
       const policyRef: PushPolicy = JSON.parse(JSON.stringify(DEFAULT_PUSH_POLICY));
+      const requiredRule =
+        key === 'on_phase_error' ? { level: 'error', channel: 'both' } : { level: 'decision', channel: 'both' };
       const reply = ['```autoloop', JSON.stringify({ tool: 'update_push_policy', args: { [key]: {} } }), '```'].join(
         '\n',
       );
@@ -1627,7 +1622,7 @@ describe('ClaudeAgentDispatcher — updatePushPolicy guard', () => {
 
       await expect(dispatcher.deliver(Msg.chat(0, { text: 'reset the critical policy rule' }))).resolves.toEqual([]);
 
-      expect(policyRef[key]).toEqual({});
+      expect(policyRef[key]).toEqual(requiredRule);
       const lines = fs
         .readFileSync(path.join(ledgerDir, 'decisions.jsonl'), 'utf-8')
         .trim()
@@ -1637,7 +1632,7 @@ describe('ClaudeAgentDispatcher — updatePushPolicy guard', () => {
         { tool: 'update_push_policy', args: { [key]: {} } },
       ]);
       expect(lines.find((line) => line.kind === 'update_push_policy')?.payload).toEqual({
-        applied: { [key]: {} },
+        applied: { [key]: requiredRule },
       });
       expect(lines.filter((line) => line.kind === 'policy_silence_blocked')).toEqual([]);
       expect(surfacedReplies).toEqual(['Planner controls persisted: update_push_policy']);
