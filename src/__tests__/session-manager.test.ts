@@ -200,6 +200,7 @@ process.env.CLAWO_WF_DIR = TEST_WF_DIR;
 const persistenceFsState = vi.hoisted(() => ({
   files: new Map<string, string>(),
   descriptors: new Map<number, string>(),
+  openPaths: new Map<number, string>(),
   nextDescriptor: 1_000_000,
 }));
 
@@ -251,7 +252,9 @@ vi.mock('node:fs', async () => {
       persistenceFsState.descriptors.set(fd, p);
       return fd;
     }
-    return (actual.openSync as (...a: unknown[]) => number)(p, ...rest);
+    const fd = (actual.openSync as (...a: unknown[]) => number)(p, ...rest);
+    if (typeof p === 'string') persistenceFsState.openPaths.set(fd, p);
+    return fd;
   });
   const writeSync = vi.fn((fd: unknown, ...rest: unknown[]) =>
     (actual.writeSync as (...a: unknown[]) => number)(fd, ...rest),
@@ -262,6 +265,7 @@ vi.mock('node:fs', async () => {
   });
   const closeSync = vi.fn((fd: number) => {
     if (persistenceFsState.descriptors.delete(fd)) return;
+    persistenceFsState.openPaths.delete(fd);
     return actual.closeSync(fd);
   });
   const mkdirSync = vi.fn((p: unknown, ...rest: unknown[]) => {
@@ -328,11 +332,19 @@ vi.mock('node:fs', async () => {
 // Import AFTER mocking fs
 const { SessionManager } = await import('../session-manager.js');
 const { Msg: AutoloopMsg } = await import('../autoloop/messages.js');
+const { AutoloopOperationError } = await import('../autoloop/dispatcher.js');
 const { applyValidatedPlannerToolCalls, validatePlannerToolCalls } = await import('../autoloop/planner-tools.js');
 
 const SESSION_REGISTRY_FILE = path.join(os.homedir(), '.openclaw', 'claude-sessions.json');
 const SESSION_PID_FILE = path.join(os.homedir(), '.openclaw', 'session-pids.json');
 const nativeSetImmediate = setImmediate;
+
+function isOpenPath(file: unknown, expectedPath: string): boolean {
+  return (
+    String(file) === expectedPath ||
+    (typeof file === 'number' && persistenceFsState.openPaths.get(file) === expectedPath)
+  );
+}
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -3371,6 +3383,194 @@ describe('SessionManager', () => {
         });
       });
 
+      it('normalizes a raw Planner boundary failure before one durable and one Runner phase-error path', async () => {
+        const runId = 'planner-raw-boundary-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const cause = new Error('runtime liveness probe failed');
+        vi.spyOn(mgr, 'inspect').mockRejectedValueOnce(cause);
+        mockSessions[0].sendImplementation = async () => ({
+          text: 'reply whose generation cannot be verified',
+          event: { type: 'result', result: 'reply whose generation cannot be verified' },
+        });
+
+        const originalDeliver = handle.dispatcher.deliver.bind(handle.dispatcher);
+        let boundaryFailure: unknown;
+        vi.spyOn(handle.dispatcher, 'deliver').mockImplementation(async (env) => {
+          try {
+            return await originalDeliver(env);
+          } catch (error) {
+            boundaryFailure = error;
+            throw error;
+          }
+        });
+        const phaseErrors: PhaseErrorPayload[] = [];
+        const pushes: Array<{ summary: string }> = [];
+        handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+        handle.runner.on('push', (payload: { summary: string }) => pushes.push(payload));
+
+        let callerFailure: unknown;
+        try {
+          await mgr.autoloopChat(runId, 'exercise the raw dispatcher boundary');
+        } catch (error) {
+          callerFailure = error;
+        }
+
+        expect(boundaryFailure).toBeInstanceOf(AutoloopOperationError);
+        expect(callerFailure).toBe(boundaryFailure);
+        expect(callerFailure).toMatchObject({
+          name: 'AutoloopOperationError',
+          code: 'AUTOLOOP_ENGINE_FAILURE',
+          retryable: true,
+          cause,
+          message: 'Planner engine transport failed: runtime liveness probe failed',
+        });
+        expect(phaseErrors).toEqual([
+          {
+            agent: 'planner',
+            phase: 'planner_turn',
+            code: 'AUTOLOOP_ENGINE_FAILURE',
+            error: 'Planner engine transport failed: runtime liveness probe failed',
+          },
+        ]);
+        expect(pushes.map(({ summary }) => summary)).toEqual(['[on_phase_error] iter 0']);
+        expect(handle.runner.state).toMatchObject({
+          consecutive_phase_errors: 1,
+          push_log_count: 1,
+        });
+        const decisions = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: PhaseErrorPayload });
+        expect(
+          decisions.filter(
+            (row) =>
+              row.kind === 'phase_error' &&
+              row.payload.agent === 'planner' &&
+              row.payload.code === 'AUTOLOOP_ENGINE_FAILURE',
+          ),
+        ).toEqual([
+          expect.objectContaining({
+            payload: expect.objectContaining({
+              error: 'Planner engine transport failed: runtime liveness probe failed',
+            }),
+          }),
+        ]);
+      });
+
+      it('rethrows the same specific typed Planner failure instead of normalizing it to engine failure', async () => {
+        const runId = 'planner-specific-boundary-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents"}', '```'].join('\n'),
+          event: { type: 'result', result: 'malformed control' },
+        });
+        const originalDeliver = handle.dispatcher.deliver.bind(handle.dispatcher);
+        let boundaryFailure: unknown;
+        vi.spyOn(handle.dispatcher, 'deliver').mockImplementation(async (env) => {
+          try {
+            return await originalDeliver(env);
+          } catch (error) {
+            boundaryFailure = error;
+            throw error;
+          }
+        });
+
+        let callerFailure: unknown;
+        try {
+          await mgr.autoloopChat(runId, 'preserve the specific failure');
+        } catch (error) {
+          callerFailure = error;
+        }
+
+        expect(boundaryFailure).toBeInstanceOf(AutoloopOperationError);
+        expect(callerFailure).toBe(boundaryFailure);
+        expect(callerFailure).toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+          retryable: false,
+        });
+      });
+
+      it('creates the Planner control ledger owner-only and hardens pre-existing weak permissions', async () => {
+        const runId = 'planner-private-control-ledger';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        const ledgerDir = path.join(workspace, 'tasks', runId);
+        const decisionsPath = path.join(ledgerDir, 'decisions.jsonl');
+        fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o777 });
+        fs.chmodSync(ledgerDir, 0o775);
+        fs.writeFileSync(decisionsPath, '', { mode: 0o666 });
+        fs.chmodSync(decisionsPath, 0o664);
+
+        await mgr.autoloopStart({ runId, workspace });
+
+        expect(fs.statSync(ledgerDir).mode & 0o777).toBe(0o700);
+        expect(fs.statSync(decisionsPath).mode & 0o777).toBe(0o600);
+      });
+
+      it('creates a new Planner ledger directory and decisions file with owner-only permissions', async () => {
+        const runId = 'planner-new-private-control-ledger';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        const ledgerDir = path.join(workspace, 'tasks', runId);
+        const decisionsPath = path.join(ledgerDir, 'decisions.jsonl');
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents"}', '```'].join('\n'),
+          event: { type: 'result', result: 'invalid control' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'create private decision evidence')).rejects.toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+        });
+
+        expect(fs.statSync(ledgerDir).mode & 0o777).toBe(0o700);
+        expect(fs.statSync(decisionsPath).mode & 0o777).toBe(0o600);
+      });
+
+      it('does not weaken already owner-only Planner control ledger permissions', async () => {
+        const runId = 'planner-private-control-ledger-preserved';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        const ledgerDir = path.join(workspace, 'tasks', runId);
+        const decisionsPath = path.join(ledgerDir, 'decisions.jsonl');
+        fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o700 });
+        fs.chmodSync(ledgerDir, 0o700);
+        fs.writeFileSync(decisionsPath, '', { mode: 0o600 });
+        fs.chmodSync(decisionsPath, 0o600);
+
+        await mgr.autoloopStart({ runId, workspace });
+
+        expect(fs.statSync(ledgerDir).mode & 0o777).toBe(0o700);
+        expect(fs.statSync(decisionsPath).mode & 0o777).toBe(0o600);
+      });
+
+      it('refuses a pre-planted Planner ledger-directory symlink without writing its target', async () => {
+        const runId = 'planner-ledger-directory-symlink';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        const tasksDir = path.join(workspace, 'tasks');
+        const external = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-external-`));
+        fs.mkdirSync(tasksDir, { recursive: true });
+        fs.symlinkSync(external, path.join(tasksDir, runId), 'dir');
+
+        await expect(mgr.autoloopStart({ runId, workspace })).rejects.toThrow(/ledger.*symbolic link/i);
+        expect(fs.readdirSync(external)).toEqual([]);
+      });
+
+      it('refuses a pre-planted decisions symlink without changing its external target', async () => {
+        const runId = 'planner-decisions-symlink';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        const ledgerDir = path.join(workspace, 'tasks', runId);
+        const external = path.join(TEST_WF_DIR, `${runId}-external.txt`);
+        fs.mkdirSync(ledgerDir, { recursive: true });
+        fs.writeFileSync(external, 'external decision sentinel\n');
+        fs.symlinkSync(external, path.join(ledgerDir, 'decisions.jsonl'));
+
+        await expect(mgr.autoloopStart({ runId, workspace })).rejects.toThrow(/decisions\.jsonl.*symbolic link/i);
+        expect(fs.readFileSync(external, 'utf8')).toBe('external decision sentinel\n');
+      });
+
       it.each(['unavailable', 'non-finite'] as const)(
         'fails closed before persisting a fenced AGY control when Planner success counters are %s',
         async (counterState) => {
@@ -4515,6 +4715,7 @@ describe('SessionManager', () => {
         const openHistory: Array<{ fd: number; target: string; flags: unknown }> = [];
         const currentOpens = new Map<number, { target: string; flags: unknown }>();
         const controlFlushFlags: unknown[] = [];
+        const flushedTargets: string[] = [];
         const openFile = vi.mocked(fs.openSync);
         const openImplementation = openFile.getMockImplementation()!;
         openFile.mockImplementation(((target: unknown, ...args: unknown[]) => {
@@ -4528,6 +4729,7 @@ describe('SessionManager', () => {
         const flushImplementation = flush.getMockImplementation()!;
         flush.mockImplementation((fd) => {
           const currentOpen = currentOpens.get(fd);
+          if (currentOpen) flushedTargets.push(currentOpen.target);
           if (currentOpen?.target === decisionsPath) {
             order.push('control-flushed');
             controlFlushFlags.push(currentOpen.flags);
@@ -4547,8 +4749,10 @@ describe('SessionManager', () => {
             reply: 'Planner controls persisted: spawn_subagents',
           });
           expect(order).toEqual(['control-flushed', 'effect-started']);
-          expect(openHistory.map(({ target }) => target)).not.toContain(ledgerDir);
-          expect(controlFlushFlags).toEqual(['r+']);
+          expect(openHistory.map(({ target }) => target)).toContain(ledgerDir);
+          expect(flushedTargets).not.toContain(ledgerDir);
+          expect(controlFlushFlags).toHaveLength(1);
+          expect((controlFlushFlags[0] as number) & fs.constants.O_RDWR).toBe(fs.constants.O_RDWR);
           expect(warn).toHaveBeenCalledWith(
             '[autoloop] parent-directory fsync is unavailable on win32; control file contents were flushed without a POSIX directory-entry guarantee',
           );
@@ -4848,7 +5052,7 @@ describe('SessionManager', () => {
             const appendFile = vi.mocked(fs.appendFileSync);
             const appendImplementation = appendFile.getMockImplementation()!;
             appendFile.mockImplementation(((file: unknown, data: unknown, ...args: unknown[]) => {
-              if (String(file) === decisionsPath && String(data).includes('"kind":"planner_turn_control"')) return;
+              if (isOpenPath(file, decisionsPath) && String(data).includes('"kind":"planner_turn_control"')) return;
               return (appendImplementation as (...values: unknown[]) => unknown)(file, data, ...args);
             }) as typeof fs.appendFileSync);
             return () => appendFile.mockImplementation(appendImplementation);
@@ -5091,7 +5295,7 @@ describe('SessionManager', () => {
         const appendFile = vi.mocked(fs.appendFileSync);
         const appendImplementation = appendFile.getMockImplementation()!;
         appendFile.mockImplementation(((file: unknown, ...args: unknown[]) => {
-          if (String(file) === decisionsPath) return;
+          if (isOpenPath(file, decisionsPath)) return;
           return (appendImplementation as (...values: unknown[]) => unknown)(file, ...args);
         }) as typeof fs.appendFileSync);
 
@@ -5123,7 +5327,7 @@ describe('SessionManager', () => {
         const appendFile = vi.mocked(fs.appendFileSync);
         const appendImplementation = appendFile.getMockImplementation()!;
         appendFile.mockImplementation(((file: unknown, data: unknown, ...args: unknown[]) => {
-          if (String(file) === decisionsPath && String(data).includes('"kind":"planner_turn_control"')) {
+          if (isOpenPath(file, decisionsPath) && String(data).includes('"kind":"planner_turn_control"')) {
             const row = JSON.parse(String(data)) as { payload: { generation: number } };
             row.payload.generation = 999;
             return (appendImplementation as (...values: unknown[]) => unknown)(
@@ -5214,7 +5418,7 @@ describe('SessionManager', () => {
           const appendFile = vi.mocked(fs.appendFileSync);
           const appendImplementation = appendFile.getMockImplementation()!;
           appendFile.mockImplementation(((file: unknown, data: unknown, ...args: unknown[]) => {
-            if (String(file) === decisionsPath && String(data).includes('"kind":"planner_turn_control"')) {
+            if (isOpenPath(file, decisionsPath) && String(data).includes('"kind":"planner_turn_control"')) {
               const row = JSON.parse(String(data)) as { payload: Record<string, unknown> };
               mutate(row.payload);
               return (appendImplementation as (...values: unknown[]) => unknown)(
@@ -6249,7 +6453,13 @@ describe('SessionManager', () => {
         const auditOpen = vi.mocked((await import('node:fs')).openSync);
         const openImplementation = auditOpen.getMockImplementation()!;
         auditOpen.mockImplementation(((file, flags, mode) => {
-          if (String(file) === auditPath && flags === 'a') throw new Error('audit append unavailable');
+          if (
+            String(file) === auditPath &&
+            typeof flags === 'number' &&
+            (flags & fs.constants.O_APPEND) === fs.constants.O_APPEND
+          ) {
+            throw new Error('audit append unavailable');
+          }
           return openImplementation(file, flags, mode);
         }) as typeof fs.openSync);
 
@@ -6647,6 +6857,82 @@ describe('SessionManager', () => {
         }
       });
 
+      it('contains a soft-resume Planner failure when its mandatory phase-error notification also fails', async () => {
+        const runId = 'planner-soft-resume-notification-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        await handle.runner.send(AutoloopMsg.pause(0, { reason: 'operator-review' }));
+        await expect(mgr.autoloopChat(runId, 'park before both failures')).rejects.toMatchObject({
+          code: 'AUTOLOOP_RUN_PAUSED',
+          retryable: false,
+        });
+        mockSessions[0].sendImplementation = async () => ({
+          text: 'reply whose generation probe will fail',
+          event: { type: 'result', result: 'reply whose generation probe will fail' },
+        });
+        vi.spyOn(mgr, 'inspect').mockRejectedValueOnce(new Error('soft-resume liveness probe failed'));
+        handle.runner.config.notifyUser = async () => {
+          throw new Error('mandatory Planner phase-error notification failed');
+        };
+
+        const originalDeliver = handle.dispatcher.deliver.bind(handle.dispatcher);
+        let boundaryFailure: unknown;
+        vi.spyOn(handle.dispatcher, 'deliver').mockImplementation(async (env) => {
+          try {
+            return await originalDeliver(env);
+          } catch (error) {
+            boundaryFailure = error;
+            throw error;
+          }
+        });
+        const phaseErrors: PhaseErrorPayload[] = [];
+        const pushes: Array<{ summary: string }> = [];
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => unhandled.push(reason);
+        handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+        handle.runner.on('push', (payload: { summary: string }) => pushes.push(payload));
+        process.on('unhandledRejection', onUnhandled);
+        expect(handle.runner.listenerCount('error')).toBe(0);
+
+        try {
+          await expect(handle.runner.send(AutoloopMsg.resume(0))).resolves.toBeUndefined();
+          await new Promise<void>((resolve) => nativeSetImmediate(resolve));
+
+          expect(boundaryFailure).toBeInstanceOf(AutoloopOperationError);
+          expect(phaseErrors).toEqual([
+            {
+              agent: 'planner',
+              phase: 'planner_turn',
+              code: 'AUTOLOOP_ENGINE_FAILURE',
+              error: 'Planner engine transport failed: soft-resume liveness probe failed',
+            },
+          ]);
+          expect(pushes.map(({ summary }) => summary)).toEqual(['[on_phase_error] iter 0']);
+          expect(unhandled).toEqual([]);
+          expect(handle.runner.state).toMatchObject({
+            status: 'running',
+            consecutive_phase_errors: 1,
+            push_log_count: 1,
+          });
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string; payload: PhaseErrorPayload });
+          expect(
+            decisions.filter(
+              (row) =>
+                row.kind === 'phase_error' &&
+                row.payload.agent === 'planner' &&
+                row.payload.code === 'AUTOLOOP_ENGINE_FAILURE',
+            ),
+          ).toHaveLength(1);
+        } finally {
+          process.off('unhandledRejection', onUnhandled);
+        }
+      });
+
       it('contains a timeout-resume parked Planner delivery failure without an unhandled rejection', async () => {
         const runId = 'planner-timeout-resumed-parked-delivery-failure';
         const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
@@ -6720,6 +7006,67 @@ describe('SessionManager', () => {
         } finally {
           process.off('unhandledRejection', onUnhandled);
           delivery.mockRestore();
+        }
+      });
+
+      it('contains a detached timeout-resume failure for a parked non-Planner message without an error listener', async () => {
+        const runId = 'coder-timeout-resume-parked-delivery-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({
+          runId,
+          workspace,
+          sendTimeoutMs: 600_000,
+          activityLeaseMs: 1_800_000,
+          autoloopHardTimeoutMs: 86_400_000,
+        });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => {
+          throw new Error('Timeout waiting for response');
+        };
+        await expect(mgr.autoloopChat(runId, 'establish timeout before parking Coder work')).rejects.toMatchObject({
+          code: 'AUTOLOOP_SEND_TIMEOUT',
+          retryable: true,
+        });
+        const pending = handle.runner.state.pending_dispatch!;
+        await handle.runner.send(
+          AutoloopMsg.directive(0, {
+            goal: 'park this Coder delivery',
+            constraints: [],
+            success_criteria: [],
+            max_attempts: 1,
+          }),
+        );
+
+        const originalDeliver = handle.dispatcher.deliver.bind(handle.dispatcher);
+        const delivery = vi.spyOn(handle.dispatcher, 'deliver').mockImplementation(async (env) => {
+          if (env.to === 'coder') throw new Error('parked Coder delivery failed');
+          return await originalDeliver(env);
+        });
+        const phaseErrors: PhaseErrorPayload[] = [];
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => unhandled.push(reason);
+        handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+        process.on('unhandledRejection', onUnhandled);
+        expect(handle.runner.listenerCount('error')).toBe(0);
+
+        try {
+          await expect(
+            mgr.autoloopResume(runId, {
+              sendTimeoutMs: 700_000,
+              pendingDispatchId: pending.dispatch_id,
+            }),
+          ).resolves.toMatchObject({ status: 'running', pending_dispatch: null });
+          await vi.waitFor(() => expect(delivery.mock.calls.some(([env]) => env.to === 'coder')).toBe(true));
+          await new Promise<void>((resolve) => nativeSetImmediate(resolve));
+
+          expect(unhandled).toEqual([]);
+          expect(phaseErrors).toEqual([]);
+          expect(handle.runner.state).toMatchObject({
+            status: 'running',
+            consecutive_phase_errors: 0,
+          });
+        } finally {
+          process.off('unhandledRejection', onUnhandled);
         }
       });
 
@@ -7348,25 +7695,40 @@ describe('SessionManager', () => {
         expect(JSON.stringify(handle.runner.config.push_policy)).toBe(before);
       });
 
-      it('refuses a silence-only critical attempt even when natural-language text is present', async () => {
-        const runId = 'planner-critical-silence-with-text';
-        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
-        await mgr.autoloopStart({ runId, workspace });
-        mockSessions[0].sendImplementation = async () => ({
-          text: [
-            'I silenced the critical notification.',
-            '```autoloop',
-            '{"tool":"update_push_policy","args":{"on_phase_error":{"silent":true}}}',
-            '```',
-          ].join('\n'),
-          event: { type: 'result', result: 'silence critical policy' },
-        });
+      it.each(['on_phase_error', 'on_decision_needed'] as const)(
+        'refuses prose plus a silence-only $key attempt without policy or successful-control audit mutation',
+        async (key) => {
+          const runId = `planner-critical-silence-with-text-${key}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          const policyBefore = JSON.stringify(handle.runner.config.push_policy);
+          mockSessions[0].sendImplementation = async () => ({
+            text: [
+              'I silenced the critical notification.',
+              '```autoloop',
+              JSON.stringify({ tool: 'update_push_policy', args: { [key]: { silent: true } } }),
+              '```',
+            ].join('\n'),
+            event: { type: 'result', result: 'silence critical policy' },
+          });
 
-        await expect(mgr.autoloopChat(runId, 'do not accept prose as a control result')).rejects.toMatchObject({
-          code: 'AUTOLOOP_CONTROL_MALFORMED',
-          retryable: false,
-        });
-      });
+          await expect(mgr.autoloopChat(runId, 'do not accept prose as a control result')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_MALFORMED',
+            retryable: false,
+          });
+
+          expect(JSON.stringify(handle.runner.config.push_policy)).toBe(policyBefore);
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string; payload: { keys?: string[] } });
+          expect(decisions.filter((row) => row.kind === 'planner_turn_control')).toEqual([]);
+          expect(decisions.filter((row) => row.kind === 'update_push_policy')).toEqual([]);
+          expect(decisions.filter((row) => row.kind === 'policy_silence_blocked')).toEqual([]);
+        },
+      );
 
       it('retains a valid non-weakening control beside a blocked critical silence attempt', async () => {
         const runId = 'planner-critical-silence-mixed-batch';

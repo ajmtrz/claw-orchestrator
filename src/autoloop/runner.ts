@@ -445,6 +445,16 @@ export class AutoloopRunner extends EventEmitter {
     }
   }
 
+  /**
+   * Node treats an `error` event with no listener as a throw. Detached drains
+   * have no caller left to reject, so publish diagnostic errors only when an
+   * observer explicitly subscribed instead of creating an unhandled rejection.
+   */
+  private emitObservedError(error: unknown): void {
+    if (this.listenerCount('error') === 0) return;
+    this.emit('error', error instanceof Error ? error : new Error(String(error)));
+  }
+
   private completeSenderMessage(sender: SenderContext | undefined): void {
     if (!sender || sender.settled) return;
     sender.pending -= 1;
@@ -485,7 +495,7 @@ export class AutoloopRunner extends EventEmitter {
     // This entry point is called outside the normal queue drain. Resume only
     // the messages parked *after* the timed-out dispatch; the timed-out message
     // itself is deliberately never requeued.
-    void this.drain().catch((err) => this.emit('error', err));
+    void this.drain().catch((err) => this.emitObservedError(err));
     return true;
   }
 
@@ -574,7 +584,7 @@ export class AutoloopRunner extends EventEmitter {
           this.enqueueMessage(phaseError, sender, true);
         } else {
           this.failSender(sender, error);
-          if (!sender || sender.settled) this.emit('error', error instanceof Error ? error : new Error(String(error)));
+          if (!sender || sender.settled) this.emitObservedError(error);
         }
       } finally {
         this.completeSenderMessage(sender);

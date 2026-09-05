@@ -382,6 +382,8 @@ import { AutoloopRunner } from './autoloop/runner.js';
 import {
   AutoloopOperationError,
   ClaudeAgentDispatcher,
+  openPrivateAutoloopDecisions,
+  securePrivateAutoloopDecisionLedger,
   type ClaudeAgentDispatcherConfig,
 } from './autoloop/dispatcher.js';
 import type {
@@ -546,10 +548,21 @@ function readStoredAutoloopResumeContext(
   validateAutoloopTimeoutConfig({ sendTimeoutMs: originalSendTimeoutMs as number | undefined });
   let effectiveSendTimeoutMs = (originalSendTimeoutMs as number | undefined) ?? DEFAULT_SEND_TIMEOUT_MS;
   let pendingDispatch: SendTimeoutPayload | null = null;
-  const auditPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
-  if (!fs.existsSync(auditPath)) return { effectiveSendTimeoutMs, pendingDispatch };
+  let audit: ReturnType<typeof openPrivateAutoloopDecisions>;
+  try {
+    audit = openPrivateAutoloopDecisions(workspace, runId, 'read');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { effectiveSendTimeoutMs, pendingDispatch };
+    throw error;
+  }
+  let auditContents: string;
+  try {
+    auditContents = fs.readFileSync(audit.fd, 'utf8');
+  } finally {
+    fs.closeSync(audit.fd);
+  }
 
-  const lines = fs.readFileSync(auditPath, 'utf8').split('\n');
+  const lines = auditContents.split('\n');
   for (const line of lines) {
     if (!line.trim()) continue;
     let row: Record<string, unknown>;
@@ -609,9 +622,12 @@ function appendSendTimeoutMigration(
   workspace: string,
   migration: Omit<SendTimeoutMigrationAuditRecord, 'ts' | 'timestamp' | 'kind' | 'actor'>,
 ): void {
-  const ledgerDir = path.join(workspace, 'tasks', migration.runId);
-  fs.mkdirSync(ledgerDir, { recursive: true });
-  fs.appendFileSync(path.join(ledgerDir, 'decisions.jsonl'), encodeSendTimeoutMigration(migration));
+  const audit = openPrivateAutoloopDecisions(workspace, migration.runId, 'append', true);
+  try {
+    fs.appendFileSync(audit.fd, encodeSendTimeoutMigration(migration));
+  } finally {
+    fs.closeSync(audit.fd);
+  }
 }
 
 /**
@@ -625,10 +641,9 @@ function prepareSendTimeoutMigrationAppend(
   workspace: string,
   migration: Omit<SendTimeoutMigrationAuditRecord, 'ts' | 'timestamp' | 'kind' | 'actor'>,
 ): PreparedSendTimeoutMigrationAppend {
-  const ledgerDir = path.join(workspace, 'tasks', migration.runId);
-  fs.mkdirSync(ledgerDir, { recursive: true });
+  const audit = openPrivateAutoloopDecisions(workspace, migration.runId, 'append', true);
   return {
-    fd: fs.openSync(path.join(ledgerDir, 'decisions.jsonl'), 'a'),
+    fd: audit.fd,
     line: encodeSendTimeoutMigration(migration),
   };
 }
@@ -3814,10 +3829,7 @@ export class SessionManager implements AgentRuntimeProbe {
     const plannerEngine = validateAutoloopRole('planner', opts.plannerEngine, opts.plannerCustomEngine);
     const coderEngine = validateAutoloopRole('coder', opts.coderEngine, opts.coderCustomEngine);
     const reviewerEngine = validateAutoloopRole('reviewer', opts.reviewerEngine, opts.reviewerCustomEngine);
-    const ledgerDir = path.join(opts.workspace, 'tasks', opts.runId);
-    if (!fs.existsSync(ledgerDir)) {
-      fs.mkdirSync(ledgerDir, { recursive: true });
-    }
+    const ledgerDir = securePrivateAutoloopDecisionLedger(opts.workspace, opts.runId);
     // Per-run policy object — mutable so Planner's update_push_policy is visible
     // to the runner without re-wiring.
     const pushPolicy: PushPolicy = JSON.parse(JSON.stringify(DEFAULT_PUSH_POLICY)) as PushPolicy;

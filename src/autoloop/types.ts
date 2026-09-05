@@ -163,7 +163,7 @@ export interface AutoloopState {
    * `AutoloopConfig.phaseErrorCircuit`, the runner auto-terminates.
    */
   consecutive_phase_errors: number;
-  /** Recent (≤ 3) phase_error payloads kept around for circuit-trip push detail. */
+  /** Recent (≤ 5) phase_error payloads kept around for circuit-trip push detail. */
   recent_phase_errors: Array<{
     ts: string;
     agent: string;

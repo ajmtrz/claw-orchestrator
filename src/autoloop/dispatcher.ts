@@ -199,6 +199,169 @@ export class AutoloopOperationError extends Error {
   }
 }
 
+function normalizePlannerOperationError(error: unknown): AutoloopOperationError {
+  if (error instanceof AutoloopOperationError) return error;
+  const cause = error instanceof Error ? error : new Error(String(error));
+  return new AutoloopOperationError('AUTOLOOP_ENGINE_FAILURE', `Planner engine transport failed: ${cause.message}`, {
+    cause,
+  });
+}
+
+const PRIVATE_AUTOLOOP_LEDGER_MODE = 0o700;
+const PRIVATE_AUTOLOOP_DECISIONS_MODE = 0o600;
+const NO_FOLLOW_FLAG = fs.constants.O_NOFOLLOW ?? 0;
+const DIRECTORY_FLAG = fs.constants.O_DIRECTORY ?? 0;
+
+function lstatIfPresent(filePath: string): fs.Stats | undefined {
+  try {
+    return fs.lstatSync(filePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
+function sameFileIdentity(left: fs.Stats, right: fs.Stats): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function rejectUnsafeLedgerPath(filePath: string, label: string, observed: fs.Stats): never {
+  if (observed.isSymbolicLink()) {
+    throw new Error(`Refusing ${label} symbolic link '${filePath}'`);
+  }
+  throw new Error(`Refusing non-${label === 'Planner ledger' ? 'directory' : 'regular'} ${label} '${filePath}'`);
+}
+
+/**
+ * Open and hold the per-run directory while a decisions descriptor is opened.
+ * The lstat/open/fstat identity checks reject pre-planted links and detect a
+ * path replacement around open even on platforms where O_NOFOLLOW is absent.
+ */
+function missingPath(filePath: string): NodeJS.ErrnoException {
+  return Object.assign(new Error(`ENOENT: no such file or directory, open '${filePath}'`), { code: 'ENOENT' });
+}
+
+function openPrivateLedgerDirectory(
+  workspace: string,
+  runId: string,
+  create: boolean,
+): {
+  ledgerDir: string;
+  ledgerFd: number;
+  ledgerStat: fs.Stats;
+} {
+  const tasksDir = path.join(workspace, 'tasks');
+  const tasksObserved = lstatIfPresent(tasksDir);
+  if (!tasksObserved) {
+    if (!create) throw missingPath(tasksDir);
+    fs.mkdirSync(tasksDir, { mode: PRIVATE_AUTOLOOP_LEDGER_MODE });
+  } else if (tasksObserved.isSymbolicLink() || !tasksObserved.isDirectory()) {
+    rejectUnsafeLedgerPath(tasksDir, 'Planner ledger parent', tasksObserved);
+  }
+
+  const ledgerDir = path.join(tasksDir, runId);
+  let ledgerObserved = lstatIfPresent(ledgerDir);
+  const created = !ledgerObserved;
+  if (created) {
+    if (!create) throw missingPath(ledgerDir);
+    fs.mkdirSync(ledgerDir, { mode: PRIVATE_AUTOLOOP_LEDGER_MODE });
+    ledgerObserved = fs.lstatSync(ledgerDir);
+  }
+  if (!ledgerObserved) throw missingPath(ledgerDir);
+  if (ledgerObserved.isSymbolicLink() || !ledgerObserved.isDirectory()) {
+    rejectUnsafeLedgerPath(ledgerDir, 'Planner ledger', ledgerObserved);
+  }
+
+  const ledgerFd = fs.openSync(ledgerDir, fs.constants.O_RDONLY | DIRECTORY_FLAG | NO_FOLLOW_FLAG);
+  try {
+    const ledgerStat = fs.fstatSync(ledgerFd);
+    if (!ledgerStat.isDirectory() || !sameFileIdentity(ledgerObserved, ledgerStat)) {
+      throw new Error(`Planner ledger path '${ledgerDir}' changed while it was being secured`);
+    }
+    const currentMode = ledgerStat.mode & 0o777;
+    const privateMode = created ? PRIVATE_AUTOLOOP_LEDGER_MODE : currentMode & PRIVATE_AUTOLOOP_LEDGER_MODE;
+    if (currentMode !== privateMode) fs.fchmodSync(ledgerFd, privateMode);
+    return { ledgerDir, ledgerFd, ledgerStat: fs.fstatSync(ledgerFd) };
+  } catch (error) {
+    fs.closeSync(ledgerFd);
+    throw error;
+  }
+}
+
+export interface PrivateAutoloopDecisionsHandle {
+  fd: number;
+  filePath: string;
+}
+
+/**
+ * Open decisions.jsonl without following a pre-planted symbolic link. New
+ * files are exactly 0600; existing files lose group/other permissions without
+ * gaining any owner permission they did not already have.
+ */
+export function openPrivateAutoloopDecisions(
+  workspace: string,
+  runId: string,
+  mode: 'read' | 'append',
+  create = false,
+): PrivateAutoloopDecisionsHandle {
+  const { ledgerDir, ledgerFd, ledgerStat } = openPrivateLedgerDirectory(workspace, runId, create);
+  const filePath = path.join(ledgerDir, 'decisions.jsonl');
+  let decisionsFd: number | undefined;
+  try {
+    const observed = lstatIfPresent(filePath);
+    if (observed && (observed.isSymbolicLink() || !observed.isFile())) {
+      rejectUnsafeLedgerPath(filePath, 'decisions.jsonl', observed);
+    }
+    if (!observed && !create) {
+      throw missingPath(filePath);
+    }
+
+    const flags =
+      mode === 'append'
+        ? fs.constants.O_RDWR |
+          fs.constants.O_APPEND |
+          NO_FOLLOW_FLAG |
+          (observed ? 0 : fs.constants.O_CREAT | fs.constants.O_EXCL)
+        : fs.constants.O_RDONLY | NO_FOLLOW_FLAG;
+    decisionsFd = fs.openSync(filePath, flags, PRIVATE_AUTOLOOP_DECISIONS_MODE);
+    const opened = fs.fstatSync(decisionsFd);
+    if (!opened.isFile() || (observed && !sameFileIdentity(observed, opened))) {
+      throw new Error(`decisions.jsonl path '${filePath}' changed while it was being secured`);
+    }
+    const currentMode = opened.mode & 0o777;
+    const privateMode = observed ? currentMode & PRIVATE_AUTOLOOP_DECISIONS_MODE : PRIVATE_AUTOLOOP_DECISIONS_MODE;
+    if (currentMode !== privateMode) fs.fchmodSync(decisionsFd, privateMode);
+
+    const currentLedger = fs.lstatSync(ledgerDir);
+    if (
+      currentLedger.isSymbolicLink() ||
+      !currentLedger.isDirectory() ||
+      !sameFileIdentity(ledgerStat, currentLedger)
+    ) {
+      throw new Error(`Planner ledger path '${ledgerDir}' changed while decisions.jsonl was being opened`);
+    }
+    return { fd: decisionsFd, filePath };
+  } catch (error) {
+    if (decisionsFd !== undefined) fs.closeSync(decisionsFd);
+    throw error;
+  } finally {
+    fs.closeSync(ledgerFd);
+  }
+}
+
+/** Create/harden the private ledger and validate any existing decisions file. */
+export function securePrivateAutoloopDecisionLedger(workspace: string, runId: string): string {
+  const { ledgerDir, ledgerFd } = openPrivateLedgerDirectory(workspace, runId, true);
+  fs.closeSync(ledgerFd);
+  try {
+    const decisions = openPrivateAutoloopDecisions(workspace, runId, 'read');
+    fs.closeSync(decisions.fd);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  return ledgerDir;
+}
+
 export type AutoloopResetResult =
   | {
       ok: true;
@@ -518,7 +681,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     this.ownerInstanceId = ownerInstanceId;
     this.now = config.now ?? (() => new Date());
     this.agentLeaseMs = config.agentLeaseMs ?? DEFAULT_ACTIVITY_LEASE_MS;
-    this.ledgerDir = path.join(config.workspace, 'tasks', config.runId);
+    this.ledgerDir = securePrivateAutoloopDecisionLedger(config.workspace, config.runId);
     this.reviewerSandboxDir = path.join(this.ledgerDir, 'reviewer_sandbox');
   }
 
@@ -970,19 +1133,20 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     if (existing) return await existing;
 
     const pending = this.deliverOnce(env, dispatchId).catch((error: unknown) => {
-      if (error instanceof AutoloopOperationError) {
+      const operationError = env.to === 'planner' ? normalizePlannerOperationError(error) : error;
+      if (operationError instanceof AutoloopOperationError) {
         this.appendDecisionLog({
           kind: 'phase_error',
           actor: 'dispatcher',
           payload: {
             agent: env.to,
             phase: `${env.to}_turn`,
-            code: error.code,
-            error: error.message,
+            code: operationError.code,
+            error: operationError.message,
           },
         });
       }
-      throw error;
+      throw operationError;
     });
     this.logicalDispatches.set(dispatchId, pending);
     // Mark settled before trimming so eviction can tell an in-flight dispatch
@@ -1469,12 +1633,15 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
    * passes, and policy-silence attempts that we rejected.
    */
   private appendDecisionLog(entry: Omit<DecisionLogEntry, 'ts'>): void {
+    let fd: number | undefined;
     try {
-      fs.mkdirSync(this.ledgerDir, { recursive: true });
       const line = JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n';
-      fs.appendFileSync(path.join(this.ledgerDir, 'decisions.jsonl'), line);
+      fd = openPrivateAutoloopDecisions(this.config.workspace, this.config.runId, 'append', true).fd;
+      fs.appendFileSync(fd, line);
     } catch (err) {
       this.logger.warn?.(`[autoloop] decisions.jsonl append failed: ${(err as Error).message}`);
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
     }
   }
 
@@ -1571,10 +1738,10 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     } satisfies DecisionLogEntry;
     const decisionsPath = path.join(this.ledgerDir, 'decisions.jsonl');
 
+    let fd: number | undefined;
     try {
-      fs.mkdirSync(this.ledgerDir, { recursive: true });
-      fs.appendFileSync(decisionsPath, `${JSON.stringify(decision)}\n`);
-      const fd = fs.openSync(decisionsPath, 'r+');
+      fd = openPrivateAutoloopDecisions(this.config.workspace, this.config.runId, 'append', true).fd;
+      fs.appendFileSync(fd, `${JSON.stringify(decision)}\n`);
       let durableLine: string;
       try {
         // The control intent is a commit boundary, not ordinary best-effort
@@ -1606,6 +1773,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         durableLine = Buffer.concat(chunks.reverse()).toString('utf8');
       } finally {
         fs.closeSync(fd);
+        fd = undefined;
       }
       const durableRow = JSON.parse(durableLine) as { kind?: unknown; payload?: unknown };
       const durableEvidence =
@@ -1622,6 +1790,8 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         `Planner control event could not be persisted: ${(error as Error).message}`,
         { cause: error },
       );
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
     }
   }
 
