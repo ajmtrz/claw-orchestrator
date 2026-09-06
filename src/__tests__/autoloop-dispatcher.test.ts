@@ -1792,13 +1792,21 @@ describe('ClaudeAgentDispatcher — stageReviewSandbox whitelist', () => {
   });
 
   it.each([
-    ['sandbox-reset', 'symlink'],
-    ['sandbox-reset', 'hardlink'],
-    ['sandbox-reset', 'unapproved'],
-    ['sandbox-stage', 'symlink'],
-    ['sandbox-stage', 'hardlink'],
-    ['sandbox-stage', 'unapproved'],
-  ] as const)('fails closed when a %s seam plants a %s entry', async (seam, kind) => {
+    ['sandbox-reset', 'symlink', /Reviewer sandbox reset seam .*symbolic link/i],
+    ['sandbox-reset', 'hardlink', /Reviewer sandbox reset seam .*hardlink with link count/i],
+    [
+      'sandbox-reset',
+      'unapproved',
+      /Reviewer sandbox reset seam membership changed unexpectedly; expected \[\], found \[unexpected-entry\]/i,
+    ],
+    ['sandbox-stage', 'symlink', /Reviewer sandbox final stage .*symbolic link/i],
+    ['sandbox-stage', 'hardlink', /Reviewer sandbox final stage .*hardlink with link count/i],
+    [
+      'sandbox-stage',
+      'unapproved',
+      /Reviewer sandbox final stage membership changed unexpectedly; expected \[iter-0\], found \[iter-0, unexpected-entry\]/i,
+    ],
+  ] as const)('fails closed when a %s seam plants a %s entry', async (seam, kind, expectedDiagnostic) => {
     const workspace = tmpRoot;
     const external = path.join(workspace, `external-${seam}-${kind}`);
     fs.writeFileSync(external, 'must remain external');
@@ -1838,7 +1846,7 @@ describe('ClaudeAgentDispatcher — stageReviewSandbox whitelist', () => {
 
     await expect(
       dispatcher.deliver(Msg.reviewRequest(0, { iter: 0, ledger_path: ledgerDir, prior_metrics: [] })),
-    ).rejects.toThrow(/symbolic link|hardlink|link count|unexpected|unapproved|unsafe/i);
+    ).rejects.toThrow(expectedDiagnostic);
 
     expect(
       calls.startSession.mock.calls.some(([config]) => (config as { name: string }).name === 'autoloop-r1-reviewer'),
