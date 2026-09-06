@@ -88,7 +88,7 @@ export class SecureAutoloopLedgerCommitError extends Error {
   readonly committed = true;
   readonly retryable = false;
   readonly effectsApplied: boolean;
-  readonly operation: 'secure_ledger_append' | 'send_timeout_migration';
+  readonly operation: 'secure_ledger_append' | 'secure_nested_artifact_write' | 'send_timeout_migration';
 
   constructor(
     readonly code: 'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE' | 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
@@ -96,7 +96,7 @@ export class SecureAutoloopLedgerCommitError extends Error {
     options: {
       cause: unknown;
       effectsApplied?: boolean;
-      operation?: 'secure_ledger_append' | 'send_timeout_migration';
+      operation?: 'secure_ledger_append' | 'secure_nested_artifact_write' | 'send_timeout_migration';
     },
   ) {
     super(message, options);
@@ -384,6 +384,12 @@ export class SecureAutoloopLedger {
   private syncPinnedDirectory(pinned: PinnedDirectory, label: string): void {
     this.assertIdentity();
     this.assertPinnedDirectory(pinned);
+    this.testHooks.beforeDirectorySync?.({
+      operation: 'directory-sync',
+      filePath: pinned.path,
+    });
+    this.assertIdentity();
+    this.assertPinnedDirectory(pinned);
     if ((this.platform ?? process.platform) === 'win32') {
       this.logger.warn?.(`[autoloop] ${label} was flushed, but directory fsync is unavailable on win32`);
       return;
@@ -397,6 +403,18 @@ export class SecureAutoloopLedger {
       fs.fsyncSync(fd);
     } finally {
       fs.closeSync(fd);
+    }
+  }
+
+  private syncCommittedNestedArtifact(parent: PinnedDirectory, relativePath: string): void {
+    try {
+      this.syncPinnedDirectory(parent, relativePath);
+    } catch (error) {
+      throw new SecureAutoloopLedgerCommitError(
+        'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+        `Autoloop nested artifact was committed to ${relativePath}, but its parent-directory durability barrier failed: ${errorMessage(error)}`,
+        { cause: error, operation: 'secure_nested_artifact_write' },
+      );
     }
   }
 
@@ -479,7 +497,7 @@ export class SecureAutoloopLedger {
       if (!existing.equals(bytes)) {
         throw new Error(`Refusing to overwrite conflicting immutable Autoloop artifact '${target}'`);
       }
-      this.syncPinnedDirectory(parent, relativePath);
+      this.syncCommittedNestedArtifact(parent, relativePath);
       return 'unchanged';
     }
 
@@ -522,7 +540,7 @@ export class SecureAutoloopLedger {
         if (!plantedBytes?.equals(bytes)) {
           throw new Error(`Refusing to overwrite conflicting immutable Autoloop artifact '${target}'`);
         }
-        this.syncPinnedDirectory(parent, relativePath);
+        this.syncCommittedNestedArtifact(parent, relativePath);
         return 'unchanged';
       }
 
@@ -530,7 +548,7 @@ export class SecureAutoloopLedger {
       renamed = true;
       const committed = this.openRegularChild(parent, name, 'Autoloop nested artifact');
       if (!committed?.equals(bytes)) throw new Error(`Autoloop artifact commit was incomplete: '${target}'`);
-      this.syncPinnedDirectory(parent, relativePath);
+      this.syncCommittedNestedArtifact(parent, relativePath);
       return 'created';
     } finally {
       if (fd !== undefined) {
@@ -605,7 +623,9 @@ export class SecureAutoloopLedger {
   }
 
   ensureReviewerSandbox(): string {
-    return this.getReviewerSandbox(true).path;
+    const sandbox = this.getReviewerSandbox(true);
+    this.assertReviewerSandboxBoundary(sandbox);
+    return sandbox.path;
   }
 
   readReviewerPersistentFile(name: SecureAutoloopReviewerPersistentFile): string | undefined {
@@ -638,6 +658,65 @@ export class SecureAutoloopLedger {
     }
   }
 
+  private readReviewerSandboxEntries(directory: PinnedDirectory): string[] {
+    this.assertIdentity();
+    this.assertPinnedDirectory(directory);
+    const entries = fs.readdirSync(directory.path).sort();
+    for (const entry of entries) validatePathComponent(entry, 'Reviewer sandbox entry');
+    this.assertPinnedDirectory(directory);
+    return entries;
+  }
+
+  private assertExactReviewerSandboxMembership(
+    directory: PinnedDirectory,
+    expected: Iterable<string>,
+    label: string,
+  ): void {
+    const observed = this.readReviewerSandboxEntries(directory);
+    const expectedEntries = [...expected].sort();
+    if (
+      observed.length !== expectedEntries.length ||
+      observed.some((entry, index) => entry !== expectedEntries[index])
+    ) {
+      throw new Error(
+        `${label} membership changed unexpectedly; expected [${expectedEntries.join(', ')}], found [${observed.join(', ')}]`,
+      );
+    }
+    for (const entry of observed) this.assertSafeRemovableSandboxEntry(path.join(directory.path, entry));
+    this.assertPinnedDirectory(directory);
+  }
+
+  private assertReviewerSandboxBoundary(sandbox: PinnedDirectory): void {
+    const persistentOrControl = new Set([
+      'reviewer_memory.md',
+      'reviewer_log.jsonl',
+      'plan.md',
+      'goal.json',
+      'prior_verdict.json',
+    ]);
+    let stagedIterationSeen = false;
+    for (const entry of this.readReviewerSandboxEntries(sandbox)) {
+      if (persistentOrControl.has(entry)) {
+        this.openRegularChild(sandbox, entry, 'Reviewer sandbox file');
+        continue;
+      }
+      const match = /^iter-(0|[1-9]\d*)$/.exec(entry);
+      if (!match || stagedIterationSeen) {
+        throw new Error(`Refusing unapproved Reviewer sandbox entry '${path.join(sandbox.path, entry)}'`);
+      }
+      const iter = Number(match[1]);
+      validateIteration(iter);
+      const staged = this.openPinnedChildDirectory(sandbox, entry, `Reviewer staged iteration ${iter}`, false);
+      this.assertExactReviewerSandboxMembership(
+        staged,
+        ['directive.json', 'eval_output.json', 'coder_summary.txt', 'diff.patch'],
+        `Reviewer staged iteration ${iter}`,
+      );
+      stagedIterationSeen = true;
+    }
+    this.assertPinnedDirectory(sandbox);
+  }
+
   stageReviewerSandbox(iter: number, controls: SecureReviewerControlFiles = {}): SecureReviewerStageResult {
     validateIteration(iter);
     const artifacts = new Map<SecureAutoloopIterationArtifact, Buffer>();
@@ -652,12 +731,14 @@ export class SecureAutoloopLedger {
 
     const sandbox = this.getReviewerSandbox(true);
     const persistent = new Set<SecureAutoloopReviewerPersistentFile>(['reviewer_memory.md', 'reviewer_log.jsonl']);
+    const persistentEntries = new Set<SecureAutoloopReviewerPersistentFile>();
     const removable: string[] = [];
-    for (const entry of fs.readdirSync(sandbox.path)) {
-      validatePathComponent(entry, 'Reviewer sandbox entry');
+    const initialEntries = this.readReviewerSandboxEntries(sandbox);
+    for (const entry of initialEntries) {
       const target = path.join(sandbox.path, entry);
       if (persistent.has(entry as SecureAutoloopReviewerPersistentFile)) {
         this.openRegularChild(sandbox, entry, 'Reviewer persistent file');
+        persistentEntries.add(entry as SecureAutoloopReviewerPersistentFile);
         continue;
       }
       this.assertSafeRemovableSandboxEntry(target);
@@ -671,10 +752,13 @@ export class SecureAutoloopLedger {
     });
     this.assertIdentity();
     this.assertPinnedDirectory(sandbox);
+    this.assertExactReviewerSandboxMembership(sandbox, initialEntries, 'Reviewer sandbox reset seam');
     for (const target of removable) {
       this.assertPinnedDirectory(sandbox);
+      this.assertSafeRemovableSandboxEntry(target);
       fs.rmSync(target, { recursive: true, force: false });
     }
+    this.assertExactReviewerSandboxMembership(sandbox, persistentEntries, 'Reviewer sandbox after reset');
 
     const destination = this.openPinnedChildDirectory(
       sandbox,
@@ -707,6 +791,19 @@ export class SecureAutoloopLedger {
       relativePath: `reviewer_sandbox/iter-${iter}`,
       filePath: destination.path,
     });
+    this.assertPinnedDirectory(sandbox);
+    this.assertPinnedDirectory(destination);
+    const expectedSandboxEntries = new Set<string>(persistentEntries);
+    expectedSandboxEntries.add(`iter-${iter}`);
+    if (controls.plan) expectedSandboxEntries.add('plan.md');
+    if (controls.goal) expectedSandboxEntries.add('goal.json');
+    if (prior) expectedSandboxEntries.add('prior_verdict.json');
+    this.assertExactReviewerSandboxMembership(sandbox, expectedSandboxEntries, 'Reviewer sandbox final stage');
+    this.assertExactReviewerSandboxMembership(
+      destination,
+      ['directive.json', 'eval_output.json', 'coder_summary.txt', 'diff.patch'],
+      `Reviewer staged iteration ${iter}`,
+    );
     this.assertPinnedDirectory(sandbox);
     this.assertPinnedDirectory(destination);
     return { directory: sandbox.path, priorVerdict: prior !== undefined };

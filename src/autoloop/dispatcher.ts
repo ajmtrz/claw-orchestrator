@@ -2410,12 +2410,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
    * keeps the per-iter prompt prefix stable so Claude's prefix cache hits.
    */
   private buildReviewerSystemPrompt(): string {
-    let memory = '';
-    try {
-      memory = this.secureLedger.readReviewerPersistentFile('reviewer_memory.md')?.trim() ?? '';
-    } catch (err) {
-      this.logger.warn?.(`[autoloop] failed to read reviewer_memory.md: ${(err as Error).message}`);
-    }
+    const memory = this.secureLedger.readReviewerPersistentFile('reviewer_memory.md')?.trim() ?? '';
     if (!memory) return this.reviewerSystemPrompt;
     return [
       this.reviewerSystemPrompt.trimEnd(),
@@ -2436,6 +2431,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     this.validateSelection('reviewer', this.reviewerSelection);
     this.secureLedger.ensureReviewerSandbox();
     const sessionPrompt = this.buildReviewerSystemPrompt();
+    this.secureLedger.ensureReviewerSandbox();
     this.reviewerSessionPrompt = sessionPrompt;
     try {
       await this.ensureAgentSession('reviewer', async (generation) => {

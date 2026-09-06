@@ -12,6 +12,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { ClaudeAgentDispatcher } from '../autoloop/dispatcher.js';
+import { SecureAutoloopLedger } from '../autoloop/secure-ledger.js';
 import {
   applyPlannerToolCalls,
   parsePlannerReply,
@@ -1220,6 +1221,45 @@ describe('ClaudeAgentDispatcher — frozen reviewer memory', () => {
     expect(sp).not.toContain('<frozen_memory_snapshot>');
   });
 
+  it.each([
+    ['reviewer_memory.md', 'symlink'],
+    ['reviewer_log.jsonl', 'hardlink'],
+  ] as const)('rejects an unsafe %s %s before starting the Reviewer', async (name, kind) => {
+    const { dispatcher, calls, ledgerDir, workspace } = makeDispatcher();
+    const sandbox = path.join(ledgerDir, 'reviewer_sandbox');
+    const external = path.join(workspace, `external-${name}`);
+    fs.mkdirSync(sandbox);
+    fs.writeFileSync(external, 'must remain external');
+    if (kind === 'symlink') fs.symlinkSync(external, path.join(sandbox, name));
+    else fs.linkSync(external, path.join(sandbox, name));
+
+    await expect(dispatcher.spawnSubagents()).rejects.toThrow(/symbolic link|hardlink|link count|unsafe/i);
+
+    expect(
+      calls.startSession.mock.calls.some(([config]) => (config as { name: string }).name === 'autoloop-r1-reviewer'),
+    ).toBe(false);
+    expect(calls.sendMessage).not.toHaveBeenCalled();
+    expect(fs.readFileSync(external, 'utf8')).toBe('must remain external');
+  });
+
+  it('validates every reachable Reviewer sandbox entry before starting the Reviewer', async () => {
+    const { dispatcher, calls, ledgerDir, workspace } = makeDispatcher();
+    const sandbox = path.join(ledgerDir, 'reviewer_sandbox');
+    const scratch = path.join(sandbox, 'unapproved');
+    const external = path.join(workspace, 'external-reachable-entry');
+    fs.mkdirSync(scratch, { recursive: true });
+    fs.writeFileSync(external, 'must remain external');
+    fs.symlinkSync(external, path.join(scratch, 'escape'));
+
+    await expect(dispatcher.spawnSubagents()).rejects.toThrow(/symbolic link|unsafe|unapproved/i);
+
+    expect(
+      calls.startSession.mock.calls.some(([config]) => (config as { name: string }).name === 'autoloop-r1-reviewer'),
+    ).toBe(false);
+    expect(calls.sendMessage).not.toHaveBeenCalled();
+    expect(fs.readFileSync(external, 'utf8')).toBe('must remain external');
+  });
+
   it('keeps the non-Claude Reviewer memory snapshot frozen after session start', async () => {
     const { dispatcher, calls, ledgerDir } = makeDispatcher({ reviewerEngine: 'gemini' });
     const sandbox = path.join(ledgerDir, 'reviewer_sandbox');
@@ -1747,6 +1787,78 @@ describe('ClaudeAgentDispatcher — stageReviewSandbox whitelist', () => {
     expect(
       calls.startSession.mock.calls.some(([config]) => (config as { name: string }).name === 'autoloop-r1-reviewer'),
     ).toBe(false);
+  });
+
+  it.each([
+    ['sandbox-reset', 'symlink'],
+    ['sandbox-reset', 'hardlink'],
+    ['sandbox-reset', 'unapproved'],
+    ['sandbox-stage', 'symlink'],
+    ['sandbox-stage', 'hardlink'],
+    ['sandbox-stage', 'unapproved'],
+  ] as const)('fails closed when a %s seam plants a %s entry', async (seam, kind) => {
+    const workspace = tmpRoot;
+    const external = path.join(workspace, `external-${seam}-${kind}`);
+    fs.writeFileSync(external, 'must remain external');
+    let armed = false;
+    const secureLedger = SecureAutoloopLedger.open(workspace, 'r1', {
+      create: true,
+      testHooks: {
+        beforeNestedMutation: (event) => {
+          if (!armed || event.operation !== seam) return;
+          if (seam === 'sandbox-stage' && event.relativePath !== 'reviewer_sandbox/iter-0') return;
+          armed = false;
+          const sandbox = path.join(secureLedger.directory, 'reviewer_sandbox');
+          const planted =
+            kind === 'unapproved'
+              ? path.join(sandbox, 'unexpected-entry')
+              : seam === 'sandbox-reset'
+                ? path.join(sandbox, `scratch-${kind}`)
+                : path.join(sandbox, 'plan.md');
+          if (kind === 'symlink' || kind === 'hardlink') fs.unlinkSync(planted);
+          if (kind === 'symlink') fs.symlinkSync(external, planted);
+          else if (kind === 'hardlink') fs.linkSync(external, planted);
+          else fs.writeFileSync(planted, 'unapproved');
+        },
+      },
+    });
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({ secureLedger }, { sendOutput: 'must not be sent' });
+    ensureCompleteReviewArtifacts(dispatcher, 0);
+    const sandbox = path.join(ledgerDir, 'reviewer_sandbox');
+    fs.mkdirSync(sandbox);
+    if (seam === 'sandbox-reset' && kind !== 'unapproved') {
+      fs.writeFileSync(path.join(sandbox, `scratch-${kind}`), 'safe before reset seam');
+    }
+    if (seam === 'sandbox-stage' && kind !== 'unapproved') {
+      fs.writeFileSync(path.join(workspace, 'plan.md'), 'safe before stage seam');
+    }
+    armed = true;
+
+    await expect(
+      dispatcher.deliver(Msg.reviewRequest(0, { iter: 0, ledger_path: ledgerDir, prior_metrics: [] })),
+    ).rejects.toThrow(/symbolic link|hardlink|link count|unexpected|unapproved|unsafe/i);
+
+    expect(
+      calls.startSession.mock.calls.some(([config]) => (config as { name: string }).name === 'autoloop-r1-reviewer'),
+    ).toBe(false);
+    expect(calls.sendMessage).not.toHaveBeenCalled();
+    expect(fs.readFileSync(external, 'utf8')).toBe('must remain external');
+  });
+
+  it('treats a fresh directive message id for the same iteration as a conflict without a second Coder send', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-06T01:00:00.000Z'));
+    const { dispatcher, calls } = makeDispatcher({}, { sendOutput: 'Coder acknowledged.' });
+    const payload = { goal: 'one immutable effect', constraints: [], success_criteria: [], max_attempts: 1 };
+    const first = Msg.directive(0, payload);
+
+    await dispatcher.deliver(first);
+    vi.setSystemTime(new Date('2026-09-06T01:00:01.000Z'));
+    const distinct = Msg.directive(0, payload);
+    expect(distinct.msg_id).not.toBe(first.msg_id);
+
+    await expect(dispatcher.deliver(distinct)).rejects.toThrow(/conflicting|immutable|overwrite/i);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(1);
   });
 
   it('stages only complete authoritative artifacts and persists an immutable Reviewer verdict', async () => {

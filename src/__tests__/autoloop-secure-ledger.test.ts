@@ -699,6 +699,57 @@ describe('SecureAutoloopLedger', () => {
       expect(warn).toHaveBeenCalledWith(expect.stringMatching(/incomplete nested artifact.*could not be located/i));
     });
 
+    it('classifies a post-rename parent-directory sync failure as committed and converges on identical retry', () => {
+      const workspace = tempWorkspace();
+      const relativePath = 'iter/0/coder_summary.txt';
+      let failDirectorySync = true;
+      let artifactCommits = 0;
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: {
+          beforeNestedMutation: (event) => {
+            if (event.operation === 'artifact-commit' && event.relativePath === relativePath) artifactCommits++;
+          },
+          beforeDirectorySync: (event) => {
+            const committedTarget = path.join(event.filePath, 'coder_summary.txt');
+            if (failDirectorySync && fs.existsSync(committedTarget)) {
+              failDirectorySync = false;
+              throw new Error('injected nested directory fsync failure');
+            }
+          },
+        },
+      });
+      const bytes = Buffer.from('complete\n');
+
+      let commitError: unknown;
+      try {
+        ledger.writeIterationArtifact(0, 'coder_summary.txt', bytes);
+      } catch (error) {
+        commitError = error;
+      }
+
+      expect(commitError).toMatchObject({
+        name: 'SecureAutoloopLedgerCommitError',
+        code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+        committed: true,
+        retryable: false,
+        operation: 'secure_nested_artifact_write',
+        cause: expect.objectContaining({ message: 'injected nested directory fsync failure' }),
+      });
+      const target = path.join(ledger.directory, 'iter', '0', 'coder_summary.txt');
+      expect(fs.readFileSync(target)).toEqual(bytes);
+      const committedIdentity = fs.lstatSync(target);
+
+      expect(ledger.writeIterationArtifact(0, 'coder_summary.txt', Buffer.from(bytes))).toBe('unchanged');
+      const retriedIdentity = fs.lstatSync(target);
+      expect({ dev: retriedIdentity.dev, ino: retriedIdentity.ino }).toEqual({
+        dev: committedIdentity.dev,
+        ino: committedIdentity.ino,
+      });
+      expect(fs.readdirSync(path.dirname(target))).toEqual(['coder_summary.txt']);
+      expect(artifactCommits).toBe(1);
+    });
+
     it('reports the win32 directory-entry durability limitation for nested artifacts', () => {
       const workspace = tempWorkspace();
       const warn = vi.fn();
