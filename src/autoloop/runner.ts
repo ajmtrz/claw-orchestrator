@@ -665,8 +665,15 @@ export class AutoloopRunner extends EventEmitter {
     }
     const replies = await this.config.dispatcher.deliver(env);
     if (this.terminationStarted || ['terminated', 'crashed'].includes(this.state.status)) return;
-    for (const r of replies) {
-      const reply = canonicalizeMessage(r);
+    // Validate and snapshot the complete logical reply batch before recording
+    // progress or enqueueing any member. Otherwise a valid early push/terminate
+    // can take effect even though a malformed later reply rejects this send.
+    const canonicalReplies = new Array<AnyAutoloopMessage>(replies.length);
+    for (let index = 0; index < replies.length; index += 1) {
+      canonicalReplies[index] = canonicalizeMessage(replies[index]);
+    }
+    for (let index = 0; index < canonicalReplies.length; index += 1) {
+      const reply = canonicalReplies[index];
       // A dispatcher-generated deadline record is bookkeeping, not agent
       // progress. Letting it renew the lease would make a timeout extend the
       // run whose lack of progress caused it.

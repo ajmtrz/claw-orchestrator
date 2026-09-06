@@ -317,13 +317,67 @@ function canonicalPayloadFields(
   return fields;
 }
 
-function canonicalPrimitiveArray<T>(
+/**
+ * Public message arrays share the eval-output container/string budgets. Ten
+ * thousand entries comfortably covers real multi-file turns while bounding
+ * descriptor enumeration and snapshot work. String limits are measured in
+ * UTF-16 code units, matching JavaScript's immutable string length.
+ */
+const MAX_MESSAGE_PRIMITIVE_ARRAY_ITEMS = 10_000;
+const MAX_MESSAGE_STRING_CODE_UNITS = 1_048_576;
+const MAX_MESSAGE_TOTAL_STRING_CODE_UNITS = 4_194_304;
+const MAX_ITER_ARTIFACT_DIFF_CODE_UNITS = MAX_MESSAGE_TOTAL_STRING_CODE_UNITS;
+
+interface PrimitiveArrayLimits {
+  maxItems: number;
+  maxStringCodeUnits?: number;
+  maxTotalStringCodeUnits?: number;
+}
+
+const STRING_ARRAY_LIMITS: PrimitiveArrayLimits = {
+  maxItems: MAX_MESSAGE_PRIMITIVE_ARRAY_ITEMS,
+  maxStringCodeUnits: MAX_MESSAGE_STRING_CODE_UNITS,
+  maxTotalStringCodeUnits: MAX_MESSAGE_TOTAL_STRING_CODE_UNITS,
+};
+
+const NUMBER_ARRAY_LIMITS: PrimitiveArrayLimits = {
+  maxItems: MAX_MESSAGE_PRIMITIVE_ARRAY_ITEMS,
+};
+
+function hasSafeArrayToJSONShadow(value: unknown[]): boolean {
+  const descriptor = Object.getOwnPropertyDescriptor(value, 'toJSON');
+  return (
+    descriptor !== undefined &&
+    Object.hasOwn(descriptor, 'value') &&
+    descriptor.value === undefined &&
+    descriptor.configurable === false &&
+    descriptor.enumerable === false &&
+    descriptor.writable === false
+  );
+}
+
+function hasExactArrayKeys(value: unknown[], length: number, keys: readonly PropertyKey[]): boolean {
+  return keys.length === length + 1 || (keys.length === length + 2 && hasSafeArrayToJSONShadow(value));
+}
+
+function freezeCanonicalArray<T>(value: T[]): T[] {
+  // JSON.stringify performs a Get(value, "toJSON") before serializing an
+  // array. Shadowing it with inert own data prevents polluted prototypes from
+  // running while retaining Array.prototype and every standard array API.
+  Object.defineProperty(value, 'toJSON', { value: undefined });
+  Object.freeze(value);
+  return value;
+}
+
+function inspectPrimitiveArray<T>(
   value: unknown,
   type: string,
   key: string,
   accepts: (candidate: unknown) => candidate is T,
   expected: string,
-): T[] {
+  limits: PrimitiveArrayLimits,
+  snapshot: boolean,
+): T[] | undefined {
   if (!Array.isArray(value)) {
     invalidDeliveryPayload(type, `${key} must be ${expected}`);
   }
@@ -337,26 +391,67 @@ function canonicalPrimitiveArray<T>(
     invalidDeliveryPayload(type, `${key} must have an own data length`);
   }
   const length = lengthDescriptor.value as number;
+  if (length > limits.maxItems) {
+    invalidDeliveryPayload(type, `${key} exceeds the ${String(limits.maxItems)}-item limit`);
+  }
   const ownKeys = Reflect.ownKeys(value);
-  if (ownKeys.length !== length + 1) {
+  if (!hasExactArrayKeys(value, length, ownKeys)) {
     invalidDeliveryPayload(type, `${key} must contain only exact contiguous indices`);
   }
-  const clone: T[] = [];
+  const clone: T[] | undefined = snapshot ? [] : undefined;
+  let totalStringCodeUnits = 0;
   for (let index = 0; index < length; index += 1) {
     const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
-    if (!descriptor || !Object.hasOwn(descriptor, 'value') || !accepts(descriptor.value)) {
+    if (
+      !descriptor ||
+      !Object.hasOwn(descriptor, 'value') ||
+      descriptor.enumerable !== true ||
+      !accepts(descriptor.value)
+    ) {
       invalidDeliveryPayload(type, `${key} must be ${expected}`);
     }
-    Object.defineProperty(clone, String(index), {
-      configurable: true,
-      enumerable: true,
-      value: descriptor.value,
-      writable: true,
-    });
+    if (typeof descriptor.value === 'string') {
+      if (limits.maxStringCodeUnits !== undefined && descriptor.value.length > limits.maxStringCodeUnits) {
+        invalidDeliveryPayload(type, `${key} contains an oversized string`);
+      }
+      totalStringCodeUnits += descriptor.value.length;
+      if (limits.maxTotalStringCodeUnits !== undefined && totalStringCodeUnits > limits.maxTotalStringCodeUnits) {
+        invalidDeliveryPayload(type, `${key} exceeds the total string-size limit`);
+      }
+    }
+    if (clone) {
+      Object.defineProperty(clone, String(index), {
+        configurable: true,
+        enumerable: true,
+        value: descriptor.value,
+        writable: true,
+      });
+    }
   }
-  Object.setPrototypeOf(clone, null);
-  Object.freeze(clone);
+  if (clone) freezeCanonicalArray(clone);
   return clone;
+}
+
+function canonicalPrimitiveArray<T>(
+  value: unknown,
+  type: string,
+  key: string,
+  accepts: (candidate: unknown) => candidate is T,
+  expected: string,
+  limits: PrimitiveArrayLimits,
+): T[] {
+  return inspectPrimitiveArray(value, type, key, accepts, expected, limits, true) as T[];
+}
+
+function validatePrimitiveArray<T>(
+  value: unknown,
+  type: string,
+  key: string,
+  accepts: (candidate: unknown) => candidate is T,
+  expected: string,
+  limits: PrimitiveArrayLimits,
+): void {
+  inspectPrimitiveArray(value, type, key, accepts, expected, limits, false);
 }
 
 function canonicalDirectiveStringArray(value: unknown, key: 'constraints' | 'success_criteria'): string[] {
@@ -366,14 +461,16 @@ function canonicalDirectiveStringArray(value: unknown, key: 'constraints' | 'suc
     key,
     (candidate): candidate is string => typeof candidate === 'string',
     'an array of strings',
+    STRING_ARRAY_LIMITS,
   );
 }
 
+/** Root is depth 0; a value reached through exactly 64 property/index edges is valid. */
 const MAX_EVAL_OUTPUT_DEPTH = 64;
-const MAX_EVAL_OUTPUT_CONTAINER_ITEMS = 10_000;
+const MAX_EVAL_OUTPUT_CONTAINER_ITEMS = MAX_MESSAGE_PRIMITIVE_ARRAY_ITEMS;
 const MAX_EVAL_OUTPUT_NODES = 100_000;
-const MAX_EVAL_OUTPUT_STRING_CODE_UNITS = 1_048_576;
-const MAX_EVAL_OUTPUT_TOTAL_STRING_CODE_UNITS = 4_194_304;
+const MAX_EVAL_OUTPUT_STRING_CODE_UNITS = MAX_MESSAGE_STRING_CODE_UNITS;
+const MAX_EVAL_OUTPUT_TOTAL_STRING_CODE_UNITS = MAX_MESSAGE_TOTAL_STRING_CODE_UNITS;
 
 interface EvalOutputSnapshotState {
   active: WeakSet<object>;
@@ -435,7 +532,7 @@ function canonicalEvalOutputValue(value: unknown, depth: number, state: EvalOutp
     }
     const length = lengthDescriptor.value as number;
     const keys = Reflect.ownKeys(value);
-    if (keys.length !== length + 1) {
+    if (!hasExactArrayKeys(value, length, keys)) {
       invalidDeliveryPayload('iter_artifacts', 'eval_output arrays must contain only exact contiguous indices');
     }
 
@@ -454,9 +551,7 @@ function canonicalEvalOutputValue(value: unknown, depth: number, state: EvalOutp
           writable: true,
         });
       }
-      Object.setPrototypeOf(canonical, null);
-      Object.freeze(canonical);
-      return canonical;
+      return freezeCanonicalArray(canonical);
     } finally {
       state.active.delete(value);
     }
@@ -546,12 +641,12 @@ function canonicalDirectiveAckPayload(payload: unknown): DirectiveAckPayload {
     invalidDeliveryPayload('directive_ack', 'understood must be a boolean');
   }
   const hasClarification = Object.hasOwn(fields, 'clarification');
-  if (hasClarification && typeof fields.clarification !== 'string') {
+  if (hasClarification && fields.clarification !== undefined && typeof fields.clarification !== 'string') {
     invalidDeliveryPayload('directive_ack', 'clarification must be a string when present');
   }
   const canonical = Object.create(null) as DirectiveAckPayload;
   Object.defineProperty(canonical, 'understood', { enumerable: true, value: fields.understood });
-  if (hasClarification) {
+  if (hasClarification && fields.clarification !== undefined) {
     Object.defineProperty(canonical, 'clarification', { enumerable: true, value: fields.clarification });
   }
   Object.freeze(canonical);
@@ -609,14 +704,18 @@ function canonicalIterArtifactsPayload(payload: unknown): IterArtifactsPayload {
   if (typeof fields.diff !== 'string') {
     invalidDeliveryPayload('iter_artifacts', 'diff must be a string');
   }
-  const evalOutput = canonicalEvalOutput(fields.eval_output);
+  if (fields.diff.length > MAX_ITER_ARTIFACT_DIFF_CODE_UNITS) {
+    invalidDeliveryPayload('iter_artifacts', 'diff exceeds the string-size limit');
+  }
   const filesChanged = canonicalPrimitiveArray(
     fields.files_changed,
     'iter_artifacts',
     'files_changed',
     (candidate): candidate is string => typeof candidate === 'string',
     'an array of strings',
+    STRING_ARRAY_LIMITS,
   );
+  const evalOutput = canonicalEvalOutput(fields.eval_output);
   const canonical = Object.create(null) as IterArtifactsPayload;
   Object.defineProperty(canonical, 'diff', { enumerable: true, value: fields.diff });
   Object.defineProperty(canonical, 'eval_output', { enumerable: true, value: evalOutput });
@@ -647,29 +746,35 @@ function canonicalReviewVerdictPayload(payload: unknown): ReviewVerdictPayload {
   const hasAccepted = Object.hasOwn(fields, 'accepted');
   const hasEvidenceId = Object.hasOwn(fields, 'evidence_id');
   const hasFlags = Object.hasOwn(fields, 'flags');
-  if (hasAccepted && fields.accepted !== undefined && typeof fields.accepted !== 'boolean') {
-    invalidDeliveryPayload('review_verdict', 'accepted must be a boolean when present');
+  if (hasAccepted && fields.accepted !== undefined && fields.accepted !== true) {
+    invalidDeliveryPayload('review_verdict', 'accepted must be true when present');
   }
   if (hasEvidenceId && fields.evidence_id !== undefined && typeof fields.evidence_id !== 'string') {
     invalidDeliveryPayload('review_verdict', 'evidence_id must be a string when present');
   }
+  const includesAccepted = hasAccepted && fields.accepted !== undefined;
+  const includesEvidenceId = hasEvidenceId && fields.evidence_id !== undefined;
+  if (includesAccepted !== includesEvidenceId || (includesEvidenceId && fields.evidence_id === '')) {
+    invalidDeliveryPayload('review_verdict', 'accepted:true and a nonempty evidence_id must be supplied together');
+  }
   if (hasFlags && fields.flags !== undefined) {
-    canonicalPrimitiveArray(
+    validatePrimitiveArray(
       fields.flags,
       'review_verdict',
       'flags',
       (candidate): candidate is string => typeof candidate === 'string',
       'an array of strings',
+      STRING_ARRAY_LIMITS,
     );
   }
   const canonical = Object.create(null) as ReviewVerdictPayload;
   Object.defineProperty(canonical, 'decision', { enumerable: true, value: fields.decision });
   Object.defineProperty(canonical, 'metric', { enumerable: true, value: fields.metric });
   Object.defineProperty(canonical, 'audit_notes', { enumerable: true, value: fields.audit_notes });
-  if (hasAccepted && fields.accepted !== undefined) {
+  if (includesAccepted) {
     Object.defineProperty(canonical, 'accepted', { enumerable: true, value: fields.accepted });
   }
-  if (hasEvidenceId && fields.evidence_id !== undefined) {
+  if (includesEvidenceId) {
     Object.defineProperty(canonical, 'evidence_id', { enumerable: true, value: fields.evidence_id });
   }
   Object.freeze(canonical);
@@ -759,6 +864,9 @@ function canonicalPhaseErrorPayload(payload: unknown, envelopeFrom: string): Pha
   if (hasRetryable && fields.retryable !== undefined && fields.retryable !== false) {
     invalidDeliveryPayload('phase_error', 'retryable must be false when present');
   }
+  if (fields.committed === true && fields.retryable !== false) {
+    invalidDeliveryPayload('phase_error', 'committed:true requires retryable:false');
+  }
   const canonical = Object.create(null) as PhaseErrorPayload;
   Object.defineProperty(canonical, 'agent', { enumerable: true, value: fields.agent });
   Object.defineProperty(canonical, 'phase', { enumerable: true, value: fields.phase });
@@ -807,13 +915,8 @@ function canonicalSendTimeoutPayload(payload: unknown, envelopeIter: number, env
   if (fields.iter !== envelopeIter) {
     invalidDeliveryPayload('send_timeout', `iter ${String(fields.iter)} does not match envelope iter ${envelopeIter}`);
   }
-  if (
-    typeof fields.timeout_ms !== 'number' ||
-    !Number.isFinite(fields.timeout_ms) ||
-    fields.timeout_ms <= 0 ||
-    Math.abs(fields.timeout_ms) > Number.MAX_SAFE_INTEGER
-  ) {
-    invalidDeliveryPayload('send_timeout', 'timeout_ms must be a positive finite safe number');
+  if (!Number.isSafeInteger(fields.timeout_ms) || (fields.timeout_ms as number) <= 0) {
+    invalidDeliveryPayload('send_timeout', 'timeout_ms must be a positive safe integer');
   }
   if (typeof fields.error !== 'string') invalidDeliveryPayload('send_timeout', 'error must be a string');
 
@@ -854,14 +957,16 @@ function canonicalIterDonePayload(payload: unknown, envelopeIter: number): IterD
     invalidDeliveryPayload('iter_done', 'metric must be null or a finite number');
   }
   const hasRegression = Object.hasOwn(fields, 'regression');
-  if (hasRegression && typeof fields.regression !== 'boolean') {
+  if (hasRegression && fields.regression !== undefined && typeof fields.regression !== 'boolean') {
     invalidDeliveryPayload('iter_done', 'regression must be a boolean when present');
   }
   const canonical = Object.create(null) as IterDonePayload;
   Object.defineProperty(canonical, 'iter', { enumerable: true, value: fields.iter });
   Object.defineProperty(canonical, 'verdict', { enumerable: true, value: fields.verdict });
   Object.defineProperty(canonical, 'metric', { enumerable: true, value: fields.metric });
-  if (hasRegression) Object.defineProperty(canonical, 'regression', { enumerable: true, value: fields.regression });
+  if (hasRegression && fields.regression !== undefined) {
+    Object.defineProperty(canonical, 'regression', { enumerable: true, value: fields.regression });
+  }
   Object.freeze(canonical);
   return canonical;
 }
@@ -890,6 +995,7 @@ function canonicalReviewRequestPayload(payload: unknown, envelopeIter: number): 
     'prior_metrics',
     (candidate): candidate is number => typeof candidate === 'number' && Number.isFinite(candidate),
     'an array of finite numbers',
+    NUMBER_ARRAY_LIMITS,
   );
   const canonical = Object.create(null) as ReviewRequestPayload;
   Object.defineProperty(canonical, 'iter', { enumerable: true, value: fields.iter });
@@ -903,9 +1009,9 @@ const MESSAGE_IDENTITY_FIELDS = ['msg_id', 'iter', 'from', 'to', 'type', 'ts', '
 
 /**
  * Validate and snapshot one public message before any routing side effect.
- * Only own data properties cross this boundary; the returned envelope and all
- * payloads whose delivery contract is schema-aware are immutable null-prototype
- * values.
+ * Only own data properties cross this boundary. Returned envelopes and record
+ * payloads are immutable null-prototype values; returned arrays remain frozen
+ * ordinary arrays so public array APIs and iteration keep working.
  */
 export function canonicalizeMessage(env: AnyAutoloopMessage): AnyAutoloopMessage {
   if (typeof env !== 'object' || env === null || Array.isArray(env)) {

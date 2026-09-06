@@ -3185,11 +3185,6 @@ describe('ClaudeAgentDispatcher — canonical immutable delivery payloads', () =
       () => Msg.directiveAck(0, { understood: 'yes' } as unknown as Parameters<typeof Msg.directiveAck>[1]),
     ],
     [
-      'directive_ack clarification',
-      () =>
-        Msg.directiveAck(0, { understood: true, clarification: undefined } as Parameters<typeof Msg.directiveAck>[1]),
-    ],
-    [
       'iter_done iter',
       () => Msg.iterDone(0, { iter: -1, verdict: 'advance', metric: 1 } as Parameters<typeof Msg.iterDone>[1]),
     ],
@@ -3203,7 +3198,6 @@ describe('ClaudeAgentDispatcher — canonical immutable delivery payloads', () =
         } as unknown as Parameters<typeof Msg.iterDone>[1]),
     ],
     ['iter_done metric', () => Msg.iterDone(0, { iter: 0, verdict: 'hold', metric: Number.NaN })],
-    ['iter_done regression', () => Msg.iterDone(0, { iter: 0, verdict: 'hold', metric: null, regression: undefined })],
     [
       'review_request ledger_path',
       () =>
@@ -3224,6 +3218,25 @@ describe('ClaudeAgentDispatcher — canonical immutable delivery payloads', () =
     expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
     expect(calls.startSession).toHaveBeenCalledTimes(0);
     expect(calls.sendMessage).toHaveBeenCalledTimes(0);
+  });
+
+  it.each([
+    [
+      'directive_ack clarification',
+      Msg.directiveAck(0, { understood: true, clarification: undefined }),
+      '[system] coder directive_ack iter=0: {"understood":true}',
+    ],
+    [
+      'iter_done regression',
+      Msg.iterDone(0, { iter: 0, verdict: 'hold', metric: null, regression: undefined }),
+      '[system] iter 0 done. verdict=hold metric=null',
+    ],
+  ] as const)('accepts and strips own undefined %s before Planner delivery', async (_description, message, prompt) => {
+    const { dispatcher, calls } = makeDispatcher({}, { sendOutput: 'Planner reply' });
+
+    await expect(dispatcher.deliver(message)).resolves.toEqual([]);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(1);
+    expect(calls.sendMessage.mock.calls[0][1]).toBe(prompt);
   });
 
   it('types directive schema rejection as an AutoloopRoutingError at the same public boundary', async () => {

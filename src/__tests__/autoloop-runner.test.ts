@@ -14,6 +14,7 @@ import {
   type AnyAutoloopMessage,
   AutoloopRoutingError,
   Msg,
+  canonicalizeMessage,
   deserialise,
   serialise,
   validateMessage,
@@ -179,6 +180,82 @@ function exactMessageCases(): Array<readonly [string, AnyAutoloopMessage]> {
   ];
 }
 
+const TEST_MAX_PRIMITIVE_ARRAY_ITEMS = 10_000;
+const TEST_MAX_MESSAGE_STRING_CODE_UNITS = 1_048_576;
+const TEST_MAX_MESSAGE_TOTAL_STRING_CODE_UNITS = 4_194_304;
+const TEST_MAX_ITER_ARTIFACT_DIFF_CODE_UNITS = 4_194_304;
+const TEST_MAX_EVAL_OUTPUT_DEPTH = 64;
+const TEST_MAX_EVAL_OUTPUT_CONTAINER_ITEMS = 10_000;
+const TEST_MAX_EVAL_OUTPUT_NODES = 100_000;
+
+function primitiveArrayMessage(
+  field: 'constraints' | 'success_criteria' | 'files_changed' | 'prior_metrics' | 'flags',
+  value: unknown[],
+): AnyAutoloopMessage {
+  switch (field) {
+    case 'constraints':
+      return Msg.directive(0, {
+        goal: 'bounded',
+        constraints: value as string[],
+        success_criteria: [],
+        max_attempts: 1,
+      });
+    case 'success_criteria':
+      return Msg.directive(0, {
+        goal: 'bounded',
+        constraints: [],
+        success_criteria: value as string[],
+        max_attempts: 1,
+      });
+    case 'files_changed':
+      return Msg.iterArtifacts(0, { diff: '', eval_output: null, files_changed: value as string[] });
+    case 'prior_metrics':
+      return Msg.reviewRequest(0, { iter: 0, ledger_path: '/run/ledger', prior_metrics: value as number[] });
+    case 'flags':
+      return Msg.reviewVerdict(0, {
+        decision: 'hold',
+        metric: null,
+        audit_notes: 'compatibility flags',
+        flags: value,
+      } as unknown as Parameters<typeof Msg.reviewVerdict>[1]);
+  }
+}
+
+function evalOutputMessage(evalOutput: unknown): AnyAutoloopMessage {
+  return Msg.iterArtifacts(0, { diff: '', eval_output: evalOutput, files_changed: [] });
+}
+
+function nestedEvalOutput(depth: number): unknown {
+  let value: unknown = null;
+  for (let index = 0; index < depth; index += 1) value = { child: value };
+  return value;
+}
+
+function evalOutputWithNodeCount(nodeCount: number): unknown {
+  // The root and ten child arrays account for eleven nodes. Nine full child
+  // arrays plus one remainder then make the requested exact total.
+  const primitiveNodes = nodeCount - 11;
+  const fullChildren = 9;
+  const remainder = primitiveNodes - fullChildren * TEST_MAX_EVAL_OUTPUT_CONTAINER_ITEMS;
+  return [
+    ...Array.from({ length: fullChildren }, () =>
+      Array.from({ length: TEST_MAX_EVAL_OUTPUT_CONTAINER_ITEMS }, () => null),
+    ),
+    Array.from({ length: remainder }, () => null),
+  ];
+}
+
+function expectOrdinaryFrozenArray(actual: unknown[], expected: unknown[]): void {
+  expect(Array.isArray(actual)).toBe(true);
+  expect(Object.getPrototypeOf(actual)).toBe(Array.prototype);
+  expect(actual.map((entry) => entry)).toEqual(expected);
+  expect([...actual]).toEqual(expected);
+  const iterated: unknown[] = [];
+  for (const entry of actual) iterated.push(entry);
+  expect(iterated).toEqual(expected);
+  expect(Object.isFrozen(actual)).toBe(true);
+}
+
 describe('autoloop messages', () => {
   it('Msg constructors build well-formed envelopes', () => {
     const e = Msg.chat(0, { text: 'hello' });
@@ -236,9 +313,9 @@ describe('autoloop messages', () => {
       checks: Array<{ metrics: number[] }>;
     };
     expect(Object.getPrototypeOf(evalOutput)).toBeNull();
-    expect(Object.getPrototypeOf(evalOutput.checks)).toBeNull();
+    expect(Object.getPrototypeOf(evalOutput.checks)).toBe(Array.prototype);
     expect(Object.getPrototypeOf(evalOutput.checks[0])).toBeNull();
-    expect(Object.getPrototypeOf(evalOutput.checks[0].metrics)).toBeNull();
+    expect(Object.getPrototypeOf(evalOutput.checks[0].metrics)).toBe(Array.prototype);
     expect(Object.isFrozen(evalOutput)).toBe(true);
     expect(Object.isFrozen(evalOutput.checks)).toBe(true);
     expect(Object.isFrozen(evalOutput.checks[0])).toBe(true);
@@ -247,6 +324,321 @@ describe('autoloop messages', () => {
     expect(Reflect.set(evalOutput.checks[0].metrics, '0', 99)).toBe(false);
     expect(back.payload.diff).toBe('stable patch');
     expect(evalOutput.checks[0].metrics).toEqual([0, 0.5, 1]);
+  });
+
+  it.each([
+    ['canonicalizeMessage', (message: AnyAutoloopMessage) => canonicalizeMessage(message)],
+    ['validateMessage', (message: AnyAutoloopMessage) => validateMessage(message)],
+    ['deserialise', (message: AnyAutoloopMessage) => deserialise(serialise(message).text)],
+  ] as const)(
+    '%s exposes frozen ordinary arrays for directive, artifact, review, and nested eval fields',
+    (_boundary, snapshot) => {
+      const directive = snapshot(
+        Msg.directive(0, {
+          goal: 'array compatibility',
+          constraints: ['one writer'],
+          success_criteria: ['all gates green'],
+          max_attempts: 1,
+        }),
+      );
+      const artifacts = snapshot(
+        Msg.iterArtifacts(0, {
+          diff: '',
+          eval_output: { checks: [{ metrics: [0, 1] }] },
+          files_changed: ['src/a.ts'],
+        }),
+      );
+      const review = snapshot(
+        Msg.reviewRequest(0, { iter: 0, ledger_path: '/run/ledger', prior_metrics: [0.25, 0.5] }),
+      );
+      if (directive.type !== 'directive' || artifacts.type !== 'iter_artifacts' || review.type !== 'review_request') {
+        throw new Error('unexpected canonical message type');
+      }
+      const evalOutput = artifacts.payload.eval_output as { checks: Array<{ metrics: number[] }> };
+
+      expectOrdinaryFrozenArray(directive.payload.constraints, ['one writer']);
+      expectOrdinaryFrozenArray(directive.payload.success_criteria, ['all gates green']);
+      expectOrdinaryFrozenArray(artifacts.payload.files_changed, ['src/a.ts']);
+      expectOrdinaryFrozenArray(review.payload.prior_metrics, [0.25, 0.5]);
+      expectOrdinaryFrozenArray(evalOutput.checks, [{ metrics: [0, 1] }]);
+      expectOrdinaryFrozenArray(evalOutput.checks[0].metrics, [0, 1]);
+      expect(Object.getPrototypeOf(evalOutput)).toBeNull();
+      expect(Object.getPrototypeOf(evalOutput.checks[0])).toBeNull();
+    },
+  );
+
+  it.each([
+    [
+      'push_user detail',
+      Msg.pushUser(0, { level: 'info', summary: 'compatible', detail: undefined, channel: 'auto' }),
+      'detail',
+    ],
+    [
+      'directive_ack clarification',
+      Msg.directiveAck(0, { understood: true, clarification: undefined }),
+      'clarification',
+    ],
+    [
+      'iter_done regression',
+      Msg.iterDone(0, { iter: 0, verdict: 'hold', metric: null, regression: undefined }),
+      'regression',
+    ],
+  ] as const)('accepts and omits own undefined optional %s', (_label, message, optionalField) => {
+    const canonical = validateMessage(message);
+
+    expect(Object.hasOwn(canonical.payload, optionalField)).toBe(false);
+  });
+
+  it.each([
+    ['undefined', undefined],
+    ['an exact string array', ['runtime-only-warning', 'second-warning']],
+  ] as const)('accepts Reviewer flags as %s, validates them, and omits them', (_label, flags) => {
+    const canonical = validateMessage(
+      Msg.reviewVerdict(0, {
+        decision: 'hold',
+        metric: null,
+        audit_notes: 'legacy-compatible flags',
+        flags,
+      } as unknown as Parameters<typeof Msg.reviewVerdict>[1]),
+    );
+
+    expect(canonical.type).toBe('review_verdict');
+    expect(Object.hasOwn(canonical.payload, 'flags')).toBe(false);
+  });
+
+  it('accepts own undefined Reviewer acceptance fields and omits them', () => {
+    const canonical = validateMessage(
+      Msg.reviewVerdict(0, {
+        decision: 'hold',
+        metric: null,
+        audit_notes: 'no acceptance contract',
+        accepted: undefined,
+        evidence_id: undefined,
+      }),
+    );
+
+    expect(Object.hasOwn(canonical.payload, 'accepted')).toBe(false);
+    expect(Object.hasOwn(canonical.payload, 'evidence_id')).toBe(false);
+  });
+
+  it.each([
+    ['accepted false', { accepted: false }],
+    ['accepted without evidence', { accepted: true }],
+    ['evidence without accepted', { evidence_id: 'iter-0' }],
+    ['empty acceptance evidence', { accepted: true, evidence_id: '' }],
+  ] as const)('rejects review_verdict with %s', (_label, optionalFields) => {
+    expect(() =>
+      validateMessage(
+        Msg.reviewVerdict(0, {
+          decision: 'advance',
+          metric: 1,
+          audit_notes: 'invalid acceptance relationship',
+          ...optionalFields,
+        } as unknown as Parameters<typeof Msg.reviewVerdict>[1]),
+      ),
+    ).toThrow(AutoloopRoutingError);
+  });
+
+  it('accepts review_verdict acceptance only as a true/nonempty evidence pair', () => {
+    const canonical = validateMessage(
+      Msg.reviewVerdict(0, {
+        decision: 'advance',
+        metric: 1,
+        audit_notes: 'measured',
+        accepted: true,
+        evidence_id: 'iter-0',
+      }),
+    );
+
+    expect(canonical.payload).toMatchObject({ accepted: true, evidence_id: 'iter-0' });
+  });
+
+  it.each([
+    ['standalone retryable:false', { retryable: false }],
+    ['committed:true with retryable:false', { committed: true, retryable: false }],
+  ] as const)('accepts phase_error %s', (_label, relationship) => {
+    const canonical = validateMessage(
+      Msg.phaseError(0, {
+        agent: 'coder',
+        phase: 'commit',
+        error: 'failed',
+        ...relationship,
+      }),
+    );
+
+    expect(canonical.payload).toMatchObject(relationship);
+  });
+
+  it('rejects committed phase_error without retryable:false', () => {
+    expect(() =>
+      validateMessage(
+        Msg.phaseError(0, {
+          agent: 'coder',
+          phase: 'commit',
+          committed: true,
+          error: 'commit outcome is not replayable',
+        }),
+      ),
+    ).toThrow(AutoloopRoutingError);
+  });
+
+  it('requires send_timeout timeout_ms to be a positive safe integer', () => {
+    const base = {
+      status: 'awaiting_resume' as const,
+      dispatch_id: 'dispatch-0',
+      agent: 'coder' as const,
+      message_id: 'message-0',
+      message_type: 'directive' as const,
+      iter: 0,
+      error: 'deadline exceeded',
+    };
+
+    expect(() => validateMessage(Msg.sendTimeout(0, { ...base, timeout_ms: Number.MAX_SAFE_INTEGER }))).not.toThrow();
+    expect(() => validateMessage(Msg.sendTimeout(0, { ...base, timeout_ms: 0.5 }))).toThrow(AutoloopRoutingError);
+  });
+
+  it.each(['constraints', 'success_criteria', 'files_changed', 'prior_metrics', 'flags'] as const)(
+    'accepts exactly the primitive-array item cap and rejects cap + 1 for %s',
+    (field) => {
+      const value = field === 'prior_metrics' ? 1 : 'x';
+      const exact = Array.from({ length: TEST_MAX_PRIMITIVE_ARRAY_ITEMS }, () => value);
+      const oversized = Array.from({ length: TEST_MAX_PRIMITIVE_ARRAY_ITEMS + 1 }, () => value);
+
+      expect(() => validateMessage(primitiveArrayMessage(field, exact))).not.toThrow();
+      expect(() => validateMessage(primitiveArrayMessage(field, oversized))).toThrow(AutoloopRoutingError);
+    },
+  );
+
+  it.each(['constraints', 'success_criteria', 'files_changed', 'prior_metrics', 'flags'] as const)(
+    'rejects over-cap %s before consulting its expensive ownKeys trap',
+    (field) => {
+      let ownKeysHits = 0;
+      const oversized = new Proxy(new Array(TEST_MAX_PRIMITIVE_ARRAY_ITEMS + 1), {
+        ownKeys(target) {
+          ownKeysHits += 1;
+          return Reflect.ownKeys(target);
+        },
+      });
+
+      expect(() => validateMessage(primitiveArrayMessage(field, oversized))).toThrow(AutoloopRoutingError);
+      expect(ownKeysHits).toBe(0);
+    },
+  );
+
+  it.each(['constraints', 'success_criteria', 'files_changed', 'prior_metrics', 'flags'] as const)(
+    'rejects a non-enumerable own index in primitive-array field %s',
+    (field) => {
+      const values: unknown[] = [field === 'prior_metrics' ? 1 : 'x'];
+      Object.defineProperty(values, '0', { configurable: true, enumerable: false, value: values[0], writable: true });
+
+      expect(() => validateMessage(primitiveArrayMessage(field, values))).toThrow(AutoloopRoutingError);
+    },
+  );
+
+  it.each(['constraints', 'success_criteria', 'files_changed', 'flags'] as const)(
+    'enforces exact per-string and aggregate string budgets for %s',
+    (field) => {
+      const exactString = 'x'.repeat(TEST_MAX_MESSAGE_STRING_CODE_UNITS);
+
+      expect(() => validateMessage(primitiveArrayMessage(field, [exactString]))).not.toThrow();
+      expect(() => validateMessage(primitiveArrayMessage(field, [`${exactString}x`]))).toThrow(AutoloopRoutingError);
+      expect(() =>
+        validateMessage(primitiveArrayMessage(field, [exactString, exactString, exactString, exactString])),
+      ).not.toThrow();
+      expect(() =>
+        validateMessage(primitiveArrayMessage(field, [exactString, exactString, exactString, exactString, 'x'])),
+      ).toThrow(AutoloopRoutingError);
+    },
+  );
+
+  it('enforces the exact iter_artifacts diff budget', () => {
+    const exact = 'x'.repeat(TEST_MAX_ITER_ARTIFACT_DIFF_CODE_UNITS);
+
+    expect(() =>
+      validateMessage(Msg.iterArtifacts(0, { diff: exact, eval_output: null, files_changed: [] })),
+    ).not.toThrow();
+    expect(() =>
+      validateMessage(Msg.iterArtifacts(0, { diff: `${exact}x`, eval_output: null, files_changed: [] })),
+    ).toThrow(AutoloopRoutingError);
+  });
+
+  it('accepts eval_output null and a null-prototype input record as frozen canonical JSON', () => {
+    expect((validateMessage(evalOutputMessage(null)).payload as { eval_output: unknown }).eval_output).toBeNull();
+    const input = Object.create(null) as Record<string, unknown>;
+    Object.defineProperty(input, 'passed', { enumerable: true, value: true });
+
+    const canonical = validateMessage(evalOutputMessage(input));
+    if (canonical.type !== 'iter_artifacts') throw new Error('expected iter_artifacts');
+    expect(canonical.payload.eval_output).toEqual({ passed: true });
+    expect(Object.getPrototypeOf(canonical.payload.eval_output)).toBeNull();
+    expect(Object.isFrozen(canonical.payload.eval_output)).toBe(true);
+  });
+
+  it('defines eval_output maximum depth as 64 edges from the root value', () => {
+    expect(() => validateMessage(evalOutputMessage(nestedEvalOutput(TEST_MAX_EVAL_OUTPUT_DEPTH)))).not.toThrow();
+    expect(() => validateMessage(evalOutputMessage(nestedEvalOutput(TEST_MAX_EVAL_OUTPUT_DEPTH + 1)))).toThrow(
+      AutoloopRoutingError,
+    );
+  });
+
+  it('enforces exact eval_output per-string and aggregate key/value budgets', () => {
+    const exactString = 'x'.repeat(TEST_MAX_MESSAGE_STRING_CODE_UNITS);
+    const exactKeyValue = 'x'.repeat(TEST_MAX_MESSAGE_STRING_CODE_UNITS - 1);
+    const exactKeyBudget = { a: exactKeyValue, b: exactKeyValue, c: exactKeyValue, d: exactKeyValue };
+    const overKeyBudget = { ...exactKeyBudget, d: `${exactKeyValue}x` };
+
+    expect(() => validateMessage(evalOutputMessage(exactString))).not.toThrow();
+    expect(() => validateMessage(evalOutputMessage(`${exactString}x`))).toThrow(AutoloopRoutingError);
+    expect(() => validateMessage(evalOutputMessage(exactKeyBudget))).not.toThrow();
+    expect(() => validateMessage(evalOutputMessage(overKeyBudget))).toThrow(AutoloopRoutingError);
+    expect(TEST_MAX_MESSAGE_TOTAL_STRING_CODE_UNITS).toBe(4 * TEST_MAX_MESSAGE_STRING_CODE_UNITS);
+  });
+
+  it('accepts the exact eval_output node cap and rejects cap + 1', () => {
+    expect(() => validateMessage(evalOutputMessage(evalOutputWithNodeCount(TEST_MAX_EVAL_OUTPUT_NODES)))).not.toThrow();
+    expect(() => validateMessage(evalOutputMessage(evalOutputWithNodeCount(TEST_MAX_EVAL_OUTPUT_NODES + 1)))).toThrow(
+      AutoloopRoutingError,
+    );
+  });
+
+  it('accepts the exact eval_output container-item cap and rejects cap + 1', () => {
+    expect(() =>
+      validateMessage(evalOutputMessage(Array.from({ length: TEST_MAX_EVAL_OUTPUT_CONTAINER_ITEMS }, () => null))),
+    ).not.toThrow();
+    expect(() =>
+      validateMessage(evalOutputMessage(Array.from({ length: TEST_MAX_EVAL_OUTPUT_CONTAINER_ITEMS + 1 }, () => null))),
+    ).toThrow(AutoloopRoutingError);
+  });
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    'rejects non-finite eval_output number %s',
+    (value) => {
+      expect(() => validateMessage(evalOutputMessage({ nested: [value] }))).toThrow(AutoloopRoutingError);
+    },
+  );
+
+  it.each([
+    ['Date', new Date('2026-01-01T00:00:00.000Z')],
+    ['boxed number', new Number(1)],
+    ['boxed string', new String('value')],
+    ['boxed boolean', new Boolean(true)],
+  ] as const)('rejects %s in eval_output', (_label, value) => {
+    expect(() => validateMessage(evalOutputMessage({ nested: value }))).toThrow(AutoloopRoutingError);
+  });
+
+  it('rejects a nested eval_output accessor without invoking it', () => {
+    let getterHits = 0;
+    const nested: Record<string, unknown> = {};
+    Object.defineProperty(nested, 'value', {
+      enumerable: true,
+      get() {
+        getterHits += 1;
+        return 'attacker-controlled';
+      },
+    });
+
+    expect(() => validateMessage(evalOutputMessage({ outer: [nested] }))).toThrow(AutoloopRoutingError);
+    expect(getterHits).toBe(0);
   });
 
   it.each([
@@ -1332,6 +1724,62 @@ describe('AutoloopRunner', () => {
         expect(runner.state.metric_history).toEqual([]);
         expect(runner.state.pending_dispatch).toBeNull();
         expect(runner.state.consecutive_phase_errors).toBe(0);
+      } finally {
+        runner.stop();
+      }
+    },
+  );
+
+  it.each([
+    ['push_user', () => Msg.pushUser(0, { level: 'info', summary: 'must stay atomic', channel: 'auto' })],
+    ['terminate', () => Msg.terminate(0, { reason: 'must-stay-atomic' })],
+  ] as const)(
+    'rejects a valid %s then invalid dispatcher reply batch without any partial reply effect',
+    async (_validType, buildValidReply) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      const invalidReply = Msg.pushUser(0, {
+        level: 'info',
+        summary: 7 as unknown as string,
+        channel: 'auto',
+      });
+      const dispatcher: AgentDispatcher = {
+        async deliver(env) {
+          if (env.type !== 'chat') return [];
+          await vi.advanceTimersByTimeAsync(1_000);
+          return [buildValidReply(), invalidReply];
+        },
+      };
+      const { runner, pushes } = makeRunner(dispatcher, [], {
+        activityLeaseMs: 60_000,
+        autoloopHardTimeoutMs: 600_000,
+      });
+      const emittedTypes: string[] = [];
+      const stateEvents: string[] = [];
+      const terminatedReasons: string[] = [];
+      runner.on('message', (message: AnyAutoloopMessage) => emittedTypes.push(message.type));
+      runner.on('state', () => stateEvents.push(runner.state.status));
+      runner.on('terminated', (reason: string) => terminatedReasons.push(reason));
+
+      try {
+        await runner.start();
+        stateEvents.length = 0;
+        await vi.advanceTimersByTimeAsync(1_000);
+        const acceptedAt = Date.now();
+
+        await expect(runner.send(Msg.chat(0, { text: 'validate the whole reply batch' }))).rejects.toBeInstanceOf(
+          AutoloopRoutingError,
+        );
+
+        if (_validType === 'push_user') expect(pushes).toEqual([]);
+        else expect(runner.state.status).toBe('planning');
+        expect(emittedTypes).toEqual(['chat']);
+        expect(runner.state.last_activity_at).toBe(acceptedAt);
+        expect(stateEvents).toEqual([]);
+        expect(runner.state.push_log_count).toBe(0);
+        expect(runner.state.status).toBe('planning');
+        expect(runner.state.status_reason).toBeNull();
+        expect(terminatedReasons).toEqual([]);
       } finally {
         runner.stop();
       }
