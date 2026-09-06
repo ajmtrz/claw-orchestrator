@@ -348,6 +348,19 @@ function isOpenPath(file: unknown, expectedPath: string): boolean {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+function seedCompleteLegacyReviewArtifacts(workspace: string, runId: string, iter: number): void {
+  const iterDirectory = path.join(workspace, 'tasks', runId, 'iter', String(iter));
+  fs.mkdirSync(iterDirectory, { recursive: true, mode: 0o700 });
+  for (const [name, content] of Object.entries({
+    'directive.json': '{}\n',
+    'eval_output.json': '{}\n',
+    'coder_summary.txt': 'complete\n',
+    'diff.patch': 'diff --git a/a b/a\n',
+  })) {
+    fs.writeFileSync(path.join(iterDirectory, name), content, { mode: 0o600 });
+  }
+}
+
 function createManager(overrides?: Record<string, unknown>): InstanceType<typeof SessionManager> {
   const mgr = new SessionManager({
     claudeBin: 'mock-claude',
@@ -5862,6 +5875,7 @@ describe('SessionManager', () => {
               }),
             );
           } else {
+            seedCompleteLegacyReviewArtifacts(workspace, runId, 0);
             await handle.runner.send(
               AutoloopMsg.reviewRequest(0, {
                 iter: 0,
@@ -5923,23 +5937,26 @@ describe('SessionManager', () => {
           const phaseErrors: PhaseErrorPayload[] = [];
           handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
 
-          const dispatch =
-            role === 'coder'
-              ? handle.runner.send(
-                  AutoloopMsg.directive(0, {
-                    goal: 'exercise exhausted coder recovery',
-                    constraints: [],
-                    success_criteria: [],
-                    max_attempts: 1,
-                  }),
-                )
-              : handle.runner.send(
-                  AutoloopMsg.reviewRequest(0, {
-                    iter: 0,
-                    ledger_path: path.join(workspace, 'tasks', runId),
-                    prior_metrics: [],
-                  }),
-                );
+          const dispatch = (() => {
+            if (role === 'coder') {
+              return handle.runner.send(
+                AutoloopMsg.directive(0, {
+                  goal: 'exercise exhausted coder recovery',
+                  constraints: [],
+                  success_criteria: [],
+                  max_attempts: 1,
+                }),
+              );
+            }
+            seedCompleteLegacyReviewArtifacts(workspace, runId, 0);
+            return handle.runner.send(
+              AutoloopMsg.reviewRequest(0, {
+                iter: 0,
+                ledger_path: path.join(workspace, 'tasks', runId),
+                prior_metrics: [],
+              }),
+            );
+          })();
           await vi.advanceTimersByTimeAsync(1_000);
           await dispatch;
 
@@ -7962,6 +7979,7 @@ describe('SessionManager', () => {
               }),
             );
           } else {
+            seedCompleteLegacyReviewArtifacts(workspace, runId, 0);
             await handle.dispatcher.deliver(
               AutoloopMsg.reviewRequest(0, {
                 iter: 0,
@@ -7993,6 +8011,7 @@ describe('SessionManager', () => {
               }),
             );
           } else {
+            seedCompleteLegacyReviewArtifacts(workspace, runId, 1);
             await handle.dispatcher.deliver(
               AutoloopMsg.reviewRequest(1, {
                 iter: 1,
@@ -8057,6 +8076,8 @@ describe('SessionManager', () => {
                   prior_metrics: [Number(rejectedMarker)],
                 });
 
+          if (role === 'reviewer') seedCompleteLegacyReviewArtifacts(workspace, runId, 0);
+
           const rejected = handle.dispatcher.deliver(rejectedEnvelope);
           await vi.advanceTimersByTimeAsync(1_000);
           await expect(rejected).resolves.toEqual([
@@ -8099,6 +8120,7 @@ describe('SessionManager', () => {
                   ledger_path: path.join(workspace, 'tasks', runId),
                   prior_metrics: [2468],
                 });
+          if (role === 'reviewer') seedCompleteLegacyReviewArtifacts(workspace, runId, 1);
           await handle.dispatcher.deliver(acceptedEnvelope);
           const replacementIndex = createdConfigs.map((config) => config.name).lastIndexOf(`autoloop-${runId}-${role}`);
           const replacementSession = mockSessions[replacementIndex];
@@ -8525,14 +8547,7 @@ describe('SessionManager', () => {
           },
           {
             tool: 'spawn_subagents',
-            args: {
-              initial_directive: {
-                constraints: [],
-                goal: 'defaulted initial directive',
-                max_attempts: 1,
-                success_criteria: [],
-              },
-            },
+            args: {},
           },
           {
             tool: 'send_directive',
@@ -8554,7 +8569,7 @@ describe('SessionManager', () => {
                   '{"tool":"notify_user","args":{"summary":"defaulted notification"}}',
                   '```',
                   '```autoloop',
-                  '{"tool":"spawn_subagents","args":{"initial_directive":{"goal":"defaulted initial directive"}}}',
+                  '{"tool":"spawn_subagents","args":{}}',
                   '```',
                   '```autoloop',
                   '{"tool":"send_directive","args":{"goal":"defaulted follow-up directive"}}',
@@ -8594,7 +8609,7 @@ describe('SessionManager', () => {
           expect(pushes).toEqual([
             { level: 'info', summary: 'defaulted notification', detail: undefined, channel: 'auto' },
           ]);
-          expect(directives).toEqual([expectedControls[1].args.initial_directive, expectedControls[2].args]);
+          expect(directives).toEqual([expectedControls[2].args]);
         } finally {
           spawn.mockRestore();
         }

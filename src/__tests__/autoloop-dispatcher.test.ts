@@ -193,6 +193,10 @@ function makeStubManager(
 
 let tmpRoot: string;
 
+function permissions(target: string): number {
+  return fs.statSync(target).mode & 0o777;
+}
+
 beforeEach(() => {
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'autoloop-disp-'));
 });
@@ -223,6 +227,22 @@ function makeDispatcher(
   });
   const ledgerDir = path.join(workspace, 'tasks', 'r1');
   return { dispatcher, calls, ledgerDir, workspace, activeNames, reservations };
+}
+
+function ensureCompleteReviewArtifacts(dispatcher: ClaudeAgentDispatcher, iter: number): void {
+  const ledger = dispatcher.secureLedgerCapability;
+  const artifacts = {
+    'directive.json': '{}\n',
+    'eval_output.json': '{}\n',
+    'coder_summary.txt': 'complete\n',
+    'diff.patch': 'diff --git a/a b/a\n',
+  } as const;
+  for (const [name, content] of Object.entries(artifacts)) {
+    const artifactName = name as keyof typeof artifacts;
+    if (ledger.readIterationArtifact(iter, artifactName) === undefined) {
+      ledger.writeIterationArtifact(iter, artifactName, content);
+    }
+  }
 }
 
 describe('Planner control argument shape', () => {
@@ -1036,6 +1056,7 @@ describe('ClaudeAgentDispatcher — role engine configuration', () => {
         max_attempts: 1,
       }),
     );
+    ensureCompleteReviewArtifacts(dispatcher, 0);
     await dispatcher.deliver(
       Msg.reviewRequest(0, {
         iter: 0,
@@ -1206,6 +1227,7 @@ describe('ClaudeAgentDispatcher — frozen reviewer memory', () => {
     fs.writeFileSync(path.join(sandbox, 'reviewer_memory.md'), 'frozen-old-memory');
     await dispatcher.spawnSubagents();
     fs.writeFileSync(path.join(sandbox, 'reviewer_memory.md'), 'new-memory-must-wait-for-reset');
+    ensureCompleteReviewArtifacts(dispatcher, 0);
 
     await dispatcher.deliver(
       Msg.reviewRequest(0, {
@@ -1279,6 +1301,7 @@ describe('ClaudeAgentDispatcher — recoverable send timeout and dispatch identi
       const { dispatcher, calls, ledgerDir } = makeDispatcher({ sendTimeoutMs: 7_200_000 });
       calls.sendMessage.mockRejectedValue(genuineSendTimeout());
       const message = makeMessage(ledgerDir);
+      if (role === 'reviewer') ensureCompleteReviewArtifacts(dispatcher, message.iter);
 
       const pending = dispatcher.deliver(message);
       void pending.catch(() => undefined);
@@ -1656,10 +1679,7 @@ describe('ClaudeAgentDispatcher — stageReviewSandbox whitelist', () => {
     fs.writeFileSync(path.join(sandbox, 'reviewer_memory.md'), 'memory');
     fs.writeFileSync(path.join(sandbox, 'reviewer_log.jsonl'), '{"a":1}\n');
     fs.writeFileSync(path.join(sandbox, 'scratch.txt'), 'temp');
-    // Plant an iter dir so stageReviewSandbox can copy from it.
-    const iterDir = path.join(ledgerDir, 'iter', '0');
-    fs.mkdirSync(iterDir, { recursive: true });
-    fs.writeFileSync(path.join(iterDir, 'directive.json'), '{}');
+    ensureCompleteReviewArtifacts(dispatcher, 0);
 
     // Reviewer needs to actually emit a review_complete or we'll observe a
     // 'hold' fallback. We just stub sendOutput to include a valid block.
@@ -1669,6 +1689,139 @@ describe('ClaudeAgentDispatcher — stageReviewSandbox whitelist', () => {
     expect(fs.existsSync(path.join(sandbox, 'reviewer_memory.md'))).toBe(true);
     expect(fs.existsSync(path.join(sandbox, 'reviewer_log.jsonl'))).toBe(true);
     expect(fs.existsSync(path.join(sandbox, 'scratch.txt'))).toBe(false);
+  });
+
+  it('does not send a Coder turn when directive persistence is unsafe', async () => {
+    const { dispatcher, calls, ledgerDir, workspace } = makeDispatcher({}, { sendOutput: 'must not be sent' });
+    const iterDir = path.join(ledgerDir, 'iter', '0');
+    const external = path.join(workspace, 'external-directive');
+    fs.mkdirSync(iterDir, { recursive: true });
+    fs.writeFileSync(external, 'sentinel');
+    fs.symlinkSync(external, path.join(iterDir, 'directive.json'));
+
+    await expect(
+      dispatcher.deliver(Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 })),
+    ).rejects.toThrow(/symbolic link|unsafe/i);
+
+    expect(calls.sendMessage).not.toHaveBeenCalled();
+    expect(fs.readFileSync(external, 'utf8')).toBe('sentinel');
+  });
+
+  it('does not send a Reviewer turn through a pre-planted sandbox destination', async () => {
+    const { dispatcher, calls, ledgerDir, workspace } = makeDispatcher({}, { sendOutput: 'must not be sent' });
+    const ledger = dispatcher.secureLedgerCapability;
+    ledger.writeIterationArtifact(0, 'directive.json', '{}');
+    ledger.writeIterationArtifact(0, 'eval_output.json', '{}');
+    ledger.writeIterationArtifact(0, 'coder_summary.txt', 'complete');
+    ledger.writeIterationArtifact(0, 'diff.patch', 'diff');
+    const external = path.join(workspace, 'external-sandbox');
+    const sandbox = path.join(ledgerDir, 'reviewer_sandbox');
+    fs.mkdirSync(external);
+    fs.writeFileSync(path.join(external, 'sentinel'), 'protected');
+    fs.mkdirSync(sandbox);
+    fs.symlinkSync(external, path.join(sandbox, 'iter-0'), 'dir');
+
+    await expect(
+      dispatcher.deliver(Msg.reviewRequest(0, { iter: 0, ledger_path: ledgerDir, prior_metrics: [] })),
+    ).rejects.toThrow(/symbolic link|unsafe/i);
+
+    expect(calls.sendMessage).not.toHaveBeenCalled();
+    expect(
+      calls.startSession.mock.calls.some(([config]) => (config as { name: string }).name === 'autoloop-r1-reviewer'),
+    ).toBe(false);
+    expect(fs.readFileSync(path.join(external, 'sentinel'), 'utf8')).toBe('protected');
+  });
+
+  it('does not start or send the Reviewer when the authoritative artifact set is incomplete', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'must not be sent' });
+    const ledger = dispatcher.secureLedgerCapability;
+    ledger.writeIterationArtifact(0, 'directive.json', '{}');
+    ledger.writeIterationArtifact(0, 'eval_output.json', '{}');
+    ledger.writeIterationArtifact(0, 'coder_summary.txt', 'complete');
+
+    await expect(
+      dispatcher.deliver(Msg.reviewRequest(0, { iter: 0, ledger_path: ledgerDir, prior_metrics: [] })),
+    ).rejects.toThrow(/missing.*diff\.patch|complete artifact set/i);
+
+    expect(calls.sendMessage).not.toHaveBeenCalled();
+    expect(
+      calls.startSession.mock.calls.some(([config]) => (config as { name: string }).name === 'autoloop-r1-reviewer'),
+    ).toBe(false);
+  });
+
+  it('stages only complete authoritative artifacts and persists an immutable Reviewer verdict', async () => {
+    const coderReply = 'Coder acknowledged the bounded directive.';
+    const reviewerReply = [
+      'Independent review complete.',
+      '```autoloop',
+      JSON.stringify({
+        tool: 'review_complete',
+        args: { decision: 'advance', metric: 1, audit_notes: 'artifacts are complete' },
+      }),
+      '```',
+    ].join('\n');
+    const { dispatcher, calls, ledgerDir, workspace } = makeDispatcher(
+      {},
+      { sendOutputs: [coderReply, reviewerReply] },
+    );
+    const ledger = dispatcher.secureLedgerCapability;
+    fs.writeFileSync(path.join(workspace, 'plan.md'), '# Plan\n');
+    fs.writeFileSync(path.join(workspace, 'goal.json'), '{"goal":"bounded"}\n');
+    ledger.writeIterationArtifact(0, 'verdict.json', '{"decision":"hold"}\n');
+
+    await dispatcher.deliver(Msg.directive(1, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }));
+    ledger.writeIterationArtifact(1, 'eval_output.json', '{"metric":1}\n');
+    ledger.writeIterationArtifact(1, 'coder_summary.txt', 'complete\n');
+    ledger.writeIterationArtifact(1, 'diff.patch', 'diff --git a/a b/a\n');
+    fs.writeFileSync(path.join(ledgerDir, 'iter', '1', 'unexpected.txt'), 'must not stage');
+
+    await expect(
+      dispatcher.deliver(Msg.reviewRequest(1, { iter: 1, ledger_path: ledgerDir, prior_metrics: [] })),
+    ).resolves.toEqual([
+      expect.objectContaining({ type: 'review_verdict', payload: expect.objectContaining({ decision: 'advance' }) }),
+    ]);
+
+    expect(calls.sendMessage).toHaveBeenCalledTimes(2);
+    const sandbox = path.join(ledgerDir, 'reviewer_sandbox');
+    const staged = path.join(sandbox, 'iter-1');
+    expect(fs.readdirSync(staged).sort()).toEqual(
+      ['coder_summary.txt', 'diff.patch', 'directive.json', 'eval_output.json'].sort(),
+    );
+    expect(fs.readFileSync(path.join(staged, 'directive.json'), 'utf8')).toContain('"schema_version"');
+    expect(fs.readFileSync(path.join(sandbox, 'plan.md'), 'utf8')).toBe('# Plan\n');
+    expect(fs.readFileSync(path.join(sandbox, 'goal.json'), 'utf8')).toBe('{"goal":"bounded"}\n');
+    expect(fs.readFileSync(path.join(sandbox, 'prior_verdict.json'), 'utf8')).toBe('{"decision":"hold"}\n');
+    expect(permissions(staged)).toBe(0o700);
+    expect(permissions(path.join(staged, 'directive.json'))).toBe(0o600);
+
+    const verdict = ledger.readIterationArtifact(1, 'verdict.json')?.toString('utf8') ?? '';
+    expect(JSON.parse(verdict)).toMatchObject({ decision: 'advance', metric: 1 });
+    expect(() => ledger.writeIterationArtifact(1, 'verdict.json', '{"decision":"hold"}')).toThrow(
+      /conflicting|immutable/i,
+    );
+    expect(ledger.readIterationArtifact(1, 'verdict.json')?.toString('utf8')).toBe(verdict);
+  });
+
+  it('keeps an identical semantic verdict byte-stable across replay and rejects a conflicting verdict', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-06T01:00:00.000Z'));
+    const { dispatcher, ledgerDir } = makeDispatcher();
+    const persistVerdict = (
+      dispatcher as unknown as {
+        persistVerdict(iter: number, payload: { decision: string; metric: number | null; audit_notes: string }): void;
+      }
+    ).persistVerdict.bind(dispatcher);
+    const payload = { decision: 'advance', metric: 1, audit_notes: 'complete' };
+
+    persistVerdict(0, payload);
+    const verdictPath = path.join(ledgerDir, 'iter', '0', 'verdict.json');
+    const first = fs.readFileSync(verdictPath);
+    vi.setSystemTime(new Date('2026-09-06T02:00:00.000Z'));
+    expect(() => persistVerdict(0, payload)).not.toThrow();
+    expect(fs.readFileSync(verdictPath)).toEqual(first);
+
+    expect(() => persistVerdict(0, { ...payload, decision: 'hold' })).toThrow(/conflicting|immutable/i);
+    expect(fs.readFileSync(verdictPath)).toEqual(first);
   });
 });
 

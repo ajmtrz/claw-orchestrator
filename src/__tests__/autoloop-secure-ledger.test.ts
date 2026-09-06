@@ -7,6 +7,7 @@ import { ClaudeAgentDispatcher } from '../autoloop/dispatcher.js';
 import {
   openPrivateAutoloopDecisions,
   SecureAutoloopLedger,
+  type SecureAutoloopIterationArtifact,
   type SecureAutoloopFlatFile,
 } from '../autoloop/secure-ledger.js';
 import { appendPushLog } from '../autoloop/notify.js';
@@ -551,5 +552,165 @@ describe('SecureAutoloopLedger', () => {
     expect(fs.readFileSync(external, 'utf8')).toBe('protected');
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn).toHaveBeenCalledWith(expect.stringMatching(/push log.*symbolic link/i));
+  });
+
+  describe('nested iteration artifacts', () => {
+    it('creates private iteration artifacts and makes identical writes idempotent but conflicts immutable', () => {
+      const workspace = tempWorkspace();
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', { create: true });
+      const bytes = Buffer.from('{"goal":"bounded"}\n');
+
+      expect(ledger.writeIterationArtifact(0, 'directive.json', bytes)).toBe('created');
+      expect(ledger.readIterationArtifact(0, 'directive.json')).toEqual(bytes);
+      expect(ledger.writeIterationArtifact(0, 'directive.json', Buffer.from(bytes))).toBe('unchanged');
+      expect(() => ledger.writeIterationArtifact(0, 'directive.json', 'conflicting')).toThrow(/conflicting|immutable/i);
+
+      const iterRoot = path.join(ledger.directory, 'iter');
+      const iterDir = path.join(iterRoot, '0');
+      expect(permissions(iterRoot)).toBe(0o700);
+      expect(permissions(iterDir)).toBe(0o700);
+      expect(permissions(path.join(iterDir, 'directive.json'))).toBe(0o600);
+      expect(fs.readFileSync(path.join(iterDir, 'directive.json'))).toEqual(bytes);
+    });
+
+    it.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+      'rejects invalid iteration %s before creating nested paths',
+      (iter) => {
+        const workspace = tempWorkspace();
+        const ledger = SecureAutoloopLedger.open(workspace, 'run-1', { create: true });
+
+        expect(() => ledger.writeIterationArtifact(iter, 'directive.json', 'x')).toThrow(/nonnegative integer/i);
+        expect(fs.existsSync(path.join(ledger.directory, 'iter'))).toBe(false);
+      },
+    );
+
+    it('rejects unapproved artifact path components before creating nested paths', () => {
+      const workspace = tempWorkspace();
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', { create: true });
+
+      expect(() =>
+        ledger.writeIterationArtifact(0, '../directive.json' as SecureAutoloopIterationArtifact, 'x'),
+      ).toThrow(/unsupported|path component/i);
+      expect(() => ledger.readIterationArtifact(0, 'nested/verdict.json' as SecureAutoloopIterationArtifact)).toThrow(
+        /unsupported|path component/i,
+      );
+      expect(fs.existsSync(path.join(ledger.directory, 'iter'))).toBe(false);
+    });
+
+    it.each(['symlink', 'hardlink'] as const)(
+      'refuses a pre-planted %s artifact without mutating its external target',
+      (kind) => {
+        const workspace = tempWorkspace();
+        const ledger = SecureAutoloopLedger.open(workspace, 'run-1', { create: true });
+        ledger.writeIterationArtifact(0, 'directive.json', 'safe');
+        const artifact = path.join(ledger.directory, 'iter', '0', 'eval_output.json');
+        const external = path.join(workspace, `external-${kind}`);
+        fs.writeFileSync(external, 'sentinel', { mode: 0o664 });
+        if (kind === 'symlink') fs.symlinkSync(external, artifact);
+        else fs.linkSync(external, artifact);
+
+        expect(() => ledger.readIterationArtifact(0, 'eval_output.json')).toThrow(
+          /symbolic link|hardlink|link count|unsafe/i,
+        );
+        expect(() => ledger.writeIterationArtifact(0, 'eval_output.json', 'mutated')).toThrow(
+          /symbolic link|hardlink|link count|unsafe/i,
+        );
+        expect(fs.readFileSync(external, 'utf8')).toBe('sentinel');
+        expect(permissions(external)).toBe(0o664);
+      },
+    );
+
+    it('fails closed when the pinned iteration directory is replaced in the checked window', () => {
+      const workspace = tempWorkspace();
+      let armed = false;
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: {
+          beforeNestedMutation: (event) => {
+            if (!armed || event.relativePath !== 'iter/0/diff.patch') return;
+            const iterDir = path.join(ledger.directory, 'iter', '0');
+            fs.renameSync(iterDir, `${iterDir}.saved`);
+            fs.mkdirSync(iterDir, { mode: 0o700 });
+          },
+        },
+      });
+      ledger.writeIterationArtifact(0, 'directive.json', 'safe');
+      armed = true;
+
+      expect(() => ledger.writeIterationArtifact(0, 'diff.patch', 'must-not-land')).toThrow(
+        /identity|changed|replaced/i,
+      );
+      expect(fs.readdirSync(path.join(ledger.directory, 'iter', '0'))).toEqual([]);
+      expect(fs.readFileSync(path.join(ledger.directory, 'iter', '0.saved', 'directive.json'), 'utf8')).toBe('safe');
+    });
+
+    it('does not overwrite a target planted immediately before the atomic commit', () => {
+      const workspace = tempWorkspace();
+      const external = path.join(workspace, 'external-sentinel');
+      fs.writeFileSync(external, 'sentinel');
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: {
+          beforeNestedMutation: (event) => {
+            if (event.operation === 'artifact-commit' && event.relativePath === 'iter/0/verdict.json') {
+              fs.symlinkSync(external, event.filePath);
+            }
+          },
+        },
+      });
+
+      expect(() => ledger.writeIterationArtifact(0, 'verdict.json', '{"decision":"advance"}')).toThrow(
+        /symbolic link|unsafe/i,
+      );
+      expect(fs.readFileSync(external, 'utf8')).toBe('sentinel');
+      expect(fs.readdirSync(path.join(ledger.directory, 'iter', '0')).filter((name) => name.includes('.tmp-'))).toEqual(
+        [],
+      );
+    });
+
+    it('preserves the primary identity failure and reports an unreachable private temp after parent replacement', () => {
+      const workspace = tempWorkspace();
+      const warn = vi.fn();
+      let armed = false;
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        logger: { warn },
+        testHooks: {
+          beforeNestedMutation: (event) => {
+            if (!armed || event.operation !== 'artifact-commit') return;
+            const iterDir = path.join(ledger.directory, 'iter', '0');
+            fs.renameSync(iterDir, `${iterDir}.saved`);
+            fs.mkdirSync(iterDir, { mode: 0o700 });
+          },
+        },
+      });
+      ledger.writeIterationArtifact(0, 'directive.json', 'safe');
+      armed = true;
+
+      expect(() => ledger.writeIterationArtifact(0, 'diff.patch', 'must-not-land')).toThrow(
+        /identity|changed|replaced/i,
+      );
+      expect(fs.readdirSync(path.join(ledger.directory, 'iter', '0'))).toEqual([]);
+      const stale = fs
+        .readdirSync(path.join(ledger.directory, 'iter', '0.saved'))
+        .filter((name) => name.includes('.diff.patch.tmp-'));
+      expect(stale).toHaveLength(1);
+      expect(permissions(path.join(ledger.directory, 'iter', '0.saved', stale[0]))).toBe(0o600);
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/incomplete nested artifact.*could not be located/i));
+    });
+
+    it('reports the win32 directory-entry durability limitation for nested artifacts', () => {
+      const workspace = tempWorkspace();
+      const warn = vi.fn();
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        platform: 'win32',
+        logger: { warn },
+      });
+
+      ledger.writeIterationArtifact(0, 'coder_summary.txt', 'complete');
+
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/directory fsync.*win32/i));
+    });
   });
 });

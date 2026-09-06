@@ -75,14 +75,6 @@ export { openPrivateAutoloopDecisions, securePrivateAutoloopDecisionLedger } fro
  */
 const REPLAY_CHAR_BUDGET = 24_000;
 
-/**
- * Files inside <ledger>/reviewer_sandbox/ that survive `stageReviewSandbox`.
- * Anything not listed is wiped between iters. `reviewer_memory.md` is also
- * frozen-injected into the Reviewer system prompt at session start, so
- * mid-session edits won't be reread until the next reset.
- */
-const REVIEWER_SANDBOX_PERSIST = new Set(['reviewer_memory.md', 'reviewer_log.jsonl']);
-
 export interface ClaudeAgentDispatcherConfig {
   manager: SessionManager;
   runId: string;
@@ -340,6 +332,24 @@ const MAX_DECISION_LEDGER_ROW_BYTES = MAX_PLANNER_CONTROL_BATCH_BYTES + 256 * 10
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+type PersistedReviewVerdictPayload = {
+  decision: string;
+  metric: number | null;
+  audit_notes: string;
+  accepted?: boolean;
+  evidence_id?: string;
+};
+
+function samePersistedVerdictPayload(stored: Record<string, unknown>, payload: PersistedReviewVerdictPayload): boolean {
+  const storedEntries = Object.entries(stored)
+    .filter(([key]) => key !== 'schema_version' && key !== 'iter' && key !== 'ts')
+    .sort(([left], [right]) => left.localeCompare(right));
+  const expectedEntries = Object.entries(payload)
+    .filter(([, value]) => value !== undefined)
+    .sort(([left], [right]) => left.localeCompare(right));
+  return JSON.stringify(storedEntries) === JSON.stringify(expectedEntries);
 }
 
 function validatedPlannerControlEvidence(value: unknown): PlannerControlEvidence | undefined {
@@ -2191,10 +2201,9 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
 
     // Compose directive prompt + write directive.json to ledger so Reviewer
     // and history can see exactly what the Coder was asked.
-    const iterDir = path.join(this.ledgerDir, 'iter', String(env.iter));
-    fs.mkdirSync(iterDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(iterDir, 'directive.json'),
+    this.secureLedger.writeIterationArtifact(
+      env.iter,
+      'directive.json',
       JSON.stringify(
         {
           schema_version: LEDGER_SCHEMA_VERSION,
@@ -2297,12 +2306,14 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     }
 
     // Persist eval output to ledger.
-    fs.writeFileSync(
-      path.join(iterDir, 'eval_output.json'),
+    this.secureLedger.writeIterationArtifact(
+      env.iter,
+      'eval_output.json',
       JSON.stringify({ schema_version: LEDGER_SCHEMA_VERSION, iter: env.iter, eval_output: ic.eval_output }, null, 2),
     );
-    fs.writeFileSync(
-      path.join(iterDir, 'coder_summary.txt'),
+    this.secureLedger.writeIterationArtifact(
+      env.iter,
+      'coder_summary.txt',
       `${ic.summary}\n\n--- coder cleaned reply ---\n${parsed.cleaned_reply}\n`,
     );
 
@@ -2319,7 +2330,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     //     supplied, so the git fallback only ran when the Coder said nothing.
     //     The comment above said we don't trust the claim; now we don't.
     const diffText = await capturePatch(this.config.workspace, 'HEAD');
-    fs.writeFileSync(path.join(iterDir, 'diff.patch'), diffText);
+    this.secureLedger.writeIterationArtifact(env.iter, 'diff.patch', diffText);
     const observed = await changedFilesSince(this.config.workspace, 'HEAD');
     const filesChanged = observed.map((f) => f.path);
     // Commit the iteration so Reviewer's git view is clean for the next iter.
@@ -2355,6 +2366,43 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
 
   // ─── Reviewer ───────────────────────────────────────────────────────────
 
+  private readReviewerControlFile(name: 'plan.md' | 'goal.json'): Buffer | undefined {
+    const target = path.join(this.config.workspace, name);
+    let observed: fs.Stats;
+    try {
+      observed = fs.lstatSync(target);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
+    }
+    if (observed.isSymbolicLink() || !observed.isFile() || observed.nlink !== 1) {
+      throw new Error(`Refusing unsafe Reviewer control source '${target}'`);
+    }
+    const fd = fs.openSync(target, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    try {
+      const opened = fs.fstatSync(fd);
+      if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== observed.dev || opened.ino !== observed.ino) {
+        throw new Error(`Reviewer control source identity changed while opening '${target}'`);
+      }
+      const content = fs.readFileSync(fd);
+      const after = fs.lstatSync(target);
+      if (
+        after.isSymbolicLink() ||
+        !after.isFile() ||
+        after.nlink !== 1 ||
+        after.dev !== opened.dev ||
+        after.ino !== opened.ino ||
+        after.size !== opened.size ||
+        after.mtimeMs !== opened.mtimeMs
+      ) {
+        throw new Error(`Reviewer control source identity or contents changed while reading '${target}'`);
+      }
+      return content;
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+
   /**
    * Compose the Reviewer's system prompt with a frozen snapshot of
    * `reviewer_memory.md` appended. Read once at session start; mid-session
@@ -2362,12 +2410,9 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
    * keeps the per-iter prompt prefix stable so Claude's prefix cache hits.
    */
   private buildReviewerSystemPrompt(): string {
-    const memoryPath = path.join(this.reviewerSandboxDir, 'reviewer_memory.md');
     let memory = '';
     try {
-      if (fs.existsSync(memoryPath)) {
-        memory = fs.readFileSync(memoryPath, 'utf-8').trim();
-      }
+      memory = this.secureLedger.readReviewerPersistentFile('reviewer_memory.md')?.trim() ?? '';
     } catch (err) {
       this.logger.warn?.(`[autoloop] failed to read reviewer_memory.md: ${(err as Error).message}`);
     }
@@ -2389,7 +2434,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   private async ensureReviewer(): Promise<void> {
     if (this.reviewerStarted) return;
     this.validateSelection('reviewer', this.reviewerSelection);
-    fs.mkdirSync(this.reviewerSandboxDir, { recursive: true });
+    this.secureLedger.ensureReviewerSandbox();
     const sessionPrompt = this.buildReviewerSystemPrompt();
     this.reviewerSessionPrompt = sessionPrompt;
     try {
@@ -2418,43 +2463,12 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
    * persistent session whose cwd is fixed at <ledger>/reviewer_sandbox/, so
    * every review must rewrite the sandbox to "this iter's view".
    */
-  private stageReviewSandbox(iter: number): void {
-    fs.mkdirSync(this.reviewerSandboxDir, { recursive: true });
-    // Wipe top-level files but preserve the Reviewer's cross-iter memory and
-    // append-only audit log (see REVIEWER_SANDBOX_PERSIST). The Reviewer prompt
-    // promises both survive across iters; the wipe used to break the log.
-    for (const ent of fs.readdirSync(this.reviewerSandboxDir)) {
-      if (REVIEWER_SANDBOX_PERSIST.has(ent)) continue;
-      const full = path.join(this.reviewerSandboxDir, ent);
-      try {
-        fs.rmSync(full, { recursive: true, force: true });
-      } catch (err) {
-        // A stale file the Reviewer then reads as "this iter" causes silent
-        // context corruption — surface anything that isn't an already-gone file.
-        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-          this.logger.warn?.(`[autoloop] failed to clear sandbox entry ${ent}: ${(err as Error).message}`);
-        }
-      }
-    }
-    const iterSrc = path.join(this.ledgerDir, 'iter', String(iter));
-    if (!fs.existsSync(iterSrc)) return;
-    const dest = path.join(this.reviewerSandboxDir, `iter-${iter}`);
-    fs.mkdirSync(dest, { recursive: true });
-    for (const ent of fs.readdirSync(iterSrc)) {
-      fs.copyFileSync(path.join(iterSrc, ent), path.join(dest, ent));
-    }
-    // Also surface goal.json + plan.md if they exist at the workspace root.
-    for (const f of ['plan.md', 'goal.json']) {
-      const src = path.join(this.config.workspace, f);
-      if (fs.existsSync(src)) fs.copyFileSync(src, path.join(this.reviewerSandboxDir, f));
-    }
-    // Last iter's verdict for context (if exists).
-    if (iter > 0) {
-      const prior = path.join(this.ledgerDir, 'iter', String(iter - 1), 'verdict.json');
-      if (fs.existsSync(prior)) {
-        fs.copyFileSync(prior, path.join(this.reviewerSandboxDir, 'prior_verdict.json'));
-      }
-    }
+  private stageReviewSandbox(iter: number): { priorVerdict: boolean } {
+    const staged = this.secureLedger.stageReviewerSandbox(iter, {
+      plan: this.readReviewerControlFile('plan.md'),
+      goal: this.readReviewerControlFile('goal.json'),
+    });
+    return { priorVerdict: staged.priorVerdict };
   }
 
   private async deliverToReviewer(env: AnyAutoloopMessage, dispatchId: string): Promise<AnyAutoloopMessage[]> {
@@ -2462,14 +2476,14 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     if (env.type !== 'review_request') {
       throw new Error(`[autoloop] reviewer does not accept message type=${env.type}`);
     }
+    const staged = this.stageReviewSandbox(env.payload.iter);
     await this.ensureReviewer();
     if (this.terminal) return [];
-    this.stageReviewSandbox(env.payload.iter);
 
     const promptText = [
       `[review_request iter=${env.payload.iter}]`,
       `Artifacts staged at: iter-${env.payload.iter}/ (directive.json, diff.patch, eval_output.json)`,
-      `prior_verdict: ${fs.existsSync(path.join(this.reviewerSandboxDir, 'prior_verdict.json')) ? 'prior_verdict.json' : '(none)'}`,
+      `prior_verdict: ${staged.priorVerdict ? 'prior_verdict.json' : '(none)'}`,
       `prior_metrics: ${JSON.stringify(env.payload.prior_metrics ?? [])}`,
       '',
       'Audit and emit `review_complete`.',
@@ -2605,14 +2619,31 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     };
   }
 
-  private persistVerdict(
-    iter: number,
-    payload: { decision: string; metric: number | null; audit_notes: string },
-  ): void {
-    const iterDir = path.join(this.ledgerDir, 'iter', String(iter));
-    fs.mkdirSync(iterDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(iterDir, 'verdict.json'),
+  private persistVerdict(iter: number, payload: PersistedReviewVerdictPayload): void {
+    const existing = this.secureLedger.readIterationArtifact(iter, 'verdict.json');
+    if (existing !== undefined) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(existing.toString('utf8'));
+      } catch (error) {
+        throw new Error(`Refusing to replay malformed immutable Reviewer verdict for iteration ${iter}`, {
+          cause: error,
+        });
+      }
+      if (
+        isPlainRecord(parsed) &&
+        parsed.schema_version === LEDGER_SCHEMA_VERSION &&
+        parsed.iter === iter &&
+        typeof parsed.ts === 'string' &&
+        samePersistedVerdictPayload(parsed, payload)
+      ) {
+        return;
+      }
+      throw new Error(`Refusing to overwrite conflicting immutable Reviewer verdict for iteration ${iter}`);
+    }
+    this.secureLedger.writeIterationArtifact(
+      iter,
+      'verdict.json',
       JSON.stringify(
         { schema_version: LEDGER_SCHEMA_VERSION, iter, ts: new Date().toISOString(), ...payload },
         null,
