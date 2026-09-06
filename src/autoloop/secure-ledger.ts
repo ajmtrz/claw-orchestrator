@@ -369,24 +369,34 @@ export class SecureAutoloopLedger {
   prepareFlatFileAppend(name: SecureAutoloopFlatFile, content: string): SecureAutoloopPreparedAppend {
     const handle = this.openFlatFile(name, 'append', true);
     let committed = false;
+    let fileSynced = false;
+    let directorySynced = false;
     let closed = false;
-    let terminalError: unknown;
+    let appendError: unknown;
     const close = (): void => {
       if (closed) return;
       closed = true;
       fs.closeSync(handle.fd);
     };
     const commitDurable = (): void => {
-      if (terminalError !== undefined) throw terminalError;
-      if (committed) return;
+      if (directorySynced) return;
+      if (appendError !== undefined) throw appendError;
       if (closed) throw new Error(`Cannot commit closed Autoloop ledger append for '${name}'`);
-      try {
-        this.beforeFileMutation(handle, 'append');
-        fs.appendFileSync(handle.fd, content, { encoding: 'utf8' });
-        committed = true;
+      if (!committed) {
+        try {
+          this.beforeFileMutation(handle, 'append');
+          fs.appendFileSync(handle.fd, content, { encoding: 'utf8' });
+          committed = true;
+        } catch (error) {
+          appendError = error;
+          throw error;
+        }
+      }
+      if (!fileSynced) {
         try {
           this.beforeFileMutation(handle, 'flush');
           fs.fsyncSync(handle.fd);
+          fileSynced = true;
         } catch (error) {
           throw new SecureAutoloopLedgerCommitError(
             'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
@@ -394,8 +404,11 @@ export class SecureAutoloopLedger {
             { cause: error },
           );
         }
+      }
+      if (!directorySynced) {
         try {
           this.syncDirectory(name);
+          directorySynced = true;
         } catch (error) {
           throw new SecureAutoloopLedgerCommitError(
             'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
@@ -403,9 +416,6 @@ export class SecureAutoloopLedger {
             { cause: error },
           );
         }
-      } catch (error) {
-        terminalError = error;
-        throw error;
       }
     };
     return {
@@ -481,12 +491,28 @@ export class SecureAutoloopLedger {
   flushFlatFile(name: SecureAutoloopFlatFile): void {
     const handle = this.openFlatFile(name, 'append');
     try {
-      this.beforeFileMutation(handle, 'flush');
-      fs.fsyncSync(handle.fd);
+      try {
+        this.beforeFileMutation(handle, 'flush');
+        fs.fsyncSync(handle.fd);
+      } catch (error) {
+        throw new SecureAutoloopLedgerCommitError(
+          'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+          `Autoloop ledger row was committed to ${name}, but its file durability barrier failed: ${errorMessage(error)}`,
+          { cause: error },
+        );
+      }
     } finally {
       fs.closeSync(handle.fd);
     }
-    this.syncDirectory(name);
+    try {
+      this.syncDirectory(name);
+    } catch (error) {
+      throw new SecureAutoloopLedgerCommitError(
+        'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+        `Autoloop ledger row was committed to ${name}, but its parent-directory durability barrier failed: ${errorMessage(error)}`,
+        { cause: error },
+      );
+    }
   }
 
   syncDirectory(name?: SecureAutoloopFlatFile): void {

@@ -59,7 +59,11 @@ import {
   type SpawnSubagentsArgs,
 } from './planner-tools.js';
 import { extractIterComplete, extractReviewComplete, parseAgentReply } from './agent-tools.js';
-import { isCommittedSecureLedgerError, SecureAutoloopLedger } from './secure-ledger.js';
+import {
+  isCommittedSecureLedgerError,
+  SecureAutoloopLedger,
+  type SecureAutoloopLedgerCommitError,
+} from './secure-ledger.js';
 
 export { openPrivateAutoloopDecisions, securePrivateAutoloopDecisionLedger } from './secure-ledger.js';
 
@@ -204,8 +208,24 @@ export class AutoloopOperationError extends Error {
   }
 }
 
-function normalizePlannerOperationError(error: unknown): AutoloopOperationError {
-  if (error instanceof AutoloopOperationError) return error;
+/**
+ * A matching control row is already authoritative, but this process cannot
+ * prove whether its effects completed. Keep the ordinary typed failure at the
+ * public boundary while suppressing another decision-log row: moving the tail
+ * would otherwise let a later recovery miss the committed control and replay
+ * it.
+ */
+class CommittedPlannerControlReplayError extends AutoloopOperationError {
+  constructor() {
+    super(
+      'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+      'Planner control event is already committed; refusing to repeat effects without a durable application receipt',
+    );
+  }
+}
+
+function normalizePlannerOperationError(error: unknown): AutoloopOperationError | SecureAutoloopLedgerCommitError {
+  if (error instanceof AutoloopOperationError || isCommittedSecureLedgerError(error)) return error;
   const cause = error instanceof Error ? error : new Error(String(error));
   return new AutoloopOperationError('AUTOLOOP_ENGINE_FAILURE', `Planner engine transport failed: ${cause.message}`, {
     cause,
@@ -291,6 +311,19 @@ function plannerControlEvidenceMatches(
     observed.persisted_at === expected.persisted_at &&
     plannerControlClaimMatches(observed, expected),
   );
+}
+
+function plannerControlEvidenceFromTail(line: string): PlannerControlEvidence | undefined {
+  if (!line.trim()) return undefined;
+  let row: { kind?: unknown; payload?: unknown };
+  try {
+    row = JSON.parse(line) as { kind?: unknown; payload?: unknown };
+  } catch {
+    return undefined;
+  }
+  return row.kind === 'planner_turn_control' && row.payload && typeof row.payload === 'object'
+    ? (row.payload as PlannerControlEvidence)
+    : undefined;
 }
 
 function assertPlannerTurnSucceeded(result: PlannerTurnResult, expected: PlannerTurnExpectation): void {
@@ -972,7 +1005,10 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
 
     const pending = this.deliverOnce(env, dispatchId).catch((error: unknown) => {
       const operationError = env.to === 'planner' ? normalizePlannerOperationError(error) : error;
-      if (operationError instanceof AutoloopOperationError) {
+      if (
+        operationError instanceof AutoloopOperationError &&
+        !(operationError instanceof CommittedPlannerControlReplayError)
+      ) {
         this.appendDecisionLog({
           kind: 'phase_error',
           actor: 'dispatcher',
@@ -1572,21 +1608,36 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     } satisfies DecisionLogEntry;
     const prepared = this.secureLedger.prepareFlatFileAppend('decisions.jsonl', `${JSON.stringify(decision)}\n`);
     try {
+      const existingEvidence = plannerControlEvidenceFromTail(prepared.readLastNonEmptyLine());
+      if (plannerControlClaimMatches(existingEvidence, evidence)) {
+        // A prior attempt already committed this exact logical control. Its
+        // effect-completion state is not durably knowable here, so finish the
+        // ledger barrier but reject replay rather than append or apply twice.
+        this.secureLedger.flushFlatFile('decisions.jsonl');
+        throw new CommittedPlannerControlReplayError();
+      }
       // The control intent is a commit boundary, not ordinary best-effort
       // audit data. Commit through the checked capability and verify the same
       // opened inode's durable tail before any prepared effect can begin.
-      prepared.commitDurable();
-      const durableLine = prepared.readLastNonEmptyLine();
-      const durableRow = JSON.parse(durableLine) as { kind?: unknown; payload?: unknown };
-      const durableEvidence =
-        durableRow.kind === 'planner_turn_control' && durableRow.payload && typeof durableRow.payload === 'object'
-          ? (durableRow.payload as PlannerControlEvidence)
-          : undefined;
+      try {
+        prepared.commitDurable();
+      } catch (error) {
+        if (!isCommittedSecureLedgerError(error) || !prepared.committed) throw error;
+        const committedEvidence = plannerControlEvidenceFromTail(prepared.readLastNonEmptyLine());
+        if (!plannerControlEvidenceMatches(committedEvidence, evidence)) throw error;
+        // Retry only the incomplete barrier; SecureAutoloopLedger remembers
+        // that the control bytes are already committed and cannot append them
+        // again. A persistent incomplete result keeps its original typed code.
+        prepared.commitDurable();
+      }
+      const durableEvidence = plannerControlEvidenceFromTail(prepared.readLastNonEmptyLine());
       if (!plannerControlEvidenceMatches(durableEvidence, evidence)) {
         throw new Error('the appended control event did not match the durable tail');
       }
       return durableEvidence;
     } catch (error) {
+      if (isCommittedSecureLedgerError(error)) throw error;
+      if (error instanceof AutoloopOperationError) throw error;
       throw new AutoloopOperationError(
         'AUTOLOOP_CONTROL_NOT_PERSISTED',
         `Planner control event could not be persisted: ${(error as Error).message}`,

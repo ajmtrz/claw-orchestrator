@@ -282,52 +282,69 @@ describe('SecureAutoloopLedger', () => {
     expect(warn).toHaveBeenCalledWith(expect.stringMatching(/parent-directory fsync.*win32/i));
   });
 
-  it('classifies a post-write directory-sync failure as committed and never appends twice', () => {
-    const workspace = tempWorkspace();
-    let failDirectorySync = true;
-    const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
-      create: true,
-      testHooks: {
-        beforeDirectorySync: () => {
-          if (failDirectorySync) {
-            failDirectorySync = false;
-            throw new Error('injected directory fsync failure');
-          }
+  it.each([
+    {
+      barrier: 'file',
+      code: 'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+    },
+    {
+      barrier: 'directory',
+      code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+    },
+  ] as const)(
+    'classifies a post-write $barrier-sync failure and resumes durability without appending twice',
+    ({ barrier, code }) => {
+      const workspace = tempWorkspace();
+      let failBarrier = true;
+      let appendChecks = 0;
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: {
+          beforeFileMutation: (event: { operation: string }) => {
+            if (event.operation === 'append') appendChecks++;
+            if (barrier === 'file' && event.operation === 'flush' && failBarrier) {
+              failBarrier = false;
+              throw new Error('injected file fsync failure');
+            }
+          },
+          beforeDirectorySync: () => {
+            if (barrier === 'directory' && failBarrier) {
+              failBarrier = false;
+              throw new Error('injected directory fsync failure');
+            }
+          },
         },
-      },
-    } as never);
-    const prepared = (
-      ledger as unknown as {
-        prepareFlatFileAppend(
-          name: SecureAutoloopFlatFile,
-          content: string,
-        ): {
-          committed: boolean;
-          commitDurable(): void;
-          close(): void;
-        };
-      }
-    ).prepareFlatFileAppend('decisions.jsonl', '{"kind":"prepared"}\n');
+      } as never);
+      const prepared = (
+        ledger as unknown as {
+          prepareFlatFileAppend(
+            name: SecureAutoloopFlatFile,
+            content: string,
+          ): {
+            committed: boolean;
+            commitDurable(): void;
+            close(): void;
+          };
+        }
+      ).prepareFlatFileAppend('decisions.jsonl', '{"kind":"prepared"}\n');
 
-    try {
-      expect(() => prepared.commitDurable()).toThrow(
-        expect.objectContaining({
-          code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
-          committed: true,
-        }),
-      );
-      expect(prepared.committed).toBe(true);
-      expect(() => prepared.commitDurable()).toThrow(
-        expect.objectContaining({
-          code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
-          committed: true,
-        }),
-      );
-    } finally {
-      prepared.close();
-    }
-    expect(countRows(path.join(ledger.directory, 'decisions.jsonl'), 'prepared')).toBe(1);
-  });
+      try {
+        expect(() => prepared.commitDurable()).toThrow(
+          expect.objectContaining({
+            code,
+            committed: true,
+          }),
+        );
+        expect(prepared.committed).toBe(true);
+        expect(() => prepared.commitDurable()).not.toThrow();
+        expect(() => prepared.commitDurable()).not.toThrow();
+      } finally {
+        prepared.close();
+      }
+      expect(appendChecks).toBe(1);
+      expect(countRows(path.join(ledger.directory, 'decisions.jsonl'), 'prepared')).toBe(1);
+    },
+  );
 
   it('does not roll back a generation reservation after its row was committed', async () => {
     const workspace = tempWorkspace();
@@ -418,6 +435,29 @@ describe('SecureAutoloopLedger', () => {
     ).rejects.toThrow(/identity|changed|replaced/i);
     expect(startSession).not.toHaveBeenCalled();
     expect(fs.readdirSync(runDir)).toEqual([]);
+    await manager.shutdown();
+  });
+
+  it('rejects an unsafe unrelated flat sibling during full boot before starting a physical session', async () => {
+    const workspace = tempWorkspace();
+    const runDir = path.join(workspace, 'tasks', 'run-1');
+    const external = path.join(workspace, 'external-chat');
+    fs.mkdirSync(runDir, { recursive: true });
+    fs.writeFileSync(path.join(runDir, 'decisions.jsonl'), '{"kind":"existing"}\n');
+    fs.writeFileSync(external, 'protected');
+    fs.symlinkSync(external, path.join(runDir, 'chat.jsonl'));
+    const manager = new SessionManager({ maxConcurrentSessions: 1 });
+    const startSession = vi.spyOn(manager, 'startSession').mockRejectedValue(new Error('runtime boot attempted'));
+
+    await expect(
+      (
+        manager as unknown as {
+          _bootAutoloop(options: Record<string, unknown>): Promise<unknown>;
+        }
+      )._bootAutoloop({ runId: 'run-1', workspace }),
+    ).rejects.toThrow(/symbolic link|unsafe/i);
+    expect(startSession).not.toHaveBeenCalled();
+    expect(fs.readFileSync(external, 'utf8')).toBe('protected');
     await manager.shutdown();
   });
 

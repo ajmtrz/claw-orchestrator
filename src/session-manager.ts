@@ -401,7 +401,12 @@ import {
 } from './autoloop/types.js';
 import { Msg as AutoloopMsg, type PushChannel, type PushLevel, type SendTimeoutPayload } from './autoloop/messages.js';
 import { appendPushLog, notifyUserFallbackChain } from './autoloop/notify.js';
-import { SecureAutoloopLedger, type SecureAutoloopPreparedAppend } from './autoloop/secure-ledger.js';
+import {
+  isCommittedSecureLedgerError,
+  SecureAutoloopLedger,
+  type SecureAutoloopLedgerCommitError,
+  type SecureAutoloopPreparedAppend,
+} from './autoloop/secure-ledger.js';
 import { UltraappManager } from './ultraapp/manager.js';
 import { UltraappStore, defaultStoreRoot } from './ultraapp/store.js';
 import type { UltraappRouter } from './ultraapp/router.js';
@@ -499,7 +504,10 @@ interface StoredAutoloopResumeContext {
   pendingDispatch: SendTimeoutPayload | null;
 }
 
-type PreparedSendTimeoutMigrationAppend = SecureAutoloopPreparedAppend;
+interface PreparedSendTimeoutMigrationAppend {
+  append: SecureAutoloopPreparedAppend;
+  expectedTail: string;
+}
 
 class AutoloopChatStateError extends Error {
   constructor(
@@ -605,8 +613,13 @@ function encodeSendTimeoutMigration(
 function appendSendTimeoutMigration(
   ledger: SecureAutoloopLedger,
   migration: Omit<SendTimeoutMigrationAuditRecord, 'ts' | 'timestamp' | 'kind' | 'actor'>,
-): void {
-  ledger.appendFlatFile('decisions.jsonl', encodeSendTimeoutMigration(migration), true);
+): SecureAutoloopLedgerCommitError | undefined {
+  const prepared = prepareSendTimeoutMigrationAppend(ledger, migration);
+  try {
+    return commitPreparedSendTimeoutMigration(prepared);
+  } finally {
+    prepared.append.close();
+  }
 }
 
 /**
@@ -620,11 +633,39 @@ function prepareSendTimeoutMigrationAppend(
   ledger: SecureAutoloopLedger,
   migration: Omit<SendTimeoutMigrationAuditRecord, 'ts' | 'timestamp' | 'kind' | 'actor'>,
 ): PreparedSendTimeoutMigrationAppend {
-  return ledger.prepareFlatFileAppend('decisions.jsonl', encodeSendTimeoutMigration(migration));
+  const encoded = encodeSendTimeoutMigration(migration);
+  return {
+    append: ledger.prepareFlatFileAppend('decisions.jsonl', encoded),
+    expectedTail: encoded.slice(0, -1),
+  };
 }
 
-function commitPreparedSendTimeoutMigration(prepared: PreparedSendTimeoutMigrationAppend): void {
-  prepared.commitDurable();
+function assertPreparedSendTimeoutMigrationTail(prepared: PreparedSendTimeoutMigrationAppend): void {
+  if (prepared.append.readLastNonEmptyLine() !== prepared.expectedTail) {
+    throw new Error('Committed timeout migration does not match the pinned decisions.jsonl tail');
+  }
+}
+
+function commitPreparedSendTimeoutMigration(
+  prepared: PreparedSendTimeoutMigrationAppend,
+): SecureAutoloopLedgerCommitError | undefined {
+  try {
+    prepared.append.commitDurable();
+  } catch (error) {
+    if (!isCommittedSecureLedgerError(error) || !prepared.append.committed) throw error;
+    assertPreparedSendTimeoutMigrationTail(prepared);
+    try {
+      // Resume only the incomplete barrier. The prepared capability remembers
+      // that its bytes are already present, so this can never append twice.
+      prepared.append.commitDurable();
+    } catch (retryError) {
+      if (!isCommittedSecureLedgerError(retryError) || !prepared.append.committed) throw retryError;
+      assertPreparedSendTimeoutMigrationTail(prepared);
+      return retryError;
+    }
+  }
+  assertPreparedSendTimeoutMigrationTail(prepared);
+  return undefined;
 }
 
 function isStringRecord(value: unknown): value is Record<string, string> {
@@ -4033,7 +4074,13 @@ export class SessionManager implements AgentRuntimeProbe {
     };
     ctx.dispatcher.on('planner_reply', onReply);
     try {
-      await ctx.runner.send(chatEnvelope);
+      try {
+        await ctx.runner.send(chatEnvelope);
+      } catch (error) {
+        const cause = (error as { cause?: unknown } | null)?.cause;
+        if (isCommittedSecureLedgerError(cause)) throw cause;
+        throw error;
+      }
     } finally {
       ctx.dispatcher.off('planner_reply', onReply);
     }
@@ -4225,7 +4272,7 @@ export class SessionManager implements AgentRuntimeProbe {
       // The checks above and the three operations below are synchronous. Audit
       // first, so an append failure leaves both the dispatcher and runner
       // untouched; after that no asynchronous work can swap the pending id.
-      appendSendTimeoutMigration(live.dispatcher.secureLedgerCapability, {
+      const migrationCommitError = appendSendTimeoutMigration(live.dispatcher.secureLedgerCapability, {
         runId,
         field: 'sendTimeoutMs',
         oldValue: current,
@@ -4238,6 +4285,7 @@ export class SessionManager implements AgentRuntimeProbe {
         throw new Error(`Autoloop run '${runId}' pending dispatch changed during resume`);
       }
       this._autoloopPublishers.get(runId)?.();
+      if (migrationCommitError) throw migrationCommitError;
       return live.runner.state;
     }
 
@@ -4305,10 +4353,11 @@ export class SessionManager implements AgentRuntimeProbe {
         : undefined;
     const preparedMigration = migration ? prepareSendTimeoutMigrationAppend(secureLedger, migration) : undefined;
     let migrationCommitted = false;
+    let migrationCommitError: SecureAutoloopLedgerCommitError | undefined;
     try {
       // Custom-engine configs are never persisted (they can carry secrets), so
       // a resume must be given them again by the caller.
-      return await this._resumeAutoloopRun(
+      const state = await this._resumeAutoloopRun(
         runId,
         {
           ...config,
@@ -4325,16 +4374,24 @@ export class SessionManager implements AgentRuntimeProbe {
           commitTimeoutMigration: preparedMigration
             ? () => {
                 if (migrationCommitted) return;
-                commitPreparedSendTimeoutMigration(preparedMigration);
-                migrationCommitted = true;
+                try {
+                  migrationCommitError = commitPreparedSendTimeoutMigration(preparedMigration);
+                } finally {
+                  // Bytes committed is itself a terminal append state even if
+                  // a durability barrier remains incomplete. Any boot retry
+                  // must observe this row, never append the migration again.
+                  migrationCommitted = preparedMigration.append.committed;
+                }
               }
             : undefined,
         },
       );
+      if (migrationCommitError) throw migrationCommitError;
+      return state;
     } finally {
       if (preparedMigration) {
         try {
-          preparedMigration.close();
+          preparedMigration.append.close();
         } catch (err) {
           // Descriptor cleanup cannot retroactively turn a committed append
           // and successful startup into a failed migration.
