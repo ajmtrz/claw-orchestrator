@@ -1955,6 +1955,164 @@ describe('ClaudeAgentDispatcher — stageReviewSandbox whitelist', () => {
   });
 });
 
+describe('ClaudeAgentDispatcher — canonical immutable Reviewer verdicts', () => {
+  type VerdictCandidate = {
+    decision: 'advance' | 'hold' | 'rollback';
+    metric: number | null;
+    audit_notes: string;
+    flags?: string[];
+    accepted?: boolean;
+    evidence_id?: string;
+  };
+
+  function verdictMethods(dispatcher: ClaudeAgentDispatcher): {
+    gateVerdict(iter: number, payload: VerdictCandidate): Promise<VerdictCandidate>;
+    persistVerdict(iter: number, payload: VerdictCandidate): void;
+  } {
+    const methods = dispatcher as unknown as {
+      gateVerdict(iter: number, payload: VerdictCandidate): Promise<VerdictCandidate>;
+      persistVerdict(iter: number, payload: VerdictCandidate): void;
+    };
+    return {
+      gateVerdict: methods.gateVerdict.bind(dispatcher),
+      persistVerdict: methods.persistVerdict.bind(dispatcher),
+    };
+  }
+
+  it('never persists ephemeral Reviewer flags in a new schema-v1 verdict', async () => {
+    const reviewerReply = [
+      'Independent review complete.',
+      '```autoloop',
+      JSON.stringify({
+        tool: 'review_complete',
+        args: {
+          decision: 'advance',
+          metric: 1,
+          audit_notes: 'durable fields only',
+          flags: ['runtime-only-warning'],
+        },
+      }),
+      '```',
+    ].join('\n');
+    const { dispatcher, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+    ensureCompleteReviewArtifacts(dispatcher, 0);
+
+    await dispatcher.deliver(Msg.reviewRequest(0, { iter: 0, ledger_path: ledgerDir, prior_metrics: [] }));
+
+    const verdict = JSON.parse(fs.readFileSync(path.join(ledgerDir, 'iter', '0', 'verdict.json'), 'utf8')) as Record<
+      string,
+      unknown
+    >;
+    expect(Object.keys(verdict)).toEqual(['schema_version', 'iter', 'ts', 'decision', 'metric', 'audit_notes']);
+    expect(verdict).toMatchObject({
+      schema_version: LEDGER_SCHEMA_VERSION,
+      iter: 0,
+      decision: 'advance',
+      metric: 1,
+      audit_notes: 'durable fields only',
+    });
+  });
+
+  it('replays calculated acceptance byte-stably across absent and different runtime flags', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-06T01:00:00.000Z'));
+    const { dispatcher, ledgerDir } = makeDispatcher({
+      contract: {
+        id: 'canonical-verdict-flags',
+        checks: [{ id: 'workspace-exists', spec: { type: 'file', path: '.', exists: true } }],
+      },
+    });
+    const { gateVerdict, persistVerdict } = verdictMethods(dispatcher);
+    const gated = await gateVerdict(0, {
+      decision: 'advance',
+      metric: 1,
+      audit_notes: 'acceptance passed',
+      flags: ['first-runtime-flag'],
+    });
+    expect(gated).toMatchObject({ accepted: true, evidence_id: 'iter-0' });
+
+    persistVerdict(0, gated);
+    const verdictPath = path.join(ledgerDir, 'iter', '0', 'verdict.json');
+    const first = fs.readFileSync(verdictPath);
+    const stored = JSON.parse(first.toString('utf8')) as Record<string, unknown>;
+    expect(Object.keys(stored)).toEqual([
+      'schema_version',
+      'iter',
+      'ts',
+      'decision',
+      'metric',
+      'audit_notes',
+      'accepted',
+      'evidence_id',
+    ]);
+
+    vi.setSystemTime(new Date('2026-09-06T02:00:00.000Z'));
+    expect(() => persistVerdict(0, { ...gated, flags: undefined })).not.toThrow();
+    expect(fs.readFileSync(verdictPath)).toEqual(first);
+    expect(() => persistVerdict(0, { ...gated, flags: ['different-runtime-flag'] })).not.toThrow();
+    expect(fs.readFileSync(verdictPath)).toEqual(first);
+  });
+
+  it('tolerates only the known legacy flags field when comparing an existing verdict', () => {
+    const { dispatcher, ledgerDir } = makeDispatcher();
+    const { persistVerdict } = verdictMethods(dispatcher);
+    const payload: VerdictCandidate = {
+      decision: 'advance',
+      metric: 1,
+      audit_notes: 'legacy runtime flags',
+      accepted: true,
+      evidence_id: 'iter-0',
+    };
+    const legacyWithFlags = `${JSON.stringify(
+      {
+        schema_version: LEDGER_SCHEMA_VERSION,
+        iter: 0,
+        ts: '2026-09-06T01:00:00.000Z',
+        ...payload,
+        flags: ['legacy-runtime-flag'],
+      },
+      null,
+      2,
+    )}\n`;
+    dispatcher.secureLedgerCapability.writeIterationArtifact(0, 'verdict.json', legacyWithFlags);
+    const legacyPath = path.join(ledgerDir, 'iter', '0', 'verdict.json');
+    const first = fs.readFileSync(legacyPath);
+
+    expect(() => persistVerdict(0, payload)).not.toThrow();
+    expect(fs.readFileSync(legacyPath)).toEqual(first);
+
+    const legacyWithUnknown = JSON.stringify({
+      schema_version: LEDGER_SCHEMA_VERSION,
+      iter: 1,
+      ts: '2026-09-06T01:00:00.000Z',
+      ...payload,
+      runtime_metadata: ['must not be ignored'],
+    });
+    dispatcher.secureLedgerCapability.writeIterationArtifact(1, 'verdict.json', legacyWithUnknown);
+    const unknownPath = path.join(ledgerDir, 'iter', '1', 'verdict.json');
+    const unknownFirst = fs.readFileSync(unknownPath);
+
+    expect(() => persistVerdict(1, payload)).toThrow(/conflicting|immutable/i);
+    expect(fs.readFileSync(unknownPath)).toEqual(unknownFirst);
+  });
+
+  it.each([
+    ['decision', { decision: 'hold' }],
+    ['metric', { metric: 2 }],
+    ['audit_notes', { audit_notes: 'materially changed audit' }],
+  ] as const)('rejects a change to durable %s while preserving the first verdict', (_field, change) => {
+    const { dispatcher, ledgerDir } = makeDispatcher();
+    const { persistVerdict } = verdictMethods(dispatcher);
+    const payload: VerdictCandidate = { decision: 'advance', metric: 1, audit_notes: 'immutable audit' };
+    persistVerdict(0, payload);
+    const verdictPath = path.join(ledgerDir, 'iter', '0', 'verdict.json');
+    const first = fs.readFileSync(verdictPath);
+
+    expect(() => persistVerdict(0, { ...payload, ...change })).toThrow(/conflicting|immutable/i);
+    expect(fs.readFileSync(verdictPath)).toEqual(first);
+  });
+});
+
 describe('ClaudeAgentDispatcher — durable directive ordering and review iteration authority', () => {
   const directivePayload = {
     goal: 'persist this exact directive before starting a Coder',
@@ -2026,6 +2184,52 @@ describe('ClaudeAgentDispatcher — durable directive ordering and review iterat
     expect(calls.startSession).toHaveBeenCalledTimes(0);
     expect(calls.sendMessage).toHaveBeenCalledTimes(0);
     expect(fs.existsSync(path.join(ledgerDir, 'chat.jsonl'))).toBe(false);
+  });
+
+  it('rejects a distinct message whose reserved payload keys forge byte-identical directive identity', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'Coder acknowledged.' });
+    const first = fixedIdentity(Msg.directive(2, directivePayload), 'directive-canonical-first', v1DirectiveTimestamp);
+    await dispatcher.deliver(first);
+    const directivePath = path.join(ledgerDir, 'iter', '2', 'directive.json');
+    const firstBytes = fs.readFileSync(directivePath);
+    const persisted = JSON.parse(firstBytes.toString('utf8')) as { dispatch_id: string };
+    const hostilePayload = {
+      ...directivePayload,
+      schema_version: LEDGER_SCHEMA_VERSION,
+      iter: first.iter,
+      ts: first.ts,
+      message_id: first.msg_id,
+      dispatch_id: persisted.dispatch_id,
+    } as typeof directivePayload;
+    const distinct = fixedIdentity(
+      Msg.directive(2, hostilePayload),
+      'directive-canonical-distinct',
+      '2026-09-03T01:00:00.000Z',
+    );
+
+    await expect(dispatcher.deliver(distinct)).rejects.toThrow(/directive payload.*(?:reserved|unsupported)/i);
+
+    expect(fs.readFileSync(directivePath)).toEqual(firstBytes);
+    expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(1);
+    expect(calls.startSession).toHaveBeenCalledTimes(1);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects additional schema-v1 directive identity keys before persistence or Coder effects', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'must not be sent' });
+    const additionalIdentityPayload = {
+      ...directivePayload,
+      delivery_id: 'future-outbox-identity-must-not-enter-v1',
+    } as typeof directivePayload;
+
+    await expect(dispatcher.deliver(Msg.directive(0, additionalIdentityPayload))).rejects.toThrow(
+      /directive payload.*(?:additional|unsupported)/i,
+    );
+
+    expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'directive.json'))).toBe(false);
+    expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+    expect(calls.startSession).toHaveBeenCalledTimes(0);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(0);
   });
 
   it('durably persists the complete directive before reserve, start, heartbeat, and send', async () => {

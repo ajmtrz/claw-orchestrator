@@ -350,14 +350,61 @@ type PersistedReviewVerdictPayload = {
   evidence_id?: string;
 };
 
+const PERSISTED_REVIEW_VERDICT_KEYS = ['decision', 'metric', 'audit_notes', 'accepted', 'evidence_id'] as const;
+const STORED_REVIEW_VERDICT_KEYS = new Set(['schema_version', 'iter', 'ts', ...PERSISTED_REVIEW_VERDICT_KEYS, 'flags']);
+
+function canonicalPersistedVerdictPayload(payload: PersistedReviewVerdictPayload): PersistedReviewVerdictPayload {
+  return {
+    decision: payload.decision,
+    metric: payload.metric,
+    audit_notes: payload.audit_notes,
+    accepted: payload.accepted,
+    evidence_id: payload.evidence_id,
+  };
+}
+
 function samePersistedVerdictPayload(stored: Record<string, unknown>, payload: PersistedReviewVerdictPayload): boolean {
-  const storedEntries = Object.entries(stored)
-    .filter(([key]) => key !== 'schema_version' && key !== 'iter' && key !== 'ts')
-    .sort(([left], [right]) => left.localeCompare(right));
-  const expectedEntries = Object.entries(payload)
-    .filter(([, value]) => value !== undefined)
-    .sort(([left], [right]) => left.localeCompare(right));
+  if (Object.keys(stored).some((key) => !STORED_REVIEW_VERDICT_KEYS.has(key))) return false;
+  if (
+    Object.hasOwn(stored, 'flags') &&
+    (!Array.isArray(stored.flags) || !stored.flags.every((flag) => typeof flag === 'string'))
+  ) {
+    return false;
+  }
+  const canonical = canonicalPersistedVerdictPayload(payload);
+  const storedEntries = PERSISTED_REVIEW_VERDICT_KEYS.filter((key) => stored[key] !== undefined).map((key) => [
+    key,
+    stored[key],
+  ]);
+  const expectedEntries = PERSISTED_REVIEW_VERDICT_KEYS.filter((key) => canonical[key] !== undefined).map((key) => [
+    key,
+    canonical[key],
+  ]);
   return JSON.stringify(storedEntries) === JSON.stringify(expectedEntries);
+}
+
+const DIRECTIVE_V1_PAYLOAD_KEYS = new Set(['goal', 'constraints', 'success_criteria', 'max_attempts']);
+
+function serializeDirectiveV1(env: Extract<AnyAutoloopMessage, { type: 'directive' }>, dispatchId: string): string {
+  const unsupportedKeys = Object.keys(env.payload).filter((key) => !DIRECTIVE_V1_PAYLOAD_KEYS.has(key));
+  if (unsupportedKeys.length > 0) {
+    throw new Error(`Directive payload contains unsupported schema-v1 fields: ${unsupportedKeys.join(', ')}`);
+  }
+  return JSON.stringify(
+    {
+      schema_version: LEDGER_SCHEMA_VERSION,
+      iter: env.iter,
+      ts: env.ts,
+      message_id: env.msg_id,
+      dispatch_id: dispatchId,
+      goal: env.payload.goal,
+      constraints: env.payload.constraints,
+      success_criteria: env.payload.success_criteria,
+      max_attempts: env.payload.max_attempts,
+    },
+    null,
+    2,
+  );
 }
 
 function validatedPlannerControlEvidence(value: unknown): PlannerControlEvidence | undefined {
@@ -2223,22 +2270,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     // Preserve the exact schema-v1 byte shape: restart replay compares this
     // write-once artifact byte-for-byte, so even additive fields require a
     // versioned migration rather than an in-place serialization change.
-    this.secureLedger.writeIterationArtifact(
-      env.iter,
-      'directive.json',
-      JSON.stringify(
-        {
-          schema_version: LEDGER_SCHEMA_VERSION,
-          iter: env.iter,
-          ts: env.ts,
-          message_id: env.msg_id,
-          dispatch_id: dispatchId,
-          ...env.payload,
-        },
-        null,
-        2,
-      ),
-    );
+    this.secureLedger.writeIterationArtifact(env.iter, 'directive.json', serializeDirectiveV1(env, dispatchId));
     if (this.terminal) return [];
     await this.ensureCoder();
     if (this.terminal) return [];
@@ -2644,6 +2676,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   }
 
   private persistVerdict(iter: number, payload: PersistedReviewVerdictPayload): void {
+    const canonical = canonicalPersistedVerdictPayload(payload);
     const existing = this.secureLedger.readIterationArtifact(iter, 'verdict.json');
     if (existing !== undefined) {
       let parsed: unknown;
@@ -2659,7 +2692,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         parsed.schema_version === LEDGER_SCHEMA_VERSION &&
         parsed.iter === iter &&
         typeof parsed.ts === 'string' &&
-        samePersistedVerdictPayload(parsed, payload)
+        samePersistedVerdictPayload(parsed, canonical)
       ) {
         return;
       }
@@ -2669,7 +2702,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       iter,
       'verdict.json',
       JSON.stringify(
-        { schema_version: LEDGER_SCHEMA_VERSION, iter, ts: new Date().toISOString(), ...payload },
+        { schema_version: LEDGER_SCHEMA_VERSION, iter, ts: new Date().toISOString(), ...canonical },
         null,
         2,
       ),
