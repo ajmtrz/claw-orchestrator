@@ -734,6 +734,324 @@ describe('SecureAutoloopLedger', () => {
       );
     });
 
+    it('preserves and rejects a conflicting regular target planted after the final absence check', () => {
+      const workspace = tempWorkspace();
+      const targetBytes = Buffer.from('approved\n');
+      const conflictingBytes = Buffer.from('concurrent-writer\n');
+      let plantedIdentity: fs.Stats | undefined;
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: {
+          beforeNestedPublish: (event) => {
+            if (event.relativePath !== 'iter/0/verdict.json') return;
+            fs.writeFileSync(event.filePath, conflictingBytes, { mode: 0o600 });
+            plantedIdentity = fs.lstatSync(event.filePath);
+          },
+        },
+      });
+
+      expect(() => ledger.writeIterationArtifact(0, 'verdict.json', targetBytes)).toThrow(/conflicting|immutable/i);
+
+      const target = path.join(ledger.directory, 'iter', '0', 'verdict.json');
+      const preserved = fs.lstatSync(target);
+      expect({ dev: preserved.dev, ino: preserved.ino }).toEqual({
+        dev: plantedIdentity?.dev,
+        ino: plantedIdentity?.ino,
+      });
+      expect(fs.readFileSync(target)).toEqual(conflictingBytes);
+      expect(fs.readdirSync(path.dirname(target)).filter((entry) => entry.startsWith('.verdict.json.tmp-'))).toEqual(
+        [],
+      );
+    });
+
+    it('converges unchanged on an identical regular target planted after the final absence check', () => {
+      const workspace = tempWorkspace();
+      const bytes = Buffer.from('same-winner\n');
+      let plantedIdentity: fs.Stats | undefined;
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: {
+          beforeNestedPublish: (event) => {
+            if (event.relativePath !== 'iter/0/eval_output.json') return;
+            fs.writeFileSync(event.filePath, bytes, { mode: 0o600 });
+            plantedIdentity = fs.lstatSync(event.filePath);
+          },
+        },
+      });
+
+      expect(ledger.writeIterationArtifact(0, 'eval_output.json', Buffer.from(bytes))).toBe('unchanged');
+
+      const target = path.join(ledger.directory, 'iter', '0', 'eval_output.json');
+      const preserved = fs.lstatSync(target);
+      expect({ dev: preserved.dev, ino: preserved.ino }).toEqual({
+        dev: plantedIdentity?.dev,
+        ino: plantedIdentity?.ino,
+      });
+      expect(fs.readFileSync(target)).toEqual(bytes);
+      expect(
+        fs.readdirSync(path.dirname(target)).filter((entry) => entry.startsWith('.eval_output.json.tmp-')),
+      ).toEqual([]);
+    });
+
+    it('fails closed on an unsafe target planted after the final absence check', () => {
+      const workspace = tempWorkspace();
+      const external = path.join(workspace, 'external-race-target');
+      fs.writeFileSync(external, 'external-sentinel\n');
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: {
+          beforeNestedPublish: (event) => {
+            if (event.relativePath === 'iter/0/diff.patch') fs.symlinkSync(external, event.filePath);
+          },
+        },
+      });
+
+      expect(() => ledger.writeIterationArtifact(0, 'diff.patch', 'must-not-land\n')).toThrow(/symbolic link|unsafe/i);
+      expect(fs.readFileSync(external, 'utf8')).toBe('external-sentinel\n');
+      expect(fs.lstatSync(path.join(ledger.directory, 'iter', '0', 'diff.patch')).isSymbolicLink()).toBe(true);
+    });
+
+    it.each(['EPERM', 'ENOTSUP'] as const)(
+      'fails closed without a replacement fallback when exclusive link publish returns %s',
+      (code) => {
+        const workspace = tempWorkspace();
+        const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+          create: true,
+          testHooks: {
+            publishNestedTemporary: () => {
+              throw Object.assign(new Error(`injected ${code} link failure`), { code });
+            },
+          },
+        });
+
+        expect(() => ledger.writeIterationArtifact(0, 'directive.json', 'must-not-land\n')).toThrow(
+          new RegExp(`injected ${code} link failure`, 'i'),
+        );
+        const directory = path.join(ledger.directory, 'iter', '0');
+        expect(fs.existsSync(path.join(directory, 'directive.json'))).toBe(false);
+        expect(fs.readdirSync(directory).filter((entry) => entry.startsWith('.directive.json.tmp-'))).toEqual([]);
+      },
+    );
+
+    it('publishes by exclusive link, removes the private alias, and only then syncs the parent directory', () => {
+      const workspace = tempWorkspace();
+      const relativePath = 'iter/0/coder_summary.txt';
+      const sequence: string[] = [];
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: {
+          afterNestedPublish: (event) => {
+            if (event.relativePath !== relativePath) return;
+            const target = fs.lstatSync(event.filePath);
+            const temporary = fs.lstatSync(event.temporaryPath);
+            expect(target.nlink).toBe(2);
+            expect(temporary.nlink).toBe(2);
+            expect({ dev: target.dev, ino: target.ino }).toEqual({ dev: temporary.dev, ino: temporary.ino });
+            sequence.push('published');
+          },
+          afterNestedTemporaryUnlink: (event) => {
+            if (event.relativePath !== relativePath) return;
+            expect(fs.existsSync(event.temporaryPath)).toBe(false);
+            expect(fs.lstatSync(event.filePath).nlink).toBe(1);
+            sequence.push('temporary-unlinked');
+          },
+          beforeDirectorySync: (event) => {
+            const target = path.join(event.filePath, 'coder_summary.txt');
+            if (!fs.existsSync(target)) return;
+            expect(sequence).toEqual(['published', 'temporary-unlinked']);
+            expect(
+              fs.readdirSync(event.filePath).filter((entry) => entry.startsWith('.coder_summary.txt.tmp-')),
+            ).toEqual([]);
+            sequence.push('parent-sync');
+          },
+        },
+      });
+
+      expect(ledger.writeIterationArtifact(0, 'coder_summary.txt', 'ordered\n')).toBe('created');
+      expect(sequence).toEqual(['published', 'temporary-unlinked', 'parent-sync']);
+    });
+
+    it('classifies a temporary-unlink failure after exclusive publication and safely reconciles its exact alias', () => {
+      const workspace = tempWorkspace();
+      const bytes = Buffer.from('published-before-unlink\n');
+      let failUnlink = true;
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: {
+          unlinkNestedTemporary: (temporaryPath) => {
+            if (failUnlink) throw Object.assign(new Error('injected temporary unlink failure'), { code: 'EIO' });
+            fs.unlinkSync(temporaryPath);
+          },
+        },
+      });
+
+      expect(() => ledger.writeIterationArtifact(0, 'coder_summary.txt', bytes)).toThrow(
+        expect.objectContaining({
+          name: 'SecureAutoloopLedgerCommitError',
+          code: 'AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID',
+          committed: true,
+          retryable: false,
+          operation: 'secure_nested_artifact_write',
+          cause: expect.objectContaining({ message: 'injected temporary unlink failure' }),
+        }),
+      );
+
+      const directory = path.join(ledger.directory, 'iter', '0');
+      const target = path.join(directory, 'coder_summary.txt');
+      const aliases = fs.readdirSync(directory).filter((entry) => entry.startsWith('.coder_summary.txt.tmp-'));
+      expect(aliases).toHaveLength(1);
+      const targetBefore = fs.lstatSync(target);
+      const aliasBefore = fs.lstatSync(path.join(directory, aliases[0]));
+      expect(targetBefore.nlink).toBe(2);
+      expect({ dev: aliasBefore.dev, ino: aliasBefore.ino }).toEqual({ dev: targetBefore.dev, ino: targetBefore.ino });
+
+      failUnlink = false;
+      expect(ledger.writeIterationArtifact(0, 'coder_summary.txt', Buffer.from(bytes))).toBe('unchanged');
+      expect(fs.readdirSync(directory)).toEqual(['coder_summary.txt']);
+      const targetAfter = fs.lstatSync(target);
+      expect(targetAfter.nlink).toBe(1);
+      expect({ dev: targetAfter.dev, ino: targetAfter.ino }).toEqual({ dev: targetBefore.dev, ino: targetBefore.ino });
+      expect(fs.readFileSync(target)).toEqual(bytes);
+    });
+
+    it('preserves an exact published alias when retry bytes do not match', () => {
+      const workspace = tempWorkspace();
+      let failUnlink = true;
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: {
+          unlinkNestedTemporary: (temporaryPath) => {
+            if (failUnlink) throw new Error('leave exact published alias');
+            fs.unlinkSync(temporaryPath);
+          },
+        },
+      });
+
+      expect(() => ledger.writeIterationArtifact(0, 'eval_output.json', 'original\n')).toThrow(
+        expect.objectContaining({ code: 'AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID', committed: true }),
+      );
+      failUnlink = false;
+      const directory = path.join(ledger.directory, 'iter', '0');
+      const before = fs.readdirSync(directory).sort();
+
+      expect(() => ledger.writeIterationArtifact(0, 'eval_output.json', 'conflicting\n')).toThrow(
+        /conflicting|immutable/i,
+      );
+      expect(fs.readdirSync(directory).sort()).toEqual(before);
+      expect(fs.readFileSync(path.join(directory, 'eval_output.json'), 'utf8')).toBe('original\n');
+    });
+
+    it('does not reconcile a published alias when another temp-shaped entry makes provenance ambiguous', () => {
+      const workspace = tempWorkspace();
+      const bytes = Buffer.from('ambiguous-alias\n');
+      let failUnlink = true;
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: {
+          unlinkNestedTemporary: (temporaryPath) => {
+            if (failUnlink) throw new Error('leave published alias for ambiguity test');
+            fs.unlinkSync(temporaryPath);
+          },
+        },
+      });
+
+      expect(() => ledger.writeIterationArtifact(0, 'eval_output.json', bytes)).toThrow(
+        expect.objectContaining({ code: 'AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID', committed: true }),
+      );
+      failUnlink = false;
+      const directory = path.join(ledger.directory, 'iter', '0');
+      const unknownTemp = path.join(directory, '.eval_output.json.tmp-1-00000000-0000-4000-8000-000000000001');
+      fs.writeFileSync(unknownTemp, bytes, { mode: 0o600 });
+      const before = fs.readdirSync(directory).sort();
+
+      expect(() => ledger.writeIterationArtifact(0, 'eval_output.json', Buffer.from(bytes))).toThrow(
+        /hardlink|link count|ambiguous|unproven|unsafe/i,
+      );
+      expect(fs.readdirSync(directory).sort()).toEqual(before);
+      expect(fs.lstatSync(path.join(directory, 'eval_output.json')).nlink).toBe(2);
+    });
+
+    it('does not reconcile an unknown hardlink alias even when target bytes match', () => {
+      const workspace = tempWorkspace();
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', { create: true });
+      ledger.writeIterationArtifact(0, 'directive.json', 'seed\n');
+      const directory = path.join(ledger.directory, 'iter', '0');
+      const target = path.join(directory, 'verdict.json');
+      const unknownAlias = path.join(directory, '.verdict.json.tmp-not-an-internal-alias');
+      fs.writeFileSync(target, 'same\n', { mode: 0o600 });
+      fs.linkSync(target, unknownAlias);
+
+      expect(() => ledger.writeIterationArtifact(0, 'verdict.json', 'same\n')).toThrow(/hardlink|link count|unsafe/i);
+      expect(fs.lstatSync(target).nlink).toBe(2);
+      expect(fs.existsSync(unknownAlias)).toBe(true);
+    });
+
+    it('classifies a post-publish verification failure after temporary unlink as committed and non-retryable', () => {
+      const workspace = tempWorkspace();
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: {
+          afterNestedTemporaryUnlink: (event) => {
+            if (event.relativePath === 'iter/0/diff.patch') fs.unlinkSync(event.filePath);
+          },
+        },
+      });
+
+      expect(() => ledger.writeIterationArtifact(0, 'diff.patch', 'published-then-removed\n')).toThrow(
+        expect.objectContaining({
+          name: 'SecureAutoloopLedgerCommitError',
+          code: 'AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID',
+          committed: true,
+          retryable: false,
+          operation: 'secure_nested_artifact_write',
+          cause: expect.objectContaining({ message: expect.stringMatching(/removed|missing|incomplete/i) }),
+        }),
+      );
+      const directory = path.join(ledger.directory, 'iter', '0');
+      expect(fs.existsSync(path.join(directory, 'diff.patch'))).toBe(false);
+      expect(fs.readdirSync(directory).filter((entry) => entry.startsWith('.diff.patch.tmp-'))).toEqual([]);
+    });
+
+    it.each([
+      ['same', Buffer.from('stable\n')],
+      ['different', Buffer.from('replacement\n')],
+    ] as const)(
+      'reports an explicit identity change when a nested child is replaced with %s bytes between lstat and open',
+      (_kind, replacementBytes) => {
+        const workspace = tempWorkspace();
+        let armed = false;
+        let replaced = false;
+        const target = path.join(workspace, 'tasks', 'run-1', 'iter', '0', 'coder_summary.txt');
+        const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+          create: true,
+          testHooks: {
+            afterNestedChildLstat: (event) => {
+              if (!armed || replaced || event.filePath !== target) return;
+              replaced = true;
+              const replacement = `${target}.replacement`;
+              fs.writeFileSync(replacement, replacementBytes, { mode: 0o600 });
+              fs.renameSync(replacement, target);
+            },
+          },
+        });
+        ledger.writeIterationArtifact(0, 'coder_summary.txt', 'stable\n');
+        armed = true;
+
+        let observed: unknown;
+        try {
+          ledger.readIterationArtifact(0, 'coder_summary.txt');
+        } catch (error) {
+          observed = error;
+        }
+        expect(observed).toBeInstanceOf(Error);
+        expect((observed as Error).message).toMatch(/identity|replaced|changed/i);
+        expect((observed as Error).message).not.toMatch(/hardlink with link count 1/i);
+        expect(replaced).toBe(true);
+        expect(fs.lstatSync(target).nlink).toBe(1);
+        expect(fs.readFileSync(target)).toEqual(replacementBytes);
+      },
+    );
+
     it('preserves the primary identity failure and reports an unreachable private temp after parent replacement', () => {
       const workspace = tempWorkspace();
       const warn = vi.fn();

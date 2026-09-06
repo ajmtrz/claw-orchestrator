@@ -53,6 +53,12 @@ export interface SecureLedgerNestedMutationEvent {
   filePath: string;
 }
 
+export interface SecureLedgerNestedPublishEvent {
+  relativePath: string;
+  filePath: string;
+  temporaryPath: string;
+}
+
 export interface SecureReviewerSandboxReadEvent {
   relativePath: string;
   filePath: string;
@@ -72,6 +78,12 @@ export interface SecureAutoloopLedgerOptions {
     beforeFileMutation?: (event: SecureLedgerMutationEvent) => void;
     beforeDirectorySync?: (event: SecureLedgerMutationEvent) => void;
     beforeNestedMutation?: (event: SecureLedgerNestedMutationEvent) => void;
+    beforeNestedPublish?: (event: SecureLedgerNestedPublishEvent) => void;
+    publishNestedTemporary?: (temporaryPath: string, targetPath: string) => void;
+    afterNestedPublish?: (event: SecureLedgerNestedPublishEvent) => void;
+    unlinkNestedTemporary?: (temporaryPath: string) => void;
+    afterNestedTemporaryUnlink?: (event: SecureLedgerNestedPublishEvent) => void;
+    afterNestedChildLstat?: (event: { filePath: string; label: string }) => void;
     afterReviewerSandboxEntryRead?: (event: SecureReviewerSandboxReadEvent) => void;
     closeDescriptor?: (fd: number) => void;
   };
@@ -597,6 +609,7 @@ export class SecureAutoloopLedger {
     parent: PinnedDirectory,
     name: string,
     label: string,
+    expectedLinkCount = 1,
   ): RegularChildSnapshot | undefined {
     validatePathComponent(name, label);
     this.assertIdentity();
@@ -604,26 +617,33 @@ export class SecureAutoloopLedger {
     const target = path.join(parent.path, name);
     const observed = lstatIfPresent(target);
     if (!observed) return undefined;
-    if (observed.isSymbolicLink() || !observed.isFile() || observed.nlink !== 1) {
+    if (observed.isSymbolicLink() || !observed.isFile() || observed.nlink !== expectedLinkCount) {
       rejectNestedFile(target, label, observed);
     }
+    this.testHooks.afterNestedChildLstat?.({ filePath: target, label });
     const fd = fs.openSync(target, fs.constants.O_RDONLY | this.flags.noFollow);
     try {
       const opened = fs.fstatSync(fd);
-      if (!opened.isFile() || opened.nlink !== 1 || !sameIdentity(observed, opened)) {
+      if (opened.isFile() && !sameIdentity(observed, opened)) {
+        throw new Error(`${label} identity changed between lstat and open: '${target}'`);
+      }
+      if (!opened.isFile() || opened.nlink !== expectedLinkCount) {
         rejectNestedFile(target, label, opened);
       }
       this.assertPinnedDirectory(parent);
       const content = fs.readFileSync(fd);
       const afterOpen = fs.fstatSync(fd);
       const current = lstatIfPresent(target);
+      if (current?.isFile() && !sameIdentity(afterOpen, current)) {
+        throw new Error(`${label} identity changed while it was being read: '${target}'`);
+      }
       if (
         !current ||
         current.isSymbolicLink() ||
         !current.isFile() ||
-        current.nlink !== 1 ||
+        current.nlink !== expectedLinkCount ||
+        afterOpen.nlink !== expectedLinkCount ||
         !sameIdentity(opened, afterOpen) ||
-        !sameIdentity(afterOpen, current) ||
         afterOpen.size !== opened.size ||
         afterOpen.mtimeMs !== opened.mtimeMs
       ) {
@@ -640,6 +660,95 @@ export class SecureAutoloopLedger {
     return this.openRegularChildSnapshot(parent, name, label)?.content;
   }
 
+  private isInternalNestedTemporaryName(name: string, entry: string): boolean {
+    const prefix = `.${name}.tmp-`;
+    if (!entry.startsWith(prefix)) return false;
+    return /^(0|[1-9]\d*)-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+      entry.slice(prefix.length),
+    );
+  }
+
+  private committedNestedArtifactError(relativePath: string, error: unknown): SecureAutoloopLedgerCommitError {
+    if (error instanceof SecureAutoloopLedgerCommitError) return error;
+    return new SecureAutoloopLedgerCommitError(
+      'AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID',
+      `Autoloop nested artifact committed state is invalid at ${relativePath}: ${errorMessage(error)}`,
+      { cause: error, operation: 'secure_nested_artifact_write' },
+    );
+  }
+
+  private unlinkNestedTemporary(temporaryPath: string): void {
+    (this.testHooks.unlinkNestedTemporary ?? fs.unlinkSync)(temporaryPath);
+  }
+
+  private reconcileExistingAtomicChild(
+    parent: PinnedDirectory,
+    name: string,
+    bytes: Buffer,
+    relativePath: string,
+  ): AtomicChildWriteResult | undefined {
+    const target = path.join(parent.path, name);
+    const observed = lstatIfPresent(target);
+    if (!observed) return undefined;
+    if (observed.isSymbolicLink() || !observed.isFile()) {
+      rejectNestedFile(target, 'Autoloop nested artifact', observed);
+    }
+
+    if (observed.nlink === 1) {
+      const existing = this.openRegularChildSnapshot(parent, name, 'Autoloop nested artifact');
+      if (!existing?.content.equals(bytes)) {
+        throw new Error(`Refusing to overwrite conflicting immutable Autoloop artifact '${target}'`);
+      }
+      return { outcome: 'unchanged', snapshot: this.syncCommittedNestedArtifact(parent, name, relativePath, existing) };
+    }
+
+    if (observed.nlink !== 2) rejectNestedFile(target, 'Autoloop nested artifact', observed);
+    this.assertIdentity();
+    this.assertPinnedDirectory(parent);
+    const aliases = fs.readdirSync(parent.path).filter((entry) => this.isInternalNestedTemporaryName(name, entry));
+    this.assertPinnedDirectory(parent);
+    if (aliases.length !== 1) rejectNestedFile(target, 'Autoloop nested artifact', observed);
+
+    const aliasName = aliases[0];
+    const aliasPath = path.join(parent.path, aliasName);
+    const aliasObserved = lstatIfPresent(aliasPath);
+    if (!aliasObserved?.isFile() || aliasObserved.nlink !== 2 || !sameIdentity(observed, aliasObserved)) {
+      rejectNestedFile(target, 'Autoloop nested artifact', observed);
+    }
+    const targetSnapshot = this.openRegularChildSnapshot(parent, name, 'Autoloop published nested artifact', 2);
+    const aliasSnapshot = this.openRegularChildSnapshot(parent, aliasName, 'Autoloop published temporary alias', 2);
+    if (
+      !targetSnapshot ||
+      !aliasSnapshot ||
+      !sameIdentity(targetSnapshot.stat, aliasSnapshot.stat) ||
+      !targetSnapshot.content.equals(aliasSnapshot.content)
+    ) {
+      throw new Error(`Refusing to reconcile an unproven Autoloop temporary alias '${aliasPath}'`);
+    }
+    if (!targetSnapshot.content.equals(bytes)) {
+      throw new Error(`Refusing to overwrite conflicting immutable Autoloop artifact '${target}'`);
+    }
+
+    try {
+      this.unlinkNestedTemporary(aliasPath);
+      this.testHooks.afterNestedTemporaryUnlink?.({
+        relativePath,
+        filePath: target,
+        temporaryPath: aliasPath,
+      });
+      const reconciled = this.openRegularChildSnapshot(parent, name, 'Autoloop reconciled nested artifact');
+      if (!reconciled || !sameIdentity(targetSnapshot.stat, reconciled.stat) || !reconciled.content.equals(bytes)) {
+        throw new Error(`Autoloop published temporary alias reconciliation was incomplete: '${relativePath}'`);
+      }
+      return {
+        outcome: 'unchanged',
+        snapshot: this.syncCommittedNestedArtifact(parent, name, relativePath, reconciled),
+      };
+    } catch (error) {
+      throw this.committedNestedArtifactError(relativePath, error);
+    }
+  }
+
   private writeAtomicChild(
     parent: PinnedDirectory,
     name: string,
@@ -650,12 +759,9 @@ export class SecureAutoloopLedger {
     validatePathComponent(name, 'Autoloop nested artifact');
     const target = path.join(parent.path, name);
     const bytes = Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf8');
-    const existing = this.openRegularChildSnapshot(parent, name, 'Autoloop nested artifact');
+    const existing = this.reconcileExistingAtomicChild(parent, name, bytes, relativePath);
     if (existing) {
-      if (!existing.content.equals(bytes)) {
-        throw new Error(`Refusing to overwrite conflicting immutable Autoloop artifact '${target}'`);
-      }
-      return { outcome: 'unchanged', snapshot: this.syncCommittedNestedArtifact(parent, name, relativePath, existing) };
+      return existing;
     }
 
     this.testHooks.beforeNestedMutation?.({ operation: 'artifact-write', relativePath, filePath: target });
@@ -665,7 +771,8 @@ export class SecureAutoloopLedger {
     const temporary = path.join(parent.path, `.${name}.tmp-${process.pid}-${randomUUID()}`);
     let fd: number | undefined;
     let temporaryCreated = false;
-    let renamed = false;
+    let published = false;
+    let temporaryIdentity: fs.Stats | undefined;
     try {
       fd = fs.openSync(
         temporary,
@@ -682,35 +789,50 @@ export class SecureAutoloopLedger {
         offset += written;
       }
       fs.fsyncSync(fd);
+      temporaryIdentity = fs.fstatSync(fd);
       fs.closeSync(fd);
       fd = undefined;
 
       this.testHooks.beforeNestedMutation?.({ operation, relativePath, filePath: target });
       this.assertIdentity();
       this.assertPinnedDirectory(parent);
-      const planted = lstatIfPresent(target);
-      if (planted) {
-        if (planted.isSymbolicLink() || !planted.isFile() || planted.nlink !== 1) {
-          rejectNestedFile(target, 'Autoloop nested artifact', planted);
+      const publishEvent = { relativePath, filePath: target, temporaryPath: temporary };
+      this.testHooks.beforeNestedPublish?.(publishEvent);
+      this.assertIdentity();
+      this.assertPinnedDirectory(parent);
+      try {
+        (this.testHooks.publishNestedTemporary ?? fs.linkSync)(temporary, target);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        this.unlinkNestedTemporary(temporary);
+        temporaryCreated = false;
+        const raced = this.reconcileExistingAtomicChild(parent, name, bytes, relativePath);
+        if (!raced) {
+          throw new Error(`Autoloop nested artifact disappeared after exclusive publish conflict: '${relativePath}'`);
         }
-        const plantedSnapshot = this.openRegularChildSnapshot(parent, name, 'Autoloop nested artifact');
-        if (!plantedSnapshot?.content.equals(bytes)) {
-          throw new Error(`Refusing to overwrite conflicting immutable Autoloop artifact '${target}'`);
-        }
-        return {
-          outcome: 'unchanged',
-          snapshot: this.syncCommittedNestedArtifact(parent, name, relativePath, plantedSnapshot),
-        };
+        return raced;
       }
-
-      fs.renameSync(temporary, target);
-      renamed = true;
+      published = true;
+      this.testHooks.afterNestedPublish?.(publishEvent);
+      this.unlinkNestedTemporary(temporary);
+      temporaryCreated = false;
+      this.testHooks.afterNestedTemporaryUnlink?.(publishEvent);
       const committed = this.openRegularChildSnapshot(parent, name, 'Autoloop nested artifact');
-      if (!committed?.content.equals(bytes)) throw new Error(`Autoloop artifact commit was incomplete: '${target}'`);
+      if (
+        !committed ||
+        !temporaryIdentity ||
+        !sameIdentity(temporaryIdentity, committed.stat) ||
+        !committed.content.equals(bytes)
+      ) {
+        throw new Error(`Autoloop artifact commit was incomplete: '${target}'`);
+      }
       return {
         outcome: 'created',
         snapshot: this.syncCommittedNestedArtifact(parent, name, relativePath, committed),
       };
+    } catch (error) {
+      if (published) throw this.committedNestedArtifactError(relativePath, error);
+      throw error;
     } finally {
       if (fd !== undefined) {
         try {
@@ -719,9 +841,9 @@ export class SecureAutoloopLedger {
           this.logger.warn?.(`[autoloop] failed to close incomplete nested artifact: ${errorMessage(error)}`);
         }
       }
-      if (!renamed) {
+      if (!published && temporaryCreated) {
         try {
-          fs.unlinkSync(temporary);
+          this.unlinkNestedTemporary(temporary);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code === 'ENOENT' && temporaryCreated) {
             this.logger.warn?.(
