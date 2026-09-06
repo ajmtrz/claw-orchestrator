@@ -81,6 +81,7 @@ export interface SecureAutoloopLedgerOptions {
     beforeNestedPublish?: (event: SecureLedgerNestedPublishEvent) => void;
     publishNestedTemporary?: (temporaryPath: string, targetPath: string) => void;
     afterNestedPublish?: (event: SecureLedgerNestedPublishEvent) => void;
+    closeNestedTemporary?: (fd: number) => void;
     unlinkNestedTemporary?: (temporaryPath: string) => void;
     afterNestedTemporaryUnlink?: (event: SecureLedgerNestedPublishEvent) => void;
     afterNestedChildLstat?: (event: { filePath: string; label: string }) => void;
@@ -681,6 +682,76 @@ export class SecureAutoloopLedger {
     (this.testHooks.unlinkNestedTemporary ?? fs.unlinkSync)(temporaryPath);
   }
 
+  private unlinkOwnedNestedTemporary(
+    temporaryPath: string,
+    expectedIdentity: fs.Stats | undefined,
+  ): 'removed' | 'missing' | 'foreign' {
+    const observed = lstatIfPresent(temporaryPath);
+    if (!observed) return 'missing';
+    if (
+      !expectedIdentity ||
+      observed.isSymbolicLink() ||
+      !observed.isFile() ||
+      !sameIdentity(expectedIdentity, observed)
+    ) {
+      return 'foreign';
+    }
+    this.unlinkNestedTemporary(temporaryPath);
+    if (lstatIfPresent(temporaryPath)) {
+      throw new Error(`Autoloop temporary artifact remained after unlink: '${temporaryPath}'`);
+    }
+    return 'removed';
+  }
+
+  private openExpectedNestedAlias(
+    parent: PinnedDirectory,
+    name: string,
+    label: string,
+    expectedIdentity: fs.Stats,
+    expectedBytes: Buffer,
+    expectedLinkCount: number,
+  ): RegularChildSnapshot {
+    const snapshot = this.openRegularChildSnapshot(parent, name, label, expectedLinkCount);
+    if (!snapshot) throw new Error(`${label} was removed before it could be verified`);
+    if (!sameIdentity(expectedIdentity, snapshot.stat)) {
+      throw new Error(`${label} identity changed before it could be verified`);
+    }
+    if (!snapshot.content.equals(expectedBytes)) {
+      throw new Error(`${label} contents changed before it could be verified`);
+    }
+    return snapshot;
+  }
+
+  private verifyPublishedNestedAliases(
+    parent: PinnedDirectory,
+    name: string,
+    temporaryName: string,
+    relativePath: string,
+    expectedIdentity: fs.Stats,
+    expectedBytes: Buffer,
+  ): RegularChildSnapshot {
+    const targetSnapshot = this.openExpectedNestedAlias(
+      parent,
+      name,
+      `Autoloop published nested artifact '${relativePath}'`,
+      expectedIdentity,
+      expectedBytes,
+      2,
+    );
+    const temporarySnapshot = this.openExpectedNestedAlias(
+      parent,
+      temporaryName,
+      `Autoloop published temporary alias '${relativePath}'`,
+      expectedIdentity,
+      expectedBytes,
+      2,
+    );
+    if (!sameIdentity(targetSnapshot.stat, temporarySnapshot.stat)) {
+      throw new Error(`Autoloop published aliases do not share one identity: '${relativePath}'`);
+    }
+    return targetSnapshot;
+  }
+
   private reconcileExistingAtomicChild(
     parent: PinnedDirectory,
     name: string,
@@ -768,10 +839,12 @@ export class SecureAutoloopLedger {
     this.assertIdentity();
     this.assertPinnedDirectory(parent);
 
-    const temporary = path.join(parent.path, `.${name}.tmp-${process.pid}-${randomUUID()}`);
+    const temporaryName = `.${name}.tmp-${process.pid}-${randomUUID()}`;
+    const temporary = path.join(parent.path, temporaryName);
     let fd: number | undefined;
     let temporaryCreated = false;
     let published = false;
+    let temporaryCleanupAttempted = false;
     let temporaryIdentity: fs.Stats | undefined;
     try {
       fd = fs.openSync(
@@ -790,8 +863,9 @@ export class SecureAutoloopLedger {
       }
       fs.fsyncSync(fd);
       temporaryIdentity = fs.fstatSync(fd);
-      fs.closeSync(fd);
+      const temporaryFd = fd;
       fd = undefined;
+      (this.testHooks.closeNestedTemporary ?? fs.closeSync)(temporaryFd);
 
       this.testHooks.beforeNestedMutation?.({ operation, relativePath, filePath: target });
       this.assertIdentity();
@@ -800,11 +874,28 @@ export class SecureAutoloopLedger {
       this.testHooks.beforeNestedPublish?.(publishEvent);
       this.assertIdentity();
       this.assertPinnedDirectory(parent);
+      if (!temporaryIdentity) {
+        throw new Error(`Autoloop temporary artifact identity was not captured: '${relativePath}'`);
+      }
+      this.openExpectedNestedAlias(
+        parent,
+        temporaryName,
+        `Autoloop temporary artifact '${relativePath}'`,
+        temporaryIdentity,
+        bytes,
+        1,
+      );
       try {
         (this.testHooks.publishNestedTemporary ?? fs.linkSync)(temporary, target);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-        this.unlinkNestedTemporary(temporary);
+        temporaryCleanupAttempted = true;
+        const cleanup = this.unlinkOwnedNestedTemporary(temporary, temporaryIdentity);
+        if (cleanup !== 'removed') {
+          throw new Error(
+            `Autoloop temporary artifact could not be safely removed after publish conflict: '${relativePath}'`,
+          );
+        }
         temporaryCreated = false;
         const raced = this.reconcileExistingAtomicChild(parent, name, bytes, relativePath);
         if (!raced) {
@@ -814,7 +905,11 @@ export class SecureAutoloopLedger {
       }
       published = true;
       this.testHooks.afterNestedPublish?.(publishEvent);
-      this.unlinkNestedTemporary(temporary);
+      this.verifyPublishedNestedAliases(parent, name, temporaryName, relativePath, temporaryIdentity, bytes);
+      const cleanup = this.unlinkOwnedNestedTemporary(temporary, temporaryIdentity);
+      if (cleanup !== 'removed') {
+        throw new Error(`Autoloop published temporary alias could not be safely removed: '${relativePath}'`);
+      }
       temporaryCreated = false;
       this.testHooks.afterNestedTemporaryUnlink?.(publishEvent);
       const committed = this.openRegularChildSnapshot(parent, name, 'Autoloop nested artifact');
@@ -841,15 +936,20 @@ export class SecureAutoloopLedger {
           this.logger.warn?.(`[autoloop] failed to close incomplete nested artifact: ${errorMessage(error)}`);
         }
       }
-      if (!published && temporaryCreated) {
+      if (!published && temporaryCreated && !temporaryCleanupAttempted) {
         try {
-          this.unlinkNestedTemporary(temporary);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === 'ENOENT' && temporaryCreated) {
+          const cleanup = this.unlinkOwnedNestedTemporary(temporary, temporaryIdentity);
+          if (cleanup === 'missing') {
             this.logger.warn?.(
               `[autoloop] incomplete nested artifact '${relativePath}' could not be located during cleanup`,
             );
-          } else if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          } else if (cleanup === 'foreign') {
+            this.logger.warn?.(
+              `[autoloop] preserved an unowned incomplete nested artifact at '${temporary}' during cleanup`,
+            );
+          }
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
             this.logger.warn?.(`[autoloop] failed to remove incomplete nested artifact: ${errorMessage(error)}`);
           }
         }
