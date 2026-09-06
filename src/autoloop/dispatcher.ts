@@ -59,6 +59,9 @@ import {
   type SpawnSubagentsArgs,
 } from './planner-tools.js';
 import { extractIterComplete, extractReviewComplete, parseAgentReply } from './agent-tools.js';
+import { SecureAutoloopLedger } from './secure-ledger.js';
+
+export { openPrivateAutoloopDecisions, securePrivateAutoloopDecisionLedger } from './secure-ledger.js';
 
 /**
  * Character budget for the replayed transcript handed to engines without native
@@ -108,6 +111,8 @@ export interface ClaudeAgentDispatcherConfig {
   now?: () => Date;
   /** Internal failure-atomic resume marker; never accepted from an agent. */
   suppressFailedStartAudit?: boolean;
+  /** Shared capability pinned by SessionManager for every flat run-ledger operation. */
+  secureLedger?: SecureAutoloopLedger;
   /**
    * Optional acceptance contract. When present the Reviewer's `advance` is no
    * longer sufficient on its own: the contract runs against the workspace and a
@@ -205,161 +210,6 @@ function normalizePlannerOperationError(error: unknown): AutoloopOperationError 
   return new AutoloopOperationError('AUTOLOOP_ENGINE_FAILURE', `Planner engine transport failed: ${cause.message}`, {
     cause,
   });
-}
-
-const PRIVATE_AUTOLOOP_LEDGER_MODE = 0o700;
-const PRIVATE_AUTOLOOP_DECISIONS_MODE = 0o600;
-const NO_FOLLOW_FLAG = fs.constants.O_NOFOLLOW ?? 0;
-const DIRECTORY_FLAG = fs.constants.O_DIRECTORY ?? 0;
-
-function lstatIfPresent(filePath: string): fs.Stats | undefined {
-  try {
-    return fs.lstatSync(filePath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-    throw error;
-  }
-}
-
-function sameFileIdentity(left: fs.Stats, right: fs.Stats): boolean {
-  return left.dev === right.dev && left.ino === right.ino;
-}
-
-function rejectUnsafeLedgerPath(filePath: string, label: string, observed: fs.Stats): never {
-  if (observed.isSymbolicLink()) {
-    throw new Error(`Refusing ${label} symbolic link '${filePath}'`);
-  }
-  throw new Error(`Refusing non-${label === 'Planner ledger' ? 'directory' : 'regular'} ${label} '${filePath}'`);
-}
-
-/**
- * Open and hold the per-run directory while a decisions descriptor is opened.
- * The lstat/open/fstat identity checks reject pre-planted links and detect a
- * path replacement around open even on platforms where O_NOFOLLOW is absent.
- */
-function missingPath(filePath: string): NodeJS.ErrnoException {
-  return Object.assign(new Error(`ENOENT: no such file or directory, open '${filePath}'`), { code: 'ENOENT' });
-}
-
-function openPrivateLedgerDirectory(
-  workspace: string,
-  runId: string,
-  create: boolean,
-): {
-  ledgerDir: string;
-  ledgerFd: number;
-  ledgerStat: fs.Stats;
-} {
-  const tasksDir = path.join(workspace, 'tasks');
-  const tasksObserved = lstatIfPresent(tasksDir);
-  if (!tasksObserved) {
-    if (!create) throw missingPath(tasksDir);
-    fs.mkdirSync(tasksDir, { mode: PRIVATE_AUTOLOOP_LEDGER_MODE });
-  } else if (tasksObserved.isSymbolicLink() || !tasksObserved.isDirectory()) {
-    rejectUnsafeLedgerPath(tasksDir, 'Planner ledger parent', tasksObserved);
-  }
-
-  const ledgerDir = path.join(tasksDir, runId);
-  let ledgerObserved = lstatIfPresent(ledgerDir);
-  const created = !ledgerObserved;
-  if (created) {
-    if (!create) throw missingPath(ledgerDir);
-    fs.mkdirSync(ledgerDir, { mode: PRIVATE_AUTOLOOP_LEDGER_MODE });
-    ledgerObserved = fs.lstatSync(ledgerDir);
-  }
-  if (!ledgerObserved) throw missingPath(ledgerDir);
-  if (ledgerObserved.isSymbolicLink() || !ledgerObserved.isDirectory()) {
-    rejectUnsafeLedgerPath(ledgerDir, 'Planner ledger', ledgerObserved);
-  }
-
-  const ledgerFd = fs.openSync(ledgerDir, fs.constants.O_RDONLY | DIRECTORY_FLAG | NO_FOLLOW_FLAG);
-  try {
-    const ledgerStat = fs.fstatSync(ledgerFd);
-    if (!ledgerStat.isDirectory() || !sameFileIdentity(ledgerObserved, ledgerStat)) {
-      throw new Error(`Planner ledger path '${ledgerDir}' changed while it was being secured`);
-    }
-    const currentMode = ledgerStat.mode & 0o777;
-    const privateMode = created ? PRIVATE_AUTOLOOP_LEDGER_MODE : currentMode & PRIVATE_AUTOLOOP_LEDGER_MODE;
-    if (currentMode !== privateMode) fs.fchmodSync(ledgerFd, privateMode);
-    return { ledgerDir, ledgerFd, ledgerStat: fs.fstatSync(ledgerFd) };
-  } catch (error) {
-    fs.closeSync(ledgerFd);
-    throw error;
-  }
-}
-
-export interface PrivateAutoloopDecisionsHandle {
-  fd: number;
-  filePath: string;
-}
-
-/**
- * Open decisions.jsonl without following a pre-planted symbolic link. New
- * files are exactly 0600; existing files lose group/other permissions without
- * gaining any owner permission they did not already have.
- */
-export function openPrivateAutoloopDecisions(
-  workspace: string,
-  runId: string,
-  mode: 'read' | 'append',
-  create = false,
-): PrivateAutoloopDecisionsHandle {
-  const { ledgerDir, ledgerFd, ledgerStat } = openPrivateLedgerDirectory(workspace, runId, create);
-  const filePath = path.join(ledgerDir, 'decisions.jsonl');
-  let decisionsFd: number | undefined;
-  try {
-    const observed = lstatIfPresent(filePath);
-    if (observed && (observed.isSymbolicLink() || !observed.isFile())) {
-      rejectUnsafeLedgerPath(filePath, 'decisions.jsonl', observed);
-    }
-    if (!observed && !create) {
-      throw missingPath(filePath);
-    }
-
-    const flags =
-      mode === 'append'
-        ? fs.constants.O_RDWR |
-          fs.constants.O_APPEND |
-          NO_FOLLOW_FLAG |
-          (observed ? 0 : fs.constants.O_CREAT | fs.constants.O_EXCL)
-        : fs.constants.O_RDONLY | NO_FOLLOW_FLAG;
-    decisionsFd = fs.openSync(filePath, flags, PRIVATE_AUTOLOOP_DECISIONS_MODE);
-    const opened = fs.fstatSync(decisionsFd);
-    if (!opened.isFile() || (observed && !sameFileIdentity(observed, opened))) {
-      throw new Error(`decisions.jsonl path '${filePath}' changed while it was being secured`);
-    }
-    const currentMode = opened.mode & 0o777;
-    const privateMode = observed ? currentMode & PRIVATE_AUTOLOOP_DECISIONS_MODE : PRIVATE_AUTOLOOP_DECISIONS_MODE;
-    if (currentMode !== privateMode) fs.fchmodSync(decisionsFd, privateMode);
-
-    const currentLedger = fs.lstatSync(ledgerDir);
-    if (
-      currentLedger.isSymbolicLink() ||
-      !currentLedger.isDirectory() ||
-      !sameFileIdentity(ledgerStat, currentLedger)
-    ) {
-      throw new Error(`Planner ledger path '${ledgerDir}' changed while decisions.jsonl was being opened`);
-    }
-    return { fd: decisionsFd, filePath };
-  } catch (error) {
-    if (decisionsFd !== undefined) fs.closeSync(decisionsFd);
-    throw error;
-  } finally {
-    fs.closeSync(ledgerFd);
-  }
-}
-
-/** Create/harden the private ledger and validate any existing decisions file. */
-export function securePrivateAutoloopDecisionLedger(workspace: string, runId: string): string {
-  const { ledgerDir, ledgerFd } = openPrivateLedgerDirectory(workspace, runId, true);
-  fs.closeSync(ledgerFd);
-  try {
-    const decisions = openPrivateAutoloopDecisions(workspace, runId, 'read');
-    fs.closeSync(decisions.fd);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-  }
-  return ledgerDir;
 }
 
 export type AutoloopResetResult =
@@ -628,6 +478,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   /** Where Reviewer reads from. Created lazily by stageReviewSandbox(). */
   private reviewerSandboxDir: string;
   private ledgerDir: string;
+  private readonly secureLedger: SecureAutoloopLedger;
   /**
    * One promise per immutable logical dispatch, so a re-delivered message is
    * coalesced onto the first send instead of spending a second agent turn.
@@ -681,7 +532,9 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     this.ownerInstanceId = ownerInstanceId;
     this.now = config.now ?? (() => new Date());
     this.agentLeaseMs = config.agentLeaseMs ?? DEFAULT_ACTIVITY_LEASE_MS;
-    this.ledgerDir = securePrivateAutoloopDecisionLedger(config.workspace, config.runId);
+    this.secureLedger =
+      config.secureLedger ?? SecureAutoloopLedger.open(config.workspace, config.runId, { create: true });
+    this.ledgerDir = this.secureLedger.directory;
     this.reviewerSandboxDir = path.join(this.ledgerDir, 'reviewer_sandbox');
   }
 
@@ -704,11 +557,8 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   }
 
   private readGenerationHistory(role: AutoloopRoleName): PhysicalAgentGeneration[] {
-    const generationsPath = path.join(this.ledgerDir, 'agent-generations.jsonl');
-    if (!fs.existsSync(generationsPath)) return [];
-
     const history: PhysicalAgentGeneration[] = [];
-    const lines = fs.readFileSync(generationsPath, 'utf8').split('\n');
+    const lines = (this.secureLedger.readFlatFile('agent-generations.jsonl') ?? '').split('\n');
     for (const line of lines) {
       if (!line) continue;
       let entry: { kind?: unknown; payload?: unknown };
@@ -740,7 +590,6 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   }
 
   private appendGenerationEvent(kind: AgentGenerationEventKind, generation: PhysicalAgentGeneration): void {
-    fs.mkdirSync(this.ledgerDir, { recursive: true });
     const line = JSON.stringify({
       schema_version: LEDGER_SCHEMA_VERSION,
       ts: this.now().toISOString(),
@@ -748,28 +597,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       actor: 'dispatcher',
       payload: { ...generation },
     });
-    const generationsPath = path.join(this.ledgerDir, 'agent-generations.jsonl');
-    fs.appendFileSync(generationsPath, `${line}\n`);
-    this.flushDurableFile(generationsPath, 'agent generation ledger');
-  }
-
-  private flushDurableFile(filePath: string, label: string): void {
-    const fd = fs.openSync(filePath, 'r+');
-    try {
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-    if (process.platform === 'win32') {
-      this.logger.warn?.(`[autoloop] ${label} was flushed, but parent-directory fsync is unavailable on win32`);
-      return;
-    }
-    const directoryFd = fs.openSync(path.dirname(filePath), 'r');
-    try {
-      fs.fsyncSync(directoryFd);
-    } finally {
-      fs.closeSync(directoryFd);
-    }
+    this.secureLedger.appendFlatFile('agent-generations.jsonl', `${line}\n`, true);
   }
 
   private conflict(code: AutoloopAgentConflictCode, role: AutoloopRoleName, detail: string): never {
@@ -841,7 +669,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
           // A prior process may have appended this row and crashed (or thrown)
           // before its durability barrier completed. Re-flush the authoritative
           // ledger before allowing the registry tombstone to commit.
-          this.flushDurableFile(path.join(this.ledgerDir, 'agent-generations.jsonl'), 'agent generation ledger');
+          this.secureLedger.flushFlatFile('agent-generations.jsonl');
           onReleaseCommitted?.();
           return;
         }
@@ -1633,15 +1461,11 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
    * passes, and policy-silence attempts that we rejected.
    */
   private appendDecisionLog(entry: Omit<DecisionLogEntry, 'ts'>): void {
-    let fd: number | undefined;
     try {
       const line = JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n';
-      fd = openPrivateAutoloopDecisions(this.config.workspace, this.config.runId, 'append', true).fd;
-      fs.appendFileSync(fd, line);
+      this.secureLedger.appendFlatFile('decisions.jsonl', line);
     } catch (err) {
       this.logger.warn?.(`[autoloop] decisions.jsonl append failed: ${(err as Error).message}`);
-    } finally {
-      if (fd !== undefined) fs.closeSync(fd);
     }
   }
 
@@ -1737,10 +1561,9 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       payload: { ...evidence },
     } satisfies DecisionLogEntry;
     const decisionsPath = path.join(this.ledgerDir, 'decisions.jsonl');
-
     let fd: number | undefined;
     try {
-      fd = openPrivateAutoloopDecisions(this.config.workspace, this.config.runId, 'append', true).fd;
+      fd = this.secureLedger.openFlatFile('decisions.jsonl', 'append', true).fd;
       fs.appendFileSync(fd, `${JSON.stringify(decision)}\n`);
       let durableLine: string;
       try {
@@ -1748,7 +1571,8 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         // audit data. Flush the appended row before tail verification and
         // before any prepared control effect can begin.
         fs.fsyncSync(fd);
-        this.syncCreatedControlFileDirectory(decisionsPath);
+        if (process.platform === 'win32') this.syncCreatedControlFileDirectory(decisionsPath);
+        else this.secureLedger.syncDirectory();
         let end = fs.fstatSync(fd).size;
         const byte = Buffer.allocUnsafe(1);
         while (end > 0) {
@@ -1807,8 +1631,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     ts: string;
   }): void {
     try {
-      fs.mkdirSync(this.ledgerDir, { recursive: true });
-      fs.appendFileSync(path.join(this.ledgerDir, 'chat.jsonl'), JSON.stringify(entry) + '\n');
+      this.secureLedger.appendFlatFile('chat.jsonl', JSON.stringify(entry) + '\n');
     } catch (err) {
       this.logger.warn?.(`[autoloop] chat.jsonl append failed: ${(err as Error).message}`);
     }

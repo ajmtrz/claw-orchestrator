@@ -16,6 +16,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 
 import type { PushChannel, PushLevel } from './messages.js';
+import { SecureAutoloopLedger } from './secure-ledger.js';
 import { type Logger, nullLogger } from '../logger.js';
 
 // Recipient identifiers are personal contact info — never hard-code them.
@@ -178,7 +179,7 @@ export async function notifyUserFallbackChain(opts: {
 
 /** Append a single push-log entry as JSONL. Best-effort; swallows fs errors. */
 export function appendPushLog(
-  ledgerDir: string,
+  ledgerTarget: string | SecureAutoloopLedger,
   entry: {
     ts: string;
     level: PushLevel;
@@ -189,9 +190,11 @@ export function appendPushLog(
   },
 ): void {
   try {
-    const file = path.join(ledgerDir, 'push_log.jsonl');
-    if (!fs.existsSync(ledgerDir)) fs.mkdirSync(ledgerDir, { recursive: true });
-    fs.appendFileSync(file, JSON.stringify(entry) + '\n');
+    const ledger =
+      typeof ledgerTarget === 'string'
+        ? SecureAutoloopLedger.forLedgerDirectory(ledgerTarget, { create: true })
+        : ledgerTarget;
+    ledger.appendFlatFile('push_log.jsonl', JSON.stringify(entry) + '\n');
   } catch {
     /* swallow — logging failure shouldn't crash the run */
   }

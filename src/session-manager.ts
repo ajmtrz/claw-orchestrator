@@ -383,7 +383,6 @@ import {
   AutoloopOperationError,
   ClaudeAgentDispatcher,
   openPrivateAutoloopDecisions,
-  securePrivateAutoloopDecisionLedger,
   type ClaudeAgentDispatcherConfig,
 } from './autoloop/dispatcher.js';
 import type {
@@ -403,6 +402,7 @@ import {
 } from './autoloop/types.js';
 import { Msg as AutoloopMsg, type PushChannel, type PushLevel, type SendTimeoutPayload } from './autoloop/messages.js';
 import { appendPushLog, notifyUserFallbackChain } from './autoloop/notify.js';
+import { SecureAutoloopLedger } from './autoloop/secure-ledger.js';
 import { UltraappManager } from './ultraapp/manager.js';
 import { UltraappStore, defaultStoreRoot } from './ultraapp/store.js';
 import type { UltraappRouter } from './ultraapp/router.js';
@@ -3829,7 +3829,8 @@ export class SessionManager implements AgentRuntimeProbe {
     const plannerEngine = validateAutoloopRole('planner', opts.plannerEngine, opts.plannerCustomEngine);
     const coderEngine = validateAutoloopRole('coder', opts.coderEngine, opts.coderCustomEngine);
     const reviewerEngine = validateAutoloopRole('reviewer', opts.reviewerEngine, opts.reviewerCustomEngine);
-    const ledgerDir = securePrivateAutoloopDecisionLedger(opts.workspace, opts.runId);
+    const secureLedger = SecureAutoloopLedger.open(opts.workspace, opts.runId, { create: true });
+    const ledgerDir = secureLedger.directory;
     // Per-run policy object — mutable so Planner's update_push_policy is visible
     // to the runner without re-wiring.
     const pushPolicy: PushPolicy = JSON.parse(JSON.stringify(DEFAULT_PUSH_POLICY)) as PushPolicy;
@@ -3855,6 +3856,7 @@ export class SessionManager implements AgentRuntimeProbe {
       runtimeProbe: this,
       ownerInstanceId: this.autoloopOwnerInstanceId,
       suppressFailedStartAudit: opts._resumeTimeoutMigration,
+      secureLedger,
       logger: this.logger,
       pushPolicyRef: pushPolicy,
       onSpawnSubagents: async (args) => {
@@ -3885,7 +3887,7 @@ export class SessionManager implements AgentRuntimeProbe {
           channel,
           logger: this.logger,
         });
-        appendPushLog(ledgerDir, {
+        appendPushLog(secureLedger, {
           ts: new Date().toISOString(),
           level,
           summary,
