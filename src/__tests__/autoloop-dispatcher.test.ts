@@ -2053,7 +2053,10 @@ describe('ClaudeAgentDispatcher — canonical immutable Reviewer verdicts', () =
     expect(fs.readFileSync(verdictPath)).toEqual(first);
   });
 
-  it('tolerates only the known legacy flags field when comparing an existing verdict', () => {
+  it.each([
+    ['an empty array', []],
+    ['a string-only array', ['legacy-runtime-flag', 'legacy-secondary-flag']],
+  ] as const)('tolerates legacy flags containing %s when comparing an existing verdict', (_description, flags) => {
     const { dispatcher, ledgerDir } = makeDispatcher();
     const { persistVerdict } = verdictMethods(dispatcher);
     const payload: VerdictCandidate = {
@@ -2069,7 +2072,7 @@ describe('ClaudeAgentDispatcher — canonical immutable Reviewer verdicts', () =
         iter: 0,
         ts: '2026-09-06T01:00:00.000Z',
         ...payload,
-        flags: ['legacy-runtime-flag'],
+        flags,
       },
       null,
       2,
@@ -2080,36 +2083,166 @@ describe('ClaudeAgentDispatcher — canonical immutable Reviewer verdicts', () =
 
     expect(() => persistVerdict(0, payload)).not.toThrow();
     expect(fs.readFileSync(legacyPath)).toEqual(first);
+  });
+
+  it.each([
+    ['a string', 'legacy-runtime-flag'],
+    ['a number', 1],
+    ['a number-containing array', ['legacy-runtime-flag', 1]],
+    ['a null-containing array', ['legacy-runtime-flag', null]],
+    ['an object-containing array', ['legacy-runtime-flag', { warning: true }]],
+    ['null', null],
+    ['an object', { warning: true }],
+  ])('rejects legacy flags containing %s while preserving the first verdict', (_description, flags) => {
+    const { dispatcher, ledgerDir } = makeDispatcher();
+    const { persistVerdict } = verdictMethods(dispatcher);
+    const payload: VerdictCandidate = {
+      decision: 'advance',
+      metric: 1,
+      audit_notes: 'invalid legacy runtime flags',
+      accepted: true,
+      evidence_id: 'iter-0',
+    };
+    const legacyWithInvalidFlags = `${JSON.stringify(
+      {
+        schema_version: LEDGER_SCHEMA_VERSION,
+        iter: 0,
+        ts: '2026-09-06T01:00:00.000Z',
+        ...payload,
+        flags,
+      },
+      null,
+      2,
+    )}\n`;
+    dispatcher.secureLedgerCapability.writeIterationArtifact(0, 'verdict.json', legacyWithInvalidFlags);
+    const legacyPath = path.join(ledgerDir, 'iter', '0', 'verdict.json');
+    const first = fs.readFileSync(legacyPath);
+
+    expect(() => persistVerdict(0, payload)).toThrow(/conflicting|immutable/i);
+    expect(fs.readFileSync(legacyPath)).toEqual(first);
+  });
+
+  it('rejects unknown own fields while preserving the first verdict', () => {
+    const { dispatcher, ledgerDir } = makeDispatcher();
+    const { persistVerdict } = verdictMethods(dispatcher);
+    const payload: VerdictCandidate = {
+      decision: 'advance',
+      metric: 1,
+      audit_notes: 'unknown legacy field',
+      accepted: true,
+      evidence_id: 'iter-0',
+    };
 
     const legacyWithUnknown = JSON.stringify({
       schema_version: LEDGER_SCHEMA_VERSION,
-      iter: 1,
+      iter: 0,
       ts: '2026-09-06T01:00:00.000Z',
       ...payload,
       runtime_metadata: ['must not be ignored'],
     });
-    dispatcher.secureLedgerCapability.writeIterationArtifact(1, 'verdict.json', legacyWithUnknown);
-    const unknownPath = path.join(ledgerDir, 'iter', '1', 'verdict.json');
+    dispatcher.secureLedgerCapability.writeIterationArtifact(0, 'verdict.json', legacyWithUnknown);
+    const unknownPath = path.join(ledgerDir, 'iter', '0', 'verdict.json');
     const unknownFirst = fs.readFileSync(unknownPath);
 
-    expect(() => persistVerdict(1, payload)).toThrow(/conflicting|immutable/i);
+    expect(() => persistVerdict(0, payload)).toThrow(/conflicting|immutable/i);
     expect(fs.readFileSync(unknownPath)).toEqual(unknownFirst);
   });
 
   it.each([
-    ['decision', { decision: 'hold' }],
-    ['metric', { metric: 2 }],
-    ['audit_notes', { audit_notes: 'materially changed audit' }],
-  ] as const)('rejects a change to durable %s while preserving the first verdict', (_field, change) => {
+    ['decision value', {}, { decision: 'hold' }],
+    ['metric value', {}, { metric: 2 }],
+    ['audit_notes value', {}, { audit_notes: 'materially changed audit' }],
+    ['accepted value', { accepted: true }, { accepted: false }],
+    ['accepted presence', {}, { accepted: true }],
+    ['accepted absence', { accepted: true }, { accepted: undefined }],
+    ['evidence_id value', { evidence_id: 'iter-0' }, { evidence_id: 'iter-1' }],
+    ['evidence_id presence', {}, { evidence_id: 'iter-0' }],
+    ['evidence_id absence', { evidence_id: 'iter-0' }, { evidence_id: undefined }],
+  ] satisfies Array<[string, Partial<VerdictCandidate>, Partial<VerdictCandidate>]>)(
+    'rejects a change to durable %s while preserving the first verdict',
+    (_field, initial, change) => {
+      const { dispatcher, ledgerDir } = makeDispatcher();
+      const { persistVerdict } = verdictMethods(dispatcher);
+      const payload: VerdictCandidate = {
+        decision: 'advance',
+        metric: 1,
+        audit_notes: 'immutable audit',
+        ...initial,
+      };
+      persistVerdict(0, payload);
+      const verdictPath = path.join(ledgerDir, 'iter', '0', 'verdict.json');
+      const first = fs.readFileSync(verdictPath);
+
+      expect(() => persistVerdict(0, { ...payload, ...change })).toThrow(/conflicting|immutable/i);
+      expect(fs.readFileSync(verdictPath)).toEqual(first);
+    },
+  );
+
+  it('rejects a sparse stored verdict when Object.prototype supplies matching durable fields', () => {
     const { dispatcher, ledgerDir } = makeDispatcher();
     const { persistVerdict } = verdictMethods(dispatcher);
-    const payload: VerdictCandidate = { decision: 'advance', metric: 1, audit_notes: 'immutable audit' };
-    persistVerdict(0, payload);
+    const payload: VerdictCandidate = {
+      decision: 'advance',
+      metric: 1,
+      audit_notes: 'inherited values are not persisted values',
+      accepted: true,
+      evidence_id: 'iter-0',
+    };
+    const sparseVerdict = `${JSON.stringify(
+      {
+        schema_version: LEDGER_SCHEMA_VERSION,
+        iter: 0,
+        ts: '2026-09-06T01:00:00.000Z',
+      },
+      null,
+      2,
+    )}\n`;
+    dispatcher.secureLedgerCapability.writeIterationArtifact(0, 'verdict.json', sparseVerdict);
     const verdictPath = path.join(ledgerDir, 'iter', '0', 'verdict.json');
     const first = fs.readFileSync(verdictPath);
+    const inheritedDurableFields = {
+      decision: payload.decision,
+      metric: payload.metric,
+      audit_notes: payload.audit_notes,
+      accepted: payload.accepted,
+      evidence_id: payload.evidence_id,
+    };
+    const originalDescriptors = new Map(
+      Object.keys(inheritedDurableFields).map((key) => [key, Object.getOwnPropertyDescriptor(Object.prototype, key)]),
+    );
+    let conflict: unknown;
 
-    expect(() => persistVerdict(0, { ...payload, ...change })).toThrow(/conflicting|immutable/i);
-    expect(fs.readFileSync(verdictPath)).toEqual(first);
+    try {
+      for (const [key, value] of Object.entries(inheritedDurableFields)) {
+        Object.defineProperty(Object.prototype, key, {
+          configurable: true,
+          enumerable: false,
+          value,
+          writable: true,
+        });
+      }
+
+      try {
+        persistVerdict(0, payload);
+      } catch (error) {
+        conflict = error;
+      }
+      expect(fs.readFileSync(verdictPath)).toEqual(first);
+    } finally {
+      for (const [key, descriptor] of originalDescriptors) {
+        if (descriptor === undefined) {
+          Reflect.deleteProperty(Object.prototype, key);
+        } else {
+          Object.defineProperty(Object.prototype, key, descriptor);
+        }
+      }
+    }
+
+    for (const [key, descriptor] of originalDescriptors) {
+      expect(Object.getOwnPropertyDescriptor(Object.prototype, key)).toEqual(descriptor);
+    }
+    expect(conflict).toBeInstanceOf(Error);
+    expect((conflict as Error).message).toMatch(/conflicting|immutable/i);
   });
 });
 

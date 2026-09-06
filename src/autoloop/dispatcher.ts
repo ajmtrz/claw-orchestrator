@@ -372,10 +372,9 @@ function samePersistedVerdictPayload(stored: Record<string, unknown>, payload: P
     return false;
   }
   const canonical = canonicalPersistedVerdictPayload(payload);
-  const storedEntries = PERSISTED_REVIEW_VERDICT_KEYS.filter((key) => stored[key] !== undefined).map((key) => [
-    key,
-    stored[key],
-  ]);
+  const storedEntries = PERSISTED_REVIEW_VERDICT_KEYS.filter(
+    (key) => Object.hasOwn(stored, key) && stored[key] !== undefined,
+  ).map((key) => [key, stored[key]]);
   const expectedEntries = PERSISTED_REVIEW_VERDICT_KEYS.filter((key) => canonical[key] !== undefined).map((key) => [
     key,
     canonical[key],
