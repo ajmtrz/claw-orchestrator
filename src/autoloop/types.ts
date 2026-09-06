@@ -169,6 +169,8 @@ export interface AutoloopState {
     agent: string;
     phase: string;
     code?: AutoloopOperationErrorCode;
+    committed?: true;
+    retryable?: false;
     error: string;
   }>;
   /** Recent metric history (most-recent last, capped at MAX_METRIC_HISTORY). */

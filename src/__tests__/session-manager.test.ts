@@ -4692,6 +4692,8 @@ describe('SessionManager', () => {
             recent_phase_errors: [
               expect.objectContaining({
                 code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+                committed: true,
+                retryable: false,
               }),
             ],
           });
@@ -4887,6 +4889,8 @@ describe('SessionManager', () => {
             recent_phase_errors: [
               expect.objectContaining({
                 code: 'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+                committed: true,
+                retryable: false,
               }),
             ],
           });
@@ -5406,6 +5410,8 @@ describe('SessionManager', () => {
               consecutive_phase_errors: 1,
               recent_phase_errors: [expect.objectContaining({ agent: 'planner', phase: 'planner_turn', code })],
             });
+            expect(handle.runner.state.recent_phase_errors[0]).not.toHaveProperty('committed');
+            expect(handle.runner.state.recent_phase_errors[0]).not.toHaveProperty('retryable');
             const decisions = fs
               .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
               .trim()

@@ -723,6 +723,8 @@ export class AutoloopRunner extends EventEmitter {
           agent: p.agent,
           phase: p.phase,
           code: p.code,
+          ...(p.committed !== undefined ? { committed: p.committed } : {}),
+          ...(p.retryable !== undefined ? { retryable: p.retryable } : {}),
           error: p.error,
         });
         if (this.state.recent_phase_errors.length > 5) {
