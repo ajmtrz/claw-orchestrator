@@ -18,15 +18,58 @@ export interface SecureLedgerPlatformFlags {
   directory?: number;
 }
 
+export interface SecureLedgerMutationEvent {
+  name?: SecureAutoloopFlatFile;
+  operation: 'chmod' | 'append' | 'flush' | 'directory-sync';
+  filePath: string;
+  fd?: number;
+}
+
 export interface SecureAutoloopLedgerOptions {
   create?: boolean;
   platformFlags?: SecureLedgerPlatformFlags;
+  /** Validate only these compatibility files at construction. Full startup omits this. */
+  validateExistingFlatFiles?: readonly SecureAutoloopFlatFile[];
+  /** Explicit platform seam for testing the documented win32 durability limitation. */
+  platform?: NodeJS.Platform;
+  logger?: { warn?: (message: string) => void };
+  /** Deterministic checked-window seam. Production callers never provide it. */
+  testHooks?: {
+    beforeFileMutation?: (event: SecureLedgerMutationEvent) => void;
+    beforeDirectorySync?: (event: SecureLedgerMutationEvent) => void;
+  };
 }
 
 export interface SecureAutoloopFileHandle {
   fd: number;
   filePath: string;
   created: boolean;
+  name: SecureAutoloopFlatFile;
+  stat: fs.Stats;
+}
+
+export interface SecureAutoloopPreparedAppend {
+  readonly committed: boolean;
+  commitDurable(): void;
+  readLastNonEmptyLine(): string;
+  close(): void;
+}
+
+export class SecureAutoloopLedgerCommitError extends Error {
+  readonly committed = true;
+
+  constructor(
+    readonly code: 'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE' | 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+    message: string,
+    options: { cause: unknown },
+  ) {
+    super(message, options);
+    this.name = 'SecureAutoloopLedgerCommitError';
+  }
+}
+
+export function isCommittedSecureLedgerError(error: unknown): error is SecureAutoloopLedgerCommitError {
+  return error instanceof SecureAutoloopLedgerCommitError && error.committed;
 }
 
 interface PinnedDirectory {
@@ -50,6 +93,10 @@ function missingPath(target: string): NodeJS.ErrnoException {
 
 function sameIdentity(left: fs.Stats, right: fs.Stats): boolean {
   return left.dev === right.dev && left.ino === right.ino;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function rejectDirectory(target: string, label: string, observed: fs.Stats): never {
@@ -95,6 +142,9 @@ export class SecureAutoloopLedger {
     private readonly tasksParent: PinnedDirectory | undefined,
     private readonly runDirectory: PinnedDirectory,
     private readonly flags: Required<SecureLedgerPlatformFlags>,
+    private readonly platform: NodeJS.Platform | undefined,
+    private readonly logger: { warn?: (message: string) => void },
+    private readonly testHooks: NonNullable<SecureAutoloopLedgerOptions['testHooks']>,
   ) {
     this.directory = runDirectory.path;
   }
@@ -106,17 +156,24 @@ export class SecureAutoloopLedger {
     const tasksDir = path.join(workspace, 'tasks');
     const runDir = path.join(tasksDir, runId);
 
-    const tasks = this.openDirectory(tasksDir, 'Autoloop ledger tasks parent', create, flags);
+    const tasks = this.openDirectory(tasksDir, 'Autoloop ledger tasks parent', create, flags, false);
     let run: { pinned: PinnedDirectory; fd: number; created: boolean } | undefined;
     try {
-      run = this.openDirectory(runDir, 'Autoloop ledger run directory', create, flags);
+      run = this.openDirectory(runDir, 'Autoloop ledger run directory', create, flags, false);
       this.assertOpenDirectory(tasks.pinned, tasks.fd);
       this.hardenDirectory(tasks.fd, tasks.created);
       this.hardenDirectory(run.fd, run.created);
       const pinnedTasks = { ...tasks.pinned, stat: fs.fstatSync(tasks.fd) };
       const pinnedRun = { ...run.pinned, stat: fs.fstatSync(run.fd) };
-      const ledger = new SecureAutoloopLedger(pinnedTasks, pinnedRun, flags);
-      ledger.secureExistingFlatFiles();
+      const ledger = new SecureAutoloopLedger(
+        pinnedTasks,
+        pinnedRun,
+        flags,
+        options.platform,
+        options.logger ?? {},
+        options.testHooks ?? {},
+      );
+      ledger.validateExistingFlatFiles(options.validateExistingFlatFiles);
       return ledger;
     } finally {
       if (run) fs.closeSync(run.fd);
@@ -128,11 +185,18 @@ export class SecureAutoloopLedger {
   static forLedgerDirectory(ledgerDir: string, options: SecureAutoloopLedgerOptions = {}): SecureAutoloopLedger {
     const flags = normalizedFlags(options.platformFlags);
     const create = options.create ?? false;
-    const run = this.openDirectory(ledgerDir, 'Autoloop ledger run directory', create, flags);
+    const run = this.openDirectory(ledgerDir, 'Autoloop ledger run directory', create, flags, true);
     try {
       this.hardenDirectory(run.fd, run.created);
-      const ledger = new SecureAutoloopLedger(undefined, { ...run.pinned, stat: fs.fstatSync(run.fd) }, flags);
-      ledger.secureExistingFlatFiles();
+      const ledger = new SecureAutoloopLedger(
+        undefined,
+        { ...run.pinned, stat: fs.fstatSync(run.fd) },
+        flags,
+        options.platform,
+        options.logger ?? {},
+        options.testHooks ?? {},
+      );
+      ledger.validateExistingFlatFiles(options.validateExistingFlatFiles);
       return ledger;
     } finally {
       fs.closeSync(run.fd);
@@ -144,12 +208,13 @@ export class SecureAutoloopLedger {
     label: string,
     create: boolean,
     flags: Required<SecureLedgerPlatformFlags>,
+    recursiveCreate: boolean,
   ): { pinned: PinnedDirectory; fd: number; created: boolean } {
     let observed = lstatIfPresent(target);
     const created = !observed;
     if (!observed) {
       if (!create) throw missingPath(target);
-      fs.mkdirSync(target, { mode: PRIVATE_DIRECTORY_MODE });
+      fs.mkdirSync(target, { mode: PRIVATE_DIRECTORY_MODE, recursive: recursiveCreate });
       observed = fs.lstatSync(target);
     }
     if (observed.isSymbolicLink() || !observed.isDirectory()) rejectDirectory(target, label, observed);
@@ -205,8 +270,9 @@ export class SecureAutoloopLedger {
     this.assertPinnedDirectory(this.runDirectory);
   }
 
-  private secureExistingFlatFiles(): void {
-    for (const name of SECURE_AUTOLOOP_FLAT_FILES) {
+  validateExistingFlatFiles(names: readonly SecureAutoloopFlatFile[] = SECURE_AUTOLOOP_FLAT_FILES): void {
+    this.assertIdentity();
+    for (const name of names) {
       if (!lstatIfPresent(path.join(this.directory, name))) continue;
       const handle = this.openFlatFile(name, 'read');
       fs.closeSync(handle.fd);
@@ -215,6 +281,7 @@ export class SecureAutoloopLedger {
 
   openFlatFile(name: SecureAutoloopFlatFile, mode: 'read' | 'append', create = false): SecureAutoloopFileHandle {
     if (!SECURE_AUTOLOOP_FLAT_FILES.includes(name)) throw new Error(`Unsupported Autoloop ledger file '${name}'`);
+    if (mode === 'read' && create) throw new Error(`Cannot combine read mode with create for '${name}'`);
     this.assertIdentity();
     const filePath = path.join(this.directory, name);
     const observed = lstatIfPresent(filePath);
@@ -237,17 +304,51 @@ export class SecureAutoloopLedger {
         rejectFlatFile(filePath, opened);
       }
 
-      // Opening is not the commit point: revalidate both pinned directories
-      // before changing file permissions or bytes.
-      this.assertIdentity();
+      const handle: SecureAutoloopFileHandle = {
+        fd,
+        filePath,
+        created: observed === undefined,
+        name,
+        stat: opened,
+      };
       const current = opened.mode & 0o777;
       const secure = observed ? current & PRIVATE_FILE_MODE : PRIVATE_FILE_MODE;
-      if (current !== secure) fs.fchmodSync(fd, secure);
-      return { fd, filePath, created: observed === undefined };
+      if (current !== secure) {
+        this.beforeFileMutation(handle, 'chmod');
+        fs.fchmodSync(fd, secure);
+        handle.stat = fs.fstatSync(fd);
+      }
+      return handle;
     } catch (error) {
       fs.closeSync(fd);
       throw error;
     }
+  }
+
+  private assertFileHandle(handle: SecureAutoloopFileHandle): void {
+    this.assertIdentity();
+    const opened = fs.fstatSync(handle.fd);
+    const observed = lstatIfPresent(handle.filePath);
+    if (!observed) throw new Error(`Autoloop ledger file identity changed or was removed: '${handle.filePath}'`);
+    if (observed.isSymbolicLink() || !observed.isFile() || observed.nlink !== 1)
+      rejectFlatFile(handle.filePath, observed);
+    if (!opened.isFile() || opened.nlink !== 1) rejectFlatFile(handle.filePath, opened);
+    if (!sameIdentity(handle.stat, opened) || !sameIdentity(opened, observed)) {
+      throw new Error(`Autoloop ledger file identity changed or was replaced: '${handle.filePath}'`);
+    }
+  }
+
+  private beforeFileMutation(
+    handle: SecureAutoloopFileHandle,
+    operation: SecureLedgerMutationEvent['operation'],
+  ): void {
+    this.testHooks.beforeFileMutation?.({
+      name: handle.name,
+      operation,
+      filePath: handle.filePath,
+      fd: handle.fd,
+    });
+    this.assertFileHandle(handle);
   }
 
   readFlatFile(name: SecureAutoloopFlatFile): string | undefined {
@@ -265,33 +366,152 @@ export class SecureAutoloopLedger {
     }
   }
 
+  prepareFlatFileAppend(name: SecureAutoloopFlatFile, content: string): SecureAutoloopPreparedAppend {
+    const handle = this.openFlatFile(name, 'append', true);
+    let committed = false;
+    let closed = false;
+    let terminalError: unknown;
+    const close = (): void => {
+      if (closed) return;
+      closed = true;
+      fs.closeSync(handle.fd);
+    };
+    const commitDurable = (): void => {
+      if (terminalError !== undefined) throw terminalError;
+      if (committed) return;
+      if (closed) throw new Error(`Cannot commit closed Autoloop ledger append for '${name}'`);
+      try {
+        this.beforeFileMutation(handle, 'append');
+        fs.appendFileSync(handle.fd, content, { encoding: 'utf8' });
+        committed = true;
+        try {
+          this.beforeFileMutation(handle, 'flush');
+          fs.fsyncSync(handle.fd);
+        } catch (error) {
+          throw new SecureAutoloopLedgerCommitError(
+            'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+            `Autoloop ledger row was committed to ${name}, but its file durability barrier failed: ${errorMessage(error)}`,
+            { cause: error },
+          );
+        }
+        try {
+          this.syncDirectory(name);
+        } catch (error) {
+          throw new SecureAutoloopLedgerCommitError(
+            'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+            `Autoloop ledger row was committed to ${name}, but its parent-directory durability barrier failed: ${errorMessage(error)}`,
+            { cause: error },
+          );
+        }
+      } catch (error) {
+        terminalError = error;
+        throw error;
+      }
+    };
+    return {
+      get committed() {
+        return committed;
+      },
+      commitDurable,
+      readLastNonEmptyLine: () => {
+        if (closed) throw new Error(`Cannot read closed Autoloop ledger append for '${name}'`);
+        this.assertFileHandle(handle);
+        let end = fs.fstatSync(handle.fd).size;
+        const byte = Buffer.allocUnsafe(1);
+        while (end > 0) {
+          fs.readSync(handle.fd, byte, 0, 1, end - 1);
+          if (byte[0] !== 0x0a && byte[0] !== 0x0d) break;
+          end--;
+        }
+        const chunks: Buffer[] = [];
+        let cursor = end;
+        while (cursor > 0) {
+          const start = Math.max(0, cursor - 8_192);
+          const chunk = Buffer.allocUnsafe(cursor - start);
+          fs.readSync(handle.fd, chunk, 0, chunk.length, start);
+          const newline = chunk.lastIndexOf(0x0a);
+          if (newline >= 0) {
+            chunks.push(chunk.subarray(newline + 1));
+            break;
+          }
+          chunks.push(chunk);
+          cursor = start;
+        }
+        return Buffer.concat(chunks.reverse()).toString('utf8');
+      },
+      close,
+    };
+  }
+
   appendFlatFile(name: SecureAutoloopFlatFile, content: string, durable = false): void {
     const handle = this.openFlatFile(name, 'append', true);
     try {
+      this.beforeFileMutation(handle, 'append');
       const expected = Buffer.byteLength(content);
       const written = fs.writeSync(handle.fd, content, null, 'utf8');
       if (written !== expected) throw new Error(`Could not append the complete ${name} record`);
-      if (durable) fs.fsyncSync(handle.fd);
+      if (durable) {
+        try {
+          this.beforeFileMutation(handle, 'flush');
+          fs.fsyncSync(handle.fd);
+        } catch (error) {
+          throw new SecureAutoloopLedgerCommitError(
+            'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+            `Autoloop ledger row was committed to ${name}, but its file durability barrier failed: ${errorMessage(error)}`,
+            { cause: error },
+          );
+        }
+      }
     } finally {
       fs.closeSync(handle.fd);
     }
-    if (durable) this.syncDirectory();
+    if (durable) {
+      try {
+        this.syncDirectory(name);
+      } catch (error) {
+        throw new SecureAutoloopLedgerCommitError(
+          'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+          `Autoloop ledger row was committed to ${name}, but its parent-directory durability barrier failed: ${errorMessage(error)}`,
+          { cause: error },
+        );
+      }
+    }
   }
 
   flushFlatFile(name: SecureAutoloopFlatFile): void {
     const handle = this.openFlatFile(name, 'append');
     try {
+      this.beforeFileMutation(handle, 'flush');
       fs.fsyncSync(handle.fd);
     } finally {
       fs.closeSync(handle.fd);
     }
+    this.syncDirectory(name);
   }
 
-  syncDirectory(): void {
+  syncDirectory(name?: SecureAutoloopFlatFile): void {
     this.assertIdentity();
-    if (process.platform === 'win32') return;
+    const event: SecureLedgerMutationEvent = {
+      ...(name ? { name } : {}),
+      operation: 'directory-sync',
+      filePath: this.directory,
+    };
+    this.testHooks.beforeDirectorySync?.(event);
+    this.assertIdentity();
+    if ((this.platform ?? process.platform) === 'win32') {
+      this.logger.warn?.(
+        name === 'decisions.jsonl'
+          ? '[autoloop] parent-directory fsync is unavailable on win32; control file contents were flushed without a POSIX directory-entry guarantee'
+          : `[autoloop] ${name ?? 'ledger'} was flushed, but parent-directory fsync is unavailable on win32`,
+      );
+      return;
+    }
     const fd = fs.openSync(this.directory, fs.constants.O_RDONLY | this.flags.directory | this.flags.noFollow);
     try {
+      const opened = fs.fstatSync(fd);
+      if (!opened.isDirectory() || !sameIdentity(opened, this.runDirectory.stat)) {
+        throw new Error(`Autoloop ledger run directory identity changed before directory sync`);
+      }
       fs.fsyncSync(fd);
     } finally {
       fs.closeSync(fd);
@@ -311,12 +531,19 @@ export function openPrivateAutoloopDecisions(
   mode: 'read' | 'append',
   create = false,
 ): PrivateAutoloopDecisionsHandle {
-  const ledger = SecureAutoloopLedger.open(workspace, runId, { create });
+  if (mode === 'read' && create) throw new Error(`Cannot combine read mode with create for decisions.jsonl`);
+  const ledger = SecureAutoloopLedger.open(workspace, runId, {
+    create,
+    validateExistingFlatFiles: ['decisions.jsonl'],
+  });
   return ledger.openFlatFile('decisions.jsonl', mode, create);
 }
 
 export function securePrivateAutoloopDecisionLedger(workspace: string, runId: string): string {
-  const ledger = SecureAutoloopLedger.open(workspace, runId, { create: true });
+  const ledger = SecureAutoloopLedger.open(workspace, runId, {
+    create: true,
+    validateExistingFlatFiles: ['decisions.jsonl'],
+  });
   ledger.readFlatFile('decisions.jsonl');
   return ledger.directory;
 }

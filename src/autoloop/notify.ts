@@ -188,14 +188,21 @@ export function appendPushLog(
     channel_requested: PushChannel;
     channel_used: string;
   },
+  logger: Pick<Logger, 'warn'> = nullLogger,
 ): void {
   try {
     const ledger =
       typeof ledgerTarget === 'string'
-        ? SecureAutoloopLedger.forLedgerDirectory(ledgerTarget, { create: true })
+        ? SecureAutoloopLedger.forLedgerDirectory(ledgerTarget, {
+            create: true,
+            validateExistingFlatFiles: ['push_log.jsonl'],
+            logger,
+          })
         : ledgerTarget;
     ledger.appendFlatFile('push_log.jsonl', JSON.stringify(entry) + '\n');
-  } catch {
-    /* swallow — logging failure shouldn't crash the run */
+  } catch (error) {
+    // Push audit remains best effort, but a containment rejection must be
+    // observable to operators instead of silently disappearing.
+    logger.warn?.(`[autoloop] push log append failed: ${(error as Error).message}`);
   }
 }

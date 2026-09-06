@@ -59,7 +59,7 @@ import {
   type SpawnSubagentsArgs,
 } from './planner-tools.js';
 import { extractIterComplete, extractReviewComplete, parseAgentReply } from './agent-tools.js';
-import { SecureAutoloopLedger } from './secure-ledger.js';
+import { isCommittedSecureLedgerError, SecureAutoloopLedger } from './secure-ledger.js';
 
 export { openPrivateAutoloopDecisions, securePrivateAutoloopDecisionLedger } from './secure-ledger.js';
 
@@ -542,6 +542,11 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     return { planner: this.plannerName, coder: this.coderName, reviewer: this.reviewerName };
   }
 
+  /** The run-scoped capability pinned when this dispatcher was constructed. */
+  get secureLedgerCapability(): SecureAutoloopLedger {
+    return this.secureLedger;
+  }
+
   private sessionNameFor(role: AutoloopRoleName): string {
     return role === 'planner' ? this.plannerName : role === 'coder' ? this.coderName : this.reviewerName;
   }
@@ -826,6 +831,11 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     try {
       this.appendGenerationEvent('agent_generation_reserved', generation);
     } catch (err) {
+      // The row is authoritative once its bytes have been written and fsynced,
+      // even if the directory-entry barrier could not be completed. Rolling
+      // back the registry reservation here would contradict durable evidence
+      // and allow a duplicate logical generation on retry.
+      if (isCommittedSecureLedgerError(err)) throw err;
       let rolledBack = false;
       let rollbackError: unknown;
       try {
@@ -1560,45 +1570,13 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       actor: 'planner',
       payload: { ...evidence },
     } satisfies DecisionLogEntry;
-    const decisionsPath = path.join(this.ledgerDir, 'decisions.jsonl');
-    let fd: number | undefined;
+    const prepared = this.secureLedger.prepareFlatFileAppend('decisions.jsonl', `${JSON.stringify(decision)}\n`);
     try {
-      fd = this.secureLedger.openFlatFile('decisions.jsonl', 'append', true).fd;
-      fs.appendFileSync(fd, `${JSON.stringify(decision)}\n`);
-      let durableLine: string;
-      try {
-        // The control intent is a commit boundary, not ordinary best-effort
-        // audit data. Flush the appended row before tail verification and
-        // before any prepared control effect can begin.
-        fs.fsyncSync(fd);
-        if (process.platform === 'win32') this.syncCreatedControlFileDirectory(decisionsPath);
-        else this.secureLedger.syncDirectory();
-        let end = fs.fstatSync(fd).size;
-        const byte = Buffer.allocUnsafe(1);
-        while (end > 0) {
-          fs.readSync(fd, byte, 0, 1, end - 1);
-          if (byte[0] !== 0x0a && byte[0] !== 0x0d) break;
-          end--;
-        }
-        const chunks: Buffer[] = [];
-        let cursor = end;
-        while (cursor > 0) {
-          const start = Math.max(0, cursor - 8_192);
-          const chunk = Buffer.allocUnsafe(cursor - start);
-          fs.readSync(fd, chunk, 0, chunk.length, start);
-          const newline = chunk.lastIndexOf(0x0a);
-          if (newline >= 0) {
-            chunks.push(chunk.subarray(newline + 1));
-            break;
-          }
-          chunks.push(chunk);
-          cursor = start;
-        }
-        durableLine = Buffer.concat(chunks.reverse()).toString('utf8');
-      } finally {
-        fs.closeSync(fd);
-        fd = undefined;
-      }
+      // The control intent is a commit boundary, not ordinary best-effort
+      // audit data. Commit through the checked capability and verify the same
+      // opened inode's durable tail before any prepared effect can begin.
+      prepared.commitDurable();
+      const durableLine = prepared.readLastNonEmptyLine();
       const durableRow = JSON.parse(durableLine) as { kind?: unknown; payload?: unknown };
       const durableEvidence =
         durableRow.kind === 'planner_turn_control' && durableRow.payload && typeof durableRow.payload === 'object'
@@ -1615,7 +1593,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         { cause: error },
       );
     } finally {
-      if (fd !== undefined) fs.closeSync(fd);
+      prepared.close();
     }
   }
 

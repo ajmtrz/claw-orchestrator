@@ -382,7 +382,6 @@ import { AutoloopRunner } from './autoloop/runner.js';
 import {
   AutoloopOperationError,
   ClaudeAgentDispatcher,
-  openPrivateAutoloopDecisions,
   type ClaudeAgentDispatcherConfig,
 } from './autoloop/dispatcher.js';
 import type {
@@ -402,7 +401,7 @@ import {
 } from './autoloop/types.js';
 import { Msg as AutoloopMsg, type PushChannel, type PushLevel, type SendTimeoutPayload } from './autoloop/messages.js';
 import { appendPushLog, notifyUserFallbackChain } from './autoloop/notify.js';
-import { SecureAutoloopLedger } from './autoloop/secure-ledger.js';
+import { SecureAutoloopLedger, type SecureAutoloopPreparedAppend } from './autoloop/secure-ledger.js';
 import { UltraappManager } from './ultraapp/manager.js';
 import { UltraappStore, defaultStoreRoot } from './ultraapp/store.js';
 import type { UltraappRouter } from './ultraapp/router.js';
@@ -500,10 +499,7 @@ interface StoredAutoloopResumeContext {
   pendingDispatch: SendTimeoutPayload | null;
 }
 
-interface PreparedSendTimeoutMigrationAppend {
-  fd: number;
-  line: string;
-}
+type PreparedSendTimeoutMigrationAppend = SecureAutoloopPreparedAppend;
 
 class AutoloopChatStateError extends Error {
   constructor(
@@ -541,26 +537,14 @@ function isSendTimeoutPayload(value: unknown): value is SendTimeoutPayload {
  * accidentally authorizing a timeout decrease after process reconstruction.
  */
 function readStoredAutoloopResumeContext(
-  workspace: string,
+  ledger: SecureAutoloopLedger,
   runId: string,
   originalSendTimeoutMs: unknown,
 ): StoredAutoloopResumeContext {
   validateAutoloopTimeoutConfig({ sendTimeoutMs: originalSendTimeoutMs as number | undefined });
   let effectiveSendTimeoutMs = (originalSendTimeoutMs as number | undefined) ?? DEFAULT_SEND_TIMEOUT_MS;
   let pendingDispatch: SendTimeoutPayload | null = null;
-  let audit: ReturnType<typeof openPrivateAutoloopDecisions>;
-  try {
-    audit = openPrivateAutoloopDecisions(workspace, runId, 'read');
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { effectiveSendTimeoutMs, pendingDispatch };
-    throw error;
-  }
-  let auditContents: string;
-  try {
-    auditContents = fs.readFileSync(audit.fd, 'utf8');
-  } finally {
-    fs.closeSync(audit.fd);
-  }
+  const auditContents = ledger.readFlatFile('decisions.jsonl') ?? '';
 
   const lines = auditContents.split('\n');
   for (const line of lines) {
@@ -619,15 +603,10 @@ function encodeSendTimeoutMigration(
 }
 
 function appendSendTimeoutMigration(
-  workspace: string,
+  ledger: SecureAutoloopLedger,
   migration: Omit<SendTimeoutMigrationAuditRecord, 'ts' | 'timestamp' | 'kind' | 'actor'>,
 ): void {
-  const audit = openPrivateAutoloopDecisions(workspace, migration.runId, 'append', true);
-  try {
-    fs.appendFileSync(audit.fd, encodeSendTimeoutMigration(migration));
-  } finally {
-    fs.closeSync(audit.fd);
-  }
+  ledger.appendFlatFile('decisions.jsonl', encodeSendTimeoutMigration(migration), true);
 }
 
 /**
@@ -638,22 +617,14 @@ function appendSendTimeoutMigration(
  * redirected by a path replacement.
  */
 function prepareSendTimeoutMigrationAppend(
-  workspace: string,
+  ledger: SecureAutoloopLedger,
   migration: Omit<SendTimeoutMigrationAuditRecord, 'ts' | 'timestamp' | 'kind' | 'actor'>,
 ): PreparedSendTimeoutMigrationAppend {
-  const audit = openPrivateAutoloopDecisions(workspace, migration.runId, 'append', true);
-  return {
-    fd: audit.fd,
-    line: encodeSendTimeoutMigration(migration),
-  };
+  return ledger.prepareFlatFileAppend('decisions.jsonl', encodeSendTimeoutMigration(migration));
 }
 
 function commitPreparedSendTimeoutMigration(prepared: PreparedSendTimeoutMigrationAppend): void {
-  const expectedBytes = Buffer.byteLength(prepared.line);
-  const writtenBytes = fs.writeSync(prepared.fd, prepared.line, null, 'utf8');
-  if (writtenBytes !== expectedBytes) {
-    throw new Error(`Could not append the complete sendTimeoutMs migration audit record`);
-  }
+  prepared.commitDurable();
 }
 
 function isStringRecord(value: unknown): value is Record<string, string> {
@@ -3820,6 +3791,8 @@ export class SessionManager implements AgentRuntimeProbe {
     _resumeTimeoutMigration?: boolean;
     /** In-memory commit barrier for a prepared append-only migration record. */
     _commitTimeoutMigration?: () => void;
+    /** Run-scoped capability pinned before a stored resume transaction starts. */
+    _secureLedger?: SecureAutoloopLedger;
   }): Promise<{
     runner: AutoloopRunner;
     dispatcher: ClaudeAgentDispatcher;
@@ -3829,7 +3802,17 @@ export class SessionManager implements AgentRuntimeProbe {
     const plannerEngine = validateAutoloopRole('planner', opts.plannerEngine, opts.plannerCustomEngine);
     const coderEngine = validateAutoloopRole('coder', opts.coderEngine, opts.coderCustomEngine);
     const reviewerEngine = validateAutoloopRole('reviewer', opts.reviewerEngine, opts.reviewerCustomEngine);
-    const secureLedger = SecureAutoloopLedger.open(opts.workspace, opts.runId, { create: true });
+    const secureLedger =
+      opts._secureLedger ??
+      SecureAutoloopLedger.open(opts.workspace, opts.runId, {
+        create: true,
+        logger: this.logger,
+      });
+    // A resume may carry a capability opened before the runtime was booted.
+    // Revalidate its pinned path and every existing flat ledger before any
+    // physical agent session can start.
+    secureLedger.assertIdentity();
+    secureLedger.validateExistingFlatFiles();
     const ledgerDir = secureLedger.directory;
     // Per-run policy object — mutable so Planner's update_push_policy is visible
     // to the runner without re-wiring.
@@ -3887,14 +3870,18 @@ export class SessionManager implements AgentRuntimeProbe {
           channel,
           logger: this.logger,
         });
-        appendPushLog(secureLedger, {
-          ts: new Date().toISOString(),
-          level,
-          summary,
-          detail,
-          channel_requested: channel,
-          channel_used: result.channel_used,
-        });
+        appendPushLog(
+          secureLedger,
+          {
+            ts: new Date().toISOString(),
+            level,
+            summary,
+            detail,
+            channel_requested: channel,
+            channel_used: result.channel_used,
+          },
+          this.logger,
+        );
         this.logger.info?.(
           `[autoloop/${runId}] push level=${level} channel=${channel}→${result.channel_used} summary="${summary.slice(0, 80)}"`,
         );
@@ -4238,7 +4225,7 @@ export class SessionManager implements AgentRuntimeProbe {
       // The checks above and the three operations below are synchronous. Audit
       // first, so an append failure leaves both the dispatcher and runner
       // untouched; after that no asynchronous work can swap the pending id.
-      appendSendTimeoutMigration(live.runner.state.workspace, {
+      appendSendTimeoutMigration(live.dispatcher.secureLedgerCapability, {
         runId,
         field: 'sendTimeoutMs',
         oldValue: current,
@@ -4269,7 +4256,15 @@ export class SessionManager implements AgentRuntimeProbe {
     validateAutoloopRole('reviewer', config.reviewerEngine as EngineType | undefined, opts.reviewerCustomEngine);
 
     const workspace = typeof config.workspace === 'string' ? config.workspace : record.cwd;
-    const storedContext = readStoredAutoloopResumeContext(workspace, runId, config.sendTimeoutMs);
+    // Pin one run capability for the complete stored-resume transaction. It
+    // remains the authority for audit replay, any prepared migration append,
+    // and the dispatcher that boots below; no stage re-resolves the path.
+    const secureLedger = SecureAutoloopLedger.open(workspace, runId, {
+      create: false,
+      validateExistingFlatFiles: ['decisions.jsonl'],
+      logger: this.logger,
+    });
+    const storedContext = readStoredAutoloopResumeContext(secureLedger, runId, config.sendTimeoutMs);
     const nodeState = (record.nodes[LEGACY_NODE]?.data as { state?: AutoloopState } | undefined)?.state;
     const recordCarriesPending = nodeState
       ? Object.prototype.hasOwnProperty.call(nodeState, 'pending_dispatch')
@@ -4308,7 +4303,7 @@ export class SessionManager implements AgentRuntimeProbe {
             ...(pending ? { pendingDispatchId: pending.dispatch_id } : {}),
           }
         : undefined;
-    const preparedMigration = migration ? prepareSendTimeoutMigrationAppend(workspace, migration) : undefined;
+    const preparedMigration = migration ? prepareSendTimeoutMigrationAppend(secureLedger, migration) : undefined;
     let migrationCommitted = false;
     try {
       // Custom-engine configs are never persisted (they can carry secrets), so
@@ -4323,6 +4318,7 @@ export class SessionManager implements AgentRuntimeProbe {
           plannerCustomEngine: opts.plannerCustomEngine,
           coderCustomEngine: opts.coderCustomEngine,
           reviewerCustomEngine: opts.reviewerCustomEngine,
+          _secureLedger: secureLedger,
         } as Parameters<SessionManager['_bootAutoloop']>[0],
         {
           timeoutMigration: hasTimeoutIncrease,
@@ -4338,7 +4334,7 @@ export class SessionManager implements AgentRuntimeProbe {
     } finally {
       if (preparedMigration) {
         try {
-          fs.closeSync(preparedMigration.fd);
+          preparedMigration.close();
         } catch (err) {
           // Descriptor cleanup cannot retroactively turn a committed append
           // and successful startup into a failed migration.
@@ -4372,6 +4368,7 @@ export class SessionManager implements AgentRuntimeProbe {
       sendTimeoutMs: config.sendTimeoutMs,
       _resumeTimeoutMigration: opts.timeoutMigration || undefined,
       _commitTimeoutMigration: opts.commitTimeoutMigration,
+      _secureLedger: config._secureLedger,
     };
     try {
       // `restart: true` because an autoloop resume means "bring the loop back
