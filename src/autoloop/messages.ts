@@ -221,21 +221,305 @@ export class AutoloopRoutingError extends Error {
   }
 }
 
-export function validateMessage(env: AnyAutoloopMessage): void {
-  const ok = ALLOWED_ROUTES.some(([f, t, ty]) => f === env.from && t === env.to && ty === env.type);
-  if (!ok) {
-    throw new AutoloopRoutingError(`Invalid v2 routing: ${env.from} → ${env.to} (type=${env.type})`, env);
+function invalidDeliveryPayload(type: string, detail: string): never {
+  const label = type === 'directive_ack' ? 'Directive_ack' : type[0].toUpperCase() + type.slice(1);
+  throw new AutoloopRoutingError(`${label} payload is invalid: ${detail}`);
+}
+
+function canonicalPayloadFields(
+  payload: unknown,
+  type: string,
+  allowed: readonly string[],
+  required: readonly string[],
+): Record<string, unknown> {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+    invalidDeliveryPayload(type, 'expected an object');
   }
-  if (env.type === 'review_request') {
-    const envelopeIter = env.iter;
-    const payloadIter = env.payload.iter;
-    if (envelopeIter !== payloadIter) {
-      throw new AutoloopRoutingError(
-        `Invalid review_request iteration: envelope iter=${String(envelopeIter)} does not match payload iter=${String(payloadIter)}`,
-        env,
-      );
+  const keys = Reflect.ownKeys(payload);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    let supported = typeof key === 'string';
+    if (supported) {
+      supported = false;
+      for (let allowedIndex = 0; allowedIndex < allowed.length; allowedIndex += 1) {
+        if (key === allowed[allowedIndex]) {
+          supported = true;
+          break;
+        }
+      }
+    }
+    if (!supported) invalidDeliveryPayload(type, 'contains unsupported fields');
+  }
+
+  const fields = Object.create(null) as Record<string, unknown>;
+  for (let index = 0; index < allowed.length; index += 1) {
+    const key = allowed[index];
+    const descriptor = Object.getOwnPropertyDescriptor(payload, key);
+    let isRequired = false;
+    for (let requiredIndex = 0; requiredIndex < required.length; requiredIndex += 1) {
+      if (key === required[requiredIndex]) {
+        isRequired = true;
+        break;
+      }
+    }
+    if (!descriptor) {
+      if (isRequired) invalidDeliveryPayload(type, `${key} must be an own data property`);
+      continue;
+    }
+    if (!Object.hasOwn(descriptor, 'value')) {
+      invalidDeliveryPayload(type, `${key} must be an own data property`);
+    }
+    Object.defineProperty(fields, key, { enumerable: true, value: descriptor.value });
+  }
+  return fields;
+}
+
+function canonicalPrimitiveArray<T>(
+  value: unknown,
+  type: string,
+  key: string,
+  accepts: (candidate: unknown) => candidate is T,
+  expected: string,
+): T[] {
+  if (!Array.isArray(value)) {
+    invalidDeliveryPayload(type, `${key} must be ${expected}`);
+  }
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  if (
+    !lengthDescriptor ||
+    !Object.hasOwn(lengthDescriptor, 'value') ||
+    !Number.isSafeInteger(lengthDescriptor.value) ||
+    lengthDescriptor.value < 0
+  ) {
+    invalidDeliveryPayload(type, `${key} must have an own data length`);
+  }
+  const length = lengthDescriptor.value as number;
+  const ownKeys = Reflect.ownKeys(value);
+  if (ownKeys.length !== length + 1) {
+    invalidDeliveryPayload(type, `${key} must contain only exact contiguous indices`);
+  }
+  const clone: T[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor || !Object.hasOwn(descriptor, 'value') || !accepts(descriptor.value)) {
+      invalidDeliveryPayload(type, `${key} must be ${expected}`);
+    }
+    Object.defineProperty(clone, String(index), {
+      configurable: true,
+      enumerable: true,
+      value: descriptor.value,
+      writable: true,
+    });
+  }
+  Object.setPrototypeOf(clone, null);
+  Object.freeze(clone);
+  return clone;
+}
+
+function canonicalDirectiveStringArray(value: unknown, key: 'constraints' | 'success_criteria'): string[] {
+  return canonicalPrimitiveArray(
+    value,
+    'directive',
+    key,
+    (candidate): candidate is string => typeof candidate === 'string',
+    'an array of strings',
+  );
+}
+
+function canonicalDirectivePayload(payload: unknown): DirectivePayload {
+  const fields = canonicalPayloadFields(
+    payload,
+    'directive',
+    ['goal', 'constraints', 'success_criteria', 'max_attempts'],
+    ['goal', 'constraints', 'success_criteria', 'max_attempts'],
+  );
+  const goal = fields.goal;
+  const constraints = canonicalDirectiveStringArray(fields.constraints, 'constraints');
+  const successCriteria = canonicalDirectiveStringArray(fields.success_criteria, 'success_criteria');
+  const maxAttempts = fields.max_attempts;
+  if (typeof goal !== 'string') {
+    invalidDeliveryPayload('directive', 'goal must be a string');
+  }
+  if (!Number.isSafeInteger(maxAttempts) || (maxAttempts as number) <= 0) {
+    invalidDeliveryPayload('directive', 'max_attempts must be a positive safe integer');
+  }
+
+  const canonical = Object.create(null) as DirectivePayload;
+  Object.defineProperty(canonical, 'goal', { enumerable: true, value: goal });
+  Object.defineProperty(canonical, 'constraints', { enumerable: true, value: constraints });
+  Object.defineProperty(canonical, 'success_criteria', { enumerable: true, value: successCriteria });
+  Object.defineProperty(canonical, 'max_attempts', { enumerable: true, value: maxAttempts });
+  Object.freeze(canonical);
+  return canonical;
+}
+
+function canonicalChatPayload(payload: unknown): UserChatPayload {
+  const fields = canonicalPayloadFields(payload, 'chat', ['text'], ['text']);
+  if (typeof fields.text !== 'string') invalidDeliveryPayload('chat', 'text must be a string');
+  const canonical = Object.create(null) as UserChatPayload;
+  Object.defineProperty(canonical, 'text', { enumerable: true, value: fields.text });
+  Object.freeze(canonical);
+  return canonical;
+}
+
+function canonicalDirectiveAckPayload(payload: unknown): DirectiveAckPayload {
+  const fields = canonicalPayloadFields(payload, 'directive_ack', ['understood', 'clarification'], ['understood']);
+  if (typeof fields.understood !== 'boolean') {
+    invalidDeliveryPayload('directive_ack', 'understood must be a boolean');
+  }
+  const hasClarification = Object.hasOwn(fields, 'clarification');
+  if (hasClarification && typeof fields.clarification !== 'string') {
+    invalidDeliveryPayload('directive_ack', 'clarification must be a string when present');
+  }
+  const canonical = Object.create(null) as DirectiveAckPayload;
+  Object.defineProperty(canonical, 'understood', { enumerable: true, value: fields.understood });
+  if (hasClarification) {
+    Object.defineProperty(canonical, 'clarification', { enumerable: true, value: fields.clarification });
+  }
+  Object.freeze(canonical);
+  return canonical;
+}
+
+function canonicalIterDonePayload(payload: unknown, envelopeIter: number): IterDonePayload {
+  const fields = canonicalPayloadFields(
+    payload,
+    'iter_done',
+    ['iter', 'verdict', 'metric', 'regression'],
+    ['iter', 'verdict', 'metric'],
+  );
+  if (!Number.isSafeInteger(fields.iter) || (fields.iter as number) < 0) {
+    invalidDeliveryPayload('iter_done', 'iter must be a nonnegative safe integer');
+  }
+  if (fields.iter !== envelopeIter) {
+    invalidDeliveryPayload('iter_done', `iter ${String(fields.iter)} does not match envelope iter ${envelopeIter}`);
+  }
+  if (fields.verdict !== 'advance' && fields.verdict !== 'hold' && fields.verdict !== 'rollback') {
+    invalidDeliveryPayload('iter_done', 'verdict must be advance, hold, or rollback');
+  }
+  if (fields.metric !== null && (typeof fields.metric !== 'number' || !Number.isFinite(fields.metric))) {
+    invalidDeliveryPayload('iter_done', 'metric must be null or a finite number');
+  }
+  const hasRegression = Object.hasOwn(fields, 'regression');
+  if (hasRegression && typeof fields.regression !== 'boolean') {
+    invalidDeliveryPayload('iter_done', 'regression must be a boolean when present');
+  }
+  const canonical = Object.create(null) as IterDonePayload;
+  Object.defineProperty(canonical, 'iter', { enumerable: true, value: fields.iter });
+  Object.defineProperty(canonical, 'verdict', { enumerable: true, value: fields.verdict });
+  Object.defineProperty(canonical, 'metric', { enumerable: true, value: fields.metric });
+  if (hasRegression) Object.defineProperty(canonical, 'regression', { enumerable: true, value: fields.regression });
+  Object.freeze(canonical);
+  return canonical;
+}
+
+function canonicalReviewRequestPayload(payload: unknown, envelopeIter: number): ReviewRequestPayload {
+  const fields = canonicalPayloadFields(
+    payload,
+    'review_request',
+    ['iter', 'ledger_path', 'prior_metrics'],
+    ['iter', 'ledger_path', 'prior_metrics'],
+  );
+  if (!Number.isSafeInteger(fields.iter) || (fields.iter as number) < 0) {
+    invalidDeliveryPayload('review_request', 'iter must be a nonnegative safe integer');
+  }
+  if (fields.iter !== envelopeIter) {
+    throw new AutoloopRoutingError(
+      `Invalid review_request iteration: envelope iter=${envelopeIter} does not match payload iter=${String(fields.iter)}`,
+    );
+  }
+  if (typeof fields.ledger_path !== 'string') {
+    invalidDeliveryPayload('review_request', 'ledger_path must be a string');
+  }
+  const priorMetrics = canonicalPrimitiveArray(
+    fields.prior_metrics,
+    'review_request',
+    'prior_metrics',
+    (candidate): candidate is number => typeof candidate === 'number' && Number.isFinite(candidate),
+    'an array of finite numbers',
+  );
+  const canonical = Object.create(null) as ReviewRequestPayload;
+  Object.defineProperty(canonical, 'iter', { enumerable: true, value: fields.iter });
+  Object.defineProperty(canonical, 'ledger_path', { enumerable: true, value: fields.ledger_path });
+  Object.defineProperty(canonical, 'prior_metrics', { enumerable: true, value: priorMetrics });
+  Object.freeze(canonical);
+  return canonical;
+}
+
+const MESSAGE_IDENTITY_FIELDS = ['msg_id', 'iter', 'from', 'to', 'type', 'ts', 'payload'] as const;
+
+/**
+ * Validate and snapshot one public message before any routing side effect.
+ * Only own data properties cross this boundary; the returned envelope and all
+ * payloads whose delivery contract is schema-aware are immutable null-prototype
+ * values.
+ */
+export function canonicalizeMessage(env: AnyAutoloopMessage): AnyAutoloopMessage {
+  if (typeof env !== 'object' || env === null || Array.isArray(env)) {
+    throw new AutoloopRoutingError('Invalid v2 envelope identity: expected an object');
+  }
+  const captured = Object.create(null) as Record<string, unknown>;
+  for (let index = 0; index < MESSAGE_IDENTITY_FIELDS.length; index += 1) {
+    const key = MESSAGE_IDENTITY_FIELDS[index];
+    const descriptor = Object.getOwnPropertyDescriptor(env, key);
+    if (!descriptor || !Object.hasOwn(descriptor, 'value')) {
+      throw new AutoloopRoutingError(`Invalid v2 envelope identity: ${key} must be an own data property`);
+    }
+    captured[key] = descriptor.value;
+  }
+
+  const msgId = captured.msg_id;
+  const iter = captured.iter;
+  const from = captured.from;
+  const to = captured.to;
+  const type = captured.type;
+  const ts = captured.ts;
+  if (
+    typeof msgId !== 'string' ||
+    !Number.isSafeInteger(iter) ||
+    (iter as number) < 0 ||
+    typeof from !== 'string' ||
+    typeof to !== 'string' ||
+    typeof type !== 'string' ||
+    typeof ts !== 'string'
+  ) {
+    throw new AutoloopRoutingError('Invalid v2 envelope identity types or iteration');
+  }
+
+  let validRoute = false;
+  for (let index = 0; index < ALLOWED_ROUTES.length; index += 1) {
+    const route = ALLOWED_ROUTES[index];
+    if (route[0] === from && route[1] === to && route[2] === type) {
+      validRoute = true;
+      break;
     }
   }
+  if (!validRoute) {
+    throw new AutoloopRoutingError(`Invalid v2 routing: ${from} → ${to} (type=${type})`, env);
+  }
+
+  if (type === 'chat') {
+    captured.payload = canonicalChatPayload(captured.payload);
+  } else if (type === 'directive') {
+    captured.payload = canonicalDirectivePayload(captured.payload);
+  } else if (type === 'directive_ack') {
+    captured.payload = canonicalDirectiveAckPayload(captured.payload);
+  } else if (type === 'iter_done') {
+    captured.payload = canonicalIterDonePayload(captured.payload, iter as number);
+  } else if (type === 'review_request') {
+    captured.payload = canonicalReviewRequestPayload(captured.payload, iter as number);
+  }
+
+  const identity = Object.create(null) as Record<string, unknown>;
+  for (let index = 0; index < MESSAGE_IDENTITY_FIELDS.length; index += 1) {
+    const key = MESSAGE_IDENTITY_FIELDS[index];
+    Object.defineProperty(identity, key, { enumerable: true, value: captured[key] });
+  }
+  Object.freeze(identity);
+  return identity as unknown as AnyAutoloopMessage;
+}
+
+export function validateMessage(env: AnyAutoloopMessage): void {
+  canonicalizeMessage(env);
 }
 
 // ─── Constructors ────────────────────────────────────────────────────────────

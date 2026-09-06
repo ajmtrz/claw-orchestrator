@@ -15,8 +15,8 @@ import {
   type AnyAutoloopMessage,
   type AutoloopOperationErrorCode,
   AutoloopRoutingError,
+  canonicalizeMessage,
   Msg,
-  validateMessage,
 } from './messages.js';
 import {
   DEFAULT_PUSH_POLICY,
@@ -403,14 +403,14 @@ export class AutoloopRunner extends EventEmitter {
 
   /** Enqueue a message and drain the queue. Resolves when the queue is idle. */
   async send(env: AnyAutoloopMessage): Promise<void> {
-    validateMessage(env);
+    const message = canonicalizeMessage(env);
     this.recordActivity('queue_message_accepted');
-    if (this.drainPromise && env.to === 'runner' && env.type === 'terminate') {
+    if (this.drainPromise && message.to === 'runner' && message.type === 'terminate') {
       // Termination is the one pre-emptive control: queueing it behind a stuck
       // agent send would make the operator unable to stop that send. Apply the
       // terminal transition now; terminate() clears queued work, and the active
       // delivery is ignored when it eventually returns into terminal state.
-      await this.handleOne(env);
+      await this.handleOne(message);
       return;
     }
     let resolve!: () => void;
@@ -420,14 +420,14 @@ export class AutoloopRunner extends EventEmitter {
       reject = rejectPromise;
     });
     const sender: SenderContext = {
-      id: env.msg_id,
+      id: message.msg_id,
       pending: 0,
       settled: false,
       promise,
       resolve,
       reject,
     };
-    this.enqueueMessage(env, sender);
+    this.enqueueMessage(message, sender);
     // Attach rejection handling before the drain can settle this sender. A
     // failed drain stops at its causal boundary; a later sender then starts a
     // fresh drain rather than inheriting the earlier failure.
@@ -664,12 +664,12 @@ export class AutoloopRunner extends EventEmitter {
     const replies = await this.config.dispatcher.deliver(env);
     if (this.terminationStarted || ['terminated', 'crashed'].includes(this.state.status)) return;
     for (const r of replies) {
-      validateMessage(r);
+      const reply = canonicalizeMessage(r);
       // A dispatcher-generated deadline record is bookkeeping, not agent
       // progress. Letting it renew the lease would make a timeout extend the
       // run whose lack of progress caused it.
-      if (r.type !== 'send_timeout') this.recordActivity('agent_progress');
-      this.enqueueMessage(r, sender);
+      if (reply.type !== 'send_timeout') this.recordActivity('agent_progress');
+      this.enqueueMessage(reply, sender);
     }
   }
 

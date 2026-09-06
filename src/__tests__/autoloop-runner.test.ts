@@ -48,7 +48,7 @@ function makeRunner(
   return { runner, pushes };
 }
 
-function makeCanonicalValidationHarness(): {
+function makeCanonicalValidationHarness(overrides: Partial<AutoloopConfig> = {}): {
   runner: AutoloopRunner;
   effects: {
     reserveAgentGeneration: ReturnType<typeof vi.fn>;
@@ -77,14 +77,18 @@ function makeCanonicalValidationHarness(): {
     compactSession: vi.fn(async () => undefined),
   } as unknown as SessionManager;
   const dispatcher = new ClaudeAgentDispatcher({ manager, runId: 'runner-routing', workspace });
+  const publicDispatcherBoundary: AgentDispatcher = {
+    deliver: (env) => dispatcher.deliver(env),
+  };
   const ledgerDir = path.join(workspace, 'tasks', 'runner-routing');
   const runner = new AutoloopRunner({
     run_id: 'runner-routing',
     workspace,
     ledger_dir: ledgerDir,
-    dispatcher,
+    dispatcher: publicDispatcherBoundary,
     phaseErrorCircuit: 3,
     notifyUser: effects.notifyUser,
+    ...overrides,
   });
   return {
     runner,
@@ -735,26 +739,50 @@ describe('AutoloopRunner', () => {
           metric: Number.NaN,
         }),
     ],
+    [
+      'iter_done iteration mismatch',
+      () =>
+        Msg.iterDone(0, {
+          iter: 1,
+          verdict: 'advance',
+          metric: 1,
+        }),
+    ],
   ] as const)(
-    'preserves repeated canonical %s payload rejections without phase-error or agent effects',
+    'rejects invalid %s before activity, message, failure, agent, or filesystem effects',
     async (_type, buildMessage) => {
-      const { runner, effects, ledgerDir, cleanup } = makeCanonicalValidationHarness();
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      const { runner, effects, ledgerDir, cleanup } = makeCanonicalValidationHarness({
+        activityLeaseMs: 60_000,
+        autoloopHardTimeoutMs: 600_000,
+      });
       const routedTypes: string[] = [];
       const phaseErrors: unknown[] = [];
+      const timeoutEvents: unknown[] = [];
+      const terminatedReasons: string[] = [];
       runner.on('message', (message: AnyAutoloopMessage) => routedTypes.push(message.type));
       runner.on('phase_error', (payload: unknown) => phaseErrors.push(payload));
+      runner.on('timeout', (payload: unknown) => timeoutEvents.push(payload));
+      runner.on('terminated', (reason: string) => terminatedReasons.push(reason));
 
       try {
+        await runner.start();
+        const initialActivity = runner.state.last_activity_at;
+        await vi.advanceTimersByTimeAsync(59_000);
         for (let attempt = 0; attempt < 3; attempt += 1) {
           await expect(runner.send(buildMessage())).rejects.toBeInstanceOf(AutoloopRoutingError);
         }
 
+        expect(runner.state.last_activity_at).toBe(initialActivity);
+        expect(timeoutEvents).toEqual([]);
         expect(phaseErrors).toEqual([]);
-        expect(routedTypes).not.toContain('phase_error');
+        expect(routedTypes).toEqual([]);
         expect(runner.state.status).toBe('planning');
         expect(runner.state.consecutive_phase_errors).toBe(0);
         expect(runner.state.recent_phase_errors).toEqual([]);
         expect(runner.state.push_log_count).toBe(0);
+        expect(terminatedReasons).toEqual([]);
         expect(effects.reserveAgentGeneration).toHaveBeenCalledTimes(0);
         expect(effects.startSession).toHaveBeenCalledTimes(0);
         expect(effects.sendMessage).toHaveBeenCalledTimes(0);
@@ -763,9 +791,60 @@ describe('AutoloopRunner', () => {
         expect(fs.existsSync(path.join(ledgerDir, 'decisions.jsonl'))).toBe(false);
         expect(fs.existsSync(path.join(ledgerDir, 'chat.jsonl'))).toBe(false);
         expect(fs.existsSync(path.join(ledgerDir, 'reviewer_sandbox'))).toBe(false);
+
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(timeoutEvents).toEqual([
+          expect.objectContaining({
+            kind: 'activity_lease_expired',
+            last_activity_at: initialActivity,
+            deadline_at: initialActivity + 60_000,
+          }),
+        ]);
+        expect(terminatedReasons).toEqual([]);
       } finally {
         cleanup();
       }
     },
   );
+
+  it('renews and emits one immutable canonical snapshot for a valid public send', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    const delivered: AnyAutoloopMessage[] = [];
+    const dispatcher: AgentDispatcher = {
+      async deliver(env) {
+        delivered.push(env);
+        return [];
+      },
+    };
+    const { runner } = makeRunner(dispatcher, [], {
+      activityLeaseMs: 60_000,
+      autoloopHardTimeoutMs: 600_000,
+    });
+    const emitted: AnyAutoloopMessage[] = [];
+    const timeoutKinds: string[] = [];
+    runner.on('message', (message: AnyAutoloopMessage) => emitted.push(message));
+    runner.on('timeout', (event: { kind: string }) => timeoutKinds.push(event.kind));
+
+    await runner.start();
+    const source = Msg.chat(0, { text: 'stable' });
+    await vi.advanceTimersByTimeAsync(59_000);
+    await runner.send(source);
+
+    expect(runner.state.last_activity_at).toBe(new Date('2026-01-01T00:00:59.000Z').getTime());
+    expect(emitted).toHaveLength(1);
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toBe(emitted[0]);
+    expect(emitted[0]).not.toBe(source);
+    expect(Object.getPrototypeOf(emitted[0])).toBeNull();
+    expect(Object.getPrototypeOf(emitted[0].payload)).toBeNull();
+    expect(Object.isFrozen(emitted[0])).toBe(true);
+    expect(Object.isFrozen(emitted[0].payload)).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(timeoutKinds).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(timeoutKinds).toEqual(['activity_lease_expired']);
+    runner.stop();
+  });
 });

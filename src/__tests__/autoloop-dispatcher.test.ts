@@ -2744,28 +2744,27 @@ describe('ClaudeAgentDispatcher — canonical immutable delivery payloads', () =
     '```',
   ].join('\n');
 
-  it('serializes distinct Reviewer dispatches through stage, send, and result handling while coalescing one ID', async () => {
-    const { dispatcher, calls, ledgerDir } = makeDispatcher();
+  it('keeps distinct Reviewer dispatches queued through post-send persistence and compaction while coalescing one ID', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher(
+      { compactThresholds: { reviewer: 50 } },
+      { contextPercent: 90 },
+    );
     ensureCompleteReviewArtifacts(dispatcher, 0);
     ensureCompleteReviewArtifacts(dispatcher, 1);
     const sandbox = path.join(ledgerDir, 'reviewer_sandbox');
     const sendOrder: number[] = [];
     const observedSandbox: Array<{ iter: number; staged: string[] }> = [];
-    let signalFirstSend!: () => void;
-    const firstSendEntered = new Promise<void>((resolve) => {
-      signalFirstSend = resolve;
+    let signalFirstCompaction!: () => void;
+    const firstCompactionEntered = new Promise<void>((resolve) => {
+      signalFirstCompaction = resolve;
     });
-    let releaseFirstSend!: () => void;
-    const firstSendGate = new Promise<void>((resolve) => {
-      releaseFirstSend = resolve;
+    let releaseFirstCompaction!: () => void;
+    const firstCompactionGate = new Promise<void>((resolve) => {
+      releaseFirstCompaction = resolve;
     });
     calls.sendMessage.mockImplementation(async (_name, prompt: string) => {
       const iter = Number(/^\[review_request iter=(\d+)\]/.exec(prompt)?.[1]);
       sendOrder.push(iter);
-      if (iter === 0) {
-        signalFirstSend();
-        await firstSendGate;
-      }
       observedSandbox.push({
         iter,
         staged: fs
@@ -2774,6 +2773,10 @@ describe('ClaudeAgentDispatcher — canonical immutable delivery payloads', () =
           .sort(),
       });
       return { output: reviewerReply, error: undefined };
+    });
+    calls.compactSession.mockImplementationOnce(async () => {
+      signalFirstCompaction();
+      await firstCompactionGate;
     });
     const firstMessage = fixedIdentity(
       Msg.reviewRequest(0, { iter: 0, ledger_path: ledgerDir, prior_metrics: [0] }),
@@ -2790,7 +2793,7 @@ describe('ClaudeAgentDispatcher — canonical immutable delivery payloads', () =
     );
 
     const first = dispatcher.deliver(firstMessage);
-    await firstSendEntered;
+    await firstCompactionEntered;
     const duplicate = dispatcher.deliver(duplicateMessage);
     const second = dispatcher.deliver(secondMessage);
     let boundaryAssertion: unknown;
@@ -2802,15 +2805,23 @@ describe('ClaudeAgentDispatcher — canonical immutable delivery payloads', () =
           .sort(),
       ).toEqual(['iter-0']);
       expect(calls.sendMessage).toHaveBeenCalledTimes(1);
+      expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'verdict.json'))).toBe(true);
+      expect(fs.existsSync(path.join(ledgerDir, 'iter', '1', 'verdict.json'))).toBe(false);
     } catch (error) {
       boundaryAssertion = error;
     } finally {
-      releaseFirstSend();
+      releaseFirstCompaction();
     }
-    const outcomes = await Promise.allSettled([first, duplicate, second]);
+    const [firstResult, duplicateResult, secondResult] = await Promise.all([first, duplicate, second]);
     if (boundaryAssertion) throw boundaryAssertion;
 
-    expect(outcomes.map(({ status }) => status)).toEqual(['fulfilled', 'fulfilled', 'fulfilled']);
+    expect(duplicateResult).toBe(firstResult);
+    expect(firstResult).toEqual([
+      expect.objectContaining({ type: 'review_verdict', payload: expect.objectContaining({ decision: 'advance' }) }),
+    ]);
+    expect(secondResult).toEqual([
+      expect.objectContaining({ type: 'review_verdict', payload: expect.objectContaining({ decision: 'advance' }) }),
+    ]);
     expect(sendOrder).toEqual([0, 1]);
     expect(observedSandbox).toEqual([
       { iter: 0, staged: ['iter-0'] },
@@ -2818,6 +2829,79 @@ describe('ClaudeAgentDispatcher — canonical immutable delivery payloads', () =
     ]);
     expect(calls.startSession).toHaveBeenCalledTimes(1);
     expect(calls.sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it('releases the Reviewer FIFO after one recoverable send timeout and runs the next distinct review once', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher();
+    ensureCompleteReviewArtifacts(dispatcher, 0);
+    ensureCompleteReviewArtifacts(dispatcher, 1);
+    calls.sendMessage
+      .mockRejectedValueOnce(genuineSendTimeout())
+      .mockResolvedValue({ output: reviewerReply, error: undefined });
+
+    const first = dispatcher.deliver(
+      fixedIdentity(Msg.reviewRequest(0, { iter: 0, ledger_path: ledgerDir, prior_metrics: [] }), 'review-timeout-0'),
+    );
+    const second = dispatcher.deliver(
+      fixedIdentity(
+        Msg.reviewRequest(1, { iter: 1, ledger_path: ledgerDir, prior_metrics: [] }),
+        'review-after-timeout-1',
+      ),
+    );
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+
+    expect(sendTimeout(firstResult).payload).toMatchObject({
+      agent: 'reviewer',
+      message_id: 'review-timeout-0',
+      iter: 0,
+    });
+    expect(secondResult).toEqual([
+      expect.objectContaining({ type: 'review_verdict', payload: expect.objectContaining({ decision: 'advance' }) }),
+    ]);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(2);
+    expect(calls.sendMessage.mock.calls.map((call) => call[1])).toEqual([
+      expect.stringMatching(/^\[review_request iter=0\]/),
+      expect.stringMatching(/^\[review_request iter=1\]/),
+    ]);
+  });
+
+  it('releases the Reviewer FIFO after one fatal phase_error outcome and runs the next distinct review once', async () => {
+    vi.useFakeTimers();
+    const { dispatcher, calls, ledgerDir } = makeDispatcher();
+    ensureCompleteReviewArtifacts(dispatcher, 0);
+    ensureCompleteReviewArtifacts(dispatcher, 1);
+    calls.sendMessage
+      .mockRejectedValueOnce(new Error('first Reviewer process failed'))
+      .mockRejectedValueOnce(new Error('replacement Reviewer process failed'))
+      .mockResolvedValue({ output: reviewerReply, error: undefined });
+
+    const first = dispatcher.deliver(
+      fixedIdentity(Msg.reviewRequest(0, { iter: 0, ledger_path: ledgerDir, prior_metrics: [] }), 'review-fatal-0'),
+    );
+    const second = dispatcher.deliver(
+      fixedIdentity(
+        Msg.reviewRequest(1, { iter: 1, ledger_path: ledgerDir, prior_metrics: [] }),
+        'review-after-fatal-1',
+      ),
+    );
+    await vi.runAllTimersAsync();
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+
+    expect(firstResult).toEqual([
+      expect.objectContaining({
+        type: 'phase_error',
+        payload: expect.objectContaining({ agent: 'reviewer', phase: 'send' }),
+      }),
+    ]);
+    expect(secondResult).toEqual([
+      expect.objectContaining({ type: 'review_verdict', payload: expect.objectContaining({ decision: 'advance' }) }),
+    ]);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(3);
+    expect(calls.sendMessage.mock.calls.map((call) => call[1])).toEqual([
+      expect.stringMatching(/^\[review_request iter=0\]/),
+      expect.stringMatching(/^\[review_request iter=0\]/),
+      expect.stringMatching(/^\[review_request iter=1\]/),
+    ]);
   });
 
   it('releases the Reviewer dispatch queue after a failed stage so the next distinct request can run', async () => {
