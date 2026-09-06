@@ -45,7 +45,11 @@ export { Council, getDefaultCouncilConfig } from './council.js';
 export { AutoloopRunner } from './autoloop/runner.js';
 export { ClaudeAgentDispatcher } from './autoloop/dispatcher.js';
 export { assessRecovery, computeRecoveryToken } from './autoloop/recovery.js';
-export { Msg as AutoloopMsg, validateMessage as autoloopValidate } from './autoloop/messages.js';
+export {
+  Msg as AutoloopMsg,
+  canonicalizeMessage as autoloopCanonicalize,
+  validateMessage as autoloopValidate,
+} from './autoloop/messages.js';
 export type { AutoloopEnvelope, AnyAutoloopMessage, AutoloopMessageType, AutoloopRole } from './autoloop/messages.js';
 export type {
   AgentDispatcher,

@@ -608,13 +608,15 @@ export class AutoloopRunner extends EventEmitter {
         }
         if (phaseAgent && operationFailure) {
           this.failSender(sender, operationFailure);
-          const phaseError = Msg.phaseError(env.iter, {
-            agent: phaseAgent,
-            phase: `${phaseAgent}_turn`,
-            code: operationFailure.code,
-            ...(operationFailure.committed === true ? { committed: true as const, retryable: false as const } : {}),
-            error: operationFailure.message,
-          });
+          const phaseError = canonicalizeMessage(
+            Msg.phaseError(env.iter, {
+              agent: phaseAgent,
+              phase: `${phaseAgent}_turn`,
+              code: operationFailure.code,
+              ...(operationFailure.committed === true ? { committed: true as const, retryable: false as const } : {}),
+              error: operationFailure.message,
+            }),
+          );
           this.enqueueMessage(phaseError, sender, true);
         } else {
           this.failSender(sender, error);
@@ -677,11 +679,13 @@ export class AutoloopRunner extends EventEmitter {
     switch (env.type) {
       case 'iter_artifacts': {
         // Coder produced work for iter N; ask Reviewer to audit.
-        const req = Msg.reviewRequest(env.iter, {
-          iter: env.iter,
-          ledger_path: this.config.ledger_dir,
-          prior_metrics: this.state.metric_history.slice(-10),
-        });
+        const req = canonicalizeMessage(
+          Msg.reviewRequest(env.iter, {
+            iter: env.iter,
+            ledger_path: this.config.ledger_dir,
+            prior_metrics: this.state.metric_history.slice(-10),
+          }),
+        );
         this.enqueueMessage(req, sender);
         return;
       }
@@ -708,12 +712,14 @@ export class AutoloopRunner extends EventEmitter {
           }
         }
 
-        const done = Msg.iterDone(env.iter, {
-          iter: env.iter,
-          verdict: v.decision,
-          metric: v.metric,
-          regression,
-        });
+        const done = canonicalizeMessage(
+          Msg.iterDone(env.iter, {
+            iter: env.iter,
+            verdict: v.decision,
+            metric: v.metric,
+            regression,
+          }),
+        );
         this.enqueueMessage(done, sender);
         // A1: advance iter counter after a verdict is committed. The new iter
         // becomes addressable for follow-up directives, push events, and SSE.
@@ -754,21 +760,21 @@ export class AutoloopRunner extends EventEmitter {
           const detail = this.state.recent_phase_errors
             .map((e) => `${e.agent}/${e.phase}: ${e.error.slice(0, 160)}`)
             .join('\n');
-          this.enqueueMessage(
+          const circuitPush = canonicalizeMessage(
             Msg.pushUser(env.iter, {
               level: 'decision',
               summary: `phase-error circuit tripped (${this.state.consecutive_phase_errors} consecutive)`,
               detail,
               channel: 'both',
             }),
-            sender,
           );
-          this.enqueueMessage(
+          this.enqueueMessage(circuitPush, sender);
+          const circuitTerminate = canonicalizeMessage(
             Msg.terminate(env.iter, {
               reason: 'phase_error_circuit',
             }),
-            sender,
           );
+          this.enqueueMessage(circuitTerminate, sender);
         }
         return;
       }
@@ -788,7 +794,7 @@ export class AutoloopRunner extends EventEmitter {
         }
         this.state.status = 'paused';
         this.state.status_reason = `awaiting_resume:send_timeout:${pending.agent}:${pending.dispatch_id}`;
-        this.state.pending_dispatch = { ...pending };
+        this.state.pending_dispatch = pending;
         this.emit('state', this.state);
         this.emit('send_timeout', this.state.pending_dispatch);
         return;
@@ -867,11 +873,13 @@ export class AutoloopRunner extends EventEmitter {
     const summary = `[${rule}] iter ${iter}`;
     // We synthesise a push_user envelope as if Planner had asked for it, so
     // dedup + push_log book-keeping go through the same path.
-    const message = Msg.pushUser(iter, {
-      level,
-      summary,
-      channel,
-    });
+    const message = canonicalizeMessage(
+      Msg.pushUser(iter, {
+        level,
+        summary,
+        channel,
+      }),
+    );
     if (critical) this.mandatoryPolicyPushes.add(message);
     this.enqueueMessage(message, sender);
     // When firePolicyPush is called from outside a running drain (e.g. the
