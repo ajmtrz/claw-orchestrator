@@ -2250,6 +2250,29 @@ describe('ClaudeAgentDispatcher — canonical immutable Reviewer verdicts', () =
     },
   );
 
+  it.each([
+    ['an unknown string field', 'runtime_metadata'],
+    ['an unknown symbol field', Symbol('runtime-metadata')],
+  ] as const)('rejects %s on an incoming immutable verdict before persistence', (_description, key) => {
+    const { dispatcher, ledgerDir } = makeDispatcher();
+    const { persistVerdict } = verdictMethods(dispatcher);
+    const verdictPath = path.join(ledgerDir, 'iter', '0', 'verdict.json');
+    const payload: Record<PropertyKey, unknown> = {
+      decision: 'advance',
+      metric: 1,
+      audit_notes: 'unknown fields must not be silently stripped',
+    };
+    Object.defineProperty(payload, key, {
+      configurable: true,
+      enumerable: false,
+      value: 'must be rejected',
+      writable: true,
+    });
+
+    expect(() => persistVerdict(0, payload as unknown as VerdictCandidate)).toThrow(/unsupported|immutable|invalid/i);
+    expect(fs.existsSync(verdictPath)).toBe(false);
+  });
+
   it('snapshots each Reviewer verdict data descriptor once without ordinary Proxy reads', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-09-06T01:00:00.000Z'));
@@ -2398,6 +2421,82 @@ describe('ClaudeAgentDispatcher — canonical immutable Reviewer verdicts', () =
 
     expect(() => persistVerdict(0, payload)).toThrow(/conflicting|immutable/i);
     expect(fs.readFileSync(legacyPath)).toEqual(first);
+  });
+
+  it('validates compatible stored legacy flags without consulting polluted array some or every methods', async () => {
+    const { dispatcher, ledgerDir } = makeDispatcher();
+    const { persistVerdict } = verdictMethods(dispatcher);
+    const payload: VerdictCandidate = {
+      decision: 'advance',
+      metric: 1,
+      audit_notes: 'legacy flags remain compatible',
+      accepted: true,
+      evidence_id: 'iter-0',
+    };
+    dispatcher.secureLedgerCapability.writeIterationArtifact(
+      0,
+      'verdict.json',
+      JSON.stringify({
+        schema_version: LEDGER_SCHEMA_VERSION,
+        iter: 0,
+        ts: '2026-09-06T01:00:00.000Z',
+        ...payload,
+        flags: ['legacy-runtime-flag'],
+      }),
+    );
+    const verdictPath = path.join(ledgerDir, 'iter', '0', 'verdict.json');
+    const first = fs.readFileSync(verdictPath);
+    const originalSome = Array.prototype.some;
+    const originalEvery = Array.prototype.every;
+    let someHits = 0;
+    let everyHits = 0;
+
+    const { thrown } = await withPrototypeDescriptors(
+      [
+        {
+          target: Array.prototype,
+          key: 'some',
+          descriptor: {
+            configurable: true,
+            value: function pollutedSome(
+              this: unknown[],
+              predicate: (value: unknown, index: number, array: unknown[]) => unknown,
+            ): boolean {
+              if (this[0] === 'schema_version') {
+                someHits += 1;
+                return true;
+              }
+              return originalSome.call(this, predicate);
+            },
+            writable: true,
+          },
+        },
+        {
+          target: Array.prototype,
+          key: 'every',
+          descriptor: {
+            configurable: true,
+            value: function pollutedEvery(
+              this: unknown[],
+              predicate: (value: unknown, index: number, array: unknown[]) => unknown,
+            ): boolean {
+              if (this[0] === 'legacy-runtime-flag') {
+                everyHits += 1;
+                return false;
+              }
+              return originalEvery.call(this, predicate);
+            },
+            writable: true,
+          },
+        },
+      ],
+      () => persistVerdict(0, payload),
+    );
+
+    expect(thrown).toBeUndefined();
+    expect(someHits).toBe(0);
+    expect(everyHits).toBe(0);
+    expect(fs.readFileSync(verdictPath)).toEqual(first);
   });
 
   it('rejects unknown own fields while preserving the first verdict', () => {
@@ -2632,6 +2731,440 @@ describe('ClaudeAgentDispatcher — canonical immutable Reviewer verdicts', () =
       expect(fs.readFileSync(verdictPath)).toEqual(first);
     },
   );
+});
+
+describe('ClaudeAgentDispatcher — canonical immutable delivery payloads', () => {
+  const reviewerReply = [
+    'Independent review complete.',
+    '```autoloop',
+    JSON.stringify({
+      tool: 'review_complete',
+      args: { decision: 'advance', metric: 1, audit_notes: 'canonical request reviewed' },
+    }),
+    '```',
+  ].join('\n');
+
+  it('snapshots a proxied chat before Planner startup and uses only the snapshot for chat and prompt effects', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'Planner reply' });
+    const target = { text: 'stable chat' };
+    const descriptorReads = new Map<PropertyKey, number>();
+    let ordinaryReads = 0;
+    const payload = new Proxy(target, {
+      get(inner, key, receiver) {
+        ordinaryReads += 1;
+        return Reflect.get(inner, key, receiver);
+      },
+      getOwnPropertyDescriptor(inner, key) {
+        descriptorReads.set(key, (descriptorReads.get(key) ?? 0) + 1);
+        return Reflect.getOwnPropertyDescriptor(inner, key);
+      },
+    });
+    const startSession = calls.startSession.getMockImplementation()!;
+    calls.startSession.mockImplementation(async (config, generation) => {
+      target.text = 'mutated after canonicalization';
+      return await startSession(config, generation);
+    });
+
+    const message = Msg.chat(0, payload);
+    await dispatcher.deliver(message);
+
+    expect(ordinaryReads).toBe(0);
+    expect(descriptorReads.get('text')).toBe(1);
+    expect(calls.sendMessage.mock.calls[0][1]).toBe('stable chat');
+    const chatLines = fs.readFileSync(path.join(ledgerDir, 'chat.jsonl'), 'utf8').trimEnd().split('\n');
+    expect(chatLines[0]).toBe(JSON.stringify({ who: 'user', text: 'stable chat', ts: message.ts }));
+    const chat = JSON.parse(chatLines[0]) as Record<string, unknown>;
+    expect(chat).toMatchObject({ who: 'user', text: 'stable chat' });
+  });
+
+  it('snapshots a proxied review request before Reviewer startup and preserves exact clean prompt bytes', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+    ensureCompleteReviewArtifacts(dispatcher, 4);
+    const metrics = [1, 2];
+    const target = { iter: 4, ledger_path: ledgerDir, prior_metrics: metrics };
+    const descriptorReads = new Map<PropertyKey, number>();
+    let ordinaryReads = 0;
+    const payload = new Proxy(target, {
+      get(inner, key, receiver) {
+        ordinaryReads += 1;
+        return Reflect.get(inner, key, receiver);
+      },
+      getOwnPropertyDescriptor(inner, key) {
+        descriptorReads.set(key, (descriptorReads.get(key) ?? 0) + 1);
+        return Reflect.getOwnPropertyDescriptor(inner, key);
+      },
+    });
+    const startSession = calls.startSession.getMockImplementation()!;
+    calls.startSession.mockImplementation(async (config, generation) => {
+      target.iter = 9;
+      target.ledger_path = '/mutated/path';
+      metrics[0] = 99;
+      return await startSession(config, generation);
+    });
+
+    await dispatcher.deliver(Msg.reviewRequest(4, payload));
+
+    expect(ordinaryReads).toBe(0);
+    for (const field of ['iter', 'ledger_path', 'prior_metrics']) expect(descriptorReads.get(field)).toBe(1);
+    expect(calls.sendMessage.mock.calls[0][1]).toBe(
+      [
+        '[review_request iter=4]',
+        'Artifacts staged at: iter-4/ (directive.json, diff.patch, eval_output.json)',
+        'prior_verdict: (none)',
+        'prior_metrics: [1,2]',
+        '',
+        'Audit and emit `review_complete`.',
+      ].join('\n'),
+    );
+  });
+
+  it('preserves clean directive_ack and iter_done prompt bytes while snapshotting before Planner startup', async () => {
+    const { dispatcher, calls } = makeDispatcher({}, { sendOutputs: ['ack reply', 'done reply'] });
+    const ack = { understood: true, clarification: 'none' };
+    const startSession = calls.startSession.getMockImplementation()!;
+    calls.startSession.mockImplementation(async (config, generation) => {
+      ack.understood = false;
+      ack.clarification = 'mutated';
+      return await startSession(config, generation);
+    });
+
+    await dispatcher.deliver(Msg.directiveAck(2, ack));
+    await dispatcher.deliver(Msg.iterDone(2, { iter: 2, verdict: 'advance', metric: 1, regression: false }));
+
+    expect(calls.sendMessage.mock.calls[0][1]).toBe(
+      '[system] coder directive_ack iter=2: {"understood":true,"clarification":"none"}',
+    );
+    expect(calls.sendMessage.mock.calls[1][1]).toBe('[system] iter 2 done. verdict=advance metric=1');
+  });
+
+  it.each([
+    ['chat', Msg.chat(0, Object.create({ text: 'inherited' }) as { text: string })],
+    ['directive_ack', Msg.directiveAck(0, Object.create({ understood: true }) as { understood: boolean })],
+    [
+      'iter_done',
+      Msg.iterDone(0, Object.create({ iter: 0, verdict: 'advance', metric: 1 }) as Parameters<typeof Msg.iterDone>[1]),
+    ],
+    [
+      'review_request',
+      Msg.reviewRequest(
+        0,
+        Object.create({ iter: 0, ledger_path: '/trusted/run', prior_metrics: [] }) as Parameters<
+          typeof Msg.reviewRequest
+        >[1],
+      ),
+    ],
+  ] as const)('rejects inherited required fields for %s as a typed pre-effect routing error', async (_type, env) => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'must not be sent' });
+
+    await expect(dispatcher.deliver(env)).rejects.toBeInstanceOf(AutoloopRoutingError);
+
+    expect(fs.existsSync(path.join(ledgerDir, 'chat.jsonl'))).toBe(false);
+    expect(fs.existsSync(path.join(ledgerDir, 'reviewer_sandbox'))).toBe(false);
+    expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+    expect(calls.startSession).toHaveBeenCalledTimes(0);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(0);
+  });
+
+  it.each([
+    ['chat', () => Msg.chat(0, { text: 'chat', extra: true } as unknown as Parameters<typeof Msg.chat>[1])],
+    [
+      'directive_ack',
+      () => Msg.directiveAck(0, { understood: true, extra: true } as unknown as Parameters<typeof Msg.directiveAck>[1]),
+    ],
+    [
+      'iter_done',
+      () =>
+        Msg.iterDone(0, {
+          iter: 0,
+          verdict: 'advance',
+          metric: 1,
+          extra: true,
+        } as unknown as Parameters<typeof Msg.iterDone>[1]),
+    ],
+    [
+      'review_request',
+      () =>
+        Msg.reviewRequest(0, {
+          iter: 0,
+          ledger_path: '/trusted/run',
+          prior_metrics: [],
+          extra: true,
+        } as unknown as Parameters<typeof Msg.reviewRequest>[1]),
+    ],
+  ] as const)('rejects extra own fields for %s before any effect', async (_type, buildMessage) => {
+    const { dispatcher, calls } = makeDispatcher({}, { sendOutput: 'must not be sent' });
+
+    await expect(dispatcher.deliver(buildMessage())).rejects.toBeInstanceOf(AutoloopRoutingError);
+    expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+    expect(calls.startSession).toHaveBeenCalledTimes(0);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(0);
+  });
+
+  it.each([
+    ['chat', () => Msg.chat(0, { text: 1 } as unknown as Parameters<typeof Msg.chat>[1])],
+    [
+      'directive_ack understood',
+      () => Msg.directiveAck(0, { understood: 'yes' } as unknown as Parameters<typeof Msg.directiveAck>[1]),
+    ],
+    [
+      'directive_ack clarification',
+      () =>
+        Msg.directiveAck(0, { understood: true, clarification: undefined } as Parameters<typeof Msg.directiveAck>[1]),
+    ],
+    [
+      'iter_done iter',
+      () => Msg.iterDone(0, { iter: -1, verdict: 'advance', metric: 1 } as Parameters<typeof Msg.iterDone>[1]),
+    ],
+    [
+      'iter_done verdict',
+      () =>
+        Msg.iterDone(0, {
+          iter: 0,
+          verdict: 'pause',
+          metric: 1,
+        } as unknown as Parameters<typeof Msg.iterDone>[1]),
+    ],
+    ['iter_done metric', () => Msg.iterDone(0, { iter: 0, verdict: 'hold', metric: Number.NaN })],
+    ['iter_done regression', () => Msg.iterDone(0, { iter: 0, verdict: 'hold', metric: null, regression: undefined })],
+    [
+      'review_request ledger_path',
+      () =>
+        Msg.reviewRequest(0, {
+          iter: 0,
+          ledger_path: 1,
+          prior_metrics: [],
+        } as unknown as Parameters<typeof Msg.reviewRequest>[1]),
+    ],
+    [
+      'review_request metric',
+      () => Msg.reviewRequest(0, { iter: 0, ledger_path: '/trusted/run', prior_metrics: [Number.POSITIVE_INFINITY] }),
+    ],
+  ] as const)('rejects invalid %s types or ranges as typed pre-effect errors', async (_description, buildMessage) => {
+    const { dispatcher, calls } = makeDispatcher({}, { sendOutput: 'must not be sent' });
+
+    await expect(dispatcher.deliver(buildMessage())).rejects.toBeInstanceOf(AutoloopRoutingError);
+    expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+    expect(calls.startSession).toHaveBeenCalledTimes(0);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(0);
+  });
+
+  it('types directive schema rejection as an AutoloopRoutingError at the same public boundary', async () => {
+    const { dispatcher, calls } = makeDispatcher({}, { sendOutput: 'must not be sent' });
+
+    await expect(
+      dispatcher.deliver(
+        Msg.directive(0, {
+          goal: 'typed rejection',
+          constraints: [],
+          success_criteria: [],
+          max_attempts: 0,
+        }),
+      ),
+    ).rejects.toBeInstanceOf(AutoloopRoutingError);
+    expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+    expect(calls.startSession).toHaveBeenCalledTimes(0);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(0);
+  });
+
+  it.each(['chat', 'directive_ack', 'iter_done', 'review_request'] as const)(
+    'rejects symbol own fields for %s before any effect',
+    async (type) => {
+      const { dispatcher, calls } = makeDispatcher({}, { sendOutput: 'must not be sent' });
+      const payload: Record<PropertyKey, unknown> =
+        type === 'chat'
+          ? { text: 'chat' }
+          : type === 'directive_ack'
+            ? { understood: true }
+            : type === 'iter_done'
+              ? { iter: 0, verdict: 'advance', metric: 1 }
+              : { iter: 0, ledger_path: '/trusted/run', prior_metrics: [] };
+      Object.defineProperty(payload, Symbol('payload-metadata'), { value: true });
+      const env =
+        type === 'chat'
+          ? Msg.chat(0, payload as unknown as Parameters<typeof Msg.chat>[1])
+          : type === 'directive_ack'
+            ? Msg.directiveAck(0, payload as unknown as Parameters<typeof Msg.directiveAck>[1])
+            : type === 'iter_done'
+              ? Msg.iterDone(0, payload as unknown as Parameters<typeof Msg.iterDone>[1])
+              : Msg.reviewRequest(0, payload as unknown as Parameters<typeof Msg.reviewRequest>[1]);
+
+      await expect(dispatcher.deliver(env)).rejects.toBeInstanceOf(AutoloopRoutingError);
+      expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+      expect(calls.startSession).toHaveBeenCalledTimes(0);
+      expect(calls.sendMessage).toHaveBeenCalledTimes(0);
+    },
+  );
+
+  it.each(['hole', 'accessor', 'named', 'symbol'] as const)(
+    'rejects review_request prior_metrics with a %s without invoking array accessors',
+    async (kind) => {
+      const { dispatcher, calls } = makeDispatcher({}, { sendOutput: 'must not be sent' });
+      const metrics = [1];
+      let getterHits = 0;
+      if (kind === 'hole') metrics.length = 2;
+      if (kind === 'accessor') {
+        Object.defineProperty(metrics, '0', {
+          configurable: true,
+          enumerable: true,
+          get() {
+            getterHits += 1;
+            return 1;
+          },
+        });
+      }
+      if (kind === 'named') Object.defineProperty(metrics, 'metadata', { value: 'unsupported' });
+      if (kind === 'symbol') Object.defineProperty(metrics, Symbol('metadata'), { value: 'unsupported' });
+
+      await expect(
+        dispatcher.deliver(Msg.reviewRequest(0, { iter: 0, ledger_path: '/trusted/run', prior_metrics: metrics })),
+      ).rejects.toBeInstanceOf(AutoloopRoutingError);
+
+      expect(getterHits).toBe(0);
+      expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+      expect(calls.startSession).toHaveBeenCalledTimes(0);
+      expect(calls.sendMessage).toHaveBeenCalledTimes(0);
+    },
+  );
+
+  it('rejects own payload toJSON without invoking it and ignores inherited payload toJSON during prompt serialization', async () => {
+    const ownPayload = { understood: true } as Record<string, unknown>;
+    let ownToJsonHits = 0;
+    Object.defineProperty(ownPayload, 'toJSON', {
+      configurable: true,
+      enumerable: false,
+      get() {
+        ownToJsonHits += 1;
+        return () => ({ understood: false });
+      },
+    });
+    const own = makeDispatcher({}, { sendOutput: 'must not be sent' });
+
+    await expect(
+      own.dispatcher.deliver(Msg.directiveAck(0, ownPayload as unknown as Parameters<typeof Msg.directiveAck>[1])),
+    ).rejects.toBeInstanceOf(AutoloopRoutingError);
+    expect(ownToJsonHits).toBe(0);
+    expect(own.calls.startSession).toHaveBeenCalledTimes(0);
+    expect(own.calls.sendMessage).toHaveBeenCalledTimes(0);
+
+    const inheritedPayload = { understood: true, clarification: 'stable' };
+    const inherited = makeDispatcher({}, { sendOutput: 'Planner reply' });
+    let inheritedToJsonHits = 0;
+    const { thrown } = await withPrototypeDescriptors(
+      [
+        {
+          target: Object.prototype,
+          key: 'toJSON',
+          descriptor: {
+            configurable: true,
+            get() {
+              if (this === inheritedPayload) {
+                inheritedToJsonHits += 1;
+                return () => ({ understood: false, clarification: 'attacker chosen' });
+              }
+              return undefined;
+            },
+          },
+        },
+      ],
+      () => inherited.dispatcher.deliver(Msg.directiveAck(0, inheritedPayload)),
+    );
+
+    expect(thrown).toBeUndefined();
+    expect(inheritedToJsonHits).toBe(0);
+    expect(inherited.calls.sendMessage.mock.calls[0][1]).toBe(
+      '[system] coder directive_ack iter=0: {"understood":true,"clarification":"stable"}',
+    );
+  });
+
+  it('serializes chat audit records without consulting Object.prototype.toJSON', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'Planner reply' });
+    let toJsonHits = 0;
+    const { thrown } = await withPrototypeDescriptors(
+      [
+        {
+          target: Object.prototype,
+          key: 'toJSON',
+          descriptor: {
+            configurable: true,
+            get() {
+              if (Object.hasOwn(this, 'who') && Object.hasOwn(this, 'text') && Object.hasOwn(this, 'ts')) {
+                toJsonHits += 1;
+                return () => ({ attacker_chosen_chat: true });
+              }
+              return undefined;
+            },
+          },
+        },
+      ],
+      () => dispatcher.deliver(Msg.chat(0, { text: 'stable chat audit' })),
+    );
+
+    expect(thrown).toBeUndefined();
+    expect(toJsonHits).toBe(0);
+    expect(calls.sendMessage.mock.calls[0][1]).toBe('stable chat audit');
+    const firstChatLine = fs.readFileSync(path.join(ledgerDir, 'chat.jsonl'), 'utf8').split('\n')[0];
+    expect(JSON.parse(firstChatLine)).toMatchObject({
+      who: 'user',
+      text: 'stable chat audit',
+    });
+  });
+
+  it('builds Reviewer system/message prompts without polluted join or prior_metrics toJSON hooks', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+    ensureCompleteReviewArtifacts(dispatcher, 0);
+    const sandbox = path.join(ledgerDir, 'reviewer_sandbox');
+    fs.mkdirSync(sandbox, { recursive: true });
+    fs.writeFileSync(path.join(sandbox, 'reviewer_memory.md'), 'stable reviewer memory\n');
+    const priorMetrics = [1, 2];
+    const originalJoin = Array.prototype.join;
+    let joinHits = 0;
+    let toJsonHits = 0;
+
+    const { thrown } = await withPrototypeDescriptors(
+      [
+        {
+          target: Array.prototype,
+          key: 'join',
+          descriptor: {
+            configurable: true,
+            value: function pollutedJoin(this: unknown[], separator?: string): string {
+              if (this[0] === '[review_request iter=0]' || this[2] === '<frozen_memory_snapshot>') {
+                joinHits += 1;
+                return 'attacker-chosen-reviewer-prompt';
+              }
+              return originalJoin.call(this, separator);
+            },
+            writable: true,
+          },
+        },
+        {
+          target: Array.prototype,
+          key: 'toJSON',
+          descriptor: {
+            configurable: true,
+            get() {
+              if (this === priorMetrics) {
+                toJsonHits += 1;
+                return () => ['attacker-chosen-metric'];
+              }
+              return undefined;
+            },
+          },
+        },
+      ],
+      () => dispatcher.deliver(Msg.reviewRequest(0, { iter: 0, ledger_path: ledgerDir, prior_metrics: priorMetrics })),
+    );
+
+    expect(thrown).toBeUndefined();
+    expect(joinHits).toBe(0);
+    expect(toJsonHits).toBe(0);
+    const reviewerStart = calls.startSession.mock.calls.find(
+      ([config]) => (config as { name: string }).name === 'autoloop-r1-reviewer',
+    );
+    expect((reviewerStart?.[0] as { systemPrompt: string }).systemPrompt).toContain('stable reviewer memory');
+    expect(calls.sendMessage.mock.calls[0][1]).toContain('prior_metrics: [1,2]');
+    expect(calls.sendMessage.mock.calls[0][1]).not.toContain('attacker-chosen');
+  });
 });
 
 describe('ClaudeAgentDispatcher — durable directive ordering and review iteration authority', () => {
@@ -3546,50 +4079,30 @@ describe('ClaudeAgentDispatcher — durable directive ordering and review iterat
     expect(calls.sendMessage).toHaveBeenCalledTimes(0);
   });
 
-  it('reads payload.iter only for equality validation and uses envelope iter for the valid review path', async () => {
-    const reviewerReply = [
-      'Independent review complete.',
-      '```autoloop',
-      JSON.stringify({
-        tool: 'review_complete',
-        args: { decision: 'advance', metric: 1, audit_notes: 'envelope iteration reviewed' },
-      }),
-      '```',
-    ].join('\n');
-    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
-    ensureCompleteReviewArtifacts(dispatcher, 4);
+  it('rejects an accessor review_request iter without invoking it or causing Reviewer effects', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'must not be sent' });
     let payloadIterReads = 0;
     const base = fixedIdentity(
       Msg.reviewRequest(4, { iter: 4, ledger_path: ledgerDir, prior_metrics: [1] }),
-      'review-authoritative-envelope-iter',
+      'review-accessor-iter',
     );
     const payload = {
       ledger_path: ledgerDir,
       prior_metrics: [1],
       get iter(): number {
         payloadIterReads += 1;
-        if (payloadIterReads > 1) throw new Error('payload.iter was trusted after validation');
         return 4;
       },
     };
     const request = { ...base, payload } as AnyAutoloopMessage;
 
-    await expect(dispatcher.deliver(request)).resolves.toEqual([
-      expect.objectContaining({
-        iter: 4,
-        type: 'review_verdict',
-        payload: expect.objectContaining({ decision: 'advance' }),
-      }),
-    ]);
+    await expect(dispatcher.deliver(request)).rejects.toBeInstanceOf(AutoloopRoutingError);
 
-    expect(payloadIterReads).toBe(1);
-    expect(calls.startSession).toHaveBeenCalledTimes(1);
-    expect((calls.startSession.mock.calls[0][0] as { name: string }).name).toBe('autoloop-r1-reviewer');
-    expect(calls.sendMessage).toHaveBeenCalledTimes(1);
-    expect(calls.sendMessage.mock.calls[0][1]).toContain('[review_request iter=4]');
-    expect(fs.existsSync(path.join(ledgerDir, 'reviewer_sandbox', 'iter-4'))).toBe(true);
-    expect(fs.existsSync(path.join(ledgerDir, 'iter', '4', 'verdict.json'))).toBe(true);
-    expect(fs.existsSync(path.join(ledgerDir, 'iter', '5', 'verdict.json'))).toBe(false);
+    expect(payloadIterReads).toBe(0);
+    expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+    expect(calls.startSession).toHaveBeenCalledTimes(0);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(0);
+    expect(fs.existsSync(path.join(ledgerDir, 'reviewer_sandbox'))).toBe(false);
   });
 });
 

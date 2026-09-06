@@ -352,16 +352,50 @@ type PersistedReviewVerdictPayload = {
 
 const PERSISTED_REVIEW_VERDICT_KEYS = ['decision', 'metric', 'audit_notes', 'accepted', 'evidence_id'] as const;
 const STORED_REVIEW_VERDICT_KEYS = new Set(['schema_version', 'iter', 'ts', ...PERSISTED_REVIEW_VERDICT_KEYS, 'flags']);
+const INCOMING_REVIEW_VERDICT_KEYS = new Set([...PERSISTED_REVIEW_VERDICT_KEYS, 'flags']);
 
-function canonicalPersistedVerdictPayload(payload: PersistedReviewVerdictPayload): PersistedReviewVerdictPayload {
+function hasExactStringArrayElements(value: unknown): value is string[] {
+  if (!Array.isArray(value)) return false;
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  if (
+    !lengthDescriptor ||
+    !Object.hasOwn(lengthDescriptor, 'value') ||
+    !Number.isSafeInteger(lengthDescriptor.value) ||
+    lengthDescriptor.value < 0
+  ) {
+    return false;
+  }
+  const length = lengthDescriptor.value as number;
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== length + 1) return false;
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor || !Object.hasOwn(descriptor, 'value') || typeof descriptor.value !== 'string') return false;
+  }
+  return true;
+}
+
+function canonicalPersistedVerdictPayload(
+  payload: PersistedReviewVerdictPayload,
+  storedEnvelope = false,
+): PersistedReviewVerdictPayload {
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
     throw new Error('Refusing to persist invalid immutable Reviewer verdict payload');
+  }
+  const allowedKeys = storedEnvelope ? STORED_REVIEW_VERDICT_KEYS : INCOMING_REVIEW_VERDICT_KEYS;
+  const payloadKeys = Reflect.ownKeys(payload);
+  for (let index = 0; index < payloadKeys.length; index += 1) {
+    const key = payloadKeys[index];
+    if (typeof key !== 'string' || !allowedKeys.has(key)) {
+      throw new Error('Refusing to persist immutable Reviewer verdict payload with unsupported fields');
+    }
   }
   const decisionDescriptor = Object.getOwnPropertyDescriptor(payload, 'decision');
   const metricDescriptor = Object.getOwnPropertyDescriptor(payload, 'metric');
   const auditNotesDescriptor = Object.getOwnPropertyDescriptor(payload, 'audit_notes');
   const acceptedDescriptor = Object.getOwnPropertyDescriptor(payload, 'accepted');
   const evidenceIdDescriptor = Object.getOwnPropertyDescriptor(payload, 'evidence_id');
+  const flagsDescriptor = Object.getOwnPropertyDescriptor(payload, 'flags');
   if (
     !decisionDescriptor ||
     !Object.hasOwn(decisionDescriptor, 'value') ||
@@ -384,7 +418,10 @@ function canonicalPersistedVerdictPayload(payload: PersistedReviewVerdictPayload
     (metric !== null && (typeof metric !== 'number' || !Number.isFinite(metric))) ||
     typeof auditNotes !== 'string' ||
     (acceptedDescriptor !== undefined && typeof accepted !== 'boolean') ||
-    (evidenceIdDescriptor !== undefined && typeof evidenceId !== 'string')
+    (evidenceIdDescriptor !== undefined && typeof evidenceId !== 'string') ||
+    (flagsDescriptor !== undefined &&
+      (!Object.hasOwn(flagsDescriptor, 'value') ||
+        (flagsDescriptor.value !== undefined && !hasExactStringArrayElements(flagsDescriptor.value))))
   ) {
     throw new Error('Refusing to persist invalid immutable Reviewer verdict payload');
   }
@@ -399,7 +436,7 @@ function canonicalPersistedVerdictPayload(payload: PersistedReviewVerdictPayload
   if (evidenceIdDescriptor !== undefined) {
     Object.defineProperty(canonical, 'evidence_id', { enumerable: true, value: evidenceId });
   }
-  Object.preventExtensions(canonical);
+  Object.freeze(canonical);
   return canonical;
 }
 
@@ -417,16 +454,21 @@ function serializePersistedVerdictV1(iter: number, ts: string, payload: Persiste
 }
 
 function samePersistedVerdictPayload(stored: Record<string, unknown>, payload: PersistedReviewVerdictPayload): boolean {
-  if (Object.keys(stored).some((key) => !STORED_REVIEW_VERDICT_KEYS.has(key))) return false;
+  const storedKeys = Reflect.ownKeys(stored);
+  for (let index = 0; index < storedKeys.length; index += 1) {
+    const key = storedKeys[index];
+    if (typeof key !== 'string' || !STORED_REVIEW_VERDICT_KEYS.has(key)) return false;
+  }
+  const flagsDescriptor = Object.getOwnPropertyDescriptor(stored, 'flags');
   if (
-    Object.hasOwn(stored, 'flags') &&
-    (!Array.isArray(stored.flags) || !stored.flags.every((flag) => typeof flag === 'string'))
+    flagsDescriptor !== undefined &&
+    (!Object.hasOwn(flagsDescriptor, 'value') || !hasExactStringArrayElements(flagsDescriptor.value))
   ) {
     return false;
   }
   let canonicalStored: PersistedReviewVerdictPayload;
   try {
-    canonicalStored = canonicalPersistedVerdictPayload(stored as PersistedReviewVerdictPayload);
+    canonicalStored = canonicalPersistedVerdictPayload(stored as PersistedReviewVerdictPayload, true);
   } catch {
     return false;
   }
@@ -439,9 +481,68 @@ function samePersistedVerdictPayload(stored: Record<string, unknown>, payload: P
   return true;
 }
 
-function canonicalDirectiveStringArray(value: unknown, key: 'constraints' | 'success_criteria'): string[] {
+function invalidDeliveryPayload(type: string, detail: string): never {
+  const label = type === 'directive_ack' ? 'Directive_ack' : type[0].toUpperCase() + type.slice(1);
+  throw new AutoloopRoutingError(`${label} payload is invalid: ${detail}`);
+}
+
+function canonicalPayloadFields(
+  payload: unknown,
+  type: string,
+  allowed: readonly string[],
+  required: readonly string[],
+): Record<string, unknown> {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+    invalidDeliveryPayload(type, 'expected an object');
+  }
+  const keys = Reflect.ownKeys(payload);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    let supported = typeof key === 'string';
+    if (supported) {
+      supported = false;
+      for (let allowedIndex = 0; allowedIndex < allowed.length; allowedIndex += 1) {
+        if (key === allowed[allowedIndex]) {
+          supported = true;
+          break;
+        }
+      }
+    }
+    if (!supported) invalidDeliveryPayload(type, 'contains unsupported fields');
+  }
+
+  const fields = Object.create(null) as Record<string, unknown>;
+  for (let index = 0; index < allowed.length; index += 1) {
+    const key = allowed[index];
+    const descriptor = Object.getOwnPropertyDescriptor(payload, key);
+    let isRequired = false;
+    for (let requiredIndex = 0; requiredIndex < required.length; requiredIndex += 1) {
+      if (key === required[requiredIndex]) {
+        isRequired = true;
+        break;
+      }
+    }
+    if (!descriptor) {
+      if (isRequired) invalidDeliveryPayload(type, `${key} must be an own data property`);
+      continue;
+    }
+    if (!Object.hasOwn(descriptor, 'value')) {
+      invalidDeliveryPayload(type, `${key} must be an own data property`);
+    }
+    Object.defineProperty(fields, key, { enumerable: true, value: descriptor.value });
+  }
+  return fields;
+}
+
+function canonicalPrimitiveArray<T>(
+  value: unknown,
+  type: string,
+  key: string,
+  accepts: (candidate: unknown) => candidate is T,
+  expected: string,
+): T[] {
   if (!Array.isArray(value)) {
-    throw new Error(`Directive payload is invalid: ${key} must be an array of strings`);
+    invalidDeliveryPayload(type, `${key} must be ${expected}`);
   }
   const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
   if (
@@ -450,18 +551,18 @@ function canonicalDirectiveStringArray(value: unknown, key: 'constraints' | 'suc
     !Number.isSafeInteger(lengthDescriptor.value) ||
     lengthDescriptor.value < 0
   ) {
-    throw new Error(`Directive payload is invalid: ${key} must have an own data length`);
+    invalidDeliveryPayload(type, `${key} must have an own data length`);
   }
   const length = lengthDescriptor.value as number;
   const ownKeys = Reflect.ownKeys(value);
   if (ownKeys.length !== length + 1) {
-    throw new Error(`Directive payload is invalid: ${key} must contain only exact contiguous indices`);
+    invalidDeliveryPayload(type, `${key} must contain only exact contiguous indices`);
   }
-  const clone: string[] = [];
+  const clone: T[] = [];
   for (let index = 0; index < length; index += 1) {
     const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
-    if (!descriptor || !Object.hasOwn(descriptor, 'value') || typeof descriptor.value !== 'string') {
-      throw new Error(`Directive payload is invalid: ${key} must be an array of strings`);
+    if (!descriptor || !Object.hasOwn(descriptor, 'value') || !accepts(descriptor.value)) {
+      invalidDeliveryPayload(type, `${key} must be ${expected}`);
     }
     Object.defineProperty(clone, String(index), {
       configurable: true,
@@ -475,45 +576,32 @@ function canonicalDirectiveStringArray(value: unknown, key: 'constraints' | 'suc
   return clone;
 }
 
+function canonicalDirectiveStringArray(value: unknown, key: 'constraints' | 'success_criteria'): string[] {
+  return canonicalPrimitiveArray(
+    value,
+    'directive',
+    key,
+    (candidate): candidate is string => typeof candidate === 'string',
+    'an array of strings',
+  );
+}
+
 function canonicalDirectivePayload(payload: unknown): Extract<AnyAutoloopMessage, { type: 'directive' }>['payload'] {
-  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
-    throw new Error('Directive payload is invalid: expected an object');
-  }
-  const payloadKeys = Reflect.ownKeys(payload);
-  for (let index = 0; index < payloadKeys.length; index += 1) {
-    const key = payloadKeys[index];
-    if (
-      typeof key !== 'string' ||
-      (key !== 'goal' && key !== 'constraints' && key !== 'success_criteria' && key !== 'max_attempts')
-    ) {
-      throw new Error('Directive payload contains unsupported schema-v1 fields');
-    }
-  }
-  const goalDescriptor = Object.getOwnPropertyDescriptor(payload, 'goal');
-  const constraintsDescriptor = Object.getOwnPropertyDescriptor(payload, 'constraints');
-  const successCriteriaDescriptor = Object.getOwnPropertyDescriptor(payload, 'success_criteria');
-  const maxAttemptsDescriptor = Object.getOwnPropertyDescriptor(payload, 'max_attempts');
-  if (
-    !goalDescriptor ||
-    !Object.hasOwn(goalDescriptor, 'value') ||
-    !constraintsDescriptor ||
-    !Object.hasOwn(constraintsDescriptor, 'value') ||
-    !successCriteriaDescriptor ||
-    !Object.hasOwn(successCriteriaDescriptor, 'value') ||
-    !maxAttemptsDescriptor ||
-    !Object.hasOwn(maxAttemptsDescriptor, 'value')
-  ) {
-    throw new Error('Directive payload is invalid: all fields must be own data properties');
-  }
-  const goal = goalDescriptor.value;
-  const constraints = canonicalDirectiveStringArray(constraintsDescriptor.value, 'constraints');
-  const successCriteria = canonicalDirectiveStringArray(successCriteriaDescriptor.value, 'success_criteria');
-  const maxAttempts = maxAttemptsDescriptor.value;
+  const fields = canonicalPayloadFields(
+    payload,
+    'directive',
+    ['goal', 'constraints', 'success_criteria', 'max_attempts'],
+    ['goal', 'constraints', 'success_criteria', 'max_attempts'],
+  );
+  const goal = fields.goal;
+  const constraints = canonicalDirectiveStringArray(fields.constraints, 'constraints');
+  const successCriteria = canonicalDirectiveStringArray(fields.success_criteria, 'success_criteria');
+  const maxAttempts = fields.max_attempts;
   if (typeof goal !== 'string') {
-    throw new Error('Directive payload is invalid: goal must be a string');
+    invalidDeliveryPayload('directive', 'goal must be a string');
   }
   if (!Number.isSafeInteger(maxAttempts) || (maxAttempts as number) <= 0) {
-    throw new Error('Directive payload is invalid: max_attempts must be a positive safe integer');
+    invalidDeliveryPayload('directive', 'max_attempts must be a positive safe integer');
   }
 
   const canonical = Object.create(null) as Extract<AnyAutoloopMessage, { type: 'directive' }>['payload'];
@@ -521,7 +609,107 @@ function canonicalDirectivePayload(payload: unknown): Extract<AnyAutoloopMessage
   Object.defineProperty(canonical, 'constraints', { enumerable: true, value: constraints });
   Object.defineProperty(canonical, 'success_criteria', { enumerable: true, value: successCriteria });
   Object.defineProperty(canonical, 'max_attempts', { enumerable: true, value: maxAttempts });
-  Object.preventExtensions(canonical);
+  Object.freeze(canonical);
+  return canonical;
+}
+
+function canonicalChatPayload(payload: unknown): Extract<AnyAutoloopMessage, { type: 'chat' }>['payload'] {
+  const fields = canonicalPayloadFields(payload, 'chat', ['text'], ['text']);
+  if (typeof fields.text !== 'string') invalidDeliveryPayload('chat', 'text must be a string');
+  const canonical = Object.create(null) as Extract<AnyAutoloopMessage, { type: 'chat' }>['payload'];
+  Object.defineProperty(canonical, 'text', { enumerable: true, value: fields.text });
+  Object.freeze(canonical);
+  return canonical;
+}
+
+function canonicalDirectiveAckPayload(
+  payload: unknown,
+): Extract<AnyAutoloopMessage, { type: 'directive_ack' }>['payload'] {
+  const fields = canonicalPayloadFields(payload, 'directive_ack', ['understood', 'clarification'], ['understood']);
+  if (typeof fields.understood !== 'boolean') {
+    invalidDeliveryPayload('directive_ack', 'understood must be a boolean');
+  }
+  const hasClarification = Object.hasOwn(fields, 'clarification');
+  if (hasClarification && typeof fields.clarification !== 'string') {
+    invalidDeliveryPayload('directive_ack', 'clarification must be a string when present');
+  }
+  const canonical = Object.create(null) as Extract<AnyAutoloopMessage, { type: 'directive_ack' }>['payload'];
+  Object.defineProperty(canonical, 'understood', { enumerable: true, value: fields.understood });
+  if (hasClarification) {
+    Object.defineProperty(canonical, 'clarification', { enumerable: true, value: fields.clarification });
+  }
+  Object.freeze(canonical);
+  return canonical;
+}
+
+function canonicalIterDonePayload(
+  payload: unknown,
+  envelopeIter: number,
+): Extract<AnyAutoloopMessage, { type: 'iter_done' }>['payload'] {
+  const fields = canonicalPayloadFields(
+    payload,
+    'iter_done',
+    ['iter', 'verdict', 'metric', 'regression'],
+    ['iter', 'verdict', 'metric'],
+  );
+  if (!Number.isSafeInteger(fields.iter) || (fields.iter as number) < 0) {
+    invalidDeliveryPayload('iter_done', 'iter must be a nonnegative safe integer');
+  }
+  if (fields.iter !== envelopeIter) {
+    invalidDeliveryPayload('iter_done', `iter ${String(fields.iter)} does not match envelope iter ${envelopeIter}`);
+  }
+  if (fields.verdict !== 'advance' && fields.verdict !== 'hold' && fields.verdict !== 'rollback') {
+    invalidDeliveryPayload('iter_done', 'verdict must be advance, hold, or rollback');
+  }
+  if (fields.metric !== null && (typeof fields.metric !== 'number' || !Number.isFinite(fields.metric))) {
+    invalidDeliveryPayload('iter_done', 'metric must be null or a finite number');
+  }
+  const hasRegression = Object.hasOwn(fields, 'regression');
+  if (hasRegression && typeof fields.regression !== 'boolean') {
+    invalidDeliveryPayload('iter_done', 'regression must be a boolean when present');
+  }
+  const canonical = Object.create(null) as Extract<AnyAutoloopMessage, { type: 'iter_done' }>['payload'];
+  Object.defineProperty(canonical, 'iter', { enumerable: true, value: fields.iter });
+  Object.defineProperty(canonical, 'verdict', { enumerable: true, value: fields.verdict });
+  Object.defineProperty(canonical, 'metric', { enumerable: true, value: fields.metric });
+  if (hasRegression) Object.defineProperty(canonical, 'regression', { enumerable: true, value: fields.regression });
+  Object.freeze(canonical);
+  return canonical;
+}
+
+function canonicalReviewRequestPayload(
+  payload: unknown,
+  envelopeIter: number,
+): Extract<AnyAutoloopMessage, { type: 'review_request' }>['payload'] {
+  const fields = canonicalPayloadFields(
+    payload,
+    'review_request',
+    ['iter', 'ledger_path', 'prior_metrics'],
+    ['iter', 'ledger_path', 'prior_metrics'],
+  );
+  if (!Number.isSafeInteger(fields.iter) || (fields.iter as number) < 0) {
+    invalidDeliveryPayload('review_request', 'iter must be a nonnegative safe integer');
+  }
+  if (fields.iter !== envelopeIter) {
+    throw new AutoloopRoutingError(
+      `Invalid review_request iteration: envelope iter=${envelopeIter} does not match payload iter=${String(fields.iter)}`,
+    );
+  }
+  if (typeof fields.ledger_path !== 'string') {
+    invalidDeliveryPayload('review_request', 'ledger_path must be a string');
+  }
+  const priorMetrics = canonicalPrimitiveArray(
+    fields.prior_metrics,
+    'review_request',
+    'prior_metrics',
+    (candidate): candidate is number => typeof candidate === 'number' && Number.isFinite(candidate),
+    'an array of finite numbers',
+  );
+  const canonical = Object.create(null) as Extract<AnyAutoloopMessage, { type: 'review_request' }>['payload'];
+  Object.defineProperty(canonical, 'iter', { enumerable: true, value: fields.iter });
+  Object.defineProperty(canonical, 'ledger_path', { enumerable: true, value: fields.ledger_path });
+  Object.defineProperty(canonical, 'prior_metrics', { enumerable: true, value: priorMetrics });
+  Object.freeze(canonical);
   return canonical;
 }
 
@@ -748,15 +936,23 @@ function canonicalMessageEnvelope(env: AnyAutoloopMessage): AnyAutoloopMessage {
   ) {
     throw new AutoloopRoutingError('Invalid v2 envelope identity types or iteration');
   }
-  if (type === 'directive') {
+  if (type === 'chat') {
+    captured.payload = canonicalChatPayload(captured.payload);
+  } else if (type === 'directive') {
     captured.payload = canonicalDirectivePayload(captured.payload);
+  } else if (type === 'directive_ack') {
+    captured.payload = canonicalDirectiveAckPayload(captured.payload);
+  } else if (type === 'iter_done') {
+    captured.payload = canonicalIterDonePayload(captured.payload, iter as number);
+  } else if (type === 'review_request') {
+    captured.payload = canonicalReviewRequestPayload(captured.payload, iter as number);
   }
   const identity = Object.create(null) as Record<string, unknown>;
   for (let index = 0; index < MESSAGE_IDENTITY_FIELDS.length; index += 1) {
     const key = MESSAGE_IDENTITY_FIELDS[index];
     Object.defineProperty(identity, key, { enumerable: true, value: captured[key] });
   }
-  Object.preventExtensions(identity);
+  Object.freeze(identity);
   const snapshot = identity as unknown as AnyAutoloopMessage;
   validateCanonicalMessageRoute(snapshot);
   return snapshot;
@@ -785,9 +981,7 @@ function validateCanonicalMessageRoute(env: AnyAutoloopMessage): void {
     throw new AutoloopRoutingError(`Invalid v2 routing: ${from} → ${to} (type=${type})`, env);
   }
   if (type === 'review_request') {
-    const payload = env.payload;
-    const payloadIter =
-      typeof payload === 'object' && payload !== null ? Reflect.get(payload as object, 'iter') : undefined;
+    const payloadIter = env.payload.iter;
     if (env.iter !== payloadIter) {
       throw new AutoloopRoutingError(
         `Invalid review_request iteration: envelope iter=${String(env.iter)} does not match payload iter=${String(payloadIter)}`,
@@ -2109,7 +2303,12 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     ts: string;
   }): void {
     try {
-      this.secureLedger.appendFlatFile('chat.jsonl', JSON.stringify(entry) + '\n');
+      const canonical = Object.create(null) as Record<string, unknown>;
+      Object.defineProperty(canonical, 'who', { enumerable: true, value: entry.who });
+      Object.defineProperty(canonical, 'text', { enumerable: true, value: entry.text });
+      Object.defineProperty(canonical, 'ts', { enumerable: true, value: entry.ts });
+      Object.freeze(canonical);
+      this.secureLedger.appendFlatFile('chat.jsonl', JSON.stringify(canonical) + '\n');
     } catch (err) {
       this.logger.warn?.(`[autoloop] chat.jsonl append failed: ${(err as Error).message}`);
     }
@@ -2695,18 +2894,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   private buildReviewerSystemPrompt(): string {
     const memory = this.secureLedger.readReviewerPersistentFile('reviewer_memory.md')?.trim() ?? '';
     if (!memory) return this.reviewerSystemPrompt;
-    return [
-      this.reviewerSystemPrompt.trimEnd(),
-      '',
-      '<frozen_memory_snapshot>',
-      memory,
-      '</frozen_memory_snapshot>',
-      '',
-      'The snapshot above was injected into your system prompt at session start',
-      'and is frozen for this Reviewer session. Append new fakery patterns or',
-      'observations to reviewer_memory.md on disk; they will be re-injected on',
-      'the next Reviewer reset, not mid-session.',
-    ].join('\n');
+    return `${this.reviewerSystemPrompt.trimEnd()}\n\n<frozen_memory_snapshot>\n${memory}\n</frozen_memory_snapshot>\n\nThe snapshot above was injected into your system prompt at session start\nand is frozen for this Reviewer session. Append new fakery patterns or\nobservations to reviewer_memory.md on disk; they will be re-injected on\nthe next Reviewer reset, not mid-session.`;
   }
 
   private async ensureReviewer(): Promise<void> {
@@ -2760,14 +2948,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     await this.ensureReviewer();
     if (this.terminal) return [];
 
-    const promptText = [
-      `[review_request iter=${iter}]`,
-      `Artifacts staged at: iter-${iter}/ (directive.json, diff.patch, eval_output.json)`,
-      `prior_verdict: ${staged.priorVerdict ? 'prior_verdict.json' : '(none)'}`,
-      `prior_metrics: ${JSON.stringify(env.payload.prior_metrics ?? [])}`,
-      '',
-      'Audit and emit `review_complete`.',
-    ].join('\n');
+    const promptText = `[review_request iter=${iter}]\nArtifacts staged at: iter-${iter}/ (directive.json, diff.patch, eval_output.json)\nprior_verdict: ${staged.priorVerdict ? 'prior_verdict.json' : '(none)'}\nprior_metrics: ${JSON.stringify(env.payload.prior_metrics)}\n\nAudit and emit \`review_complete\`.`;
 
     // Heartbeat so the dashboard's Reviewer pane shows "auditing" the moment
     // a review_request lands, instead of staying blank until the verdict.
