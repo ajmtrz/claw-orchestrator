@@ -56,6 +56,7 @@ import {
   type PlannerToolCall,
   type PlannerToolEffects,
   type PlannerToolName,
+  MAX_PLANNER_CONTROL_BATCH_BYTES,
   type SpawnSubagentsArgs,
 } from './planner-tools.js';
 import { extractIterComplete, extractReviewComplete, parseAgentReply } from './agent-tools.js';
@@ -190,6 +191,8 @@ const AUTOLOOP_OPERATION_RETRYABILITY = {
   AUTOLOOP_CONTROL_APPLICATION_FAILED: false,
   AUTOLOOP_CONTROL_NOT_PERSISTED: true,
   AUTOLOOP_RESET_POSTCONDITION_FAILED: false,
+  AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE: false,
+  AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE: false,
 } as const satisfies Record<AutoloopOperationErrorCode, boolean>;
 
 export class AutoloopOperationError extends Error {
@@ -216,11 +219,17 @@ export class AutoloopOperationError extends Error {
  * it.
  */
 class CommittedPlannerControlReplayError extends AutoloopOperationError {
-  constructor() {
-    super(
-      'AUTOLOOP_CONTROL_APPLICATION_FAILED',
-      'Planner control event is already committed; refusing to repeat effects without a durable application receipt',
-    );
+  constructor(
+    message = 'Planner control event is already committed; refusing to repeat effects without a durable application receipt',
+  ) {
+    super('AUTOLOOP_CONTROL_APPLICATION_FAILED', message);
+  }
+}
+
+/** Ledger inspection failed, so even best-effort audit must not write through it. */
+class PlannerControlLedgerInvalidError extends AutoloopOperationError {
+  constructor(message: string, options?: ErrorOptions) {
+    super('AUTOLOOP_CONTROL_NOT_PERSISTED', message, options);
   }
 }
 
@@ -324,6 +333,108 @@ function plannerControlEvidenceFromTail(line: string): PlannerControlEvidence | 
   return row.kind === 'planner_turn_control' && row.payload && typeof row.payload === 'object'
     ? (row.payload as PlannerControlEvidence)
     : undefined;
+}
+
+const MAX_DECISION_LEDGER_BYTES = 64 * 1024 * 1024;
+const MAX_DECISION_LEDGER_ROW_BYTES = MAX_PLANNER_CONTROL_BATCH_BYTES + 256 * 1024;
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function validatedPlannerControlEvidence(value: unknown): PlannerControlEvidence | undefined {
+  if (!isPlainRecord(value)) return undefined;
+  const controls = value.controls;
+  const tools = value.tools;
+  if (
+    typeof value.control_id !== 'string' ||
+    typeof value.persisted_at !== 'string' ||
+    typeof value.dispatch_id !== 'string' ||
+    typeof value.message_id !== 'string' ||
+    !Number.isSafeInteger(value.iter) ||
+    !Number.isSafeInteger(value.generation) ||
+    typeof value.owner_instance_id !== 'string' ||
+    (value.session_id !== undefined && typeof value.session_id !== 'string') ||
+    !Array.isArray(tools) ||
+    !tools.every((tool) => typeof tool === 'string') ||
+    !Array.isArray(controls) ||
+    !controls.every(
+      (control) => isPlainRecord(control) && typeof control.tool === 'string' && isPlainRecord(control.args),
+    ) ||
+    typeof value.controls_sha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(value.controls_sha256)
+  ) {
+    return undefined;
+  }
+  return value as unknown as PlannerControlEvidence;
+}
+
+function readBoundedDecisionLedger(ledger: SecureAutoloopLedger): Array<{ kind: string; payload?: unknown }> {
+  let handle;
+  try {
+    handle = ledger.openFlatFile('decisions.jsonl', 'read');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+  try {
+    const before = fs.fstatSync(handle.fd);
+    if (before.size > MAX_DECISION_LEDGER_BYTES) {
+      throw new Error(`decisions.jsonl exceeds the ${MAX_DECISION_LEDGER_BYTES}-byte recovery limit`);
+    }
+    if (before.size === 0) return [];
+    const bytes = Buffer.allocUnsafe(before.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = fs.readSync(handle.fd, bytes, offset, bytes.length - offset, offset);
+      if (count <= 0) throw new Error('decisions.jsonl ended before its validated snapshot was complete');
+      offset += count;
+    }
+    const after = fs.fstatSync(handle.fd);
+    if (after.size !== before.size || after.dev !== before.dev || after.ino !== before.ino) {
+      throw new Error('decisions.jsonl changed while its recovery snapshot was being validated');
+    }
+    if (bytes.at(-1) !== 0x0a) throw new Error('decisions.jsonl has an incomplete final record');
+    const text = bytes.toString('utf8');
+    if (!Buffer.from(text, 'utf8').equals(bytes)) throw new Error('decisions.jsonl is not valid UTF-8');
+    return text
+      .slice(0, -1)
+      .split('\n')
+      .map((line, index) => {
+        const normalized = line.endsWith('\r') ? line.slice(0, -1) : line;
+        if (!normalized || Buffer.byteLength(normalized, 'utf8') > MAX_DECISION_LEDGER_ROW_BYTES) {
+          throw new Error(`decisions.jsonl record ${index + 1} is empty or exceeds its byte limit`);
+        }
+        let row: unknown;
+        try {
+          row = JSON.parse(normalized);
+        } catch (error) {
+          throw new Error(`decisions.jsonl record ${index + 1} is malformed`, { cause: error });
+        }
+        if (!isPlainRecord(row) || typeof row.kind !== 'string' || !row.kind) {
+          throw new Error(`decisions.jsonl record ${index + 1} is not a valid decision object`);
+        }
+        if (row.kind === 'planner_turn_control' && !validatedPlannerControlEvidence(row.payload)) {
+          throw new Error(`decisions.jsonl record ${index + 1} has invalid Planner control evidence`);
+        }
+        return { kind: row.kind, payload: row.payload };
+      });
+  } finally {
+    fs.closeSync(handle.fd);
+  }
+}
+
+function findCommittedPlannerControl(
+  ledger: SecureAutoloopLedger,
+  expected: Omit<PlannerControlEvidence, 'control_id' | 'persisted_at'>,
+): 'none' | 'matching' | 'conflicting' {
+  const claims = readBoundedDecisionLedger(ledger)
+    .filter((row) => row.kind === 'planner_turn_control')
+    .map((row) => validatedPlannerControlEvidence(row.payload)!)
+    .filter((evidence) => evidence.dispatch_id === expected.dispatch_id);
+  if (claims.length === 0) return 'none';
+  if (claims.length === 1 && plannerControlClaimMatches(claims[0], expected)) return 'matching';
+  return 'conflicting';
 }
 
 function assertPlannerTurnSucceeded(result: PlannerTurnResult, expected: PlannerTurnExpectation): void {
@@ -1007,7 +1118,8 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       const operationError = env.to === 'planner' ? normalizePlannerOperationError(error) : error;
       if (
         operationError instanceof AutoloopOperationError &&
-        !(operationError instanceof CommittedPlannerControlReplayError)
+        !(operationError instanceof CommittedPlannerControlReplayError) &&
+        !(operationError instanceof PlannerControlLedgerInvalidError)
       ) {
         this.appendDecisionLog({
           kind: 'phase_error',
@@ -1606,16 +1718,28 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       actor: 'planner',
       payload: { ...evidence },
     } satisfies DecisionLogEntry;
+    let committedClaim: ReturnType<typeof findCommittedPlannerControl>;
+    try {
+      committedClaim = findCommittedPlannerControl(this.secureLedger, evidence);
+    } catch (error) {
+      throw new PlannerControlLedgerInvalidError(
+        `Planner control ledger could not be validated: ${(error as Error).message}`,
+        { cause: error },
+      );
+    }
+    if (committedClaim !== 'none') {
+      // Flush the already-committed ledger before treating its claim as an
+      // authoritative recovery boundary. Never append a second claim or run
+      // either the matching or conflicting effect.
+      this.secureLedger.flushFlatFile('decisions.jsonl');
+      throw new CommittedPlannerControlReplayError(
+        committedClaim === 'matching'
+          ? undefined
+          : 'Planner control event conflicts with an already committed claim for this logical dispatch; refusing a second effect',
+      );
+    }
     const prepared = this.secureLedger.prepareFlatFileAppend('decisions.jsonl', `${JSON.stringify(decision)}\n`);
     try {
-      const existingEvidence = plannerControlEvidenceFromTail(prepared.readLastNonEmptyLine());
-      if (plannerControlClaimMatches(existingEvidence, evidence)) {
-        // A prior attempt already committed this exact logical control. Its
-        // effect-completion state is not durably knowable here, so finish the
-        // ledger barrier but reject replay rather than append or apply twice.
-        this.secureLedger.flushFlatFile('decisions.jsonl');
-        throw new CommittedPlannerControlReplayError();
-      }
       // The control intent is a commit boundary, not ordinary best-effort
       // audit data. Commit through the checked capability and verify the same
       // opened inode's durable tail before any prepared effect can begin.

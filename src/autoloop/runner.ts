@@ -37,6 +37,8 @@ const DEFAULT_STALL_CHECK_MS = 30_000;
 
 interface PlannerOperationFailure extends Error {
   code: AutoloopOperationErrorCode;
+  committed?: true;
+  retryable?: boolean;
   secondaryErrors?: Error[];
 }
 
@@ -59,14 +61,29 @@ const AUTOLOOP_OPERATION_ERROR_CODES = new Set<AutoloopOperationErrorCode>([
   'AUTOLOOP_CONTROL_APPLICATION_FAILED',
   'AUTOLOOP_CONTROL_NOT_PERSISTED',
   'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+  'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+  'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+]);
+
+const COMMITTED_LEDGER_ERROR_CODES = new Set<AutoloopOperationErrorCode>([
+  'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+  'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
 ]);
 
 function isPlannerOperationFailure(error: unknown): error is PlannerOperationFailure {
-  if (!(error instanceof Error) || error.name !== 'AutoloopOperationError') return false;
-  const candidate = error as Error & { code?: unknown };
+  if (!(error instanceof Error)) return false;
+  const candidate = error as Error & { code?: unknown; committed?: unknown };
+  if (
+    typeof candidate.code !== 'string' ||
+    !AUTOLOOP_OPERATION_ERROR_CODES.has(candidate.code as AutoloopOperationErrorCode)
+  ) {
+    return false;
+  }
+  if (error.name === 'AutoloopOperationError') return true;
   return (
-    typeof candidate.code === 'string' &&
-    AUTOLOOP_OPERATION_ERROR_CODES.has(candidate.code as AutoloopOperationErrorCode)
+    error.name === 'SecureAutoloopLedgerCommitError' &&
+    candidate.committed === true &&
+    COMMITTED_LEDGER_ERROR_CODES.has(candidate.code as AutoloopOperationErrorCode)
   );
 }
 
@@ -579,6 +596,7 @@ export class AutoloopRunner extends EventEmitter {
             agent: 'planner',
             phase: 'planner_turn',
             code: plannerFailure.code,
+            ...(plannerFailure.committed === true ? { committed: true as const, retryable: false as const } : {}),
             error: plannerFailure.message,
           });
           this.enqueueMessage(phaseError, sender, true);

@@ -103,7 +103,9 @@ export type AutoloopOperationErrorCode =
   | 'AUTOLOOP_CONTROL_MALFORMED'
   | 'AUTOLOOP_CONTROL_APPLICATION_FAILED'
   | 'AUTOLOOP_CONTROL_NOT_PERSISTED'
-  | 'AUTOLOOP_RESET_POSTCONDITION_FAILED';
+  | 'AUTOLOOP_RESET_POSTCONDITION_FAILED'
+  | 'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE'
+  | 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE';
 
 /**
  * Surfaced when an agent subprocess dies, a phase-bound side effect fails
@@ -117,6 +119,10 @@ export interface PhaseErrorPayload {
   phase: string;
   /** Stable internal classification. Public HTTP/MCP mapping is handled separately. */
   code?: AutoloopOperationErrorCode;
+  /** True only when the requested ledger bytes were appended before a durability barrier failed. */
+  committed?: true;
+  /** Committed ledger outcomes are never safe to retry as ordinary engine turns. */
+  retryable?: false;
   error: string;
 }
 

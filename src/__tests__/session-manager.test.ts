@@ -4672,6 +4672,8 @@ describe('SessionManager', () => {
           return flushImplementation(fd);
         });
         const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents');
+        const phaseErrors: PhaseErrorPayload[] = [];
+        handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
 
         try {
           await expect(mgr.autoloopChat(runId, 'require directory durability')).rejects.toMatchObject({
@@ -4684,7 +4686,19 @@ describe('SessionManager', () => {
             status: 'planning',
             subagents_spawned: false,
             consecutive_phase_errors: 1,
+            recent_phase_errors: [
+              expect.objectContaining({
+                code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+              }),
+            ],
           });
+          expect(phaseErrors).toEqual([
+            expect.objectContaining({
+              code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+              committed: true,
+              retryable: false,
+            }),
+          ]);
           const controls = fs
             .readFileSync(path.join(ledgerDir, 'decisions.jsonl'), 'utf8')
             .trim()
@@ -4692,6 +4706,14 @@ describe('SessionManager', () => {
             .map((line) => JSON.parse(line) as { kind?: string })
             .filter((row) => row.kind === 'planner_turn_control');
           expect(controls).toHaveLength(1);
+          expect(
+            fs
+              .readFileSync(path.join(ledgerDir, 'decisions.jsonl'), 'utf8')
+              .trim()
+              .split('\n')
+              .map((line) => JSON.parse(line) as { kind?: string })
+              .filter((row) => row.kind === 'phase_error'),
+          ).toHaveLength(0);
         } finally {
           openFile.mockImplementation(openImplementation);
           flush.mockImplementation(flushImplementation);
@@ -4840,6 +4862,8 @@ describe('SessionManager', () => {
         });
         const flush = vi.mocked(fs.fsyncSync);
         const flushImplementation = flush.getMockImplementation()!;
+        const phaseErrors: PhaseErrorPayload[] = [];
+        handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
         flush.mockImplementation(() => {
           throw new Error('stable-storage flush failed');
         });
@@ -4854,7 +4878,19 @@ describe('SessionManager', () => {
             status: 'planning',
             subagents_spawned: false,
             consecutive_phase_errors: 1,
+            recent_phase_errors: [
+              expect.objectContaining({
+                code: 'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+              }),
+            ],
           });
+          expect(phaseErrors).toEqual([
+            expect.objectContaining({
+              code: 'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+              committed: true,
+              retryable: false,
+            }),
+          ]);
           const controls = fs
             .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
             .trim()
@@ -4862,12 +4898,20 @@ describe('SessionManager', () => {
             .map((line) => JSON.parse(line) as { kind?: string })
             .filter((row) => row.kind === 'planner_turn_control');
           expect(controls).toHaveLength(1);
+          expect(
+            fs
+              .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+              .trim()
+              .split('\n')
+              .map((line) => JSON.parse(line) as { kind?: string })
+              .filter((row) => row.kind === 'phase_error'),
+          ).toHaveLength(0);
         } finally {
           flush.mockImplementation(flushImplementation);
         }
       });
 
-      it('keeps a recovered matching control tail authoritative across repeated logical re-entry', async () => {
+      it('keeps a recovered matching control authoritative after later valid decision rows', async () => {
         const runId = 'planner-control-committed-recovery-reentry';
         const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
         await mgr.autoloopStart({ runId, workspace });
@@ -4903,6 +4947,20 @@ describe('SessionManager', () => {
             committed: true,
           });
           flush.mockImplementation(flushImplementation);
+          fs.appendFileSync(
+            decisionsPath,
+            `${JSON.stringify({
+              ts: '2026-09-06T00:00:00.000Z',
+              kind: 'phase_error',
+              actor: 'dispatcher',
+              payload: {
+                agent: 'planner',
+                phase: 'planner_turn',
+                code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+                error: 'later valid audit row',
+              },
+            })}\n`,
+          );
 
           forgetProcessLocalDispatch();
           await expect(handle.dispatcher.deliver(envelope)).rejects.toMatchObject({
@@ -4929,6 +4987,130 @@ describe('SessionManager', () => {
           spawn.mockRestore();
         }
       });
+
+      it('rejects a conflicting control for the same committed logical dispatch after later rows', async () => {
+        const runId = 'planner-control-committed-conflict-after-later-row';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const ledgerDir = path.join(workspace, 'tasks', runId);
+        const decisionsPath = path.join(ledgerDir, 'decisions.jsonl');
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'first logical claim' },
+        });
+        const envelope = AutoloopMsg.chat(0, { text: 'one immutable logical dispatch' });
+        const dispatchState = handle.dispatcher as unknown as {
+          logicalDispatches: Map<string, unknown>;
+          settledDispatches: Set<string>;
+        };
+        const flush = vi.mocked(fs.fsyncSync);
+        const flushImplementation = flush.getMockImplementation()!;
+        flush.mockImplementation((fd) => {
+          if (persistenceFsState.openPaths.get(fd) === ledgerDir) {
+            throw new Error('persistent control directory sync interruption');
+          }
+          return flushImplementation(fd);
+        });
+        const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents');
+        const pushes: Array<{ summary: string }> = [];
+        handle.runner.on('push', (payload: { summary: string }) => pushes.push(payload));
+
+        try {
+          await expect(handle.dispatcher.deliver(envelope)).rejects.toMatchObject({
+            code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+            committed: true,
+          });
+          flush.mockImplementation(flushImplementation);
+          fs.appendFileSync(
+            decisionsPath,
+            `${JSON.stringify({
+              ts: '2026-09-06T00:00:01.000Z',
+              kind: 'phase_error',
+              actor: 'dispatcher',
+              payload: { agent: 'planner', phase: 'planner_turn', error: 'later valid audit row' },
+            })}\n`,
+          );
+          mockSessions[0].sendImplementation = async () => ({
+            text: [
+              '```autoloop',
+              '{"tool":"notify_user","args":{"level":"info","summary":"must not run","channel":"auto"}}',
+              '```',
+            ].join('\n'),
+            event: { type: 'result', result: 'conflicting logical claim' },
+          });
+          dispatchState.logicalDispatches.clear();
+          dispatchState.settledDispatches.clear();
+
+          await expect(handle.dispatcher.deliver(envelope)).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+            retryable: false,
+          });
+
+          expect(spawn).not.toHaveBeenCalled();
+          expect(pushes).toEqual([]);
+          expect(mockSessions).toHaveLength(1);
+          const controls = fs
+            .readFileSync(decisionsPath, 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind?: string })
+            .filter((row) => row.kind === 'planner_turn_control');
+          expect(controls).toHaveLength(1);
+        } finally {
+          flush.mockImplementation(flushImplementation);
+          spawn.mockRestore();
+        }
+      });
+
+      it.each([
+        {
+          label: 'malformed',
+          arrange: (decisionsPath: string) => fs.writeFileSync(decisionsPath, 'not-json\n'),
+        },
+        {
+          label: 'oversized',
+          arrange: (decisionsPath: string) => {
+            const maximumLedgerBytes = 64 * 1024 * 1024;
+            fs.writeFileSync(decisionsPath, '{"kind":"phase_error"}\n');
+            fs.truncateSync(decisionsPath, maximumLedgerBytes + 1);
+            const fd = fs.openSync(decisionsPath, 'r+');
+            try {
+              fs.writeSync(fd, Buffer.from('\n'), 0, 1, maximumLedgerBytes);
+            } finally {
+              fs.closeSync(fd);
+            }
+          },
+        },
+      ])(
+        'fails closed before applying a Planner control when the decision ledger is $label',
+        async ({ label, arrange }) => {
+          const runId = `planner-control-ledger-${label}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          const decisionsPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+          arrange(decisionsPath);
+          const sizeBefore = fs.statSync(decisionsPath).size;
+          mockSessions[0].sendImplementation = async () => ({
+            text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+            event: { type: 'result', result: 'must fail closed' },
+          });
+          const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents');
+
+          try {
+            await expect(mgr.autoloopChat(runId, 'do not trust an invalid ledger')).rejects.toMatchObject({
+              code: 'AUTOLOOP_CONTROL_NOT_PERSISTED',
+              retryable: true,
+            });
+            expect(spawn).not.toHaveBeenCalled();
+            expect(mockSessions).toHaveLength(1);
+            expect(fs.statSync(decisionsPath).size).toBe(sizeBefore);
+          } finally {
+            spawn.mockRestore();
+          }
+        },
+      );
 
       it('records only accepted Planner turns in replay history for non-native engines', async () => {
         const runId = 'planner-replay-accepted-only';
@@ -6559,74 +6741,85 @@ describe('SessionManager', () => {
         expect(fs.readFileSync(evidencePath, 'utf8')).toBe(original.evidence);
       });
 
-      it('recovers a committed stored migration after a directory-sync interruption without appending it again', async () => {
-        const runId = 'resume-timeout-stored-directory-sync-incomplete';
-        const workspace = workspaceFor(runId);
-        const dispatchId = 'dispatch-stored-directory-sync-incomplete';
-        await pauseForTimeout(runId, workspace, 600_000, dispatchId);
+      it.each([
+        { barrier: 'file', target: 'decisions.jsonl' },
+        { barrier: 'directory', target: '' },
+      ] as const)(
+        'recovers a committed stored migration after a $barrier-sync interruption without appending it again',
+        async ({ barrier, target }) => {
+          const runId = `resume-timeout-stored-${barrier}-sync-incomplete`;
+          const workspace = workspaceFor(runId);
+          const dispatchId = `dispatch-stored-${barrier}-sync-incomplete`;
+          await pauseForTimeout(runId, workspace, 600_000, dispatchId);
 
-        // Simulate process loss while retaining the recoverable timeout state.
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const oldKernel = (mgr as any).kernel;
-        oldKernel.cancel(runId);
-        await oldKernel.wait(runId);
-        await mgr.shutdown();
-        mgr = createManager();
+          // Simulate process loss while retaining the recoverable timeout state.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const oldKernel = (mgr as any).kernel;
+          oldKernel.cancel(runId);
+          await oldKernel.wait(runId);
+          await mgr.shutdown();
+          mgr = createManager();
 
-        const auditPath = auditPathFor(workspace, runId);
-        const ledgerDir = path.dirname(auditPath);
-        const appendFile = vi.mocked(fs.appendFileSync);
-        const appendImplementation = appendFile.getMockImplementation()!;
-        const flush = vi.mocked(fs.fsyncSync);
-        const flushImplementation = flush.getMockImplementation()!;
-        let migrationBytesAppended = false;
-        let injectedFailures = 0;
-        appendFile.mockImplementation(((file: unknown, data: unknown, ...args: unknown[]) => {
-          const result = (appendImplementation as (...values: unknown[]) => unknown)(file, data, ...args);
-          if (isOpenPath(file, auditPath) && String(data).includes('"kind":"timeout_migration"')) {
-            migrationBytesAppended = true;
+          const auditPath = auditPathFor(workspace, runId);
+          const ledgerDir = path.dirname(auditPath);
+          const failedTarget = target ? path.join(ledgerDir, target) : ledgerDir;
+          const appendFile = vi.mocked(fs.appendFileSync);
+          const appendImplementation = appendFile.getMockImplementation()!;
+          const flush = vi.mocked(fs.fsyncSync);
+          const flushImplementation = flush.getMockImplementation()!;
+          let migrationBytesAppended = false;
+          let injectedFailures = 0;
+          appendFile.mockImplementation(((file: unknown, data: unknown, ...args: unknown[]) => {
+            const result = (appendImplementation as (...values: unknown[]) => unknown)(file, data, ...args);
+            if (isOpenPath(file, auditPath) && String(data).includes('"kind":"timeout_migration"')) {
+              migrationBytesAppended = true;
+            }
+            return result;
+          }) as typeof fs.appendFileSync);
+          flush.mockImplementation((fd) => {
+            if (
+              migrationBytesAppended &&
+              persistenceFsState.openPaths.get(fd) === failedTarget &&
+              injectedFailures === 0
+            ) {
+              injectedFailures++;
+              throw new Error(`injected stored ${barrier} sync interruption`);
+            }
+            return flushImplementation(fd);
+          });
+
+          try {
+            await expect(
+              resumeWithOverride(runId, { sendTimeoutMs: 700_000, pendingDispatchId: dispatchId }),
+            ).resolves.toMatchObject({ run_id: runId });
+          } finally {
+            appendFile.mockImplementation(appendImplementation);
+            flush.mockImplementation(flushImplementation);
           }
-          return result;
-        }) as typeof fs.appendFileSync);
-        flush.mockImplementation((fd) => {
-          if (migrationBytesAppended && persistenceFsState.openPaths.get(fd) === ledgerDir && injectedFailures === 0) {
-            injectedFailures++;
-            throw new Error('injected stored directory sync interruption');
-          }
-          return flushImplementation(fd);
-        });
 
-        try {
-          await expect(
-            resumeWithOverride(runId, { sendTimeoutMs: 700_000, pendingDispatchId: dispatchId }),
-          ).resolves.toMatchObject({ run_id: runId });
-        } finally {
-          appendFile.mockImplementation(appendImplementation);
-          flush.mockImplementation(flushImplementation);
-        }
+          expect(injectedFailures).toBe(1);
+          expect(mgr.getAutoloop(runId)!.dispatcher.effectiveSendTimeoutMs).toBe(700_000);
+          let migrations = fs
+            .readFileSync(auditPath, 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind?: string })
+            .filter((row) => row.kind === 'timeout_migration');
+          expect(migrations).toHaveLength(1);
 
-        expect(injectedFailures).toBe(1);
-        expect(mgr.getAutoloop(runId)!.dispatcher.effectiveSendTimeoutMs).toBe(700_000);
-        let migrations = fs
-          .readFileSync(auditPath, 'utf8')
-          .trim()
-          .split('\n')
-          .map((line) => JSON.parse(line) as { kind?: string })
-          .filter((row) => row.kind === 'timeout_migration');
-        expect(migrations).toHaveLength(1);
-
-        await terminateAndReconstructManager(runId);
-        const beforePlainRecovery = fs.readFileSync(auditPath, 'utf8');
-        await expect(mgr.autoloopResume(runId)).resolves.toMatchObject({ run_id: runId });
-        expect(mgr.getAutoloop(runId)!.dispatcher.effectiveSendTimeoutMs).toBe(700_000);
-        expect(fs.readFileSync(auditPath, 'utf8')).toBe(beforePlainRecovery);
-        migrations = beforePlainRecovery
-          .trim()
-          .split('\n')
-          .map((line) => JSON.parse(line) as { kind?: string })
-          .filter((row) => row.kind === 'timeout_migration');
-        expect(migrations).toHaveLength(1);
-      });
+          await terminateAndReconstructManager(runId);
+          const beforePlainRecovery = fs.readFileSync(auditPath, 'utf8');
+          await expect(mgr.autoloopResume(runId)).resolves.toMatchObject({ run_id: runId });
+          expect(mgr.getAutoloop(runId)!.dispatcher.effectiveSendTimeoutMs).toBe(700_000);
+          expect(fs.readFileSync(auditPath, 'utf8')).toBe(beforePlainRecovery);
+          migrations = beforePlainRecovery
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind?: string })
+            .filter((row) => row.kind === 'timeout_migration');
+          expect(migrations).toHaveLength(1);
+        },
+      );
 
       it('uses the 600000ms compatibility default for a legacy stored run', async () => {
         const runId = 'resume-timeout-legacy';
