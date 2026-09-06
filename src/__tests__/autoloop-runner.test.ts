@@ -2045,6 +2045,125 @@ describe('AutoloopRunner', () => {
     }
   });
 
+  it.each(['named', 'symbol'] as const)(
+    'rejects a dispatcher reply batch whose ownKeys substitutes index 0 with a %s key before every effect',
+    async (substitutionKind) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      const source = [
+        Msg.pushUser(0, { level: 'info', summary: 'must not be notified', channel: 'auto' }),
+        Msg.sendTimeout(0, {
+          status: 'awaiting_resume',
+          dispatch_id: 'must-not-be-pending',
+          agent: 'planner',
+          message_id: 'chat-cardinality-bypass',
+          message_type: 'chat',
+          iter: 0,
+          timeout_ms: 60_000,
+          error: 'must not pause',
+        }),
+        Msg.phaseError(0, {
+          agent: 'planner',
+          phase: 'planner_turn',
+          error: 'must not count',
+        }),
+        Msg.pause(0, { reason: 'must not pause' }),
+        Msg.terminate(0, { reason: 'must not terminate' }),
+      ];
+      const replacementKey: PropertyKey = substitutionKind === 'named' ? 'metadata' : Symbol('reply-batch-metadata');
+      Object.defineProperty(source, replacementKey, {
+        configurable: true,
+        enumerable: true,
+        value: 'unsupported',
+        writable: true,
+      });
+      let ownKeysHits = 0;
+      let memberDescriptorReads = 0;
+      const replies = new Proxy(source, {
+        ownKeys(target) {
+          ownKeysHits += 1;
+          return Reflect.ownKeys(target).filter((key) => key !== '0');
+        },
+        getOwnPropertyDescriptor(target, key) {
+          if (typeof key === 'string' && /^(?:0|[1-9]\d*)$/.test(key)) memberDescriptorReads += 1;
+          return Reflect.getOwnPropertyDescriptor(target, key);
+        },
+      });
+      const dispatcher: AgentDispatcher = {
+        async deliver(env) {
+          if (env.type !== 'chat') return [];
+          await vi.advanceTimersByTimeAsync(1_000);
+          return replies;
+        },
+      };
+      const { runner, pushes } = makeRunner(dispatcher, [], {
+        activityLeaseMs: 60_000,
+        autoloopHardTimeoutMs: 600_000,
+      });
+      const emittedTypes: string[] = [];
+      const stateEvents: string[] = [];
+      const timeoutEvents: unknown[] = [];
+      const phaseErrors: unknown[] = [];
+      const terminatedReasons: string[] = [];
+      runner.on('message', (message: AnyAutoloopMessage) => emittedTypes.push(message.type));
+      runner.on('state', () => stateEvents.push(runner.state.status));
+      runner.on('send_timeout', (event) => timeoutEvents.push(event));
+      runner.on('phase_error', (event) => phaseErrors.push(event));
+      runner.on('terminated', (reason: string) => terminatedReasons.push(reason));
+
+      try {
+        await runner.start();
+        stateEvents.length = 0;
+        await vi.advanceTimersByTimeAsync(1_000);
+        const acceptedAt = Date.now();
+        let observed: unknown;
+        try {
+          await runner.send(Msg.chat(0, { text: 'reject substituted reply index atomically' }));
+        } catch (error) {
+          observed = error;
+        }
+
+        expect({
+          routingError: observed instanceof AutoloopRoutingError,
+          ownKeysHits,
+          memberDescriptorReads,
+          lastActivityAt: runner.state.last_activity_at,
+          emittedTypes,
+          pushes,
+          stateEvents,
+          timeoutEvents,
+          phaseErrors,
+          terminatedReasons,
+          status: runner.state.status,
+          statusReason: runner.state.status_reason,
+          pendingDispatch: runner.state.pending_dispatch,
+          phaseErrorCount: runner.state.consecutive_phase_errors,
+          recentPhaseErrors: runner.state.recent_phase_errors,
+          pushLogCount: runner.state.push_log_count,
+        }).toEqual({
+          routingError: true,
+          ownKeysHits: 1,
+          memberDescriptorReads: 0,
+          lastActivityAt: acceptedAt,
+          emittedTypes: ['chat'],
+          pushes: [],
+          stateEvents: [],
+          timeoutEvents: [],
+          phaseErrors: [],
+          terminatedReasons: [],
+          status: 'planning',
+          statusReason: null,
+          pendingDispatch: null,
+          phaseErrorCount: 0,
+          recentPhaseErrors: [],
+          pushLogCount: 0,
+        });
+      } finally {
+        runner.stop();
+      }
+    },
+  );
+
   it('bounds a dispatcher reply container before enumerating or reading members', async () => {
     let ownKeysHits = 0;
     let indexDescriptorHits = 0;
@@ -2203,8 +2322,9 @@ describe('AutoloopRunner', () => {
 
         expect(observed).toBeInstanceOf(AutoloopRoutingError);
         expect(ordinaryLengthReads).toBe(0);
-        // The malformed member is rejected before exact-key enumeration.
-        expect(ownKeysHits).toBe(0);
+        // Container shape is validated once before any member snapshot; the
+        // malformed second member is then rejected without applying the first.
+        expect(ownKeysHits).toBe(1);
         expect(descriptorReads.get('length')).toBe(1);
         expect(descriptorReads.get('0')).toBe(1);
         expect(descriptorReads.get('1')).toBe(1);

@@ -2547,6 +2547,45 @@ describe('ClaudeAgentDispatcher — canonical immutable Reviewer verdicts', () =
     expect(fs.readFileSync(verdictPath)).toEqual(first);
   });
 
+  it.each(['named', 'symbol'] as const)(
+    'rejects legacy flags whose ownKeys substitutes index 0 with a %s key without persisting a verdict',
+    (substitutionKind) => {
+      const { dispatcher, ledgerDir } = makeDispatcher();
+      const { persistVerdict } = verdictMethods(dispatcher);
+      const verdictPath = path.join(ledgerDir, 'iter', '0', 'verdict.json');
+      const target = ['legacy-runtime-flag'];
+      const replacementKey: PropertyKey = substitutionKind === 'named' ? 'metadata' : Symbol('legacy-flags-metadata');
+      Object.defineProperty(target, replacementKey, {
+        configurable: true,
+        enumerable: true,
+        value: 'unsupported',
+        writable: true,
+      });
+      let getterHits = 0;
+      const flags = new Proxy(target, {
+        get(inner, key, receiver) {
+          if (key === '0') getterHits += 1;
+          return Reflect.get(inner, key, receiver);
+        },
+        ownKeys(inner) {
+          return Reflect.ownKeys(inner).filter((key) => key !== '0');
+        },
+      });
+      const payload = {
+        decision: 'advance' as const,
+        metric: 1,
+        audit_notes: 'cardinality substitution is not a legacy flag shape',
+        accepted: true,
+        evidence_id: 'iter-0',
+        flags,
+      };
+
+      expect(() => persistVerdict(0, payload)).toThrow(/immutable|invalid/i);
+      expect(getterHits).toBe(0);
+      expect(fs.existsSync(verdictPath)).toBe(false);
+    },
+  );
+
   it('rejects near-miss canonical flag shadows and malformed array shapes without invoking accessors', () => {
     const { dispatcher, ledgerDir } = makeDispatcher();
     const { persistVerdict } = verdictMethods(dispatcher);

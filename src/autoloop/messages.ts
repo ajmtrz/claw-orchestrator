@@ -68,6 +68,16 @@ export interface ReviewVerdictPayload {
   evidence_id?: string;
 }
 
+/**
+ * Production compile-time guard for the acceptance marker. The canonical
+ * boundary only understands literal `true`; widening the public field to
+ * `boolean` must therefore fail the normal production TypeScript build rather
+ * than relying on the noisy test-only typecheck to notice the regression.
+ */
+function requireLiteralReviewAcceptance(accepted: NonNullable<ReviewVerdictPayload['accepted']>): true {
+  return accepted;
+}
+
 export interface IterDonePayload {
   iter: number;
   verdict: 'advance' | 'hold' | 'rollback';
@@ -345,8 +355,7 @@ const NUMBER_ARRAY_LIMITS: PrimitiveArrayLimits = {
   maxItems: MAX_MESSAGE_PRIMITIVE_ARRAY_ITEMS,
 };
 
-function hasSafeArrayToJSONShadow(value: unknown[]): boolean {
-  const descriptor = Object.getOwnPropertyDescriptor(value, 'toJSON');
+function isSafeArrayToJSONShadow(descriptor: PropertyDescriptor | undefined): boolean {
   return (
     descriptor !== undefined &&
     Object.hasOwn(descriptor, 'value') &&
@@ -358,7 +367,32 @@ function hasSafeArrayToJSONShadow(value: unknown[]): boolean {
 }
 
 function hasExactArrayKeys(value: unknown[], length: number, keys: readonly PropertyKey[]): boolean {
-  return keys.length === length + 1 || (keys.length === length + 2 && hasSafeArrayToJSONShadow(value));
+  const toJSONDescriptor = Object.getOwnPropertyDescriptor(value, 'toJSON');
+  const hasToJSONShadow = toJSONDescriptor !== undefined;
+  if (hasToJSONShadow && !isSafeArrayToJSONShadow(toJSONDescriptor)) return false;
+
+  const expectedKeyCount = length + 1 + (hasToJSONShadow ? 1 : 0);
+  if (keys.length !== expectedKeyCount) return false;
+
+  // Cardinality alone is insufficient for Proxy ownKeys traps: a configurable
+  // index can be hidden and replaced by a named/symbol key while keeping the
+  // same count. Consume the exact expected key set in O(n) so every canonical
+  // String(index), `length`, and optional inert `toJSON` shadow is present once.
+  const remaining = Object.create(null) as Record<string, true>;
+  for (let index = 0; index < length; index += 1) {
+    remaining[String(index)] = true;
+  }
+  remaining.length = true;
+  if (hasToJSONShadow) remaining.toJSON = true;
+
+  let remainingCount = expectedKeyCount;
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    if (typeof key !== 'string' || !Object.hasOwn(remaining, key)) return false;
+    Reflect.deleteProperty(remaining, key);
+    remainingCount -= 1;
+  }
+  return remainingCount === 0;
 }
 
 function freezeCanonicalArray<T>(value: T[]): T[] {
@@ -794,7 +828,10 @@ function canonicalReviewVerdictPayload(payload: unknown): ReviewVerdictPayload {
   Object.defineProperty(canonical, 'metric', { enumerable: true, value: fields.metric });
   Object.defineProperty(canonical, 'audit_notes', { enumerable: true, value: fields.audit_notes });
   if (includesAccepted) {
-    Object.defineProperty(canonical, 'accepted', { enumerable: true, value: fields.accepted });
+    Object.defineProperty(canonical, 'accepted', {
+      enumerable: true,
+      value: requireLiteralReviewAcceptance(fields.accepted as NonNullable<ReviewVerdictPayload['accepted']>),
+    });
   }
   if (includesEvidenceId) {
     Object.defineProperty(canonical, 'evidence_id', { enumerable: true, value: fields.evidence_id });
@@ -1157,6 +1194,11 @@ export function canonicalizeMessageBatch(value: unknown): AnyAutoloopMessage[] {
       );
     }
 
+    const ownKeys = Reflect.ownKeys(value);
+    if (!hasExactArrayKeys(value, length, ownKeys)) {
+      throw new AutoloopRoutingError('Dispatcher reply batch must contain only exact contiguous indices');
+    }
+
     const canonical: AnyAutoloopMessage[] = [];
     for (let index = 0; index < length; index += 1) {
       const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
@@ -1169,10 +1211,6 @@ export function canonicalizeMessageBatch(value: unknown): AnyAutoloopMessage[] {
         value: canonicalizeMessage(descriptor.value as AnyAutoloopMessage),
         writable: true,
       });
-    }
-    const ownKeys = Reflect.ownKeys(value);
-    if (!hasExactArrayKeys(value, length, ownKeys)) {
-      throw new AutoloopRoutingError('Dispatcher reply batch must contain only exact contiguous indices');
     }
     return freezeCanonicalArray(canonical);
   } catch (error) {
