@@ -2220,8 +2220,9 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
 
     // Persist the complete immutable intent before reserving or starting a
     // physical Coder, writing its working heartbeat, or sending a prompt.
-    // Keep the historical top-level payload fields for ledger compatibility
-    // while retaining the exact payload as one auditable value.
+    // Preserve the exact schema-v1 byte shape: restart replay compares this
+    // write-once artifact byte-for-byte, so even additive fields require a
+    // versioned migration rather than an in-place serialization change.
     this.secureLedger.writeIterationArtifact(
       env.iter,
       'directive.json',
@@ -2232,11 +2233,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
           ts: env.ts,
           message_id: env.msg_id,
           dispatch_id: dispatchId,
-          payload: env.payload,
-          goal: env.payload.goal,
-          constraints: env.payload.constraints,
-          success_criteria: env.payload.success_criteria,
-          max_attempts: env.payload.max_attempts,
+          ...env.payload,
         },
         null,
         2,

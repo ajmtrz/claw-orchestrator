@@ -1962,6 +1962,71 @@ describe('ClaudeAgentDispatcher — durable directive ordering and review iterat
     success_criteria: ['durable intent precedes every agent effect'],
     max_attempts: 2,
   };
+  const v1DirectiveMessageId = 'directive-restart-v1-2';
+  const v1DirectiveTimestamp = '2026-09-03T00:00:00.000Z';
+  const v1DirectiveBytes = [
+    '{',
+    '  "schema_version": 1,',
+    '  "iter": 2,',
+    `  "ts": "${v1DirectiveTimestamp}",`,
+    `  "message_id": "${v1DirectiveMessageId}",`,
+    '  "dispatch_id": "dispatch_107b7aedd81cedd949e7cbf6d971b759fd017304241766c27209186719946a5d",',
+    '  "goal": "persist this exact directive before starting a Coder",',
+    '  "constraints": [',
+    '    "one writer",',
+    '    "no speculative send"',
+    '  ],',
+    '  "success_criteria": [',
+    '    "durable intent precedes every agent effect"',
+    '  ],',
+    '  "max_attempts": 2',
+    '}',
+  ].join('\n');
+
+  it('replays exact schema-v1 directive bytes after a dispatcher restart without changing the immutable artifact', async () => {
+    const directive = fixedIdentity(Msg.directive(2, directivePayload), v1DirectiveMessageId, v1DirectiveTimestamp);
+    const secureLedger = SecureAutoloopLedger.open(tmpRoot, 'r1', { create: true });
+    secureLedger.writeIterationArtifact(2, 'directive.json', v1DirectiveBytes);
+
+    // A new dispatcher has no in-memory logical-dispatch cache. Durable replay
+    // compatibility therefore depends on reproducing the exact v1 bytes.
+    const { dispatcher, calls, ledgerDir } = makeDispatcher(
+      { secureLedger },
+      { sendOutput: 'Coder acknowledged the persisted directive.' },
+    );
+
+    await expect(dispatcher.deliver(directive)).resolves.toHaveLength(1);
+
+    expect(fs.readFileSync(path.join(ledgerDir, 'iter', '2', 'directive.json'), 'utf8')).toBe(v1DirectiveBytes);
+    expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(1);
+    expect(calls.startSession).toHaveBeenCalledTimes(1);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails closed on a different message identity after restart instead of equating semantic payloads', async () => {
+    const secureLedger = SecureAutoloopLedger.open(tmpRoot, 'r1', { create: true });
+    secureLedger.writeIterationArtifact(2, 'directive.json', v1DirectiveBytes);
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({ secureLedger }, { sendOutput: 'must not be sent' });
+    const distinctIntent = fixedIdentity(
+      Msg.directive(2, directivePayload),
+      'directive-restart-distinct-intent-2',
+      v1DirectiveTimestamp,
+    );
+
+    // msg_id is the logical intent identity. Task 5's durable outbox and
+    // acknowledgement protocol will own unacknowledged redelivery; payload
+    // equality alone cannot prove that a second intent is safe to send.
+    await expect(dispatcher.deliver(distinctIntent)).rejects.toMatchObject({
+      name: 'Error',
+      message: expect.stringMatching(/conflicting|immutable|overwrite/i),
+    });
+
+    expect(fs.readFileSync(path.join(ledgerDir, 'iter', '2', 'directive.json'), 'utf8')).toBe(v1DirectiveBytes);
+    expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+    expect(calls.startSession).toHaveBeenCalledTimes(0);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(0);
+    expect(fs.existsSync(path.join(ledgerDir, 'chat.jsonl'))).toBe(false);
+  });
 
   it('durably persists the complete directive before reserve, start, heartbeat, and send', async () => {
     const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'Coder acknowledged.' });
@@ -2008,7 +2073,6 @@ describe('ClaudeAgentDispatcher — durable directive ordering and review iterat
       ts: directive.ts,
       message_id: directive.msg_id,
       dispatch_id: expect.stringMatching(/^dispatch_[a-f0-9]{64}$/),
-      payload: directivePayload,
       ...directivePayload,
     });
 
