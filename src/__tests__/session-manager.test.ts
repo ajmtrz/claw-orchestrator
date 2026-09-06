@@ -4679,6 +4679,9 @@ describe('SessionManager', () => {
           await expect(mgr.autoloopChat(runId, 'require directory durability')).rejects.toMatchObject({
             code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
             committed: true,
+            retryable: false,
+            effectsApplied: false,
+            operation: 'secure_ledger_append',
           });
           expect(spawn).not.toHaveBeenCalled();
           expect(mockSessions).toHaveLength(1);
@@ -4872,6 +4875,9 @@ describe('SessionManager', () => {
           await expect(mgr.autoloopChat(runId, 'require a durable control row')).rejects.toMatchObject({
             code: 'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
             committed: true,
+            retryable: false,
+            effectsApplied: false,
+            operation: 'secure_ledger_append',
           });
           expect(mockSessions).toHaveLength(1);
           expect(handle.runner.state).toMatchObject({
@@ -6596,6 +6602,74 @@ describe('SessionManager', () => {
         },
       );
 
+      it.each([
+        {
+          barrier: 'file',
+          target: 'decisions.jsonl',
+          code: 'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+        },
+        {
+          barrier: 'directory',
+          target: '',
+          code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+        },
+      ] as const)(
+        'reports applied live migration effects after a persistent $barrier-sync failure without replay',
+        async ({ barrier, target, code }) => {
+          const runId = `resume-timeout-live-${barrier}-sync-persistent`;
+          const workspace = workspaceFor(runId);
+          const dispatchId = `dispatch-live-${barrier}-sync-persistent`;
+          const { handle } = await pauseForTimeout(runId, workspace, 600_000, dispatchId);
+          const auditPath = auditPathFor(workspace, runId);
+          const failedTarget = target ? path.join(workspace, 'tasks', runId, target) : path.dirname(auditPath);
+          const flush = vi.mocked(fs.fsyncSync);
+          const flushImplementation = flush.getMockImplementation()!;
+          let injectedFailures = 0;
+          flush.mockImplementation((fd) => {
+            if (persistenceFsState.openPaths.get(fd) === failedTarget) {
+              injectedFailures++;
+              throw new Error(`persistent live ${barrier} sync failure`);
+            }
+            return flushImplementation(fd);
+          });
+
+          try {
+            await expect(
+              resumeWithOverride(runId, { sendTimeoutMs: 700_000, pendingDispatchId: dispatchId }),
+            ).rejects.toMatchObject({
+              code,
+              committed: true,
+              retryable: false,
+              effectsApplied: true,
+              operation: 'send_timeout_migration',
+            });
+          } finally {
+            flush.mockImplementation(flushImplementation);
+          }
+
+          expect(injectedFailures).toBe(2);
+          expect(handle.dispatcher.effectiveSendTimeoutMs).toBe(700_000);
+          expect(handle.runner.state).toMatchObject({ status: 'running', pending_dispatch: null });
+          const auditAfter = fs.readFileSync(auditPath, 'utf8');
+          expect(
+            auditAfter
+              .trim()
+              .split('\n')
+              .map((line) => JSON.parse(line) as { kind?: string })
+              .filter((row) => row.kind === 'timeout_migration'),
+          ).toHaveLength(1);
+          const sendsAfterMigration = mockSessions[0].sendCalls.length;
+
+          await expect(
+            resumeWithOverride(runId, { sendTimeoutMs: 700_000, pendingDispatchId: dispatchId }),
+          ).rejects.toThrow(/not awaiting.*send timeout/i);
+          expect(mockSessions[0].sendCalls).toHaveLength(sendsAfterMigration);
+          expect(handle.dispatcher.effectiveSendTimeoutMs).toBe(700_000);
+          expect(handle.runner.state).toMatchObject({ status: 'running', pending_dispatch: null });
+          expect(fs.readFileSync(auditPath, 'utf8')).toBe(auditAfter);
+        },
+      );
+
       it('contains a live timeout migration inside its pinned run capability after a run-directory swap', async () => {
         const runId = 'resume-timeout-live-pinned-run-swap';
         const workspace = workspaceFor(runId);
@@ -6818,6 +6892,117 @@ describe('SessionManager', () => {
             .map((line) => JSON.parse(line) as { kind?: string })
             .filter((row) => row.kind === 'timeout_migration');
           expect(migrations).toHaveLength(1);
+        },
+      );
+
+      it.each([
+        {
+          barrier: 'file',
+          target: 'decisions.jsonl',
+          code: 'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+        },
+        {
+          barrier: 'directory',
+          target: '',
+          code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+        },
+      ] as const)(
+        'reports applied stored migration effects after a persistent $barrier-sync failure across restart',
+        async ({ barrier, target, code }) => {
+          const runId = `resume-timeout-stored-${barrier}-sync-persistent`;
+          const workspace = workspaceFor(runId);
+          const dispatchId = `dispatch-stored-${barrier}-sync-persistent`;
+          await pauseForTimeout(runId, workspace, 600_000, dispatchId);
+
+          // Simulate process loss while retaining the recoverable timeout state.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const oldKernel = (mgr as any).kernel;
+          oldKernel.cancel(runId);
+          await oldKernel.wait(runId);
+          await mgr.shutdown();
+          mgr = createManager();
+
+          const auditPath = auditPathFor(workspace, runId);
+          const ledgerDir = path.dirname(auditPath);
+          const failedTarget = target ? path.join(ledgerDir, target) : ledgerDir;
+          const appendFile = vi.mocked(fs.appendFileSync);
+          const appendImplementation = appendFile.getMockImplementation()!;
+          const flush = vi.mocked(fs.fsyncSync);
+          const flushImplementation = flush.getMockImplementation()!;
+          let migrationBytesAppended = false;
+          let injectedFailures = 0;
+          appendFile.mockImplementation(((file: unknown, data: unknown, ...args: unknown[]) => {
+            const result = (appendImplementation as (...values: unknown[]) => unknown)(file, data, ...args);
+            if (isOpenPath(file, auditPath) && String(data).includes('"kind":"timeout_migration"')) {
+              migrationBytesAppended = true;
+            }
+            return result;
+          }) as typeof fs.appendFileSync);
+          flush.mockImplementation((fd) => {
+            if (migrationBytesAppended && persistenceFsState.openPaths.get(fd) === failedTarget) {
+              injectedFailures++;
+              throw new Error(`persistent stored ${barrier} sync failure`);
+            }
+            return flushImplementation(fd);
+          });
+
+          try {
+            await expect(
+              resumeWithOverride(runId, { sendTimeoutMs: 700_000, pendingDispatchId: dispatchId }),
+            ).rejects.toMatchObject({
+              code,
+              committed: true,
+              retryable: false,
+              effectsApplied: true,
+              operation: 'send_timeout_migration',
+            });
+          } finally {
+            appendFile.mockImplementation(appendImplementation);
+            flush.mockImplementation(flushImplementation);
+          }
+
+          expect(injectedFailures).toBe(2);
+          const liveAfterError = mgr.getAutoloop(runId)!;
+          expect(liveAfterError.dispatcher.effectiveSendTimeoutMs).toBe(700_000);
+          expect(liveAfterError.runner.state).toMatchObject({ status: 'planning', pending_dispatch: null });
+          const auditAfter = fs.readFileSync(auditPath, 'utf8');
+          expect(
+            auditAfter
+              .trim()
+              .split('\n')
+              .map((line) => JSON.parse(line) as { kind?: string })
+              .filter((row) => row.kind === 'timeout_migration'),
+          ).toHaveLength(1);
+
+          // A fresh manager reconstructs the committed row as authoritative.
+          // The identical outer request cannot append again or revive the
+          // resolved pending dispatch; a plain recovery keeps the new timeout.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const resumedKernel = (mgr as any).kernel;
+          resumedKernel.cancel(runId);
+          await resumedKernel.wait(runId);
+          await mgr.shutdown();
+          mgr = createManager();
+          const auditBeforeOuterRetry = fs.readFileSync(auditPath, 'utf8');
+          expect(auditBeforeOuterRetry.startsWith(auditAfter)).toBe(true);
+          expect(
+            auditBeforeOuterRetry
+              .trim()
+              .split('\n')
+              .map((line) => JSON.parse(line) as { kind?: string })
+              .filter((row) => row.kind === 'timeout_migration'),
+          ).toHaveLength(1);
+
+          await expect(
+            resumeWithOverride(runId, { sendTimeoutMs: 700_000, pendingDispatchId: dispatchId }),
+          ).rejects.toThrow(/no pending dispatch/i);
+          expect(mgr.getAutoloop(runId)).toBeUndefined();
+          expect(fs.readFileSync(auditPath, 'utf8')).toBe(auditBeforeOuterRetry);
+
+          await expect(mgr.autoloopResume(runId)).resolves.toMatchObject({ run_id: runId });
+          expect(mgr.getAutoloop(runId)!.dispatcher.effectiveSendTimeoutMs).toBe(700_000);
+          expect(mgr.getAutoloop(runId)!.runner.state).toMatchObject({ status: 'planning', pending_dispatch: null });
+          expect(fs.readFileSync(auditPath, 'utf8')).toBe(auditBeforeOuterRetry);
         },
       );
 

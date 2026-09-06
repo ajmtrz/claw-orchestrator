@@ -4285,7 +4285,7 @@ export class SessionManager implements AgentRuntimeProbe {
         throw new Error(`Autoloop run '${runId}' pending dispatch changed during resume`);
       }
       this._autoloopPublishers.get(runId)?.();
-      if (migrationCommitError) throw migrationCommitError;
+      if (migrationCommitError) throw migrationCommitError.withAppliedOutcome('send_timeout_migration');
       return live.runner.state;
     }
 
@@ -4386,7 +4386,7 @@ export class SessionManager implements AgentRuntimeProbe {
             : undefined,
         },
       );
-      if (migrationCommitError) throw migrationCommitError;
+      if (migrationCommitError) throw migrationCommitError.withAppliedOutcome('send_timeout_migration');
       return state;
     } finally {
       if (preparedMigration) {

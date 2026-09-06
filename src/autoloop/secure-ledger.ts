@@ -57,14 +57,33 @@ export interface SecureAutoloopPreparedAppend {
 
 export class SecureAutoloopLedgerCommitError extends Error {
   readonly committed = true;
+  readonly retryable = false;
+  readonly effectsApplied: boolean;
+  readonly operation: 'secure_ledger_append' | 'send_timeout_migration';
 
   constructor(
     readonly code: 'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE' | 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
     message: string,
-    options: { cause: unknown },
+    options: {
+      cause: unknown;
+      effectsApplied?: boolean;
+      operation?: 'secure_ledger_append' | 'send_timeout_migration';
+    },
   ) {
     super(message, options);
     this.name = 'SecureAutoloopLedgerCommitError';
+    this.effectsApplied = options.effectsApplied ?? false;
+    this.operation = options.operation ?? 'secure_ledger_append';
+  }
+
+  withAppliedOutcome(operation: 'send_timeout_migration'): SecureAutoloopLedgerCommitError {
+    const error = new SecureAutoloopLedgerCommitError(this.code, this.message, {
+      cause: this.cause,
+      effectsApplied: true,
+      operation,
+    });
+    error.stack = this.stack;
+    return error;
   }
 }
 
