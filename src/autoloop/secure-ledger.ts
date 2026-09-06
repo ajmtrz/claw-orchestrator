@@ -65,6 +65,12 @@ export interface SecureReviewerSandboxReadEvent {
   kind: 'file' | 'directory';
 }
 
+export interface SecureReviewerSandboxResidueRemovalEvent {
+  relativePath: string;
+  filePath: string;
+  kind: 'file' | 'symlink' | 'directory' | 'special';
+}
+
 export interface SecureAutoloopLedgerOptions {
   create?: boolean;
   platformFlags?: SecureLedgerPlatformFlags;
@@ -92,6 +98,7 @@ export interface SecureAutoloopLedgerOptions {
     afterNestedTemporaryUnlink?: (event: SecureLedgerNestedPublishEvent) => void;
     afterNestedChildLstat?: (event: { filePath: string; label: string }) => void;
     afterReviewerSandboxEntryRead?: (event: SecureReviewerSandboxReadEvent) => void;
+    beforeReviewerSandboxResidueRemoval?: (event: SecureReviewerSandboxResidueRemovalEvent) => void;
     closeDescriptor?: (fd: number) => void;
   };
 }
@@ -180,6 +187,14 @@ type ReviewerSandboxEntrySnapshot =
   | { kind: 'directory'; entries: ReviewerSandboxSnapshot; stat: fs.Stats };
 
 type ReviewerSandboxSnapshot = Map<string, ReviewerSandboxEntrySnapshot>;
+
+type ReviewerSandboxResidueSnapshot =
+  | { kind: 'file'; content: Buffer; stat: fs.Stats }
+  | { kind: 'symlink'; linkTarget: string; stat: fs.Stats }
+  | { kind: 'directory'; entries: ReviewerSandboxResidueMap; stat: fs.Stats }
+  | { kind: 'special'; stat: fs.Stats };
+
+type ReviewerSandboxResidueMap = Map<string, ReviewerSandboxResidueSnapshot>;
 
 type ReviewerSandboxEntryExpectation =
   | { kind: 'file'; content: Buffer; stat?: fs.Stats }
@@ -1082,22 +1097,6 @@ export class SecureAutoloopLedger {
     return this.openRegularChild(sandbox, name, 'Reviewer persistent file')?.toString('utf8');
   }
 
-  private assertSafeRemovableSandboxEntry(target: string): void {
-    const observed = fs.lstatSync(target);
-    if (observed.isSymbolicLink()) throw new Error(`Refusing unsafe Reviewer sandbox symbolic link '${target}'`);
-    if (observed.isFile()) {
-      if (observed.nlink !== 1) {
-        throw new Error(`Refusing unsafe Reviewer sandbox hardlink with link count ${observed.nlink} at '${target}'`);
-      }
-      return;
-    }
-    if (!observed.isDirectory()) throw new Error(`Refusing unsafe Reviewer sandbox entry '${target}'`);
-    for (const entry of fs.readdirSync(target)) {
-      validatePathComponent(entry, 'Reviewer sandbox entry');
-      this.assertSafeRemovableSandboxEntry(path.join(target, entry));
-    }
-  }
-
   private readReviewerSandboxEntries(directory: PinnedDirectory): string[] {
     this.assertIdentity();
     this.assertPinnedDirectory(directory);
@@ -1107,31 +1106,248 @@ export class SecureAutoloopLedger {
     return entries;
   }
 
-  private snapshotReviewerSandbox(directory: PinnedDirectory, label: string): ReviewerSandboxSnapshot {
-    const snapshot: ReviewerSandboxSnapshot = new Map();
-    for (const entry of this.readReviewerSandboxEntries(directory)) {
-      const target = path.join(directory.path, entry);
-      const observed = lstatIfPresent(target);
-      if (!observed) throw new Error(`${label} membership changed unexpectedly; '${target}' was removed`);
-      if (observed.isSymbolicLink()) {
-        throw new Error(`Refusing unsafe Reviewer sandbox symbolic link '${target}'`);
+  private assertReviewerSandboxResidueNode(
+    parent: PinnedDirectory,
+    name: string,
+    expected: ReviewerSandboxResidueSnapshot,
+    label: string,
+  ): fs.Stats {
+    validatePathComponent(name, 'Reviewer sandbox residue');
+    this.assertIdentity();
+    this.assertPinnedDirectory(parent);
+    const target = path.join(parent.path, name);
+    const observed = lstatIfPresent(target);
+    if (!observed) throw new Error(`${label} membership changed unexpectedly; '${target}' was removed`);
+    if (observed.dev !== parent.stat.dev) {
+      throw new Error(`${label} crossed a filesystem boundary at '${target}'`);
+    }
+    if (
+      !sameIdentity(observed, expected.stat) ||
+      (observed.mode & fs.constants.S_IFMT) !== (expected.stat.mode & fs.constants.S_IFMT) ||
+      (expected.kind !== 'directory' && observed.nlink !== expected.stat.nlink)
+    ) {
+      if (observed.isSymbolicLink()) throw new Error(`Refusing ${label} symbolic link '${target}'`);
+      if (observed.isFile() && observed.nlink > 1) {
+        throw new Error(`Refusing ${label} hardlink with link count ${observed.nlink} at '${target}'`);
       }
-      if (observed.isFile()) {
-        const file = this.openRegularChildSnapshot(directory, entry, `${label} regular file`);
-        if (!file) throw new Error(`${label} membership changed unexpectedly; '${target}' was removed`);
-        snapshot.set(entry, { kind: 'file', content: Buffer.from(file.content), stat: file.stat });
+      throw new Error(`${label} type or identity changed unexpectedly: '${target}'`);
+    }
+    this.assertPinnedDirectory(parent);
+    return observed;
+  }
+
+  private snapshotReviewerSandboxResidue(
+    parent: PinnedDirectory,
+    name: string,
+    label: string,
+  ): ReviewerSandboxResidueSnapshot {
+    validatePathComponent(name, 'Reviewer sandbox residue');
+    const target = path.join(parent.path, name);
+    const observed = lstatIfPresent(target);
+    if (!observed) throw new Error(`${label} membership changed unexpectedly; '${target}' was removed`);
+    if (observed.dev !== parent.stat.dev) {
+      throw new Error(`${label} crossed a filesystem boundary at '${target}'`);
+    }
+    if (observed.isFile()) {
+      const file = this.openRegularChildSnapshot(parent, name, `${label} regular file`, observed.nlink);
+      if (!file || !sameIdentity(observed, file.stat)) {
+        throw new Error(`${label} regular file identity changed unexpectedly: '${target}'`);
+      }
+      return { kind: 'file', content: Buffer.from(file.content), stat: file.stat };
+    }
+    if (observed.isSymbolicLink()) {
+      const linkTarget = fs.readlinkSync(target);
+      const current = this.assertReviewerSandboxResidueNode(
+        parent,
+        name,
+        { kind: 'symlink', linkTarget, stat: observed },
+        label,
+      );
+      return { kind: 'symlink', linkTarget, stat: current };
+    }
+    if (observed.isDirectory()) {
+      const child = this.openPinnedChildDirectory(parent, name, `${label} directory`, false);
+      if (!sameIdentity(observed, child.stat) || child.stat.dev !== parent.stat.dev) {
+        throw new Error(`${label} directory identity or filesystem changed unexpectedly: '${target}'`);
+      }
+      const entries: ReviewerSandboxResidueMap = new Map();
+      for (const entry of this.readReviewerSandboxEntries(child)) {
+        entries.set(entry, this.snapshotReviewerSandboxResidue(child, entry, `${label}/${entry}`));
+      }
+      this.assertPinnedDirectory(child);
+      this.assertPinnedDirectory(parent);
+      return { kind: 'directory', entries, stat: child.stat };
+    }
+    const current = this.assertReviewerSandboxResidueNode(parent, name, { kind: 'special', stat: observed }, label);
+    return { kind: 'special', stat: current };
+  }
+
+  private assertReviewerSandboxResidueMatches(
+    parent: PinnedDirectory,
+    name: string,
+    expected: ReviewerSandboxResidueSnapshot,
+    label: string,
+  ): void {
+    const target = path.join(parent.path, name);
+    this.assertReviewerSandboxResidueNode(parent, name, expected, label);
+    if (expected.kind === 'file') {
+      const file = this.openRegularChildSnapshot(parent, name, `${label} regular file`, expected.stat.nlink);
+      if (!file || !sameIdentity(file.stat, expected.stat)) {
+        throw new Error(`${label} regular file identity changed unexpectedly: '${target}'`);
+      }
+      if (!file.content.equals(expected.content)) {
+        throw new Error(`${label} regular file contents changed unexpectedly: '${target}'`);
+      }
+      return;
+    }
+    if (expected.kind === 'symlink') {
+      if (fs.readlinkSync(target) !== expected.linkTarget) {
+        throw new Error(`${label} symbolic link target changed unexpectedly: '${target}'`);
+      }
+      this.assertReviewerSandboxResidueNode(parent, name, expected, label);
+      return;
+    }
+    if (expected.kind === 'special') return;
+
+    const child = this.openPinnedChildDirectory(parent, name, `${label} directory`, false);
+    if (!sameIdentity(child.stat, expected.stat) || child.stat.dev !== parent.stat.dev) {
+      throw new Error(`${label} directory identity or filesystem changed unexpectedly: '${target}'`);
+    }
+    const observedEntries = this.readReviewerSandboxEntries(child);
+    const expectedEntries = [...expected.entries.keys()].sort();
+    if (
+      observedEntries.length !== expectedEntries.length ||
+      observedEntries.some((entry, index) => entry !== expectedEntries[index])
+    ) {
+      throw new Error(
+        `${label} membership changed unexpectedly; expected [${expectedEntries.join(', ')}], found [${observedEntries.join(', ')}]`,
+      );
+    }
+    for (const entry of observedEntries) {
+      this.assertReviewerSandboxResidueMatches(child, entry, expected.entries.get(entry)!, `${label}/${entry}`);
+    }
+    this.assertPinnedDirectory(child);
+    this.assertPinnedDirectory(parent);
+  }
+
+  private removeReviewerSandboxResidue(
+    parent: PinnedDirectory,
+    name: string,
+    expected: ReviewerSandboxResidueSnapshot,
+    relativePath: string,
+  ): void {
+    const target = path.join(parent.path, name);
+    this.assertReviewerSandboxResidueMatches(parent, name, expected, `Reviewer sandbox reset seam/${relativePath}`);
+    if (expected.kind === 'directory') {
+      const child = this.openPinnedChildDirectory(
+        parent,
+        name,
+        `Reviewer sandbox residue directory '${relativePath}'`,
+        false,
+      );
+      if (!sameIdentity(child.stat, expected.stat) || child.stat.dev !== parent.stat.dev) {
+        throw new Error(`Reviewer sandbox residue directory identity changed unexpectedly: '${target}'`);
+      }
+      for (const [entry, childExpected] of expected.entries) {
+        this.removeReviewerSandboxResidue(child, entry, childExpected, `${relativePath}/${entry}`);
+      }
+      if (this.readReviewerSandboxEntries(child).length !== 0) {
+        throw new Error(`Reviewer sandbox residue directory membership changed unexpectedly: '${target}'`);
+      }
+      this.syncPinnedDirectory(child, `Reviewer sandbox residue directory '${relativePath}' cleanup`);
+      this.testHooks.beforeReviewerSandboxResidueRemoval?.({
+        relativePath,
+        filePath: target,
+        kind: 'directory',
+      });
+      this.assertReviewerSandboxResidueNode(parent, name, expected, `Reviewer sandbox residue '${relativePath}'`);
+      this.assertPinnedDirectory(child);
+      fs.rmdirSync(target);
+    } else {
+      this.testHooks.beforeReviewerSandboxResidueRemoval?.({
+        relativePath,
+        filePath: target,
+        kind: expected.kind,
+      });
+      this.assertReviewerSandboxResidueMatches(parent, name, expected, `Reviewer sandbox residue '${relativePath}'`);
+      fs.unlinkSync(target);
+    }
+    if (lstatIfPresent(target)) {
+      throw new Error(`Reviewer sandbox residue remained after removal: '${target}'`);
+    }
+    this.syncPinnedDirectory(parent, `Reviewer sandbox residue '${relativePath}' removal`);
+    this.assertPinnedDirectory(parent);
+  }
+
+  private snapshotReviewerSandboxForReset(sandbox: PinnedDirectory): {
+    persistent: ReviewerSandboxSnapshot;
+    removable: ReviewerSandboxResidueMap;
+  } {
+    const persistentNames = new Set<SecureAutoloopReviewerPersistentFile>(['reviewer_memory.md', 'reviewer_log.jsonl']);
+    const persistent: ReviewerSandboxSnapshot = new Map();
+    const removable: ReviewerSandboxResidueMap = new Map();
+    for (const entry of this.readReviewerSandboxEntries(sandbox)) {
+      if (entry.startsWith('iter-')) {
+        const match = /^iter-(0|[1-9]\d*)$/.exec(entry);
+        if (!match) throw new Error(`Refusing unsafe Reviewer sandbox iteration alias '${entry}'`);
+        validateIteration(Number(match[1]));
+        const target = path.join(sandbox.path, entry);
+        const observed = lstatIfPresent(target);
+        if (!observed) throw new Error(`Reviewer sandbox iteration alias was removed: '${target}'`);
+        if (observed.isSymbolicLink()) {
+          throw new Error(`Refusing unsafe Reviewer sandbox symbolic link '${target}'`);
+        }
+        if (!observed.isDirectory()) {
+          throw new Error(`Refusing non-directory Reviewer sandbox iteration alias '${target}'`);
+        }
+      }
+      if (persistentNames.has(entry as SecureAutoloopReviewerPersistentFile)) {
+        const file = this.openRegularChildSnapshot(sandbox, entry, 'Reviewer persistent file');
+        if (!file) throw new Error(`Reviewer persistent file was removed while being secured: '${entry}'`);
+        persistent.set(entry, { kind: 'file', content: Buffer.from(file.content), stat: file.stat });
         continue;
       }
-      if (!observed.isDirectory()) throw new Error(`Refusing unsafe Reviewer sandbox entry '${target}'`);
-      const child = this.openPinnedChildDirectory(directory, entry, `${label} directory '${entry}'`, false);
-      snapshot.set(entry, {
-        kind: 'directory',
-        entries: this.snapshotReviewerSandbox(child, `${label}/${entry}`),
-        stat: child.stat,
-      });
+      removable.set(entry, this.snapshotReviewerSandboxResidue(sandbox, entry, 'Reviewer sandbox before reset'));
     }
-    this.assertPinnedDirectory(directory);
-    return snapshot;
+    this.assertPinnedDirectory(sandbox);
+    return { persistent, removable };
+  }
+
+  private assertReviewerSandboxResetSnapshot(
+    sandbox: PinnedDirectory,
+    persistent: ReviewerSandboxSnapshot,
+    removable: ReviewerSandboxResidueMap,
+    label: string,
+  ): void {
+    const observedEntries = this.readReviewerSandboxEntries(sandbox);
+    const expectedEntries = [...persistent.keys(), ...removable.keys()].sort();
+    if (
+      observedEntries.length !== expectedEntries.length ||
+      observedEntries.some((entry, index) => entry !== expectedEntries[index])
+    ) {
+      throw new Error(
+        `${label} membership changed unexpectedly; expected [${expectedEntries.join(', ')}], found [${observedEntries.join(', ')}]`,
+      );
+    }
+    for (const entry of observedEntries) {
+      const persistentEntry = persistent.get(entry);
+      if (persistentEntry) {
+        if (persistentEntry.kind !== 'file') {
+          throw new Error(`${label} persistent entry was not a regular file: '${path.join(sandbox.path, entry)}'`);
+        }
+        const file = this.openRegularChildSnapshot(sandbox, entry, `${label} expected regular file`);
+        if (!file) throw new Error(`${label} expected regular file was removed: '${path.join(sandbox.path, entry)}'`);
+        if (!sameIdentity(file.stat, persistentEntry.stat)) {
+          throw new Error(`${label} regular file identity changed unexpectedly: '${path.join(sandbox.path, entry)}'`);
+        }
+        if (!file.content.equals(persistentEntry.content)) {
+          throw new Error(`${label} regular file contents changed unexpectedly: '${path.join(sandbox.path, entry)}'`);
+        }
+        continue;
+      }
+      this.assertReviewerSandboxResidueMatches(sandbox, entry, removable.get(entry)!, label);
+    }
+    this.assertPinnedDirectory(sandbox);
   }
 
   private assertReviewerSandboxMatches(
@@ -1277,21 +1493,7 @@ export class SecureAutoloopLedger {
     const plan = controls.plan === undefined ? undefined : Buffer.from(controls.plan);
     const goal = controls.goal === undefined ? undefined : Buffer.from(controls.goal);
     const sandbox = this.getReviewerSandbox(true);
-    const persistent = new Set<SecureAutoloopReviewerPersistentFile>(['reviewer_memory.md', 'reviewer_log.jsonl']);
-    const persistentEntries: ReviewerSandboxSnapshot = new Map();
-    const removable: string[] = [];
-    const initialSnapshot = this.snapshotReviewerSandbox(sandbox, 'Reviewer sandbox before reset');
-    for (const [entry, snapshot] of initialSnapshot) {
-      const target = path.join(sandbox.path, entry);
-      if (persistent.has(entry as SecureAutoloopReviewerPersistentFile)) {
-        if (snapshot.kind !== 'file') {
-          throw new Error(`Reviewer persistent file must be a regular file: '${target}'`);
-        }
-        persistentEntries.set(entry, snapshot);
-        continue;
-      }
-      removable.push(target);
-    }
+    const { persistent: persistentEntries, removable } = this.snapshotReviewerSandboxForReset(sandbox);
 
     this.testHooks.beforeNestedMutation?.({
       operation: 'sandbox-reset',
@@ -1300,12 +1502,12 @@ export class SecureAutoloopLedger {
     });
     this.assertIdentity();
     this.assertPinnedDirectory(sandbox);
-    this.assertReviewerSandboxMatches(sandbox, initialSnapshot, 'Reviewer sandbox reset seam');
-    for (const target of removable) {
-      this.assertPinnedDirectory(sandbox);
-      this.assertSafeRemovableSandboxEntry(target);
-      fs.rmSync(target, { recursive: true, force: false });
+    this.assertReviewerSandboxResetSnapshot(sandbox, persistentEntries, removable, 'Reviewer sandbox reset seam');
+    for (const [entry, snapshot] of removable) {
+      this.removeReviewerSandboxResidue(sandbox, entry, snapshot, entry);
     }
+    this.syncPinnedDirectory(sandbox, 'Reviewer sandbox reset cleanup');
+    this.assertPinnedDirectory(sandbox);
     this.assertReviewerSandboxMatches(sandbox, persistentEntries, 'Reviewer sandbox after reset');
 
     const destination = this.openPinnedChildDirectory(
