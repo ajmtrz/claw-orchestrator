@@ -17,6 +17,7 @@ import { AutoloopRunner } from '../autoloop/runner.js';
 import { appendPushLog } from '../autoloop/notify.js';
 import { SessionManager } from '../session-manager.js';
 import type { AgentReservationReleaseOptions, AutoloopState, PhysicalAgentGeneration } from '../autoloop/types.js';
+import { DEFAULT_PUSH_POLICY } from '../autoloop/types.js';
 
 const roots: string[] = [];
 
@@ -619,6 +620,279 @@ describe('SecureAutoloopLedger', () => {
     } finally {
       runner.stop();
     }
+  });
+
+  describe('committed Coder and Reviewer delivery failures', () => {
+    async function exerciseCommittedDeliveryFailure(
+      role: 'coder' | 'reviewer',
+      options: { failDecisionAudit?: boolean } = {},
+    ): Promise<{
+      closeCause: Error;
+      decisionAuditCause: Error;
+      rejection: unknown;
+      closeAttempts: number;
+      decisionAuditAttempts: number;
+      phaseErrors: Array<Record<string, unknown>>;
+      notifications: Array<{ level: string; summary: string; channel: string }>;
+      messageOrder: string[];
+      decisionRows: Array<Record<string, unknown>>;
+      dispatcher: ClaudeAgentDispatcher;
+      message: ReturnType<typeof Msg.directive> | ReturnType<typeof Msg.reviewRequest>;
+      runner: AutoloopRunner;
+    }> {
+      const workspace = tempWorkspace();
+      const closeCause = new Error(`injected ${role} descriptor close failure`);
+      const decisionAuditCause = new Error(`injected ${role} phase-error audit failure`);
+      let armed = false;
+      let closeAttempts = 0;
+      let decisionAuditAttempts = 0;
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: {
+          closeDescriptor: (fd) => {
+            fs.closeSync(fd);
+            if (!armed) return;
+            closeAttempts++;
+            if (closeAttempts === 1) throw closeCause;
+          },
+          beforeFileMutation: (event) => {
+            if (
+              armed &&
+              options.failDecisionAudit &&
+              event.name === 'decisions.jsonl' &&
+              event.operation === 'append'
+            ) {
+              decisionAuditAttempts++;
+              throw decisionAuditCause;
+            }
+          },
+        },
+      });
+      if (role === 'reviewer') seedCompleteReviewerArtifacts(ledger, 0);
+
+      const { manager } = stubGenerationManager();
+      const dispatcher = new ClaudeAgentDispatcher({
+        manager: manager as never,
+        runId: 'run-1',
+        workspace,
+        secureLedger: ledger,
+        ownerInstanceId: TEST_OWNER_INSTANCE_ID,
+      });
+      const notifications: Array<{ level: string; summary: string; channel: string }> = [];
+      const runner = new AutoloopRunner({
+        run_id: 'run-1',
+        workspace,
+        ledger_dir: ledger.directory,
+        dispatcher,
+        push_policy: {
+          ...DEFAULT_PUSH_POLICY,
+          on_phase_error: { silent: true, channel: 'email' },
+        },
+        notifyUser: vi.fn(async (level, summary, _detail, channel) => {
+          notifications.push({ level, summary, channel });
+        }),
+        stallCheckIntervalMs: 24 * 60 * 60 * 1000,
+      });
+      const message =
+        role === 'coder'
+          ? Msg.directive(0, {
+              goal: 'exercise committed Coder delivery',
+              constraints: [],
+              success_criteria: [],
+              max_attempts: 1,
+            })
+          : Msg.reviewRequest(0, { iter: 0, ledger_path: ledger.directory, prior_metrics: [] });
+      const phaseErrors: Array<Record<string, unknown>> = [];
+      const messageOrder: string[] = [];
+      let settleUnrelated!: () => void;
+      let rejectUnrelated!: (error: unknown) => void;
+      const unrelatedCompleted = new Promise<void>((resolve, reject) => {
+        settleUnrelated = resolve;
+        rejectUnrelated = reject;
+      });
+      runner.on('phase_error', (payload) => phaseErrors.push(payload as unknown as Record<string, unknown>));
+      runner.on('message', (observed) => {
+        messageOrder.push(observed.type);
+        if (observed.msg_id !== message.msg_id) return;
+        void runner
+          .send(Msg.pushUser(0, { level: 'info', summary: 'unrelated queued work', channel: 'auto' }))
+          .then(settleUnrelated, rejectUnrelated);
+      });
+
+      await runner.start();
+      armed = true;
+      let rejection: unknown;
+      try {
+        await runner.send(message);
+      } catch (error) {
+        rejection = error;
+      }
+      await unrelatedCompleted;
+
+      const decisionPath = path.join(ledger.directory, 'decisions.jsonl');
+      const decisionRows = fs.existsSync(decisionPath)
+        ? fs
+            .readFileSync(decisionPath, 'utf8')
+            .trim()
+            .split('\n')
+            .filter(Boolean)
+            .map((line) => JSON.parse(line) as Record<string, unknown>)
+        : [];
+
+      return {
+        closeCause,
+        decisionAuditCause,
+        rejection,
+        closeAttempts,
+        decisionAuditAttempts,
+        phaseErrors,
+        notifications,
+        messageOrder,
+        decisionRows,
+        dispatcher,
+        message,
+        runner,
+      };
+    }
+
+    it.each(['coder', 'reviewer'] as const)(
+      'routes one real committed %s failure through the runner before unrelated work without replay',
+      async (role) => {
+        const observed = await exerciseCommittedDeliveryFailure(role);
+        try {
+          expect(observed.messageOrder.slice(0, 4)).toEqual([
+            observed.message.type,
+            'phase_error',
+            'push_user',
+            'push_user',
+          ]);
+          expect(observed.phaseErrors).toEqual([
+            expect.objectContaining({
+              agent: role,
+              phase: `${role}_turn`,
+              code: 'AUTOLOOP_LEDGER_DESCRIPTOR_CLOSE_INCOMPLETE',
+              committed: true,
+              retryable: false,
+            }),
+          ]);
+          expect(observed.runner.state.consecutive_phase_errors).toBe(1);
+          expect(observed.runner.state.recent_phase_errors).toEqual([
+            expect.objectContaining({
+              agent: role,
+              phase: `${role}_turn`,
+              code: 'AUTOLOOP_LEDGER_DESCRIPTOR_CLOSE_INCOMPLETE',
+              committed: true,
+              retryable: false,
+            }),
+          ]);
+          expect(observed.notifications.filter(({ summary }) => summary === '[on_phase_error] iter 0')).toEqual([
+            { level: 'error', summary: '[on_phase_error] iter 0', channel: 'both' },
+          ]);
+          expect(observed.rejection).toBeInstanceOf(SecureAutoloopLedgerCommitError);
+          expect(observed.rejection).toMatchObject({
+            name: 'SecureAutoloopLedgerCommitError',
+            code: 'AUTOLOOP_LEDGER_DESCRIPTOR_CLOSE_INCOMPLETE',
+            committed: true,
+            retryable: false,
+            effectsApplied: false,
+            operation: 'secure_nested_artifact_write',
+          });
+          expect((observed.rejection as Error).cause).toBe(observed.closeCause);
+          expect(observed.decisionRows.filter(({ kind }) => kind === 'phase_error')).toEqual([
+            expect.objectContaining({
+              actor: 'dispatcher',
+              payload: expect.objectContaining({
+                agent: role,
+                phase: `${role}_turn`,
+                code: 'AUTOLOOP_LEDGER_DESCRIPTOR_CLOSE_INCOMPLETE',
+                committed: true,
+                retryable: false,
+              }),
+            }),
+          ]);
+
+          await expect(observed.dispatcher.deliver(observed.message)).rejects.toBe(observed.rejection);
+          expect(observed.closeAttempts).toBe(1);
+        } finally {
+          observed.runner.stop();
+        }
+      },
+    );
+
+    it('keeps a failed phase-error audit secondary to the original committed Coder rejection', async () => {
+      const observed = await exerciseCommittedDeliveryFailure('coder', { failDecisionAudit: true });
+      try {
+        expect(observed.decisionAuditAttempts).toBe(1);
+        expect(observed.decisionRows.filter(({ kind }) => kind === 'phase_error')).toEqual([]);
+        expect((observed.rejection as SecureAutoloopLedgerCommitError).secondaryErrors).toEqual([
+          observed.decisionAuditCause,
+        ]);
+        expect(observed.phaseErrors).toHaveLength(1);
+        expect(observed.runner.state.consecutive_phase_errors).toBe(1);
+        expect(observed.notifications.filter(({ summary }) => summary === '[on_phase_error] iter 0')).toHaveLength(1);
+        await expect(observed.dispatcher.deliver(observed.message)).rejects.toBe(observed.rejection);
+        expect(observed.closeAttempts).toBe(1);
+        expect(observed.decisionAuditAttempts).toBe(1);
+      } finally {
+        observed.runner.stop();
+      }
+    });
+
+    it('does not invent a Coder phase error for an arbitrary uncommitted delivery failure', async () => {
+      const workspace = tempWorkspace();
+      const arbitrary = new Error('injected pre-commit Coder failure');
+      let armed = false;
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: {
+          beforeNestedMutation: (event) => {
+            if (armed && event.operation === 'artifact-write' && event.relativePath === 'iter/0/directive.json') {
+              throw arbitrary;
+            }
+          },
+        },
+      });
+      const { manager } = stubGenerationManager();
+      const dispatcher = new ClaudeAgentDispatcher({
+        manager: manager as never,
+        runId: 'run-1',
+        workspace,
+        secureLedger: ledger,
+        ownerInstanceId: TEST_OWNER_INSTANCE_ID,
+      });
+      const notifyUser = vi.fn(async () => undefined);
+      const runner = new AutoloopRunner({
+        run_id: 'run-1',
+        workspace,
+        ledger_dir: ledger.directory,
+        dispatcher,
+        notifyUser,
+        stallCheckIntervalMs: 24 * 60 * 60 * 1000,
+      });
+      const phaseErrors: unknown[] = [];
+      runner.on('phase_error', (payload) => phaseErrors.push(payload));
+
+      try {
+        await runner.start();
+        armed = true;
+        await expect(
+          runner.send(
+            Msg.directive(0, {
+              goal: 'exercise arbitrary failure',
+              constraints: [],
+              success_criteria: [],
+              max_attempts: 1,
+            }),
+          ),
+        ).rejects.toBe(arbitrary);
+        expect(phaseErrors).toEqual([]);
+        expect(runner.state.consecutive_phase_errors).toBe(0);
+        expect(notifyUser).not.toHaveBeenCalled();
+        expect(countRows(path.join(ledger.directory, 'decisions.jsonl'), 'phase_error')).toBe(0);
+      } finally {
+        runner.stop();
+      }
+    });
   });
 
   describe('nested iteration artifacts', () => {
@@ -1801,9 +2075,22 @@ describe('SecureAutoloopLedger', () => {
       ledger.writeIterationArtifact(0, 'coder_summary.txt', bytes);
       armed = true;
 
-      expect(() => ledger.writeIterationArtifact(0, 'coder_summary.txt', Buffer.from(bytes))).toThrow(
-        /injected close-only failure/,
-      );
+      let rejection: unknown;
+      try {
+        ledger.writeIterationArtifact(0, 'coder_summary.txt', Buffer.from(bytes));
+      } catch (error) {
+        rejection = error;
+      }
+      expect(rejection).toMatchObject({
+        name: 'SecureAutoloopLedgerCommitError',
+        code: 'AUTOLOOP_LEDGER_DESCRIPTOR_CLOSE_INCOMPLETE',
+        committed: true,
+        retryable: false,
+        effectsApplied: false,
+        operation: 'secure_nested_artifact_write',
+        cause: expect.objectContaining({ message: 'injected close-only failure' }),
+        secondaryErrors: [],
+      });
       expect(closeFailureInjected).toBe(true);
     });
 

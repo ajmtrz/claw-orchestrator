@@ -185,6 +185,7 @@ const AUTOLOOP_OPERATION_RETRYABILITY = {
   AUTOLOOP_RESET_POSTCONDITION_FAILED: false,
   AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE: false,
   AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE: false,
+  AUTOLOOP_LEDGER_DESCRIPTOR_CLOSE_INCOMPLETE: false,
   AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID: false,
 } as const satisfies Record<AutoloopOperationErrorCode, boolean>;
 
@@ -1127,21 +1128,27 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
 
     const pending = this.deliverOnce(env, dispatchId).catch((error: unknown) => {
       const operationError = env.to === 'planner' ? normalizePlannerOperationError(error) : error;
+      const shouldAuditOperationFailure =
+        operationError instanceof AutoloopOperationError ||
+        ((env.to === 'coder' || env.to === 'reviewer') && isCommittedSecureLedgerError(operationError));
       if (
-        operationError instanceof AutoloopOperationError &&
+        shouldAuditOperationFailure &&
         !(operationError instanceof CommittedPlannerControlReplayError) &&
         !(operationError instanceof PlannerControlLedgerInvalidError)
       ) {
-        this.appendDecisionLog({
+        const committed = isCommittedSecureLedgerError(operationError);
+        const auditFailure = this.appendDecisionLog({
           kind: 'phase_error',
           actor: 'dispatcher',
           payload: {
             agent: env.to,
             phase: `${env.to}_turn`,
             code: operationError.code,
+            ...(committed ? { committed: true, retryable: false } : {}),
             error: operationError.message,
           },
         });
+        if (auditFailure) operationError.secondaryErrors.push(auditFailure);
       }
       throw operationError;
     });
@@ -1629,12 +1636,15 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
    * push-policy mutations, compact triggers, subagent spawns, phase-error
    * passes, and policy-silence attempts that we rejected.
    */
-  private appendDecisionLog(entry: Omit<DecisionLogEntry, 'ts'>): void {
+  private appendDecisionLog(entry: Omit<DecisionLogEntry, 'ts'>): Error | undefined {
     try {
       const line = JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n';
       this.secureLedger.appendFlatFile('decisions.jsonl', line);
+      return undefined;
     } catch (err) {
-      this.logger.warn?.(`[autoloop] decisions.jsonl append failed: ${(err as Error).message}`);
+      const error = err instanceof Error ? err : new Error(String(err));
+      this.logger.warn?.(`[autoloop] decisions.jsonl append failed: ${error.message}`);
+      return error;
     }
   }
 

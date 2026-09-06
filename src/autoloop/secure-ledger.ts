@@ -133,6 +133,7 @@ export class SecureAutoloopLedgerCommitError extends Error {
     readonly code:
       | 'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE'
       | 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE'
+      | 'AUTOLOOP_LEDGER_DESCRIPTOR_CLOSE_INCOMPLETE'
       | 'AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID',
     message: string,
     options: {
@@ -565,7 +566,11 @@ export class SecureAutoloopLedger {
               `[autoloop] nested artifact descriptor close failed after the primary error: ${errorMessage(error)}`,
             );
           } else {
-            primaryFailure = error;
+            primaryFailure = new SecureAutoloopLedgerCommitError(
+              'AUTOLOOP_LEDGER_DESCRIPTOR_CLOSE_INCOMPLETE',
+              `Autoloop nested artifact was committed to ${relativePath}, but its verification descriptor close failed: ${errorMessage(error)}`,
+              { cause: error, operation: 'secure_nested_artifact_write' },
+            );
           }
         }
       }

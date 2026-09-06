@@ -35,7 +35,7 @@ const DEFAULT_PHASE_ERROR_CIRCUIT = 3;
 const DEFAULT_STALL_MS = 30 * 60_000;
 const DEFAULT_STALL_CHECK_MS = 30_000;
 
-interface PlannerOperationFailure extends Error {
+interface AutoloopOperationFailure extends Error {
   code: AutoloopOperationErrorCode;
   committed?: true;
   retryable?: boolean;
@@ -63,16 +63,18 @@ const AUTOLOOP_OPERATION_ERROR_CODES = new Set<AutoloopOperationErrorCode>([
   'AUTOLOOP_RESET_POSTCONDITION_FAILED',
   'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
   'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+  'AUTOLOOP_LEDGER_DESCRIPTOR_CLOSE_INCOMPLETE',
   'AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID',
 ]);
 
 const COMMITTED_LEDGER_ERROR_CODES = new Set<AutoloopOperationErrorCode>([
   'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
   'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+  'AUTOLOOP_LEDGER_DESCRIPTOR_CLOSE_INCOMPLETE',
   'AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID',
 ]);
 
-function isPlannerOperationFailure(error: unknown): error is PlannerOperationFailure {
+function isAutoloopOperationFailure(error: unknown): error is AutoloopOperationFailure {
   if (!(error instanceof Error)) return false;
   const candidate = error as Error & { code?: unknown; committed?: unknown };
   if (
@@ -89,19 +91,19 @@ function isPlannerOperationFailure(error: unknown): error is PlannerOperationFai
   );
 }
 
-function normalisePlannerOperationFailure(error: unknown): PlannerOperationFailure {
-  if (isPlannerOperationFailure(error)) return error;
+function normalisePlannerOperationFailure(error: unknown): AutoloopOperationFailure {
+  if (isAutoloopOperationFailure(error)) return error;
   const cause = error instanceof Error ? error : new Error(String(error));
   const failure = new Error(`Planner engine transport failed: ${cause.message}`, {
     cause,
-  }) as PlannerOperationFailure & { retryable: true };
+  }) as AutoloopOperationFailure & { retryable: true };
   failure.name = 'AutoloopOperationError';
   failure.code = 'AUTOLOOP_ENGINE_FAILURE';
   failure.retryable = true;
   return failure;
 }
 
-function preserveSecondaryPlannerFailure(primary: PlannerOperationFailure, secondary: unknown): void {
+function preserveSecondaryOperationFailure(primary: AutoloopOperationFailure, secondary: unknown): void {
   const error = secondary instanceof Error ? secondary : new Error(String(secondary));
   (primary.secondaryErrors ??= []).push(error);
 }
@@ -457,8 +459,8 @@ export class AutoloopRunner extends EventEmitter {
 
   private failSender(sender: SenderContext | undefined, error: unknown): void {
     if (!sender || sender.settled) return;
-    if (sender.failure && isPlannerOperationFailure(sender.failure)) {
-      preserveSecondaryPlannerFailure(sender.failure, error);
+    if (sender.failure && isAutoloopOperationFailure(sender.failure)) {
+      preserveSecondaryOperationFailure(sender.failure, error);
     } else if (sender.failure === undefined) {
       sender.failure = error;
     }
@@ -591,15 +593,23 @@ export class AutoloopRunner extends EventEmitter {
       try {
         await this.handleOne(env, sender);
       } catch (error) {
+        let phaseAgent: 'planner' | 'coder' | 'reviewer' | undefined;
+        let operationFailure: AutoloopOperationFailure | undefined;
         if (env.to === 'planner') {
-          const plannerFailure = normalisePlannerOperationFailure(error);
-          this.failSender(sender, plannerFailure);
+          phaseAgent = env.to;
+          operationFailure = normalisePlannerOperationFailure(error);
+        } else if ((env.to === 'coder' || env.to === 'reviewer') && isAutoloopOperationFailure(error)) {
+          phaseAgent = env.to;
+          operationFailure = error;
+        }
+        if (phaseAgent && operationFailure) {
+          this.failSender(sender, operationFailure);
           const phaseError = Msg.phaseError(env.iter, {
-            agent: 'planner',
-            phase: 'planner_turn',
-            code: plannerFailure.code,
-            ...(plannerFailure.committed === true ? { committed: true as const, retryable: false as const } : {}),
-            error: plannerFailure.message,
+            agent: phaseAgent,
+            phase: `${phaseAgent}_turn`,
+            code: operationFailure.code,
+            ...(operationFailure.committed === true ? { committed: true as const, retryable: false as const } : {}),
+            error: operationFailure.message,
           });
           this.enqueueMessage(phaseError, sender, true);
         } else {
