@@ -21,7 +21,7 @@ import {
   validatePlannerToolCalls,
 } from '../autoloop/planner-tools.js';
 import { AutoloopRunner } from '../autoloop/runner.js';
-import { type AnyAutoloopMessage, Msg } from '../autoloop/messages.js';
+import { AutoloopRoutingError, type AnyAutoloopMessage, Msg, validateMessage } from '../autoloop/messages.js';
 import type { SessionManager } from '../session-manager.js';
 import type {
   AgentReservationReleaseOptions,
@@ -1745,6 +1745,8 @@ describe('ClaudeAgentDispatcher — stageReviewSandbox whitelist', () => {
       dispatcher.deliver(Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 })),
     ).rejects.toThrow(/symbolic link|unsafe/i);
 
+    expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+    expect(calls.startSession).toHaveBeenCalledTimes(0);
     expect(calls.sendMessage).not.toHaveBeenCalled();
     expect(fs.readFileSync(external, 'utf8')).toBe('sentinel');
   });
@@ -1950,6 +1952,223 @@ describe('ClaudeAgentDispatcher — stageReviewSandbox whitelist', () => {
 
     expect(() => persistVerdict(0, { ...payload, decision: 'hold' })).toThrow(/conflicting|immutable/i);
     expect(fs.readFileSync(verdictPath)).toEqual(first);
+  });
+});
+
+describe('ClaudeAgentDispatcher — durable directive ordering and review iteration authority', () => {
+  const directivePayload = {
+    goal: 'persist this exact directive before starting a Coder',
+    constraints: ['one writer', 'no speculative send'],
+    success_criteria: ['durable intent precedes every agent effect'],
+    max_attempts: 2,
+  };
+
+  it('durably persists the complete directive before reserve, start, heartbeat, and send', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'Coder acknowledged.' });
+    const ledger = dispatcher.secureLedgerCapability;
+    const events: string[] = [];
+    const writeIterationArtifact = ledger.writeIterationArtifact.bind(ledger);
+    const appendFlatFile = ledger.appendFlatFile.bind(ledger);
+    const reserveAgentGeneration = calls.reserveAgentGeneration.getMockImplementation()!;
+    const startSession = calls.startSession.getMockImplementation()!;
+    const sendMessage = calls.sendMessage.getMockImplementation()!;
+
+    vi.spyOn(ledger, 'writeIterationArtifact').mockImplementation((iter, name, content) => {
+      if (name === 'directive.json') events.push('persist:start');
+      const outcome = writeIterationArtifact(iter, name, content);
+      if (name === 'directive.json') events.push('persist:complete');
+      return outcome;
+    });
+    calls.reserveAgentGeneration.mockImplementation((generation: PhysicalAgentGeneration) => {
+      events.push('reserve');
+      return reserveAgentGeneration(generation);
+    });
+    calls.startSession.mockImplementation(async (config, generation) => {
+      events.push('start');
+      return await startSession(config, generation);
+    });
+    vi.spyOn(ledger, 'appendFlatFile').mockImplementation((name, content, durable) => {
+      if (name === 'chat.jsonl' && content.includes('Coder iter 2 working')) events.push('heartbeat');
+      return appendFlatFile(name, content, durable);
+    });
+    calls.sendMessage.mockImplementation(async (name, message, options) => {
+      events.push('send');
+      return await sendMessage(name, message, options);
+    });
+
+    const directive = fixedIdentity(Msg.directive(2, directivePayload), 'directive-order-2');
+    await dispatcher.deliver(directive);
+
+    expect(events).toEqual(['persist:start', 'persist:complete', 'reserve', 'start', 'heartbeat', 'send']);
+    const directivePath = path.join(ledgerDir, 'iter', '2', 'directive.json');
+    const firstBytes = fs.readFileSync(directivePath);
+    expect(JSON.parse(firstBytes.toString('utf8'))).toEqual({
+      schema_version: LEDGER_SCHEMA_VERSION,
+      iter: 2,
+      ts: directive.ts,
+      message_id: directive.msg_id,
+      dispatch_id: expect.stringMatching(/^dispatch_[a-f0-9]{64}$/),
+      payload: directivePayload,
+      ...directivePayload,
+    });
+
+    await dispatcher.deliver(directive);
+
+    expect(fs.readFileSync(directivePath)).toEqual(firstBytes);
+    expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(1);
+    expect(calls.startSession).toHaveBeenCalledTimes(1);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['before-write', 'before-flush'] as const)(
+    'propagates a directive %s failure before any Coder reservation or observable effect',
+    async (phase) => {
+      const failure = Object.assign(new Error(`injected directive ${phase} failure`), {
+        code: `INJECTED_${phase.toUpperCase().replace('-', '_')}`,
+      });
+      const secureLedger = SecureAutoloopLedger.open(tmpRoot, 'r1', {
+        create: true,
+        testHooks: {
+          beforeNestedTemporaryIo: (event) => {
+            if (event.relativePath === 'iter/0/directive.json' && event.phase === phase) throw failure;
+          },
+        },
+      });
+      const { dispatcher, calls, ledgerDir } = makeDispatcher({ secureLedger }, { sendOutput: 'must not be sent' });
+
+      let observed: unknown;
+      try {
+        await dispatcher.deliver(Msg.directive(0, directivePayload));
+      } catch (error) {
+        observed = error;
+      }
+
+      expect(observed).toBe(failure);
+      expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+      expect(calls.startSession).toHaveBeenCalledTimes(0);
+      expect(calls.sendMessage).toHaveBeenCalledTimes(0);
+      expect(fs.existsSync(path.join(ledgerDir, 'chat.jsonl'))).toBe(false);
+      expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'directive.json'))).toBe(false);
+    },
+  );
+
+  it('preserves a conflicting immutable directive and starts no Coder', async () => {
+    const secureLedger = SecureAutoloopLedger.open(tmpRoot, 'r1', { create: true });
+    secureLedger.writeIterationArtifact(0, 'directive.json', 'pre-existing conflicting bytes\n');
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({ secureLedger }, { sendOutput: 'must not be sent' });
+    const directivePath = path.join(ledgerDir, 'iter', '0', 'directive.json');
+    const before = fs.readFileSync(directivePath);
+
+    await expect(dispatcher.deliver(Msg.directive(0, directivePayload))).rejects.toThrow(/conflicting|immutable/i);
+
+    expect(fs.readFileSync(directivePath)).toEqual(before);
+    expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+    expect(calls.startSession).toHaveBeenCalledTimes(0);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(0);
+    expect(fs.existsSync(path.join(ledgerDir, 'chat.jsonl'))).toBe(false);
+  });
+
+  it('propagates a committed directive failure without starting or messaging a Coder', async () => {
+    const cause = new Error('injected failure after exclusive directive publish');
+    const secureLedger = SecureAutoloopLedger.open(tmpRoot, 'r1', {
+      create: true,
+      testHooks: {
+        afterNestedPublish: (event) => {
+          if (event.relativePath === 'iter/0/directive.json') throw cause;
+        },
+      },
+    });
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({ secureLedger }, { sendOutput: 'must not be sent' });
+
+    await expect(dispatcher.deliver(Msg.directive(0, directivePayload))).rejects.toMatchObject({
+      name: 'SecureAutoloopLedgerCommitError',
+      code: 'AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID',
+      committed: true,
+      retryable: false,
+      cause,
+    });
+
+    expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+    expect(calls.startSession).toHaveBeenCalledTimes(0);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(0);
+    expect(fs.existsSync(path.join(ledgerDir, 'chat.jsonl'))).toBe(false);
+    expect(fs.readFileSync(path.join(ledgerDir, 'iter', '0', 'directive.json'), 'utf8')).toContain(
+      directivePayload.goal,
+    );
+  });
+
+  it('rejects a forged review_request iteration mismatch at the message validator', () => {
+    const valid = fixedIdentity(
+      Msg.reviewRequest(4, { iter: 4, ledger_path: '/trusted/run', prior_metrics: [] }),
+      'review-mismatch-validator',
+    );
+    const forged = { ...valid, payload: { ...valid.payload, iter: 5 } } as AnyAutoloopMessage;
+
+    expect(() => validateMessage(forged)).toThrowError(AutoloopRoutingError);
+    expect(() => validateMessage(forged)).toThrow(/review_request.*envelope iter=4.*payload iter=5/i);
+  });
+
+  it('rejects a direct forged review_request before sandbox, reservation, start, or send', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'must not be sent' });
+    ensureCompleteReviewArtifacts(dispatcher, 4);
+    const valid = fixedIdentity(
+      Msg.reviewRequest(4, { iter: 4, ledger_path: ledgerDir, prior_metrics: [] }),
+      'review-mismatch-direct',
+    );
+    const forged = { ...valid, payload: { ...valid.payload, iter: 5 } } as AnyAutoloopMessage;
+
+    await expect(dispatcher.deliver(forged)).rejects.toBeInstanceOf(AutoloopRoutingError);
+
+    expect(fs.existsSync(path.join(ledgerDir, 'reviewer_sandbox'))).toBe(false);
+    expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+    expect(calls.startSession).toHaveBeenCalledTimes(0);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(0);
+  });
+
+  it('reads payload.iter only for equality validation and uses envelope iter for the valid review path', async () => {
+    const reviewerReply = [
+      'Independent review complete.',
+      '```autoloop',
+      JSON.stringify({
+        tool: 'review_complete',
+        args: { decision: 'advance', metric: 1, audit_notes: 'envelope iteration reviewed' },
+      }),
+      '```',
+    ].join('\n');
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+    ensureCompleteReviewArtifacts(dispatcher, 4);
+    let payloadIterReads = 0;
+    const base = fixedIdentity(
+      Msg.reviewRequest(4, { iter: 4, ledger_path: ledgerDir, prior_metrics: [1] }),
+      'review-authoritative-envelope-iter',
+    );
+    const payload = {
+      ledger_path: ledgerDir,
+      prior_metrics: [1],
+      get iter(): number {
+        payloadIterReads += 1;
+        if (payloadIterReads > 1) throw new Error('payload.iter was trusted after validation');
+        return 4;
+      },
+    };
+    const request = { ...base, payload } as AnyAutoloopMessage;
+
+    await expect(dispatcher.deliver(request)).resolves.toEqual([
+      expect.objectContaining({
+        iter: 4,
+        type: 'review_verdict',
+        payload: expect.objectContaining({ decision: 'advance' }),
+      }),
+    ]);
+
+    expect(payloadIterReads).toBe(1);
+    expect(calls.startSession).toHaveBeenCalledTimes(1);
+    expect((calls.startSession.mock.calls[0][0] as { name: string }).name).toBe('autoloop-r1-reviewer');
+    expect(calls.sendMessage).toHaveBeenCalledTimes(1);
+    expect(calls.sendMessage.mock.calls[0][1]).toContain('[review_request iter=4]');
+    expect(fs.existsSync(path.join(ledgerDir, 'reviewer_sandbox', 'iter-4'))).toBe(true);
+    expect(fs.existsSync(path.join(ledgerDir, 'iter', '4', 'verdict.json'))).toBe(true);
+    expect(fs.existsSync(path.join(ledgerDir, 'iter', '5', 'verdict.json'))).toBe(false);
   });
 });
 

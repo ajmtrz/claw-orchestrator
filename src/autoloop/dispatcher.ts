@@ -32,7 +32,13 @@ import { capturePatch, changedFilesSince } from '../verify/baseline.js';
 import { runContract } from '../verify/runner.js';
 import { writeEvidence } from '../verify/evidence.js';
 import type { AcceptanceContract } from '../verify/contract.js';
-import { type AnyAutoloopMessage, type AutoloopOperationErrorCode, Msg, type SendTimeoutPayload } from './messages.js';
+import {
+  type AnyAutoloopMessage,
+  type AutoloopOperationErrorCode,
+  Msg,
+  type SendTimeoutPayload,
+  validateMessage,
+} from './messages.js';
 import {
   AutoloopAgentReleaseOwnerError,
   DEFAULT_ACTIVITY_LEASE_MS,
@@ -1121,6 +1127,10 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   }
 
   async deliver(env: AnyAutoloopMessage): Promise<AnyAutoloopMessage[]> {
+    // Runner callers validate before enqueueing, but direct/recovery callers
+    // share this boundary. In particular, a forged review payload must not
+    // choose a different iteration after the envelope has been routed.
+    validateMessage(env);
     if (this.terminal) return [];
     const dispatchId = deriveDispatchId(this.config.runId, env);
     const existing = this.logicalDispatches.get(dispatchId);
@@ -2207,11 +2217,11 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     if (env.type !== 'directive') {
       throw new Error(`[autoloop] coder does not accept message type=${env.type}`);
     }
-    await this.ensureCoder();
-    if (this.terminal) return [];
 
-    // Compose directive prompt + write directive.json to ledger so Reviewer
-    // and history can see exactly what the Coder was asked.
+    // Persist the complete immutable intent before reserving or starting a
+    // physical Coder, writing its working heartbeat, or sending a prompt.
+    // Keep the historical top-level payload fields for ledger compatibility
+    // while retaining the exact payload as one auditable value.
     this.secureLedger.writeIterationArtifact(
       env.iter,
       'directive.json',
@@ -2222,12 +2232,19 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
           ts: env.ts,
           message_id: env.msg_id,
           dispatch_id: dispatchId,
-          ...env.payload,
+          payload: env.payload,
+          goal: env.payload.goal,
+          constraints: env.payload.constraints,
+          success_criteria: env.payload.success_criteria,
+          max_attempts: env.payload.max_attempts,
         },
         null,
         2,
       ),
     );
+    if (this.terminal) return [];
+    await this.ensureCoder();
+    if (this.terminal) return [];
 
     // Defensive: Planner may emit constraints / success_criteria as either
     // a string or a string[]. Normalise.
@@ -2485,13 +2502,14 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     if (env.type !== 'review_request') {
       throw new Error(`[autoloop] reviewer does not accept message type=${env.type}`);
     }
-    const staged = this.stageReviewSandbox(env.payload.iter);
+    const iter = env.iter;
+    const staged = this.stageReviewSandbox(iter);
     await this.ensureReviewer();
     if (this.terminal) return [];
 
     const promptText = [
-      `[review_request iter=${env.payload.iter}]`,
-      `Artifacts staged at: iter-${env.payload.iter}/ (directive.json, diff.patch, eval_output.json)`,
+      `[review_request iter=${iter}]`,
+      `Artifacts staged at: iter-${iter}/ (directive.json, diff.patch, eval_output.json)`,
       `prior_verdict: ${staged.priorVerdict ? 'prior_verdict.json' : '(none)'}`,
       `prior_metrics: ${JSON.stringify(env.payload.prior_metrics ?? [])}`,
       '',
@@ -2502,7 +2520,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     // a review_request lands, instead of staying blank until the verdict.
     this.appendChatEntry({
       who: 'reviewer',
-      text: `🔍 Reviewer iter ${env.payload.iter} auditing…`,
+      text: `🔍 Reviewer iter ${iter} auditing…`,
       ts: new Date().toISOString(),
     });
 
@@ -2529,7 +2547,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         payload: { agent: 'reviewer', phase: 'send', code: result.code, error: result.error ?? 'unknown' },
       });
       return [
-        Msg.phaseError(env.payload.iter, {
+        Msg.phaseError(iter, {
           agent: 'reviewer',
           phase: 'send',
           code: result.code,
@@ -2554,12 +2572,12 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     if (!rc) {
       // Reviewer didn't emit a verdict — treat as 'hold' with the cleaned
       // reply as audit notes so the loop doesn't stall silently.
-      const verdict = Msg.reviewVerdict(env.payload.iter, {
+      const verdict = Msg.reviewVerdict(iter, {
         decision: 'hold',
         metric: null,
         audit_notes: `[no verdict emitted] ${parsed.cleaned_reply.slice(0, 500)}`,
       });
-      this.persistVerdict(env.payload.iter, {
+      this.persistVerdict(iter, {
         decision: 'hold',
         metric: null,
         audit_notes: verdict.payload.audit_notes,
@@ -2568,10 +2586,10 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       return [verdict];
     }
 
-    const gated = await this.gateVerdict(env.payload.iter, rc);
-    this.persistVerdict(env.payload.iter, gated);
+    const gated = await this.gateVerdict(iter, rc);
+    this.persistVerdict(iter, gated);
     await this.maybeCompact('reviewer', this.reviewerName);
-    return [Msg.reviewVerdict(env.payload.iter, gated)];
+    return [Msg.reviewVerdict(iter, gated)];
   }
 
   /**

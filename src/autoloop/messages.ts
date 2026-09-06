@@ -226,6 +226,16 @@ export function validateMessage(env: AnyAutoloopMessage): void {
   if (!ok) {
     throw new AutoloopRoutingError(`Invalid v2 routing: ${env.from} → ${env.to} (type=${env.type})`, env);
   }
+  if (env.type === 'review_request') {
+    const envelopeIter = env.iter;
+    const payloadIter = env.payload.iter;
+    if (envelopeIter !== payloadIter) {
+      throw new AutoloopRoutingError(
+        `Invalid review_request iteration: envelope iter=${String(envelopeIter)} does not match payload iter=${String(payloadIter)}`,
+        env,
+      );
+    }
+  }
 }
 
 // ─── Constructors ────────────────────────────────────────────────────────────
