@@ -2744,6 +2744,145 @@ describe('ClaudeAgentDispatcher — canonical immutable delivery payloads', () =
     '```',
   ].join('\n');
 
+  it('serializes distinct Reviewer dispatches through stage, send, and result handling while coalescing one ID', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher();
+    ensureCompleteReviewArtifacts(dispatcher, 0);
+    ensureCompleteReviewArtifacts(dispatcher, 1);
+    const sandbox = path.join(ledgerDir, 'reviewer_sandbox');
+    const sendOrder: number[] = [];
+    const observedSandbox: Array<{ iter: number; staged: string[] }> = [];
+    let signalFirstSend!: () => void;
+    const firstSendEntered = new Promise<void>((resolve) => {
+      signalFirstSend = resolve;
+    });
+    let releaseFirstSend!: () => void;
+    const firstSendGate = new Promise<void>((resolve) => {
+      releaseFirstSend = resolve;
+    });
+    calls.sendMessage.mockImplementation(async (_name, prompt: string) => {
+      const iter = Number(/^\[review_request iter=(\d+)\]/.exec(prompt)?.[1]);
+      sendOrder.push(iter);
+      if (iter === 0) {
+        signalFirstSend();
+        await firstSendGate;
+      }
+      observedSandbox.push({
+        iter,
+        staged: fs
+          .readdirSync(sandbox)
+          .filter((entry) => entry.startsWith('iter-'))
+          .sort(),
+      });
+      return { output: reviewerReply, error: undefined };
+    });
+    const firstMessage = fixedIdentity(
+      Msg.reviewRequest(0, { iter: 0, ledger_path: ledgerDir, prior_metrics: [0] }),
+      'review-serialized-0',
+    );
+    const duplicateMessage = fixedIdentity(
+      Msg.reviewRequest(0, { iter: 0, ledger_path: ledgerDir, prior_metrics: [0] }),
+      'review-serialized-0',
+      '2035-01-01T00:00:00.000Z',
+    );
+    const secondMessage = fixedIdentity(
+      Msg.reviewRequest(1, { iter: 1, ledger_path: ledgerDir, prior_metrics: [0, 1] }),
+      'review-serialized-1',
+    );
+
+    const first = dispatcher.deliver(firstMessage);
+    await firstSendEntered;
+    const duplicate = dispatcher.deliver(duplicateMessage);
+    const second = dispatcher.deliver(secondMessage);
+    let boundaryAssertion: unknown;
+    try {
+      expect(
+        fs
+          .readdirSync(sandbox)
+          .filter((entry) => entry.startsWith('iter-'))
+          .sort(),
+      ).toEqual(['iter-0']);
+      expect(calls.sendMessage).toHaveBeenCalledTimes(1);
+    } catch (error) {
+      boundaryAssertion = error;
+    } finally {
+      releaseFirstSend();
+    }
+    const outcomes = await Promise.allSettled([first, duplicate, second]);
+    if (boundaryAssertion) throw boundaryAssertion;
+
+    expect(outcomes.map(({ status }) => status)).toEqual(['fulfilled', 'fulfilled', 'fulfilled']);
+    expect(sendOrder).toEqual([0, 1]);
+    expect(observedSandbox).toEqual([
+      { iter: 0, staged: ['iter-0'] },
+      { iter: 1, staged: ['iter-1'] },
+    ]);
+    expect(calls.startSession).toHaveBeenCalledTimes(1);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it('releases the Reviewer dispatch queue after a failed stage so the next distinct request can run', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+    ensureCompleteReviewArtifacts(dispatcher, 1);
+    const first = dispatcher.deliver(
+      fixedIdentity(
+        Msg.reviewRequest(0, { iter: 0, ledger_path: ledgerDir, prior_metrics: [] }),
+        'review-failed-stage-0',
+      ),
+    );
+    const second = dispatcher.deliver(
+      fixedIdentity(
+        Msg.reviewRequest(1, { iter: 1, ledger_path: ledgerDir, prior_metrics: [] }),
+        'review-after-failed-stage-1',
+      ),
+    );
+
+    await expect(first).rejects.toThrow(/complete artifact set.*missing/i);
+    await expect(second).resolves.toEqual([
+      expect.objectContaining({ type: 'review_verdict', payload: expect.objectContaining({ decision: 'advance' }) }),
+    ]);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(1);
+    expect(calls.sendMessage.mock.calls[0][1]).toMatch(/^\[review_request iter=1\]/);
+  });
+
+  it('skips a queued Reviewer dispatch when the run becomes terminal during the active send', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher();
+    ensureCompleteReviewArtifacts(dispatcher, 0);
+    ensureCompleteReviewArtifacts(dispatcher, 1);
+    let signalFirstSend!: () => void;
+    const firstSendEntered = new Promise<void>((resolve) => {
+      signalFirstSend = resolve;
+    });
+    let releaseFirstSend!: () => void;
+    const firstSendGate = new Promise<void>((resolve) => {
+      releaseFirstSend = resolve;
+    });
+    calls.sendMessage.mockImplementation(async () => {
+      signalFirstSend();
+      await firstSendGate;
+      return { output: reviewerReply, error: undefined };
+    });
+
+    const first = dispatcher.deliver(
+      fixedIdentity(Msg.reviewRequest(0, { iter: 0, ledger_path: ledgerDir, prior_metrics: [] }), 'review-terminal-0'),
+    );
+    await firstSendEntered;
+    const second = dispatcher.deliver(
+      fixedIdentity(Msg.reviewRequest(1, { iter: 1, ledger_path: ledgerDir, prior_metrics: [] }), 'review-terminal-1'),
+    );
+    await dispatcher.shutdown('operator-stop');
+    releaseFirstSend();
+
+    await expect(first).resolves.toEqual([]);
+    await expect(second).resolves.toEqual([]);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(1);
+    expect(
+      fs
+        .readdirSync(path.join(ledgerDir, 'reviewer_sandbox'))
+        .filter((entry) => entry.startsWith('iter-'))
+        .sort(),
+    ).toEqual(['iter-0']);
+  });
+
   it('snapshots a proxied chat before Planner startup and uses only the snapshot for chat and prompt effects', async () => {
     const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'Planner reply' });
     const target = { text: 'stable chat' };
@@ -2835,6 +2974,61 @@ describe('ClaudeAgentDispatcher — canonical immutable delivery payloads', () =
       '[system] coder directive_ack iter=2: {"understood":true,"clarification":"none"}',
     );
     expect(calls.sendMessage.mock.calls[1][1]).toBe('[system] iter 2 done. verdict=advance metric=1');
+  });
+
+  it('snapshots an iter_done delivered first and never consults its mutated source after Planner startup', async () => {
+    const { dispatcher, calls } = makeDispatcher({}, { sendOutput: 'done reply' });
+    const target = { iter: 2, verdict: 'advance' as const, metric: 1, regression: false };
+    const descriptorReads = new Map<PropertyKey, number>();
+    let ordinaryReads = 0;
+    let lateAccessorReads = 0;
+    const payload = new Proxy(target, {
+      get(inner, key, receiver) {
+        ordinaryReads += 1;
+        return Reflect.get(inner, key, receiver);
+      },
+      getOwnPropertyDescriptor(inner, key) {
+        descriptorReads.set(key, (descriptorReads.get(key) ?? 0) + 1);
+        return Reflect.getOwnPropertyDescriptor(inner, key);
+      },
+    });
+    const startSession = calls.startSession.getMockImplementation()!;
+    calls.startSession.mockImplementation(async (config, generation) => {
+      for (const key of ['iter', 'verdict', 'metric', 'regression'] as const) {
+        const value = target[key];
+        Object.defineProperty(target, key, {
+          configurable: true,
+          enumerable: true,
+          get() {
+            lateAccessorReads += 1;
+            return value;
+          },
+        });
+      }
+      return await startSession(config, generation);
+    });
+
+    await dispatcher.deliver(Msg.iterDone(2, payload));
+
+    expect(ordinaryReads).toBe(0);
+    expect(lateAccessorReads).toBe(0);
+    for (const field of ['iter', 'verdict', 'metric', 'regression']) expect(descriptorReads.get(field)).toBe(1);
+    expect(calls.sendMessage.mock.calls[0][1]).toBe('[system] iter 2 done. verdict=advance metric=1');
+  });
+
+  it('rejects an iter_done envelope/payload mismatch before Planner, chat, or sandbox effects', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'must not be sent' });
+
+    await expect(
+      dispatcher.deliver(Msg.iterDone(4, { iter: 5, verdict: 'advance', metric: 1 })),
+    ).rejects.toBeInstanceOf(AutoloopRoutingError);
+
+    expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+    expect(calls.startSession).toHaveBeenCalledTimes(0);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(0);
+    expect(fs.existsSync(path.join(ledgerDir, 'decisions.jsonl'))).toBe(false);
+    expect(fs.existsSync(path.join(ledgerDir, 'chat.jsonl'))).toBe(false);
+    expect(fs.existsSync(path.join(ledgerDir, 'reviewer_sandbox'))).toBe(false);
   });
 
   it.each([
@@ -3241,7 +3435,10 @@ describe('ClaudeAgentDispatcher — durable directive ordering and review iterat
     const valid = fixedIdentity(Msg.directive(0, directivePayload), 'inherited-envelope-identity');
     const inherited = Object.create(valid) as AnyAutoloopMessage;
 
-    await expect(dispatcher.deliver(inherited)).rejects.toThrow(/envelope|identity|own data property/i);
+    await expect(dispatcher.deliver(inherited)).rejects.toMatchObject({
+      name: 'AutoloopRoutingError',
+      message: expect.stringMatching(/envelope|identity|own data property/i),
+    });
 
     expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'directive.json'))).toBe(false);
     expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
@@ -3276,7 +3473,7 @@ describe('ClaudeAgentDispatcher — durable directive ordering and review iterat
       }
 
       expect(getterHits).toBe(0);
-      expect(thrown).toBeInstanceOf(Error);
+      expect(thrown).toBeInstanceOf(AutoloopRoutingError);
       expect((thrown as Error).message).toMatch(/envelope|identity|own data property/i);
       expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'directive.json'))).toBe(false);
       expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
@@ -3297,7 +3494,10 @@ describe('ClaudeAgentDispatcher — durable directive ordering and review iterat
         writable: true,
       });
 
-      await expect(dispatcher.deliver(envelope)).rejects.toThrow(/envelope|identity|iteration|iter/i);
+      await expect(dispatcher.deliver(envelope)).rejects.toMatchObject({
+        name: 'AutoloopRoutingError',
+        message: expect.stringMatching(/envelope|identity|iteration|iter/i),
+      });
 
       expect(fs.existsSync(path.join(ledgerDir, 'iter', String(iter), 'directive.json'))).toBe(false);
       expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
@@ -3402,7 +3602,7 @@ describe('ClaudeAgentDispatcher — durable directive ordering and review iterat
       }
 
       expect(getterHits).toBe(0);
-      expect(thrown).toBeInstanceOf(Error);
+      expect(thrown).toBeInstanceOf(AutoloopRoutingError);
       expect((thrown as Error).message).toMatch(/directive payload.*invalid/i);
       expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'directive.json'))).toBe(false);
       expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
@@ -3434,7 +3634,7 @@ describe('ClaudeAgentDispatcher — durable directive ordering and review iterat
       }
 
       expect(getterHits).toBe(0);
-      expect(thrown).toBeInstanceOf(Error);
+      expect(thrown).toBeInstanceOf(AutoloopRoutingError);
       expect((thrown as Error).message).toMatch(/directive payload.*invalid/i);
       expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'directive.json'))).toBe(false);
       expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
@@ -3451,7 +3651,10 @@ describe('ClaudeAgentDispatcher — durable directive ordering and review iterat
       sparse.length = 2;
       const payload = { ...directivePayload, [field]: sparse };
 
-      await expect(dispatcher.deliver(Msg.directive(0, payload))).rejects.toThrow(/directive payload.*invalid/i);
+      await expect(dispatcher.deliver(Msg.directive(0, payload))).rejects.toMatchObject({
+        name: 'AutoloopRoutingError',
+        message: expect.stringMatching(/directive payload.*invalid/i),
+      });
 
       expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'directive.json'))).toBe(false);
       expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
@@ -3476,7 +3679,10 @@ describe('ClaudeAgentDispatcher — durable directive ordering and review iterat
       });
       const payload = { ...directivePayload, [field]: values };
 
-      await expect(dispatcher.deliver(Msg.directive(0, payload))).rejects.toThrow(/directive payload.*invalid/i);
+      await expect(dispatcher.deliver(Msg.directive(0, payload))).rejects.toMatchObject({
+        name: 'AutoloopRoutingError',
+        message: expect.stringMatching(/directive payload.*invalid/i),
+      });
 
       expect(getterHits).toBe(0);
       expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'directive.json'))).toBe(false);
@@ -3502,9 +3708,10 @@ describe('ClaudeAgentDispatcher — durable directive ordering and review iterat
         writable: true,
       });
 
-      await expect(dispatcher.deliver(Msg.directive(0, { ...directivePayload, constraints }))).rejects.toThrow(
-        /directive payload.*invalid/i,
-      );
+      await expect(dispatcher.deliver(Msg.directive(0, { ...directivePayload, constraints }))).rejects.toMatchObject({
+        name: 'AutoloopRoutingError',
+        message: expect.stringMatching(/directive payload.*invalid/i),
+      });
 
       expect(methodHits).toBe(0);
       expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'directive.json'))).toBe(false);
@@ -3524,9 +3731,10 @@ describe('ClaudeAgentDispatcher — durable directive ordering and review iterat
       writable: true,
     });
 
-    await expect(dispatcher.deliver(Msg.directive(0, { ...directivePayload, constraints }))).rejects.toThrow(
-      /directive payload.*invalid/i,
-    );
+    await expect(dispatcher.deliver(Msg.directive(0, { ...directivePayload, constraints }))).rejects.toMatchObject({
+      name: 'AutoloopRoutingError',
+      message: expect.stringMatching(/directive payload.*invalid/i),
+    });
 
     expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'directive.json'))).toBe(false);
     expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
@@ -3544,9 +3752,10 @@ describe('ClaudeAgentDispatcher — durable directive ordering and review iterat
       writable: true,
     });
 
-    await expect(dispatcher.deliver(Msg.directive(0, payload))).rejects.toThrow(
-      /directive payload.*(?:additional|reserved|unsupported)/i,
-    );
+    await expect(dispatcher.deliver(Msg.directive(0, payload))).rejects.toMatchObject({
+      name: 'AutoloopRoutingError',
+      message: expect.stringMatching(/directive payload.*(?:additional|reserved|unsupported)/i),
+    });
 
     expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'directive.json'))).toBe(false);
     expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
@@ -3582,7 +3791,7 @@ describe('ClaudeAgentDispatcher — durable directive ordering and review iterat
       thrown = error;
     }
 
-    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown).toBeInstanceOf(AutoloopRoutingError);
     expect((thrown as Error).message).toMatch(/directive payload.*invalid/i);
     expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'directive.json'))).toBe(false);
     expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
@@ -3893,7 +4102,10 @@ describe('ClaudeAgentDispatcher — durable directive ordering and review iterat
       '2026-09-03T01:00:00.000Z',
     );
 
-    await expect(dispatcher.deliver(distinct)).rejects.toThrow(/directive payload.*(?:reserved|unsupported)/i);
+    await expect(dispatcher.deliver(distinct)).rejects.toMatchObject({
+      name: 'AutoloopRoutingError',
+      message: expect.stringMatching(/directive payload.*(?:reserved|unsupported)/i),
+    });
 
     expect(fs.readFileSync(directivePath)).toEqual(firstBytes);
     expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(1);
@@ -3908,9 +4120,10 @@ describe('ClaudeAgentDispatcher — durable directive ordering and review iterat
       delivery_id: 'future-outbox-identity-must-not-enter-v1',
     } as typeof directivePayload;
 
-    await expect(dispatcher.deliver(Msg.directive(0, additionalIdentityPayload))).rejects.toThrow(
-      /directive payload.*(?:additional|unsupported)/i,
-    );
+    await expect(dispatcher.deliver(Msg.directive(0, additionalIdentityPayload))).rejects.toMatchObject({
+      name: 'AutoloopRoutingError',
+      message: expect.stringMatching(/directive payload.*(?:additional|unsupported)/i),
+    });
 
     expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'directive.json'))).toBe(false);
     expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);

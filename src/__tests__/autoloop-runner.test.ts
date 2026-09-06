@@ -6,6 +6,10 @@
  */
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { ClaudeAgentDispatcher } from '../autoloop/dispatcher.js';
 import {
   type AnyAutoloopMessage,
   AutoloopRoutingError,
@@ -15,7 +19,8 @@ import {
   validateMessage,
 } from '../autoloop/messages.js';
 import { AutoloopRunner } from '../autoloop/runner.js';
-import type { AgentDispatcher, AutoloopConfig } from '../autoloop/types.js';
+import type { SessionManager } from '../session-manager.js';
+import type { AgentDispatcher, AutoloopConfig, PhysicalAgentGeneration } from '../autoloop/types.js';
 
 function makeRunner(
   dispatcher: AgentDispatcher,
@@ -41,6 +46,55 @@ function makeRunner(
   };
   const runner = new AutoloopRunner(config);
   return { runner, pushes };
+}
+
+function makeCanonicalValidationHarness(): {
+  runner: AutoloopRunner;
+  effects: {
+    reserveAgentGeneration: ReturnType<typeof vi.fn>;
+    startSession: ReturnType<typeof vi.fn>;
+    sendMessage: ReturnType<typeof vi.fn>;
+    stopSession: ReturnType<typeof vi.fn>;
+    notifyUser: ReturnType<typeof vi.fn>;
+  };
+  ledgerDir: string;
+  cleanup: () => void;
+} {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'autoloop-runner-routing-'));
+  const effects = {
+    reserveAgentGeneration: vi.fn((_generation: PhysicalAgentGeneration) => true),
+    startSession: vi.fn(async () => ({ state: 'ready' })),
+    sendMessage: vi.fn(async () => ({ output: 'must not be sent', error: undefined })),
+    stopSession: vi.fn(async () => undefined),
+    notifyUser: vi.fn(async () => undefined),
+  };
+  const manager = {
+    autoloopOwnerInstanceId: `session-manager:${process.pid}:00000000-0000-4000-8000-000000000001`,
+    ...effects,
+    inspect: vi.fn(async () => 'absent'),
+    releaseReservation: vi.fn(async () => true),
+    getStatus: vi.fn(() => ({ stats: {} })),
+    compactSession: vi.fn(async () => undefined),
+  } as unknown as SessionManager;
+  const dispatcher = new ClaudeAgentDispatcher({ manager, runId: 'runner-routing', workspace });
+  const ledgerDir = path.join(workspace, 'tasks', 'runner-routing');
+  const runner = new AutoloopRunner({
+    run_id: 'runner-routing',
+    workspace,
+    ledger_dir: ledgerDir,
+    dispatcher,
+    phaseErrorCircuit: 3,
+    notifyUser: effects.notifyUser,
+  });
+  return {
+    runner,
+    effects,
+    ledgerDir,
+    cleanup: () => {
+      runner.stop();
+      fs.rmSync(workspace, { recursive: true, force: true });
+    },
+  };
 }
 
 describe('autoloop messages', () => {
@@ -662,4 +716,56 @@ describe('AutoloopRunner', () => {
     } as AnyAutoloopMessage;
     await expect(runner.send(bogus)).rejects.toThrow(AutoloopRoutingError);
   });
+
+  it.each([
+    ['chat', () => Msg.chat(0, { text: 7 } as unknown as Parameters<typeof Msg.chat>[1])],
+    [
+      'directive_ack',
+      () =>
+        Msg.directiveAck(0, {
+          understood: 'yes',
+        } as unknown as Parameters<typeof Msg.directiveAck>[1]),
+    ],
+    [
+      'iter_done',
+      () =>
+        Msg.iterDone(0, {
+          iter: 0,
+          verdict: 'advance',
+          metric: Number.NaN,
+        }),
+    ],
+  ] as const)(
+    'preserves repeated canonical %s payload rejections without phase-error or agent effects',
+    async (_type, buildMessage) => {
+      const { runner, effects, ledgerDir, cleanup } = makeCanonicalValidationHarness();
+      const routedTypes: string[] = [];
+      const phaseErrors: unknown[] = [];
+      runner.on('message', (message: AnyAutoloopMessage) => routedTypes.push(message.type));
+      runner.on('phase_error', (payload: unknown) => phaseErrors.push(payload));
+
+      try {
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          await expect(runner.send(buildMessage())).rejects.toBeInstanceOf(AutoloopRoutingError);
+        }
+
+        expect(phaseErrors).toEqual([]);
+        expect(routedTypes).not.toContain('phase_error');
+        expect(runner.state.status).toBe('planning');
+        expect(runner.state.consecutive_phase_errors).toBe(0);
+        expect(runner.state.recent_phase_errors).toEqual([]);
+        expect(runner.state.push_log_count).toBe(0);
+        expect(effects.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+        expect(effects.startSession).toHaveBeenCalledTimes(0);
+        expect(effects.sendMessage).toHaveBeenCalledTimes(0);
+        expect(effects.stopSession).toHaveBeenCalledTimes(0);
+        expect(effects.notifyUser).toHaveBeenCalledTimes(0);
+        expect(fs.existsSync(path.join(ledgerDir, 'decisions.jsonl'))).toBe(false);
+        expect(fs.existsSync(path.join(ledgerDir, 'chat.jsonl'))).toBe(false);
+        expect(fs.existsSync(path.join(ledgerDir, 'reviewer_sandbox'))).toBe(false);
+      } finally {
+        cleanup();
+      }
+    },
+  );
 });

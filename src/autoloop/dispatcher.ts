@@ -1138,6 +1138,8 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
    */
   private logicalDispatches = new Map<string, Promise<AnyAutoloopMessage[]>>();
   private readonly settledDispatches = new Set<string>();
+  /** Per-run FIFO gate for the Reviewer's one mutable sandbox and session. */
+  private reviewerDispatchTail: Promise<void> = Promise.resolve();
 
   constructor(config: ClaudeAgentDispatcherConfig) {
     super();
@@ -1694,9 +1696,23 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       case 'coder':
         return await this.deliverToCoder(env, dispatchId);
       case 'reviewer':
-        return await this.deliverToReviewer(env, dispatchId);
+        return await this.serializeReviewerDispatch(() => this.deliverToReviewer(env, dispatchId));
       default:
         throw new Error(`[autoloop] unexpected dispatcher target: ${env.to}`);
+    }
+  }
+
+  private async serializeReviewerDispatch<T>(dispatch: () => Promise<T>): Promise<T> {
+    const predecessor = this.reviewerDispatchTail;
+    let release!: () => void;
+    this.reviewerDispatchTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await predecessor;
+    try {
+      return await dispatch();
+    } finally {
+      release();
     }
   }
 

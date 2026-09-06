@@ -595,7 +595,11 @@ export class AutoloopRunner extends EventEmitter {
       } catch (error) {
         let phaseAgent: 'planner' | 'coder' | 'reviewer' | undefined;
         let operationFailure: AutoloopOperationFailure | undefined;
-        if (env.to === 'planner') {
+        if (error instanceof AutoloopRoutingError) {
+          // Canonical routing/schema rejection happens before an agent effect.
+          // Preserve that public taxonomy instead of turning caller input into
+          // a retryable engine failure that mutates the phase-error circuit.
+        } else if (env.to === 'planner') {
           phaseAgent = env.to;
           operationFailure = normalisePlannerOperationFailure(error);
         } else if ((env.to === 'coder' || env.to === 'reviewer') && isAutoloopOperationFailure(error)) {
