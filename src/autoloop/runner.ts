@@ -15,6 +15,7 @@ import {
   type AnyAutoloopMessage,
   type AutoloopOperationErrorCode,
   AutoloopRoutingError,
+  canonicalizeMessageBatch,
   canonicalizeMessage,
   Msg,
 } from './messages.js';
@@ -668,10 +669,7 @@ export class AutoloopRunner extends EventEmitter {
     // Validate and snapshot the complete logical reply batch before recording
     // progress or enqueueing any member. Otherwise a valid early push/terminate
     // can take effect even though a malformed later reply rejects this send.
-    const canonicalReplies = new Array<AnyAutoloopMessage>(replies.length);
-    for (let index = 0; index < replies.length; index += 1) {
-      canonicalReplies[index] = canonicalizeMessage(replies[index]);
-    }
+    const canonicalReplies = canonicalizeMessageBatch(replies);
     for (let index = 0; index < canonicalReplies.length; index += 1) {
       const reply = canonicalReplies[index];
       // A dispatcher-generated deadline record is bookkeeping, not agent

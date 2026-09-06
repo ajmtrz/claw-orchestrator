@@ -2499,6 +2499,93 @@ describe('ClaudeAgentDispatcher — canonical immutable Reviewer verdicts', () =
     expect(fs.readFileSync(verdictPath)).toEqual(first);
   });
 
+  it('accepts the shared canonical string-array shape when replaying a verdict with legacy flags', () => {
+    const { dispatcher, ledgerDir } = makeDispatcher();
+    const { persistVerdict } = verdictMethods(dispatcher);
+    const payload: VerdictCandidate = {
+      decision: 'advance',
+      metric: 1,
+      audit_notes: 'canonical runtime flags remain compatible',
+      accepted: true,
+      evidence_id: 'iter-0',
+    };
+    const directive = validateMessage(
+      Msg.directive(0, {
+        goal: 'derive a canonical string array',
+        constraints: ['canonical-runtime-flag'],
+        success_criteria: [],
+        max_attempts: 1,
+      }),
+    );
+    if (directive.type !== 'directive') throw new Error('expected directive');
+    const canonicalFlags = directive.payload.constraints;
+    dispatcher.secureLedgerCapability.writeIterationArtifact(
+      0,
+      'verdict.json',
+      `${JSON.stringify(
+        {
+          schema_version: LEDGER_SCHEMA_VERSION,
+          iter: 0,
+          ts: '2026-09-06T01:00:00.000Z',
+          ...payload,
+          flags: ['legacy-runtime-flag'],
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    const verdictPath = path.join(ledgerDir, 'iter', '0', 'verdict.json');
+    const first = fs.readFileSync(verdictPath);
+
+    expect(Object.getOwnPropertyDescriptor(canonicalFlags, 'toJSON')).toEqual({
+      configurable: false,
+      enumerable: false,
+      value: undefined,
+      writable: false,
+    });
+    expect(() => persistVerdict(0, { ...payload, flags: canonicalFlags })).not.toThrow();
+    expect(fs.readFileSync(verdictPath)).toEqual(first);
+  });
+
+  it('rejects near-miss canonical flag shadows and malformed array shapes without invoking accessors', () => {
+    const { dispatcher, ledgerDir } = makeDispatcher();
+    const { persistVerdict } = verdictMethods(dispatcher);
+    const payload: VerdictCandidate = {
+      decision: 'advance',
+      metric: 1,
+      audit_notes: 'near-miss runtime flags fail closed',
+      accepted: true,
+      evidence_id: 'iter-0',
+    };
+    persistVerdict(0, payload);
+    const verdictPath = path.join(ledgerDir, 'iter', '0', 'verdict.json');
+    const first = fs.readFileSync(verdictPath);
+
+    for (const kind of ['configurable-shadow', 'accessor-shadow', 'sparse', 'named', 'symbol'] as const) {
+      const flags = ['runtime-flag'];
+      let getterHits = 0;
+      if (kind === 'configurable-shadow') {
+        Object.defineProperty(flags, 'toJSON', { configurable: true, value: undefined });
+      }
+      if (kind === 'accessor-shadow') {
+        Object.defineProperty(flags, 'toJSON', {
+          configurable: true,
+          get() {
+            getterHits += 1;
+            return undefined;
+          },
+        });
+      }
+      if (kind === 'sparse') delete flags[0];
+      if (kind === 'named') Object.defineProperty(flags, 'metadata', { value: 'unsupported' });
+      if (kind === 'symbol') Object.defineProperty(flags, Symbol('metadata'), { value: 'unsupported' });
+
+      expect(() => persistVerdict(0, { ...payload, flags }), kind).toThrow(/conflicting|immutable|invalid/i);
+      expect(getterHits, kind).toBe(0);
+      expect(fs.readFileSync(verdictPath), kind).toEqual(first);
+    }
+  });
+
   it('rejects unknown own fields while preserving the first verdict', () => {
     const { dispatcher, ledgerDir } = makeDispatcher();
     const { persistVerdict } = verdictMethods(dispatcher);

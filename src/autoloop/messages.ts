@@ -63,7 +63,7 @@ export interface ReviewVerdictPayload {
    * autoloop had no way to notice it had succeeded, only ways to notice it was
    * failing. Absent means no contract was configured, not that it failed.
    */
-  accepted?: boolean;
+  accepted?: true;
   /** Evidence bundle id backing `accepted`. */
   evidence_id?: string;
 }
@@ -324,6 +324,7 @@ function canonicalPayloadFields(
  * UTF-16 code units, matching JavaScript's immutable string length.
  */
 const MAX_MESSAGE_PRIMITIVE_ARRAY_ITEMS = 10_000;
+const MAX_DISPATCHER_REPLY_BATCH_ITEMS = MAX_MESSAGE_PRIMITIVE_ARRAY_ITEMS;
 const MAX_MESSAGE_STRING_CODE_UNITS = 1_048_576;
 const MAX_MESSAGE_TOTAL_STRING_CODE_UNITS = 4_194_304;
 const MAX_ITER_ARTIFACT_DIFF_CODE_UNITS = MAX_MESSAGE_TOTAL_STRING_CODE_UNITS;
@@ -394,10 +395,6 @@ function inspectPrimitiveArray<T>(
   if (length > limits.maxItems) {
     invalidDeliveryPayload(type, `${key} exceeds the ${String(limits.maxItems)}-item limit`);
   }
-  const ownKeys = Reflect.ownKeys(value);
-  if (!hasExactArrayKeys(value, length, ownKeys)) {
-    invalidDeliveryPayload(type, `${key} must contain only exact contiguous indices`);
-  }
   const clone: T[] | undefined = snapshot ? [] : undefined;
   let totalStringCodeUnits = 0;
   for (let index = 0; index < length; index += 1) {
@@ -428,6 +425,10 @@ function inspectPrimitiveArray<T>(
       });
     }
   }
+  const ownKeys = Reflect.ownKeys(value);
+  if (!hasExactArrayKeys(value, length, ownKeys)) {
+    invalidDeliveryPayload(type, `${key} must contain only exact contiguous indices`);
+  }
   if (clone) freezeCanonicalArray(clone);
   return clone;
 }
@@ -452,6 +453,27 @@ function validatePrimitiveArray<T>(
   limits: PrimitiveArrayLimits,
 ): void {
   inspectPrimitiveArray(value, type, key, accepts, expected, limits, false);
+}
+
+/**
+ * Shared compatibility predicate for exact public string arrays. It accepts
+ * ordinary source arrays and our frozen canonical arrays carrying the exact
+ * inert `toJSON` shadow, while failing closed on every other shape.
+ */
+export function hasExactStringArrayElements(value: unknown): value is string[] {
+  try {
+    validatePrimitiveArray(
+      value,
+      'review_verdict',
+      'flags',
+      (candidate): candidate is string => typeof candidate === 'string',
+      'an array of strings',
+      STRING_ARRAY_LIMITS,
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function canonicalDirectiveStringArray(value: unknown, key: 'constraints' | 'success_criteria'): string[] {
@@ -1106,6 +1128,57 @@ export function canonicalizeMessage(env: AnyAutoloopMessage): AnyAutoloopMessage
   }
   Object.freeze(identity);
   return identity as unknown as AnyAutoloopMessage;
+}
+
+/**
+ * Validate and snapshot one complete dispatcher result before the Runner
+ * records activity or queues any member. Descriptor-only capture avoids
+ * mutable `length`/index reads, and exact-key validation rejects holes and
+ * side-channel properties as one typed routing failure.
+ */
+export function canonicalizeMessageBatch(value: unknown): AnyAutoloopMessage[] {
+  try {
+    if (!Array.isArray(value)) {
+      throw new AutoloopRoutingError('Dispatcher reply batch must be an array');
+    }
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+    if (
+      !lengthDescriptor ||
+      !Object.hasOwn(lengthDescriptor, 'value') ||
+      !Number.isSafeInteger(lengthDescriptor.value) ||
+      lengthDescriptor.value < 0
+    ) {
+      throw new AutoloopRoutingError('Dispatcher reply batch must have an own data length');
+    }
+    const length = lengthDescriptor.value as number;
+    if (length > MAX_DISPATCHER_REPLY_BATCH_ITEMS) {
+      throw new AutoloopRoutingError(
+        `Dispatcher reply batch exceeds the ${String(MAX_DISPATCHER_REPLY_BATCH_ITEMS)}-item limit`,
+      );
+    }
+
+    const canonical: AnyAutoloopMessage[] = [];
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor || !Object.hasOwn(descriptor, 'value') || descriptor.enumerable !== true) {
+        throw new AutoloopRoutingError('Dispatcher reply batch must contain only own enumerable data members');
+      }
+      Object.defineProperty(canonical, String(index), {
+        configurable: true,
+        enumerable: true,
+        value: canonicalizeMessage(descriptor.value as AnyAutoloopMessage),
+        writable: true,
+      });
+    }
+    const ownKeys = Reflect.ownKeys(value);
+    if (!hasExactArrayKeys(value, length, ownKeys)) {
+      throw new AutoloopRoutingError('Dispatcher reply batch must contain only exact contiguous indices');
+    }
+    return freezeCanonicalArray(canonical);
+  } catch (error) {
+    if (error instanceof AutoloopRoutingError) throw error;
+    throw new AutoloopRoutingError('Dispatcher reply batch could not be inspected safely');
+  }
 }
 
 export function validateMessage(env: AnyAutoloopMessage): AnyAutoloopMessage {

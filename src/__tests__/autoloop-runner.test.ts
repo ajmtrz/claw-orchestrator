@@ -5,13 +5,14 @@
  * drive the runner through a representative iter and assert routing invariants.
  */
 
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, expectTypeOf, vi, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { ClaudeAgentDispatcher } from '../autoloop/dispatcher.js';
 import {
   type AnyAutoloopMessage,
+  type ReviewVerdictPayload,
   AutoloopRoutingError,
   Msg,
   canonicalizeMessage,
@@ -181,6 +182,7 @@ function exactMessageCases(): Array<readonly [string, AnyAutoloopMessage]> {
 }
 
 const TEST_MAX_PRIMITIVE_ARRAY_ITEMS = 10_000;
+const TEST_MAX_REPLY_BATCH_ITEMS = 10_000;
 const TEST_MAX_MESSAGE_STRING_CODE_UNITS = 1_048_576;
 const TEST_MAX_MESSAGE_TOTAL_STRING_CODE_UNITS = 4_194_304;
 const TEST_MAX_ITER_ARTIFACT_DIFF_CODE_UNITS = 4_194_304;
@@ -453,6 +455,10 @@ describe('autoloop messages', () => {
     expect(canonical.payload).toMatchObject({ accepted: true, evidence_id: 'iter-0' });
   });
 
+  it('exposes only the runtime-supported true marker in the public review verdict type', () => {
+    expectTypeOf<ReviewVerdictPayload['accepted']>().toEqualTypeOf<true | undefined>();
+  });
+
   it.each([
     ['standalone retryable:false', { retryable: false }],
     ['committed:true with retryable:false', { committed: true, retryable: false }],
@@ -551,6 +557,141 @@ describe('autoloop messages', () => {
     },
   );
 
+  it.each(['constraints', 'success_criteria', 'files_changed', 'flags'] as const)(
+    'rejects oversized strings in %s before consulting ownKeys while retaining exact-limit inputs',
+    (field) => {
+      const exactString = 'x'.repeat(TEST_MAX_MESSAGE_STRING_CODE_UNITS);
+      const cases = [
+        { label: 'per-string', value: [`${exactString}x`] },
+        { label: 'aggregate', value: [exactString, exactString, exactString, exactString, 'x'] },
+      ] as const;
+
+      for (const testCase of cases) {
+        let ownKeysHits = 0;
+        const guarded = new Proxy(testCase.value.slice(), {
+          ownKeys(target) {
+            ownKeysHits += 1;
+            return Reflect.ownKeys(target);
+          },
+        });
+
+        expect(() => validateMessage(primitiveArrayMessage(field, guarded)), testCase.label).toThrow(
+          AutoloopRoutingError,
+        );
+        expect(ownKeysHits, testCase.label).toBe(0);
+      }
+
+      for (const [label, value] of [
+        ['per-string exact', [exactString]],
+        ['aggregate exact', [exactString, exactString, exactString, exactString]],
+      ] as const) {
+        let ownKeysHits = 0;
+        const guarded = new Proxy(value.slice(), {
+          ownKeys(target) {
+            ownKeysHits += 1;
+            return Reflect.ownKeys(target);
+          },
+        });
+
+        expect(() => validateMessage(primitiveArrayMessage(field, guarded)), label).not.toThrow();
+        expect(ownKeysHits, label).toBe(1);
+      }
+    },
+  );
+
+  it.each(['constraints', 'success_criteria', 'files_changed', 'prior_metrics', 'flags'] as const)(
+    'rejects sparse, named, symbol, and accessor shapes for public primitive-array field %s',
+    (field) => {
+      const item = field === 'prior_metrics' ? 1 : 'x';
+      for (const kind of ['sparse', 'named', 'symbol', 'accessor'] as const) {
+        const candidate: unknown[] = [item];
+        let getterHits = 0;
+        if (kind === 'sparse') delete candidate[0];
+        if (kind === 'named') Object.defineProperty(candidate, 'metadata', { value: 'unsupported' });
+        if (kind === 'symbol') Object.defineProperty(candidate, Symbol('metadata'), { value: 'unsupported' });
+        if (kind === 'accessor') {
+          Object.defineProperty(candidate, '0', {
+            configurable: true,
+            enumerable: true,
+            get() {
+              getterHits += 1;
+              return item;
+            },
+          });
+        }
+
+        expect(() => validateMessage(primitiveArrayMessage(field, candidate)), kind).toThrow(AutoloopRoutingError);
+        expect(getterHits, kind).toBe(0);
+      }
+    },
+  );
+
+  it('keeps canonical arrays byte-stable and re-canonicalizable under Array.prototype.toJSON pollution', () => {
+    const originalToJSON = Object.getOwnPropertyDescriptor(Array.prototype, 'toJSON');
+    let getterHits = 0;
+    let callHits = 0;
+    let encoded = '';
+    try {
+      Object.defineProperty(Array.prototype, 'toJSON', {
+        configurable: true,
+        get() {
+          getterHits += 1;
+          return () => {
+            callHits += 1;
+            return ['polluted'];
+          };
+        },
+      });
+      const first = canonicalizeMessage(
+        Msg.directive(0, {
+          goal: 'stable arrays',
+          constraints: ['one writer'],
+          success_criteria: ['all gates green'],
+          max_attempts: 1,
+        }),
+      );
+      const second = canonicalizeMessage(first);
+      if (first.type !== 'directive' || second.type !== 'directive') throw new Error('expected directive');
+
+      for (const value of [
+        first.payload.constraints,
+        first.payload.success_criteria,
+        second.payload.constraints,
+        second.payload.success_criteria,
+      ]) {
+        expect(Object.getOwnPropertyDescriptor(value, 'toJSON')).toEqual({
+          configurable: false,
+          enumerable: false,
+          value: undefined,
+          writable: false,
+        });
+      }
+      encoded = serialise(second).text;
+    } finally {
+      if (originalToJSON === undefined) Reflect.deleteProperty(Array.prototype, 'toJSON');
+      else Object.defineProperty(Array.prototype, 'toJSON', originalToJSON);
+    }
+
+    expect(getterHits).toBe(0);
+    expect(callHits).toBe(0);
+    expect(JSON.parse(encoded)).toMatchObject({
+      payload: { constraints: ['one writer'], success_criteria: ['all gates green'] },
+    });
+  });
+
+  it.each([
+    ['configurable shadow', { configurable: true, value: undefined }],
+    ['writable shadow', { value: undefined, writable: true }],
+    ['enumerable shadow', { enumerable: true, value: undefined }],
+    ['callable shadow', { value: () => ['mutated'] }],
+    ['accessor shadow', { configurable: true, get: () => ['mutated'] }],
+  ] as const)('rejects primitive arrays with a near-miss own toJSON %s', (_label, descriptor) => {
+    const candidate = ['one writer'];
+    Object.defineProperty(candidate, 'toJSON', descriptor);
+
+    expect(() => validateMessage(primitiveArrayMessage('constraints', candidate))).toThrow(AutoloopRoutingError);
+  });
+
   it('enforces the exact iter_artifacts diff budget', () => {
     const exact = 'x'.repeat(TEST_MAX_ITER_ARTIFACT_DIFF_CODE_UNITS);
 
@@ -560,6 +701,38 @@ describe('autoloop messages', () => {
     expect(() =>
       validateMessage(Msg.iterArtifacts(0, { diff: `${exact}x`, eval_output: null, files_changed: [] })),
     ).toThrow(AutoloopRoutingError);
+  });
+
+  it('rejects an oversized diff before traversing files_changed or eval_output', () => {
+    let filesOwnKeysHits = 0;
+    let evalOwnKeysHits = 0;
+    const filesChanged = new Proxy([], {
+      ownKeys(target) {
+        filesOwnKeysHits += 1;
+        return Reflect.ownKeys(target);
+      },
+    });
+    const evalOutput = new Proxy(
+      {},
+      {
+        ownKeys(target) {
+          evalOwnKeysHits += 1;
+          return Reflect.ownKeys(target);
+        },
+      },
+    );
+
+    expect(() =>
+      validateMessage(
+        Msg.iterArtifacts(0, {
+          diff: 'x'.repeat(TEST_MAX_ITER_ARTIFACT_DIFF_CODE_UNITS + 1),
+          eval_output: evalOutput,
+          files_changed: filesChanged,
+        }),
+      ),
+    ).toThrow(AutoloopRoutingError);
+    expect(filesOwnKeysHits).toBe(0);
+    expect(evalOwnKeysHits).toBe(0);
   });
 
   it('accepts eval_output null and a null-prototype input record as frozen canonical JSON', () => {
@@ -608,6 +781,19 @@ describe('autoloop messages', () => {
     expect(() =>
       validateMessage(evalOutputMessage(Array.from({ length: TEST_MAX_EVAL_OUTPUT_CONTAINER_ITEMS + 1 }, () => null))),
     ).toThrow(AutoloopRoutingError);
+  });
+
+  it('rejects an overlength eval_output array before consulting ownKeys', () => {
+    let ownKeysHits = 0;
+    const overlength = new Proxy(new Array(TEST_MAX_EVAL_OUTPUT_CONTAINER_ITEMS + 1), {
+      ownKeys(target) {
+        ownKeysHits += 1;
+        return Reflect.ownKeys(target);
+      },
+    });
+
+    expect(() => validateMessage(evalOutputMessage(overlength))).toThrow(AutoloopRoutingError);
+    expect(ownKeysHits).toBe(0);
   });
 
   it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
@@ -1786,13 +1972,266 @@ describe('AutoloopRunner', () => {
     },
   );
 
+  it.each([
+    [
+      'sparse',
+      () => {
+        const replies = [Msg.pushUser(0, { level: 'info', summary: 'must not escape', channel: 'auto' })];
+        replies.length = 2;
+        return { replies, getterHits: (): number => 0 };
+      },
+    ],
+    [
+      'named',
+      () => {
+        const replies = [
+          Msg.pushUser(0, { level: 'info', summary: 'must not escape', channel: 'auto' }),
+        ] as Array<AnyAutoloopMessage> & { metadata?: string };
+        replies.metadata = 'unsupported';
+        return { replies, getterHits: (): number => 0 };
+      },
+    ],
+    [
+      'symbol',
+      () => {
+        const replies = [
+          Msg.pushUser(0, { level: 'info', summary: 'must not escape', channel: 'auto' }),
+        ] as Array<AnyAutoloopMessage> & Record<symbol, string>;
+        replies[Symbol('metadata')] = 'unsupported';
+        return { replies, getterHits: (): number => 0 };
+      },
+    ],
+    [
+      'accessor',
+      () => {
+        const replies = [Msg.pushUser(0, { level: 'info', summary: 'must not escape', channel: 'auto' })];
+        let hits = 0;
+        const value = replies[0];
+        Object.defineProperty(replies, '0', {
+          configurable: true,
+          enumerable: true,
+          get() {
+            hits += 1;
+            return value;
+          },
+        });
+        return { replies, getterHits: (): number => hits };
+      },
+    ],
+  ] as const)('rejects a %s dispatcher reply container before any member effect', async (_shape, buildReplies) => {
+    const candidate = buildReplies();
+    const dispatcher: AgentDispatcher = {
+      async deliver(env) {
+        return env.type === 'chat' ? candidate.replies : [];
+      },
+    };
+    const { runner, pushes } = makeRunner(dispatcher);
+    const emittedTypes: string[] = [];
+    runner.on('message', (message: AnyAutoloopMessage) => emittedTypes.push(message.type));
+
+    try {
+      await runner.start();
+      await expect(runner.send(Msg.chat(0, { text: 'reject malformed batch shape' }))).rejects.toBeInstanceOf(
+        AutoloopRoutingError,
+      );
+      expect(candidate.getterHits()).toBe(0);
+      expect(pushes).toEqual([]);
+      expect(emittedTypes).toEqual(['chat']);
+      expect(runner.state.status).toBe('planning');
+      expect(runner.state.push_log_count).toBe(0);
+      expect(runner.state.consecutive_phase_errors).toBe(0);
+    } finally {
+      runner.stop();
+    }
+  });
+
+  it('bounds a dispatcher reply container before enumerating or reading members', async () => {
+    let ownKeysHits = 0;
+    let indexDescriptorHits = 0;
+    const replies = new Proxy(new Array<AnyAutoloopMessage>(TEST_MAX_REPLY_BATCH_ITEMS + 1), {
+      ownKeys(target) {
+        ownKeysHits += 1;
+        return Reflect.ownKeys(target);
+      },
+      getOwnPropertyDescriptor(target, key) {
+        if (key !== 'length') indexDescriptorHits += 1;
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    const dispatcher: AgentDispatcher = {
+      async deliver(env) {
+        return env.type === 'chat' ? replies : [];
+      },
+    };
+    const { runner } = makeRunner(dispatcher);
+
+    try {
+      await runner.start();
+      let observed: unknown;
+      try {
+        await runner.send(Msg.chat(0, { text: 'bound the whole batch' }));
+      } catch (error) {
+        observed = error;
+      }
+      expect(observed).toBeInstanceOf(AutoloopRoutingError);
+      expect((observed as Error).message).toMatch(/reply batch.*10000-item limit/i);
+      expect(ownKeysHits).toBe(0);
+      expect(indexDescriptorHits).toBe(0);
+      expect(runner.state.consecutive_phase_errors).toBe(0);
+    } finally {
+      runner.stop();
+    }
+  });
+
+  it('snapshots a valid dispatcher reply container through data descriptors exactly once', async () => {
+    const source = [Msg.pushUser(0, { level: 'info', summary: 'one canonical effect', channel: 'auto' })];
+    let ordinaryDataReads = 0;
+    let ownKeysHits = 0;
+    const descriptorReads = new Map<PropertyKey, number>();
+    const replies = new Proxy(source, {
+      get(target, key, receiver) {
+        // Async return-value assimilation is allowed to inspect `then`; the
+        // reply data itself must be captured exclusively via descriptors.
+        if (key === 'length' || key === '0') ordinaryDataReads += 1;
+        return Reflect.get(target, key, receiver);
+      },
+      ownKeys(target) {
+        ownKeysHits += 1;
+        return Reflect.ownKeys(target);
+      },
+      getOwnPropertyDescriptor(target, key) {
+        descriptorReads.set(key, (descriptorReads.get(key) ?? 0) + 1);
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    const dispatcher: AgentDispatcher = {
+      async deliver(env) {
+        return env.type === 'chat' ? replies : [];
+      },
+    };
+    const { runner, pushes } = makeRunner(dispatcher);
+
+    try {
+      await runner.start();
+      await runner.send(Msg.chat(0, { text: 'snapshot the batch' }));
+
+      expect(ordinaryDataReads).toBe(0);
+      expect(ownKeysHits).toBe(1);
+      expect(descriptorReads.get('length')).toBe(1);
+      expect(descriptorReads.get('0')).toBe(1);
+      expect(pushes).toEqual([{ level: 'info', summary: 'one canonical effect' }]);
+    } finally {
+      runner.stop();
+    }
+  });
+
+  it.each([
+    ['pause', () => Msg.pause(0, { reason: 'must remain unapplied' })],
+    [
+      'send_timeout',
+      () =>
+        Msg.sendTimeout(0, {
+          status: 'awaiting_resume',
+          dispatch_id: 'must-remain-unapplied',
+          agent: 'planner',
+          message_id: 'chat-0',
+          message_type: 'chat',
+          iter: 0,
+          timeout_ms: 600_000,
+          error: 'must remain unapplied',
+        }),
+    ],
+  ] as const)(
+    'rejects a length-shifting batch containing valid %s plus an invalid sibling with zero partial effect',
+    async (_validType, buildValidReply) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      const source = [
+        buildValidReply(),
+        Msg.pushUser(0, { level: 'info', summary: 7 as unknown as string, channel: 'auto' }),
+      ];
+      let ordinaryLengthReads = 0;
+      let ownKeysHits = 0;
+      const descriptorReads = new Map<PropertyKey, number>();
+      const replies = new Proxy(source, {
+        get(target, key, receiver) {
+          if (key === 'length') {
+            ordinaryLengthReads += 1;
+            return ordinaryLengthReads === 1 ? 2 : 1;
+          }
+          return Reflect.get(target, key, receiver);
+        },
+        ownKeys(target) {
+          ownKeysHits += 1;
+          return Reflect.ownKeys(target);
+        },
+        getOwnPropertyDescriptor(target, key) {
+          descriptorReads.set(key, (descriptorReads.get(key) ?? 0) + 1);
+          return Reflect.getOwnPropertyDescriptor(target, key);
+        },
+      });
+      const dispatcher: AgentDispatcher = {
+        async deliver(env) {
+          if (env.type !== 'chat') return [];
+          await vi.advanceTimersByTimeAsync(1_000);
+          return replies;
+        },
+      };
+      const { runner, pushes } = makeRunner(dispatcher, [], {
+        activityLeaseMs: 60_000,
+        autoloopHardTimeoutMs: 600_000,
+      });
+      const stateEvents: string[] = [];
+      const emittedTypes: string[] = [];
+      const timeoutEvents: unknown[] = [];
+      const phaseErrors: unknown[] = [];
+      runner.on('state', () => stateEvents.push(runner.state.status));
+      runner.on('message', (message: AnyAutoloopMessage) => emittedTypes.push(message.type));
+      runner.on('send_timeout', (event) => timeoutEvents.push(event));
+      runner.on('phase_error', (event) => phaseErrors.push(event));
+
+      try {
+        await runner.start();
+        stateEvents.length = 0;
+        const acceptedAt = Date.now();
+        let observed: unknown;
+        try {
+          await runner.send(Msg.chat(0, { text: 'reject a shifting batch atomically' }));
+        } catch (error) {
+          observed = error;
+        }
+
+        expect(observed).toBeInstanceOf(AutoloopRoutingError);
+        expect(ordinaryLengthReads).toBe(0);
+        // The malformed member is rejected before exact-key enumeration.
+        expect(ownKeysHits).toBe(0);
+        expect(descriptorReads.get('length')).toBe(1);
+        expect(descriptorReads.get('0')).toBe(1);
+        expect(descriptorReads.get('1')).toBe(1);
+        expect(runner.state.last_activity_at).toBe(acceptedAt);
+        expect(runner.state.status).toBe('planning');
+        expect(runner.state.status_reason).toBeNull();
+        expect(runner.state.pending_dispatch).toBeNull();
+        expect(runner.state.consecutive_phase_errors).toBe(0);
+        expect(runner.state.push_log_count).toBe(0);
+        expect(stateEvents).toEqual([]);
+        expect(emittedTypes).toEqual(['chat']);
+        expect(timeoutEvents).toEqual([]);
+        expect(phaseErrors).toEqual([]);
+        expect(pushes).toEqual([]);
+      } finally {
+        runner.stop();
+      }
+    },
+  );
+
   it('uses immutable one-snapshot boundaries for a valid reply and derived review messages', async () => {
     const delivered: AnyAutoloopMessage[] = [];
     const verdictTarget = {
       decision: 'advance' as const,
       metric: 0.9,
       audit_notes: 'verified',
-      accepted: true,
+      accepted: true as const,
       evidence_id: 'evidence-0',
     };
     const verdictDescriptorReads = new Map<PropertyKey, number>();

@@ -36,6 +36,7 @@ import {
   type AnyAutoloopMessage,
   type AutoloopOperationErrorCode,
   canonicalizeMessage,
+  hasExactStringArrayElements,
   Msg,
   type SendTimeoutPayload,
 } from './messages.js';
@@ -353,27 +354,6 @@ type PersistedReviewVerdictPayload = {
 const PERSISTED_REVIEW_VERDICT_KEYS = ['decision', 'metric', 'audit_notes', 'accepted', 'evidence_id'] as const;
 const STORED_REVIEW_VERDICT_KEYS = new Set(['schema_version', 'iter', 'ts', ...PERSISTED_REVIEW_VERDICT_KEYS, 'flags']);
 const INCOMING_REVIEW_VERDICT_KEYS = new Set([...PERSISTED_REVIEW_VERDICT_KEYS, 'flags']);
-
-function hasExactStringArrayElements(value: unknown): value is string[] {
-  if (!Array.isArray(value)) return false;
-  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
-  if (
-    !lengthDescriptor ||
-    !Object.hasOwn(lengthDescriptor, 'value') ||
-    !Number.isSafeInteger(lengthDescriptor.value) ||
-    lengthDescriptor.value < 0
-  ) {
-    return false;
-  }
-  const length = lengthDescriptor.value as number;
-  const keys = Reflect.ownKeys(value);
-  if (keys.length !== length + 1) return false;
-  for (let index = 0; index < length; index += 1) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
-    if (!descriptor || !Object.hasOwn(descriptor, 'value') || typeof descriptor.value !== 'string') return false;
-  }
-  return true;
-}
 
 function canonicalPersistedVerdictPayload(
   payload: PersistedReviewVerdictPayload,
@@ -2735,7 +2715,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   private async gateVerdict<T extends { decision: string; metric: number | null; audit_notes: string }>(
     iter: number,
     rc: T,
-  ): Promise<T & { accepted?: boolean; evidence_id?: string }> {
+  ): Promise<T & { accepted?: true; evidence_id?: string }> {
     const contract = this.config.contract;
     if (!contract || rc.decision !== 'advance') return rc;
 
