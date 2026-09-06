@@ -35,6 +35,13 @@ function countRows(target: string, kind?: string): number {
     .filter((line) => !kind || (JSON.parse(line) as { kind?: unknown }).kind === kind).length;
 }
 
+function seedCompleteReviewerArtifacts(ledger: SecureAutoloopLedger, iter: number): void {
+  ledger.writeIterationArtifact(iter, 'directive.json', `directive-${iter}\n`);
+  ledger.writeIterationArtifact(iter, 'eval_output.json', `eval-${iter}\n`);
+  ledger.writeIterationArtifact(iter, 'coder_summary.txt', `summary-${iter}\n`);
+  ledger.writeIterationArtifact(iter, 'diff.patch', `diff-${iter}\n`);
+}
+
 const TEST_OWNER_INSTANCE_ID = `session-manager:${process.pid}:00000000-0000-4000-8000-000000000099`;
 
 function stubGenerationManager() {
@@ -748,6 +755,264 @@ describe('SecureAutoloopLedger', () => {
       });
       expect(fs.readdirSync(path.dirname(target))).toEqual(['coder_summary.txt']);
       expect(artifactCommits).toBe(1);
+    });
+
+    it('reports a committed failure when the created child is deleted during its parent-directory barrier', () => {
+      const workspace = tempWorkspace();
+      const bytes = Buffer.from('created-child\n');
+      let armed = false;
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: {
+          beforeDirectorySync: (event) => {
+            const target = path.join(event.filePath, 'coder_summary.txt');
+            if (!armed || !fs.existsSync(target)) return;
+            armed = false;
+            fs.unlinkSync(target);
+          },
+        },
+      });
+      armed = true;
+
+      expect(() => ledger.writeIterationArtifact(0, 'coder_summary.txt', bytes)).toThrow(
+        expect.objectContaining({
+          name: 'SecureAutoloopLedgerCommitError',
+          code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+          committed: true,
+          retryable: false,
+          operation: 'secure_nested_artifact_write',
+          cause: expect.objectContaining({ message: expect.stringMatching(/removed|missing|incomplete|changed/i) }),
+        }),
+      );
+      expect(fs.existsSync(path.join(ledger.directory, 'iter', '0', 'coder_summary.txt'))).toBe(false);
+    });
+
+    it('reports a committed failure when an existing identical child is replaced during its durability barrier', () => {
+      const workspace = tempWorkspace();
+      const bytes = Buffer.from('existing-child\n');
+      let armed = false;
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: {
+          beforeDirectorySync: (event) => {
+            const target = path.join(event.filePath, 'coder_summary.txt');
+            if (!armed || !fs.existsSync(target)) return;
+            armed = false;
+            fs.unlinkSync(target);
+            fs.writeFileSync(target, bytes, { mode: 0o600 });
+          },
+        },
+      });
+      ledger.writeIterationArtifact(0, 'coder_summary.txt', bytes);
+      const original = fs.lstatSync(path.join(ledger.directory, 'iter', '0', 'coder_summary.txt'));
+      armed = true;
+
+      expect(() => ledger.writeIterationArtifact(0, 'coder_summary.txt', Buffer.from(bytes))).toThrow(
+        expect.objectContaining({
+          name: 'SecureAutoloopLedgerCommitError',
+          code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+          committed: true,
+          retryable: false,
+          operation: 'secure_nested_artifact_write',
+          cause: expect.objectContaining({ message: expect.stringMatching(/identity|replaced|changed/i) }),
+        }),
+      );
+      const replacement = fs.lstatSync(path.join(ledger.directory, 'iter', '0', 'coder_summary.txt'));
+      expect({ dev: replacement.dev, ino: replacement.ino }).not.toEqual({ dev: original.dev, ino: original.ino });
+      expect(fs.readFileSync(path.join(ledger.directory, 'iter', '0', 'coder_summary.txt'))).toEqual(bytes);
+    });
+
+    it('reports a committed failure when a planted identical child changes during its durability barrier', () => {
+      const workspace = tempWorkspace();
+      const bytes = Buffer.from('planted-child\n');
+      let planted = false;
+      let armed = true;
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: {
+          beforeNestedMutation: (event) => {
+            if (event.operation !== 'artifact-commit' || event.relativePath !== 'iter/0/coder_summary.txt') return;
+            fs.writeFileSync(event.filePath, bytes, { mode: 0o600 });
+            planted = true;
+          },
+          beforeDirectorySync: (event) => {
+            const target = path.join(event.filePath, 'coder_summary.txt');
+            if (!armed || !planted || !fs.existsSync(target)) return;
+            armed = false;
+            fs.writeFileSync(target, 'mismatched-child\n');
+          },
+        },
+      });
+
+      expect(() => ledger.writeIterationArtifact(0, 'coder_summary.txt', bytes)).toThrow(
+        expect.objectContaining({
+          name: 'SecureAutoloopLedgerCommitError',
+          code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+          committed: true,
+          retryable: false,
+          operation: 'secure_nested_artifact_write',
+          cause: expect.objectContaining({ message: expect.stringMatching(/contents|mismatch|incomplete|changed/i) }),
+        }),
+      );
+      expect(fs.readFileSync(path.join(ledger.directory, 'iter', '0', 'coder_summary.txt'), 'utf8')).toBe(
+        'mismatched-child\n',
+      );
+    });
+
+    it.each(['reviewer_memory.md', 'reviewer_log.jsonl'] as const)(
+      'rejects a %s byte change at the sandbox reset seam',
+      (persistentName) => {
+        const workspace = tempWorkspace();
+        let armed = false;
+        const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+          create: true,
+          testHooks: {
+            beforeNestedMutation: (event) => {
+              if (!armed || event.operation !== 'sandbox-reset') return;
+              fs.writeFileSync(path.join(event.filePath, persistentName), 'changed-at-reset\n');
+            },
+          },
+        });
+        seedCompleteReviewerArtifacts(ledger, 0);
+        const sandbox = path.join(ledger.directory, 'reviewer_sandbox');
+        fs.mkdirSync(sandbox);
+        fs.writeFileSync(path.join(sandbox, persistentName), 'captured-before-reset\n');
+        armed = true;
+
+        expect(() => ledger.stageReviewerSandbox(0)).toThrow(/contents|changed|mismatch|reset seam/i);
+      },
+    );
+
+    it('rejects a removable file byte change at the sandbox reset seam', () => {
+      const workspace = tempWorkspace();
+      let armed = false;
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: {
+          beforeNestedMutation: (event) => {
+            if (!armed || event.operation !== 'sandbox-reset') return;
+            fs.writeFileSync(path.join(event.filePath, 'scratch.txt'), 'changed-before-removal\n');
+          },
+        },
+      });
+      seedCompleteReviewerArtifacts(ledger, 0);
+      const sandbox = path.join(ledger.directory, 'reviewer_sandbox');
+      fs.mkdirSync(sandbox);
+      fs.writeFileSync(path.join(sandbox, 'scratch.txt'), 'captured-before-reset\n');
+      armed = true;
+
+      expect(() => ledger.stageReviewerSandbox(0)).toThrow(/contents|changed|mismatch|reset seam/i);
+    });
+
+    it('rejects an artifact directory masquerading as a required regular file at the final sandbox seam', () => {
+      const workspace = tempWorkspace();
+      let armed = false;
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: {
+          beforeNestedMutation: (event) => {
+            if (!armed || event.operation !== 'sandbox-stage' || event.relativePath !== 'reviewer_sandbox/iter-0') {
+              return;
+            }
+            const target = path.join(event.filePath, 'directive.json');
+            fs.unlinkSync(target);
+            fs.mkdirSync(target);
+          },
+        },
+      });
+      seedCompleteReviewerArtifacts(ledger, 0);
+      armed = true;
+
+      expect(() => ledger.stageReviewerSandbox(0)).toThrow(/regular|directory|type|staged iteration/i);
+    });
+
+    it.each([
+      'iter-1/directive.json',
+      'iter-1/eval_output.json',
+      'iter-1/coder_summary.txt',
+      'iter-1/diff.patch',
+      'plan.md',
+      'goal.json',
+      'prior_verdict.json',
+      'reviewer_memory.md',
+      'reviewer_log.jsonl',
+    ] as const)('rejects a byte change to final staged file %s', (relativeTarget) => {
+      const workspace = tempWorkspace();
+      let armed = false;
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: {
+          beforeNestedMutation: (event) => {
+            if (!armed || event.operation !== 'sandbox-stage' || event.relativePath !== 'reviewer_sandbox/iter-1') {
+              return;
+            }
+            fs.writeFileSync(path.join(path.dirname(event.filePath), relativeTarget), 'changed-at-final-seam\n');
+          },
+        },
+      });
+      seedCompleteReviewerArtifacts(ledger, 1);
+      ledger.writeIterationArtifact(0, 'verdict.json', '{"decision":"hold"}\n');
+      const sandbox = path.join(ledger.directory, 'reviewer_sandbox');
+      fs.mkdirSync(sandbox);
+      fs.writeFileSync(path.join(sandbox, 'reviewer_memory.md'), 'persistent-memory\n');
+      fs.writeFileSync(path.join(sandbox, 'reviewer_log.jsonl'), '{"persistent":true}\n');
+      armed = true;
+
+      expect(() =>
+        ledger.stageReviewerSandbox(1, {
+          plan: Buffer.from('# approved plan\n'),
+          goal: Buffer.from('{"goal":"approved"}\n'),
+        }),
+      ).toThrow(/contents|changed|mismatch|final stage/i);
+    });
+
+    it('classifies the final sandbox barrier as committed and converges on safe restage', () => {
+      const workspace = tempWorkspace();
+      let completeSandboxSyncs = 0;
+      let failFinalBarrier = true;
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: {
+          beforeDirectorySync: (event) => {
+            const staged = path.join(event.filePath, 'iter-0');
+            if (
+              !failFinalBarrier ||
+              !fs.existsSync(path.join(staged, 'diff.patch')) ||
+              !fs.existsSync(path.join(event.filePath, 'plan.md')) ||
+              !fs.existsSync(path.join(event.filePath, 'goal.json'))
+            ) {
+              return;
+            }
+            completeSandboxSyncs++;
+            if (completeSandboxSyncs === 2) {
+              failFinalBarrier = false;
+              throw new Error('injected final Reviewer sandbox sync failure');
+            }
+          },
+        },
+      });
+      seedCompleteReviewerArtifacts(ledger, 0);
+      const controls = { plan: Buffer.from('# plan\n'), goal: Buffer.from('{"goal":true}\n') };
+
+      expect(() => ledger.stageReviewerSandbox(0, controls)).toThrow(
+        expect.objectContaining({
+          name: 'SecureAutoloopLedgerCommitError',
+          code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+          committed: true,
+          retryable: false,
+          operation: 'secure_nested_artifact_write',
+          cause: expect.objectContaining({ message: 'injected final Reviewer sandbox sync failure' }),
+        }),
+      );
+
+      expect(ledger.stageReviewerSandbox(0, controls)).toEqual({
+        directory: path.join(ledger.directory, 'reviewer_sandbox'),
+        priorVerdict: false,
+      });
+      expect(fs.readFileSync(path.join(ledger.directory, 'reviewer_sandbox', 'iter-0', 'directive.json'), 'utf8')).toBe(
+        'directive-0\n',
+      );
+      expect(fs.readFileSync(path.join(ledger.directory, 'reviewer_sandbox', 'plan.md'), 'utf8')).toBe('# plan\n');
     });
 
     it('reports the win32 directory-entry durability limitation for nested artifacts', () => {

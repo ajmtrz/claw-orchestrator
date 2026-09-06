@@ -2209,6 +2209,8 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
           schema_version: LEDGER_SCHEMA_VERSION,
           iter: env.iter,
           ts: env.ts,
+          message_id: env.msg_id,
+          dispatch_id: dispatchId,
           ...env.payload,
         },
         null,

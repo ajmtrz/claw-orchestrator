@@ -1242,22 +1242,24 @@ describe('ClaudeAgentDispatcher — frozen reviewer memory', () => {
     expect(fs.readFileSync(external, 'utf8')).toBe('must remain external');
   });
 
-  it('validates every reachable Reviewer sandbox entry before starting the Reviewer', async () => {
-    const { dispatcher, calls, ledgerDir, workspace } = makeDispatcher();
+  it('rejects a directory masquerading as an allowed staged artifact before starting the Reviewer', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher();
+    const ledger = dispatcher.secureLedgerCapability;
+    ensureCompleteReviewArtifacts(dispatcher, 0);
     const sandbox = path.join(ledgerDir, 'reviewer_sandbox');
-    const scratch = path.join(sandbox, 'unapproved');
-    const external = path.join(workspace, 'external-reachable-entry');
-    fs.mkdirSync(scratch, { recursive: true });
-    fs.writeFileSync(external, 'must remain external');
-    fs.symlinkSync(external, path.join(scratch, 'escape'));
+    const staged = path.join(sandbox, 'iter-0');
+    fs.mkdirSync(path.join(staged, 'directive.json'), { recursive: true });
+    fs.writeFileSync(path.join(staged, 'directive.json', 'nested-unapproved.txt'), 'must not be accepted');
+    for (const name of ['eval_output.json', 'coder_summary.txt', 'diff.patch'] as const) {
+      fs.writeFileSync(path.join(staged, name), ledger.readIterationArtifact(0, name)!);
+    }
 
-    await expect(dispatcher.spawnSubagents()).rejects.toThrow(/symbolic link|unsafe|unapproved/i);
+    await expect(dispatcher.spawnSubagents()).rejects.toThrow(/regular|directory|type|staged artifact/i);
 
     expect(
       calls.startSession.mock.calls.some(([config]) => (config as { name: string }).name === 'autoloop-r1-reviewer'),
     ).toBe(false);
     expect(calls.sendMessage).not.toHaveBeenCalled();
-    expect(fs.readFileSync(external, 'utf8')).toBe('must remain external');
   });
 
   it('keeps the non-Claude Reviewer memory snapshot frozen after session start', async () => {
@@ -1848,14 +1850,20 @@ describe('ClaudeAgentDispatcher — stageReviewSandbox whitelist', () => {
   it('treats a fresh directive message id for the same iteration as a conflict without a second Coder send', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-09-06T01:00:00.000Z'));
-    const { dispatcher, calls } = makeDispatcher({}, { sendOutput: 'Coder acknowledged.' });
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'Coder acknowledged.' });
     const payload = { goal: 'one immutable effect', constraints: [], success_criteria: [], max_attempts: 1 };
     const first = Msg.directive(0, payload);
 
     await dispatcher.deliver(first);
-    vi.setSystemTime(new Date('2026-09-06T01:00:01.000Z'));
     const distinct = Msg.directive(0, payload);
+    expect(distinct.ts).toBe(first.ts);
     expect(distinct.msg_id).not.toBe(first.msg_id);
+
+    const persisted = JSON.parse(
+      fs.readFileSync(path.join(ledgerDir, 'iter', '0', 'directive.json'), 'utf8'),
+    ) as Record<string, unknown>;
+    expect(persisted.message_id).toBe(first.msg_id);
+    expect(persisted.dispatch_id).toMatch(/^dispatch_[a-f0-9]{64}$/);
 
     await expect(dispatcher.deliver(distinct)).rejects.toThrow(/conflicting|immutable|overwrite/i);
     expect(calls.sendMessage).toHaveBeenCalledTimes(1);
