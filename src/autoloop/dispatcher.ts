@@ -354,12 +354,24 @@ const PERSISTED_REVIEW_VERDICT_KEYS = ['decision', 'metric', 'audit_notes', 'acc
 const STORED_REVIEW_VERDICT_KEYS = new Set(['schema_version', 'iter', 'ts', ...PERSISTED_REVIEW_VERDICT_KEYS, 'flags']);
 
 function canonicalPersistedVerdictPayload(payload: PersistedReviewVerdictPayload): PersistedReviewVerdictPayload {
+  if (
+    !Object.hasOwn(payload, 'decision') ||
+    !Object.hasOwn(payload, 'metric') ||
+    !Object.hasOwn(payload, 'audit_notes') ||
+    !['advance', 'hold', 'rollback'].includes(payload.decision) ||
+    (payload.metric !== null && (typeof payload.metric !== 'number' || !Number.isFinite(payload.metric))) ||
+    typeof payload.audit_notes !== 'string' ||
+    (Object.hasOwn(payload, 'accepted') && typeof payload.accepted !== 'boolean') ||
+    (Object.hasOwn(payload, 'evidence_id') && typeof payload.evidence_id !== 'string')
+  ) {
+    throw new Error('Refusing to persist invalid immutable Reviewer verdict payload');
+  }
   return {
     decision: payload.decision,
     metric: payload.metric,
     audit_notes: payload.audit_notes,
-    accepted: payload.accepted,
-    evidence_id: payload.evidence_id,
+    ...(Object.hasOwn(payload, 'accepted') ? { accepted: payload.accepted } : {}),
+    ...(Object.hasOwn(payload, 'evidence_id') ? { evidence_id: payload.evidence_id } : {}),
   };
 }
 
@@ -371,15 +383,18 @@ function samePersistedVerdictPayload(stored: Record<string, unknown>, payload: P
   ) {
     return false;
   }
+  let canonicalStored: PersistedReviewVerdictPayload;
+  try {
+    canonicalStored = canonicalPersistedVerdictPayload(stored as PersistedReviewVerdictPayload);
+  } catch {
+    return false;
+  }
   const canonical = canonicalPersistedVerdictPayload(payload);
-  const storedEntries = PERSISTED_REVIEW_VERDICT_KEYS.filter(
-    (key) => Object.hasOwn(stored, key) && stored[key] !== undefined,
-  ).map((key) => [key, stored[key]]);
-  const expectedEntries = PERSISTED_REVIEW_VERDICT_KEYS.filter((key) => canonical[key] !== undefined).map((key) => [
-    key,
-    canonical[key],
-  ]);
-  return JSON.stringify(storedEntries) === JSON.stringify(expectedEntries);
+  return PERSISTED_REVIEW_VERDICT_KEYS.every((key) => {
+    const storedHasKey = Object.hasOwn(canonicalStored, key);
+    const expectedHasKey = Object.hasOwn(canonical, key);
+    return storedHasKey === expectedHasKey && (!storedHasKey || canonicalStored[key] === canonical[key]);
+  });
 }
 
 const DIRECTIVE_V1_PAYLOAD_KEYS = new Set(['goal', 'constraints', 'success_criteria', 'max_attempts']);
@@ -2688,8 +2703,11 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       }
       if (
         isPlainRecord(parsed) &&
+        Object.hasOwn(parsed, 'schema_version') &&
         parsed.schema_version === LEDGER_SCHEMA_VERSION &&
+        Object.hasOwn(parsed, 'iter') &&
         parsed.iter === iter &&
+        Object.hasOwn(parsed, 'ts') &&
         typeof parsed.ts === 'string' &&
         samePersistedVerdictPayload(parsed, canonical)
       ) {

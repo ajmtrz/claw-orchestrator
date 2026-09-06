@@ -1979,6 +1979,46 @@ describe('ClaudeAgentDispatcher — canonical immutable Reviewer verdicts', () =
     };
   }
 
+  function withObjectPrototypePollution<T>(
+    pollution: Record<string, unknown>,
+    action: () => T,
+  ): { result: T | undefined; thrown: unknown } {
+    const originalDescriptors = new Map(
+      Object.keys(pollution).map((key) => [key, Object.getOwnPropertyDescriptor(Object.prototype, key)]),
+    );
+    let result: T | undefined;
+    let thrown: unknown;
+
+    try {
+      for (const [key, value] of Object.entries(pollution)) {
+        Object.defineProperty(Object.prototype, key, {
+          configurable: true,
+          enumerable: false,
+          value,
+          writable: true,
+        });
+      }
+      try {
+        result = action();
+      } catch (error) {
+        thrown = error;
+      }
+    } finally {
+      for (const [key, descriptor] of originalDescriptors) {
+        if (descriptor === undefined) {
+          Reflect.deleteProperty(Object.prototype, key);
+        } else {
+          Object.defineProperty(Object.prototype, key, descriptor);
+        }
+      }
+    }
+
+    for (const [key, descriptor] of originalDescriptors) {
+      expect(Object.getOwnPropertyDescriptor(Object.prototype, key)).toEqual(descriptor);
+    }
+    return { result, thrown };
+  }
+
   it('never persists ephemeral Reviewer flags in a new schema-v1 verdict', async () => {
     const reviewerReply = [
       'Independent review complete.',
@@ -2050,6 +2090,79 @@ describe('ClaudeAgentDispatcher — canonical immutable Reviewer verdicts', () =
     expect(() => persistVerdict(0, { ...gated, flags: undefined })).not.toThrow();
     expect(fs.readFileSync(verdictPath)).toEqual(first);
     expect(() => persistVerdict(0, { ...gated, flags: ['different-runtime-flag'] })).not.toThrow();
+    expect(fs.readFileSync(verdictPath)).toEqual(first);
+  });
+
+  it('omits inherited optional fields from a first persisted verdict', () => {
+    const { dispatcher, ledgerDir } = makeDispatcher();
+    const { persistVerdict } = verdictMethods(dispatcher);
+    const payload: VerdictCandidate = {
+      decision: 'hold',
+      metric: null,
+      audit_notes: 'optional prototype values are not durable evidence',
+    };
+
+    const { thrown } = withObjectPrototypePollution({ accepted: false, evidence_id: 'inherited-evidence' }, () =>
+      persistVerdict(0, payload),
+    );
+
+    expect(thrown).toBeUndefined();
+    const stored = JSON.parse(fs.readFileSync(path.join(ledgerDir, 'iter', '0', 'verdict.json'), 'utf8')) as Record<
+      string,
+      unknown
+    >;
+    expect(Object.keys(stored)).toEqual(['schema_version', 'iter', 'ts', 'decision', 'metric', 'audit_notes']);
+    expect(stored).toMatchObject(payload);
+  });
+
+  it('rejects inherited required fields on a first persisted verdict', () => {
+    const { dispatcher, ledgerDir } = makeDispatcher();
+    const { persistVerdict } = verdictMethods(dispatcher);
+    const verdictPath = path.join(ledgerDir, 'iter', '0', 'verdict.json');
+    const inheritedPayload = {
+      decision: 'hold',
+      metric: null,
+      audit_notes: 'required prototype values are not durable evidence',
+    };
+
+    const { thrown } = withObjectPrototypePollution(inheritedPayload, () => persistVerdict(0, {} as VerdictCandidate));
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toMatch(/conflicting|immutable|invalid/i);
+    expect(fs.existsSync(verdictPath)).toBe(false);
+  });
+
+  it.each([
+    ['decision outside the verdict allowlist', { decision: 'pause', metric: 1, audit_notes: 'invalid decision' }],
+    ['non-finite metric', { decision: 'hold', metric: Number.NaN, audit_notes: 'invalid metric' }],
+    ['non-string audit notes', { decision: 'hold', metric: null, audit_notes: 1 }],
+    ['non-boolean accepted', { decision: 'advance', metric: 1, audit_notes: 'invalid accepted', accepted: 'yes' }],
+    ['non-string evidence id', { decision: 'advance', metric: 1, audit_notes: 'invalid evidence', evidence_id: 1 }],
+  ])('rejects a first persisted verdict with %s', (_description, payload) => {
+    const { dispatcher, ledgerDir } = makeDispatcher();
+    const { persistVerdict } = verdictMethods(dispatcher);
+    const verdictPath = path.join(ledgerDir, 'iter', '0', 'verdict.json');
+
+    expect(() => persistVerdict(0, payload as unknown as VerdictCandidate)).toThrow(/conflicting|immutable|invalid/i);
+    expect(fs.existsSync(verdictPath)).toBe(false);
+  });
+
+  it.each([
+    ['accepted', { accepted: undefined }],
+    ['evidence_id', { evidence_id: undefined }],
+  ] as const)('does not collapse an own undefined %s into absence on replay', (_field, optional) => {
+    const { dispatcher, ledgerDir } = makeDispatcher();
+    const { persistVerdict } = verdictMethods(dispatcher);
+    const payload: VerdictCandidate = {
+      decision: 'hold',
+      metric: null,
+      audit_notes: 'own undefined is not absence',
+    };
+    persistVerdict(0, payload);
+    const verdictPath = path.join(ledgerDir, 'iter', '0', 'verdict.json');
+    const first = fs.readFileSync(verdictPath);
+
+    expect(() => persistVerdict(0, { ...payload, ...optional })).toThrow(/conflicting|immutable|invalid/i);
     expect(fs.readFileSync(verdictPath)).toEqual(first);
   });
 
@@ -2244,6 +2357,116 @@ describe('ClaudeAgentDispatcher — canonical immutable Reviewer verdicts', () =
     expect(conflict).toBeInstanceOf(Error);
     expect((conflict as Error).message).toMatch(/conflicting|immutable/i);
   });
+
+  it('rejects a sparse incoming replay whose complete verdict is inherited from Object.prototype', () => {
+    const { dispatcher, ledgerDir } = makeDispatcher();
+    const { persistVerdict } = verdictMethods(dispatcher);
+    const payload: VerdictCandidate = {
+      decision: 'advance',
+      metric: 1,
+      audit_notes: 'a sparse replay cannot borrow durable identity',
+      accepted: false,
+      evidence_id: 'iter-0',
+    };
+    persistVerdict(0, payload);
+    const verdictPath = path.join(ledgerDir, 'iter', '0', 'verdict.json');
+    const first = fs.readFileSync(verdictPath);
+
+    const { thrown } = withObjectPrototypePollution(payload, () => persistVerdict(0, {} as VerdictCandidate));
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toMatch(/conflicting|immutable|invalid/i);
+    expect(fs.readFileSync(verdictPath)).toEqual(first);
+  });
+
+  it('rejects stored verdict envelope identity inherited from Object.prototype', () => {
+    const { dispatcher, ledgerDir } = makeDispatcher();
+    const { persistVerdict } = verdictMethods(dispatcher);
+    const payload: VerdictCandidate = {
+      decision: 'advance',
+      metric: 1,
+      audit_notes: 'envelope identity must be stored',
+      accepted: false,
+      evidence_id: 'iter-0',
+    };
+    dispatcher.secureLedgerCapability.writeIterationArtifact(0, 'verdict.json', JSON.stringify(payload));
+    const verdictPath = path.join(ledgerDir, 'iter', '0', 'verdict.json');
+    const first = fs.readFileSync(verdictPath);
+
+    const { thrown } = withObjectPrototypePollution(
+      { schema_version: LEDGER_SCHEMA_VERSION, iter: 0, ts: '2026-09-06T01:00:00.000Z' },
+      () => persistVerdict(0, payload),
+    );
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toMatch(/conflicting|immutable/i);
+    expect(fs.readFileSync(verdictPath)).toEqual(first);
+  });
+
+  it('rejects a required-only hold replay against matching inherited stored durable fields', () => {
+    const { dispatcher, ledgerDir } = makeDispatcher();
+    const { persistVerdict } = verdictMethods(dispatcher);
+    const payload: VerdictCandidate = {
+      decision: 'hold',
+      metric: null,
+      audit_notes: 'required values must be stored as own properties',
+    };
+    const sparseVerdict = JSON.stringify({
+      schema_version: LEDGER_SCHEMA_VERSION,
+      iter: 0,
+      ts: '2026-09-06T01:00:00.000Z',
+    });
+    dispatcher.secureLedgerCapability.writeIterationArtifact(0, 'verdict.json', sparseVerdict);
+    const verdictPath = path.join(ledgerDir, 'iter', '0', 'verdict.json');
+    const first = fs.readFileSync(verdictPath);
+
+    const { thrown } = withObjectPrototypePollution(payload, () => persistVerdict(0, payload));
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toMatch(/conflicting|immutable/i);
+    expect(fs.readFileSync(verdictPath)).toEqual(first);
+  });
+
+  it.each([
+    [
+      'stored accepted false versus incoming absence',
+      { decision: 'hold', metric: 1, audit_notes: 'falsy presence', accepted: false },
+      { decision: 'hold', metric: 1, audit_notes: 'falsy presence' },
+    ],
+    [
+      'stored accepted absence versus incoming false',
+      { decision: 'hold', metric: 1, audit_notes: 'falsy presence' },
+      { decision: 'hold', metric: 1, audit_notes: 'falsy presence', accepted: false },
+    ],
+    [
+      'stored metric null versus incoming absence',
+      { decision: 'hold', metric: null, audit_notes: 'falsy presence' },
+      { decision: 'hold', audit_notes: 'falsy presence' },
+    ],
+    [
+      'stored metric absence versus incoming null',
+      { decision: 'hold', audit_notes: 'falsy presence' },
+      { decision: 'hold', metric: null, audit_notes: 'falsy presence' },
+    ],
+  ] satisfies Array<[string, Record<string, unknown>, Record<string, unknown>]>)(
+    'rejects %s while preserving the first verdict',
+    (_description, storedPayload, incomingPayload) => {
+      const { dispatcher, ledgerDir } = makeDispatcher();
+      const { persistVerdict } = verdictMethods(dispatcher);
+      const storedVerdict = JSON.stringify({
+        schema_version: LEDGER_SCHEMA_VERSION,
+        iter: 0,
+        ts: '2026-09-06T01:00:00.000Z',
+        ...storedPayload,
+      });
+      dispatcher.secureLedgerCapability.writeIterationArtifact(0, 'verdict.json', storedVerdict);
+      const verdictPath = path.join(ledgerDir, 'iter', '0', 'verdict.json');
+      const first = fs.readFileSync(verdictPath);
+
+      expect(() => persistVerdict(0, incomingPayload as VerdictCandidate)).toThrow(/conflicting|immutable|invalid/i);
+      expect(fs.readFileSync(verdictPath)).toEqual(first);
+    },
+  );
 });
 
 describe('ClaudeAgentDispatcher — durable directive ordering and review iteration authority', () => {
