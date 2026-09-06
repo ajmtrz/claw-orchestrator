@@ -53,6 +53,12 @@ export interface SecureLedgerNestedMutationEvent {
   filePath: string;
 }
 
+export interface SecureReviewerSandboxReadEvent {
+  relativePath: string;
+  filePath: string;
+  kind: 'file' | 'directory';
+}
+
 export interface SecureAutoloopLedgerOptions {
   create?: boolean;
   platformFlags?: SecureLedgerPlatformFlags;
@@ -66,6 +72,8 @@ export interface SecureAutoloopLedgerOptions {
     beforeFileMutation?: (event: SecureLedgerMutationEvent) => void;
     beforeDirectorySync?: (event: SecureLedgerMutationEvent) => void;
     beforeNestedMutation?: (event: SecureLedgerNestedMutationEvent) => void;
+    afterReviewerSandboxEntryRead?: (event: SecureReviewerSandboxReadEvent) => void;
+    closeDescriptor?: (fd: number) => void;
   };
 }
 
@@ -87,16 +95,28 @@ export interface SecureAutoloopPreparedAppend {
 export class SecureAutoloopLedgerCommitError extends Error {
   readonly committed = true;
   readonly retryable = false;
+  readonly secondaryErrors: Error[] = [];
   readonly effectsApplied: boolean;
-  readonly operation: 'secure_ledger_append' | 'secure_nested_artifact_write' | 'send_timeout_migration';
+  readonly operation:
+    | 'secure_ledger_append'
+    | 'secure_nested_artifact_write'
+    | 'secure_reviewer_sandbox_stage'
+    | 'send_timeout_migration';
 
   constructor(
-    readonly code: 'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE' | 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+    readonly code:
+      | 'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE'
+      | 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE'
+      | 'AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID',
     message: string,
     options: {
       cause: unknown;
       effectsApplied?: boolean;
-      operation?: 'secure_ledger_append' | 'secure_nested_artifact_write' | 'send_timeout_migration';
+      operation?:
+        | 'secure_ledger_append'
+        | 'secure_nested_artifact_write'
+        | 'secure_reviewer_sandbox_stage'
+        | 'send_timeout_migration';
     },
   ) {
     super(message, options);
@@ -131,17 +151,29 @@ interface RegularChildSnapshot {
   stat: fs.Stats;
 }
 
+interface AtomicChildWriteResult {
+  outcome: 'created' | 'unchanged';
+  snapshot: RegularChildSnapshot;
+}
+
 type ReviewerSandboxEntrySnapshot =
   | { kind: 'file'; content: Buffer; stat: fs.Stats }
-  | { kind: 'directory'; entries: ReviewerSandboxSnapshot };
+  | { kind: 'directory'; entries: ReviewerSandboxSnapshot; stat: fs.Stats };
 
 type ReviewerSandboxSnapshot = Map<string, ReviewerSandboxEntrySnapshot>;
 
-type ReviewerSandboxEntryContents =
-  | { kind: 'file'; content: Buffer }
-  | { kind: 'directory'; entries: ReviewerSandboxContents };
+type ReviewerSandboxEntryExpectation =
+  | { kind: 'file'; content: Buffer; stat?: fs.Stats }
+  | { kind: 'directory'; entries: ReviewerSandboxExpectation; stat?: fs.Stats };
 
-type ReviewerSandboxContents = Map<string, ReviewerSandboxEntryContents>;
+type ReviewerSandboxExpectation = ReadonlyMap<string, ReviewerSandboxEntryExpectation>;
+
+interface ReviewerSourceSnapshot {
+  directory: PinnedDirectory;
+  name: SecureAutoloopIterationArtifact;
+  relativePath: string;
+  snapshot: RegularChildSnapshot;
+}
 
 function lstatIfPresent(target: string): fs.Stats | undefined {
   try {
@@ -428,56 +460,110 @@ export class SecureAutoloopLedger {
     name: string,
     relativePath: string,
     expected: RegularChildSnapshot,
-  ): void {
+  ): RegularChildSnapshot {
     const target = path.join(parent.path, name);
     let fd: number | undefined;
+    let verified: RegularChildSnapshot | undefined;
+    let primaryFailure: unknown;
     try {
-      const observed = lstatIfPresent(target);
-      if (!observed || observed.isSymbolicLink() || !observed.isFile() || observed.nlink !== 1) {
-        if (!observed)
-          throw new Error(`Autoloop nested artifact was removed before its durability barrier: '${relativePath}'`);
-        rejectNestedFile(target, 'Autoloop nested artifact', observed);
+      try {
+        const observed = lstatIfPresent(target);
+        if (!observed || observed.isSymbolicLink() || !observed.isFile() || observed.nlink !== 1) {
+          if (!observed) {
+            throw new Error(`Autoloop nested artifact was removed before its durability barrier: '${relativePath}'`);
+          }
+          rejectNestedFile(target, 'Autoloop nested artifact', observed);
+        }
+        fd = fs.openSync(target, fs.constants.O_RDONLY | this.flags.noFollow);
+        const opened = fs.fstatSync(fd);
+        if (!opened.isFile() || opened.nlink !== 1 || !sameIdentity(expected.stat, opened)) {
+          throw new Error(`Autoloop nested artifact identity changed before its durability barrier: '${relativePath}'`);
+        }
+      } catch (error) {
+        throw new SecureAutoloopLedgerCommitError(
+          'AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID',
+          `Autoloop nested artifact committed state is invalid at ${relativePath}: ${errorMessage(error)}`,
+          { cause: error, operation: 'secure_nested_artifact_write' },
+        );
       }
-      fd = fs.openSync(target, fs.constants.O_RDONLY | this.flags.noFollow);
-      const opened = fs.fstatSync(fd);
-      if (!opened.isFile() || opened.nlink !== 1 || !sameIdentity(expected.stat, opened)) {
-        throw new Error(`Autoloop nested artifact identity changed before its durability barrier: '${relativePath}'`);
+
+      try {
+        this.syncPinnedDirectory(parent, relativePath);
+      } catch (error) {
+        throw new SecureAutoloopLedgerCommitError(
+          'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+          `Autoloop nested artifact was committed to ${relativePath}, but its parent-directory durability barrier failed: ${errorMessage(error)}`,
+          { cause: error, operation: 'secure_nested_artifact_write' },
+        );
       }
-      this.syncPinnedDirectory(parent, relativePath);
-      const verified = this.openRegularChildSnapshot(parent, name, 'Autoloop nested artifact');
-      if (!verified) {
-        throw new Error(`Autoloop nested artifact was removed after its durability barrier: '${relativePath}'`);
-      }
-      if (!sameIdentity(expected.stat, verified.stat)) {
-        throw new Error(`Autoloop nested artifact identity changed after its durability barrier: '${relativePath}'`);
-      }
-      if (!verified.content.equals(expected.content)) {
-        throw new Error(`Autoloop nested artifact contents changed after its durability barrier: '${relativePath}'`);
+
+      try {
+        verified = this.openRegularChildSnapshot(parent, name, 'Autoloop nested artifact');
+        if (!verified) {
+          throw new Error(`Autoloop nested artifact was removed after its durability barrier: '${relativePath}'`);
+        }
+        if (!sameIdentity(expected.stat, verified.stat)) {
+          throw new Error(`Autoloop nested artifact identity changed after its durability barrier: '${relativePath}'`);
+        }
+        if (!verified.content.equals(expected.content)) {
+          throw new Error(`Autoloop nested artifact contents changed after its durability barrier: '${relativePath}'`);
+        }
+      } catch (error) {
+        throw new SecureAutoloopLedgerCommitError(
+          'AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID',
+          `Autoloop nested artifact committed state is invalid after the durability barrier at ${relativePath}: ${errorMessage(error)}`,
+          { cause: error, operation: 'secure_nested_artifact_write' },
+        );
       }
     } catch (error) {
-      throw new SecureAutoloopLedgerCommitError(
-        'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
-        `Autoloop nested artifact was committed to ${relativePath}, but its parent-directory durability barrier failed: ${errorMessage(error)}`,
-        { cause: error, operation: 'secure_nested_artifact_write' },
-      );
+      primaryFailure = error;
     } finally {
-      if (fd !== undefined) fs.closeSync(fd);
+      if (fd !== undefined) {
+        try {
+          (this.testHooks.closeDescriptor ?? fs.closeSync)(fd);
+        } catch (error) {
+          if (primaryFailure) {
+            const secondary = error instanceof Error ? error : new Error(String(error));
+            if (primaryFailure instanceof SecureAutoloopLedgerCommitError) {
+              primaryFailure.secondaryErrors.push(secondary);
+            }
+            this.logger.warn?.(
+              `[autoloop] nested artifact descriptor close failed after the primary error: ${errorMessage(error)}`,
+            );
+          } else {
+            primaryFailure = error;
+          }
+        }
+      }
     }
+    if (primaryFailure) throw primaryFailure;
+    if (!verified) throw new Error(`Autoloop nested artifact verification produced no snapshot: '${relativePath}'`);
+    return verified;
   }
 
   private syncCommittedReviewerSandbox(
     sandbox: PinnedDirectory,
     iter: number,
     expected: ReviewerSandboxSnapshot,
+    assertAuthoritativeSources: () => void,
   ): void {
     try {
       this.syncPinnedDirectory(sandbox, `Reviewer sandbox iteration ${iter}`);
-      this.assertReviewerSandboxMatches(sandbox, expected, 'Reviewer sandbox final durability barrier');
     } catch (error) {
       throw new SecureAutoloopLedgerCommitError(
         'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
         `Reviewer sandbox iteration ${iter} was staged, but its final parent-directory durability barrier failed: ${errorMessage(error)}`,
-        { cause: error, operation: 'secure_nested_artifact_write' },
+        { cause: error, operation: 'secure_reviewer_sandbox_stage' },
+      );
+    }
+    try {
+      this.assertReviewerSandboxMatches(sandbox, expected, 'Reviewer sandbox final durability barrier');
+      assertAuthoritativeSources();
+    } catch (error) {
+      throw new SecureAutoloopLedgerCommitError(
+        'AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID',
+        `Reviewer sandbox iteration ${iter} committed state is invalid after its final durability barrier: ${errorMessage(error)}`,
+        { cause: error, operation: 'secure_reviewer_sandbox_stage' },
       );
     }
   }
@@ -560,7 +646,7 @@ export class SecureAutoloopLedger {
     content: string | Buffer,
     relativePath: string,
     operation: SecureLedgerNestedMutationEvent['operation'],
-  ): 'created' | 'unchanged' {
+  ): AtomicChildWriteResult {
     validatePathComponent(name, 'Autoloop nested artifact');
     const target = path.join(parent.path, name);
     const bytes = Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf8');
@@ -569,8 +655,7 @@ export class SecureAutoloopLedger {
       if (!existing.content.equals(bytes)) {
         throw new Error(`Refusing to overwrite conflicting immutable Autoloop artifact '${target}'`);
       }
-      this.syncCommittedNestedArtifact(parent, name, relativePath, existing);
-      return 'unchanged';
+      return { outcome: 'unchanged', snapshot: this.syncCommittedNestedArtifact(parent, name, relativePath, existing) };
     }
 
     this.testHooks.beforeNestedMutation?.({ operation: 'artifact-write', relativePath, filePath: target });
@@ -612,16 +697,20 @@ export class SecureAutoloopLedger {
         if (!plantedSnapshot?.content.equals(bytes)) {
           throw new Error(`Refusing to overwrite conflicting immutable Autoloop artifact '${target}'`);
         }
-        this.syncCommittedNestedArtifact(parent, name, relativePath, plantedSnapshot);
-        return 'unchanged';
+        return {
+          outcome: 'unchanged',
+          snapshot: this.syncCommittedNestedArtifact(parent, name, relativePath, plantedSnapshot),
+        };
       }
 
       fs.renameSync(temporary, target);
       renamed = true;
       const committed = this.openRegularChildSnapshot(parent, name, 'Autoloop nested artifact');
       if (!committed?.content.equals(bytes)) throw new Error(`Autoloop artifact commit was incomplete: '${target}'`);
-      this.syncCommittedNestedArtifact(parent, name, relativePath, committed);
-      return 'created';
+      return {
+        outcome: 'created',
+        snapshot: this.syncCommittedNestedArtifact(parent, name, relativePath, committed),
+      };
     } finally {
       if (fd !== undefined) {
         try {
@@ -668,6 +757,45 @@ export class SecureAutoloopLedger {
     return this.openRegularChild(directory, name, `Autoloop iteration ${iter} artifact`);
   }
 
+  private snapshotReviewerSource(
+    iter: number,
+    name: SecureAutoloopIterationArtifact,
+  ): ReviewerSourceSnapshot | undefined {
+    validateIteration(iter);
+    validateIterationArtifact(name);
+    let directory: PinnedDirectory;
+    try {
+      directory = this.getIterationDirectory(iter, false);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
+    }
+    const snapshot = this.openRegularChildSnapshot(
+      directory,
+      name,
+      `Reviewer authoritative source iter/${iter}/${name}`,
+    );
+    if (!snapshot) return undefined;
+    return { directory, name, relativePath: `iter/${iter}/${name}`, snapshot };
+  }
+
+  private assertReviewerSourcesMatch(sources: readonly ReviewerSourceSnapshot[]): void {
+    for (const source of sources) {
+      const observed = this.openRegularChildSnapshot(
+        source.directory,
+        source.name,
+        `Reviewer authoritative source ${source.relativePath}`,
+      );
+      if (!observed) throw new Error(`Reviewer authoritative source was removed: '${source.relativePath}'`);
+      if (!sameIdentity(observed.stat, source.snapshot.stat)) {
+        throw new Error(`Reviewer authoritative source identity changed: '${source.relativePath}'`);
+      }
+      if (!observed.content.equals(source.snapshot.content)) {
+        throw new Error(`Reviewer authoritative source contents changed: '${source.relativePath}'`);
+      }
+    }
+  }
+
   writeIterationArtifact(
     iter: number,
     name: SecureAutoloopIterationArtifact,
@@ -676,7 +804,7 @@ export class SecureAutoloopLedger {
     validateIteration(iter);
     validateIterationArtifact(name);
     const directory = this.getIterationDirectory(iter, true);
-    return this.writeAtomicChild(directory, name, content, `iter/${iter}/${name}`, 'artifact-commit');
+    return this.writeAtomicChild(directory, name, content, `iter/${iter}/${name}`, 'artifact-commit').outcome;
   }
 
   private getReviewerSandbox(create: boolean): PinnedDirectory {
@@ -756,7 +884,11 @@ export class SecureAutoloopLedger {
       }
       if (!observed.isDirectory()) throw new Error(`Refusing unsafe Reviewer sandbox entry '${target}'`);
       const child = this.openPinnedChildDirectory(directory, entry, `${label} directory '${entry}'`, false);
-      snapshot.set(entry, { kind: 'directory', entries: this.snapshotReviewerSandbox(child, `${label}/${entry}`) });
+      snapshot.set(entry, {
+        kind: 'directory',
+        entries: this.snapshotReviewerSandbox(child, `${label}/${entry}`),
+        stat: child.stat,
+      });
     }
     this.assertPinnedDirectory(directory);
     return snapshot;
@@ -792,16 +924,20 @@ export class SecureAutoloopLedger {
         continue;
       }
       const child = this.openPinnedChildDirectory(directory, entry, `${label} expected directory`, false);
+      if (!sameIdentity(child.stat, expectedEntry.stat)) {
+        throw new Error(`${label} directory identity changed unexpectedly: '${target}'`);
+      }
       this.assertReviewerSandboxMatches(child, expectedEntry.entries, `${label}/${entry}`);
     }
     this.assertPinnedDirectory(directory);
   }
 
-  private assertReviewerSandboxContentsMatch(
+  private validateAndSnapshotReviewerSandbox(
     directory: PinnedDirectory,
-    expected: ReviewerSandboxContents,
+    expected: ReviewerSandboxExpectation,
     label: string,
-  ): void {
+    relativeDirectory = '',
+  ): ReviewerSandboxSnapshot {
     const observed = this.readReviewerSandboxEntries(directory);
     const expectedEntries = [...expected.keys()].sort();
     if (
@@ -812,21 +948,42 @@ export class SecureAutoloopLedger {
         `${label} membership changed unexpectedly; expected [${expectedEntries.join(', ')}], found [${observed.join(', ')}]`,
       );
     }
+    const snapshot: ReviewerSandboxSnapshot = new Map();
     for (const entry of observed) {
       const expectedEntry = expected.get(entry)!;
       const target = path.join(directory.path, entry);
+      const relativePath = relativeDirectory ? `${relativeDirectory}/${entry}` : entry;
       if (expectedEntry.kind === 'file') {
         const file = this.openRegularChildSnapshot(directory, entry, `${label} expected regular file`);
         if (!file) throw new Error(`${label} expected regular file was removed: '${target}'`);
+        if (expectedEntry.stat && !sameIdentity(file.stat, expectedEntry.stat)) {
+          throw new Error(`${label} regular file identity changed unexpectedly: '${target}'`);
+        }
         if (!file.content.equals(expectedEntry.content)) {
           throw new Error(`${label} regular file contents changed unexpectedly: '${target}'`);
         }
+        this.testHooks.afterReviewerSandboxEntryRead?.({ relativePath, filePath: target, kind: 'file' });
+        snapshot.set(entry, { kind: 'file', content: Buffer.from(file.content), stat: file.stat });
         continue;
       }
       const child = this.openPinnedChildDirectory(directory, entry, `${label} expected directory`, false);
-      this.assertReviewerSandboxContentsMatch(child, expectedEntry.entries, `${label}/${entry}`);
+      if (expectedEntry.stat && !sameIdentity(child.stat, expectedEntry.stat)) {
+        throw new Error(`${label} directory identity changed unexpectedly: '${target}'`);
+      }
+      this.testHooks.afterReviewerSandboxEntryRead?.({ relativePath, filePath: target, kind: 'directory' });
+      snapshot.set(entry, {
+        kind: 'directory',
+        entries: this.validateAndSnapshotReviewerSandbox(
+          child,
+          expectedEntry.entries,
+          `${label}/${entry}`,
+          relativePath,
+        ),
+        stat: child.stat,
+      });
     }
     this.assertPinnedDirectory(directory);
+    return snapshot;
   }
 
   private assertReviewerSandboxBoundary(sandbox: PinnedDirectory): void {
@@ -850,7 +1007,7 @@ export class SecureAutoloopLedger {
       const iter = Number(match[1]);
       validateIteration(iter);
       const staged = this.openPinnedChildDirectory(sandbox, entry, `Reviewer staged iteration ${iter}`, false);
-      const expectedArtifacts: ReviewerSandboxContents = new Map();
+      const expectedArtifacts = new Map<string, ReviewerSandboxEntryExpectation>();
       for (const artifact of ['directive.json', 'eval_output.json', 'coder_summary.txt', 'diff.patch'] as const) {
         const content = this.readIterationArtifact(iter, artifact);
         if (content === undefined) {
@@ -858,7 +1015,7 @@ export class SecureAutoloopLedger {
         }
         expectedArtifacts.set(artifact, { kind: 'file', content });
       }
-      this.assertReviewerSandboxContentsMatch(staged, expectedArtifacts, `Reviewer staged iteration ${iter}`);
+      this.validateAndSnapshotReviewerSandbox(staged, expectedArtifacts, `Reviewer staged iteration ${iter}`);
       stagedIterationSeen = true;
     }
     this.assertPinnedDirectory(sandbox);
@@ -866,15 +1023,16 @@ export class SecureAutoloopLedger {
 
   stageReviewerSandbox(iter: number, controls: SecureReviewerControlFiles = {}): SecureReviewerStageResult {
     validateIteration(iter);
-    const artifacts = new Map<SecureAutoloopIterationArtifact, Buffer>();
+    const artifacts = new Map<SecureAutoloopIterationArtifact, ReviewerSourceSnapshot>();
     for (const name of ['directive.json', 'eval_output.json', 'coder_summary.txt', 'diff.patch'] as const) {
-      const content = this.readIterationArtifact(iter, name);
-      if (content === undefined) {
+      const source = this.snapshotReviewerSource(iter, name);
+      if (!source) {
         throw new Error(`Reviewer stage requires a complete artifact set; missing iter/${iter}/${name}`);
       }
-      artifacts.set(name, content);
+      artifacts.set(name, source);
     }
-    const prior = iter > 0 ? this.readIterationArtifact(iter - 1, 'verdict.json') : undefined;
+    const prior = iter > 0 ? this.snapshotReviewerSource(iter - 1, 'verdict.json') : undefined;
+    const authoritativeSources = [...artifacts.values(), ...(prior ? [prior] : [])];
 
     const plan = controls.plan === undefined ? undefined : Buffer.from(controls.plan);
     const goal = controls.goal === undefined ? undefined : Buffer.from(controls.goal);
@@ -916,51 +1074,70 @@ export class SecureAutoloopLedger {
       `Reviewer staged iteration ${iter}`,
       true,
     );
-    for (const [name, content] of artifacts) {
-      this.writeAtomicChild(destination, name, content, `reviewer_sandbox/iter-${iter}/${name}`, 'sandbox-stage');
+    const expectedArtifacts: ReviewerSandboxSnapshot = new Map();
+    for (const [name, source] of artifacts) {
+      const staged = this.writeAtomicChild(
+        destination,
+        name,
+        source.snapshot.content,
+        `reviewer_sandbox/iter-${iter}/${name}`,
+        'sandbox-stage',
+      );
+      expectedArtifacts.set(name, { kind: 'file', ...staged.snapshot });
     }
+    const expectedSandboxEntries: ReviewerSandboxSnapshot = new Map(persistentEntries);
+    expectedSandboxEntries.set(`iter-${iter}`, {
+      kind: 'directory',
+      entries: expectedArtifacts,
+      stat: destination.stat,
+    });
     if (plan) {
-      this.writeAtomicChild(sandbox, 'plan.md', plan, 'reviewer_sandbox/plan.md', 'sandbox-stage');
+      const staged = this.writeAtomicChild(sandbox, 'plan.md', plan, 'reviewer_sandbox/plan.md', 'sandbox-stage');
+      expectedSandboxEntries.set('plan.md', { kind: 'file', ...staged.snapshot });
     }
     if (goal) {
-      this.writeAtomicChild(sandbox, 'goal.json', goal, 'reviewer_sandbox/goal.json', 'sandbox-stage');
+      const staged = this.writeAtomicChild(sandbox, 'goal.json', goal, 'reviewer_sandbox/goal.json', 'sandbox-stage');
+      expectedSandboxEntries.set('goal.json', { kind: 'file', ...staged.snapshot });
     }
 
     if (prior) {
-      this.writeAtomicChild(
+      const staged = this.writeAtomicChild(
         sandbox,
         'prior_verdict.json',
-        prior,
+        prior.snapshot.content,
         'reviewer_sandbox/prior_verdict.json',
         'sandbox-stage',
       );
+      expectedSandboxEntries.set('prior_verdict.json', { kind: 'file', ...staged.snapshot });
     }
-    const expectedArtifacts: ReviewerSandboxContents = new Map();
-    for (const [name, content] of artifacts) {
-      expectedArtifacts.set(name, { kind: 'file', content: Buffer.from(content) });
+
+    let stagedSnapshot: ReviewerSandboxSnapshot;
+    try {
+      stagedSnapshot = this.validateAndSnapshotReviewerSandbox(
+        sandbox,
+        expectedSandboxEntries,
+        'Reviewer sandbox authoritative files',
+      );
+      this.testHooks.beforeNestedMutation?.({
+        operation: 'sandbox-stage',
+        relativePath: `reviewer_sandbox/iter-${iter}`,
+        filePath: destination.path,
+      });
+      this.assertPinnedDirectory(sandbox);
+      this.assertPinnedDirectory(destination);
+      this.assertReviewerSandboxMatches(sandbox, stagedSnapshot, 'Reviewer sandbox final stage');
+      this.assertReviewerSourcesMatch(authoritativeSources);
+    } catch (error) {
+      if (error instanceof SecureAutoloopLedgerCommitError) throw error;
+      throw new SecureAutoloopLedgerCommitError(
+        'AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID',
+        `Reviewer sandbox iteration ${iter} committed state is invalid before its final durability barrier: ${errorMessage(error)}`,
+        { cause: error, operation: 'secure_reviewer_sandbox_stage' },
+      );
     }
-    const expectedSandboxEntries: ReviewerSandboxContents = new Map();
-    for (const [entry, snapshot] of persistentEntries) {
-      if (snapshot.kind !== 'file') {
-        throw new Error(`Reviewer persistent file must be a regular file: '${path.join(sandbox.path, entry)}'`);
-      }
-      expectedSandboxEntries.set(entry, { kind: 'file', content: snapshot.content });
-    }
-    expectedSandboxEntries.set(`iter-${iter}`, { kind: 'directory', entries: expectedArtifacts });
-    if (plan) expectedSandboxEntries.set('plan.md', { kind: 'file', content: plan });
-    if (goal) expectedSandboxEntries.set('goal.json', { kind: 'file', content: goal });
-    if (prior) expectedSandboxEntries.set('prior_verdict.json', { kind: 'file', content: prior });
-    this.assertReviewerSandboxContentsMatch(sandbox, expectedSandboxEntries, 'Reviewer sandbox authoritative files');
-    const stagedSnapshot = this.snapshotReviewerSandbox(sandbox, 'Reviewer sandbox staged snapshot');
-    this.testHooks.beforeNestedMutation?.({
-      operation: 'sandbox-stage',
-      relativePath: `reviewer_sandbox/iter-${iter}`,
-      filePath: destination.path,
+    this.syncCommittedReviewerSandbox(sandbox, iter, stagedSnapshot, () => {
+      this.assertReviewerSourcesMatch(authoritativeSources);
     });
-    this.assertPinnedDirectory(sandbox);
-    this.assertPinnedDirectory(destination);
-    this.assertReviewerSandboxMatches(sandbox, stagedSnapshot, 'Reviewer sandbox final stage');
-    this.syncCommittedReviewerSandbox(sandbox, iter, stagedSnapshot);
     return { directory: sandbox.path, priorVerdict: prior !== undefined };
   }
 

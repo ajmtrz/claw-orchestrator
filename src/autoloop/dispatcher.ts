@@ -185,6 +185,7 @@ const AUTOLOOP_OPERATION_RETRYABILITY = {
   AUTOLOOP_RESET_POSTCONDITION_FAILED: false,
   AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE: false,
   AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE: false,
+  AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID: false,
 } as const satisfies Record<AutoloopOperationErrorCode, boolean>;
 
 export class AutoloopOperationError extends Error {
