@@ -78,6 +78,12 @@ export interface SecureAutoloopLedgerOptions {
     beforeFileMutation?: (event: SecureLedgerMutationEvent) => void;
     beforeDirectorySync?: (event: SecureLedgerMutationEvent) => void;
     beforeNestedMutation?: (event: SecureLedgerNestedMutationEvent) => void;
+    beforeNestedTemporaryIo?: (
+      event: SecureLedgerNestedPublishEvent & {
+        phase: 'after-create' | 'before-write' | 'before-flush';
+        fd: number;
+      },
+    ) => void;
     beforeNestedPublish?: (event: SecureLedgerNestedPublishEvent) => void;
     publishNestedTemporary?: (temporaryPath: string, targetPath: string) => void;
     afterNestedPublish?: (event: SecureLedgerNestedPublishEvent) => void;
@@ -853,14 +859,18 @@ export class SecureAutoloopLedger {
         PRIVATE_FILE_MODE,
       );
       temporaryCreated = true;
+      const temporaryIoEvent = { relativePath, filePath: target, temporaryPath: temporary, fd };
+      this.testHooks.beforeNestedTemporaryIo?.({ ...temporaryIoEvent, phase: 'after-create' });
       const opened = fs.fstatSync(fd);
       if (!opened.isFile() || opened.nlink !== 1) rejectNestedFile(temporary, 'Autoloop temporary artifact', opened);
       let offset = 0;
+      this.testHooks.beforeNestedTemporaryIo?.({ ...temporaryIoEvent, phase: 'before-write' });
       while (offset < bytes.length) {
         const written = fs.writeSync(fd, bytes, offset, bytes.length - offset, null);
         if (written <= 0) throw new Error(`Could not write complete Autoloop artifact '${target}'`);
         offset += written;
       }
+      this.testHooks.beforeNestedTemporaryIo?.({ ...temporaryIoEvent, phase: 'before-flush' });
       fs.fsyncSync(fd);
       temporaryIdentity = fs.fstatSync(fd);
       const temporaryFd = fd;
@@ -930,6 +940,14 @@ export class SecureAutoloopLedger {
       throw error;
     } finally {
       if (fd !== undefined) {
+        if (!temporaryIdentity) {
+          try {
+            const incompleteIdentity = fs.fstatSync(fd);
+            if (incompleteIdentity.isFile()) temporaryIdentity = incompleteIdentity;
+          } catch (error) {
+            this.logger.warn?.(`[autoloop] failed to identify incomplete nested artifact: ${errorMessage(error)}`);
+          }
+        }
         try {
           fs.closeSync(fd);
         } catch (error) {

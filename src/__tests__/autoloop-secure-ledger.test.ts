@@ -1159,6 +1159,111 @@ describe('SecureAutoloopLedger', () => {
       expect(fs.readFileSync(temporary)).toEqual(mutated);
     });
 
+    it.each(['before-write', 'before-flush'] as const)(
+      'removes its owned private temporary when %s fails before the identity checkpoint',
+      (phase) => {
+        const workspace = tempWorkspace();
+        let temporary = '';
+        let incompleteSize = 0;
+        const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+          create: true,
+          testHooks: {
+            beforeNestedTemporaryIo: (event) => {
+              if (event.relativePath !== 'iter/0/coder_summary.txt' || event.phase !== phase) return;
+              temporary = event.temporaryPath;
+              if (phase === 'before-write') fs.writeSync(event.fd, Buffer.from('partial-private-bytes'));
+              incompleteSize = fs.fstatSync(event.fd).size;
+              throw new Error(`injected nested temporary ${phase} failure`);
+            },
+          },
+        });
+
+        expect(() => ledger.writeIterationArtifact(0, 'coder_summary.txt', 'private-bytes\n')).toThrow(
+          `injected nested temporary ${phase} failure`,
+        );
+
+        const directory = path.join(ledger.directory, 'iter', '0');
+        expect(temporary).not.toBe('');
+        expect(incompleteSize).toBeGreaterThan(0);
+        expect(lstatIfPresentForTest(temporary)).toBeUndefined();
+        expect(fs.existsSync(path.join(directory, 'coder_summary.txt'))).toBe(false);
+        expect(fs.readdirSync(directory).filter((entry) => entry.startsWith('.coder_summary.txt.tmp-'))).toEqual([]);
+      },
+    );
+
+    it('removes its owned temporary name when the initial descriptor check rejects an added hardlink', () => {
+      const workspace = tempWorkspace();
+      const externalAlias = path.join(workspace, 'external-incomplete-alias');
+      let temporary = '';
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: {
+          beforeNestedTemporaryIo: (event) => {
+            if (event.relativePath !== 'iter/0/eval_output.json' || event.phase !== 'after-create') return;
+            temporary = event.temporaryPath;
+            fs.linkSync(event.temporaryPath, externalAlias);
+          },
+        },
+      });
+
+      expect(() => ledger.writeIterationArtifact(0, 'eval_output.json', 'must-not-land\n')).toThrow(
+        /temporary|hardlink|link count/i,
+      );
+
+      expect(temporary).not.toBe('');
+      expect(lstatIfPresentForTest(temporary)).toBeUndefined();
+      expect(fs.readFileSync(externalAlias)).toEqual(Buffer.alloc(0));
+      expect(fs.lstatSync(externalAlias).nlink).toBe(1);
+      expect(fs.existsSync(path.join(ledger.directory, 'iter', '0', 'eval_output.json'))).toBe(false);
+    });
+
+    it.each(['regular', 'symlink'] as const)(
+      'preserves a foreign %s replacement when temporary flush fails before identity capture',
+      (kind) => {
+        const workspace = tempWorkspace();
+        const external = path.join(workspace, `external-incomplete-${kind}`);
+        fs.writeFileSync(external, 'foreign-sentinel\n', { mode: 0o664 });
+        const externalIdentity = fs.lstatSync(external);
+        let temporary = '';
+        const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+          create: true,
+          testHooks: {
+            beforeNestedTemporaryIo: (event) => {
+              if (event.relativePath !== 'iter/0/diff.patch' || event.phase !== 'before-flush') return;
+              temporary = event.temporaryPath;
+              fs.unlinkSync(event.temporaryPath);
+              if (kind === 'regular') fs.renameSync(external, event.temporaryPath);
+              else fs.symlinkSync(external, event.temporaryPath);
+              throw new Error(`injected ${kind} replacement before flush`);
+            },
+          },
+        });
+
+        expect(() => ledger.writeIterationArtifact(0, 'diff.patch', 'private-candidate\n')).toThrow(
+          `injected ${kind} replacement before flush`,
+        );
+
+        expect(temporary).not.toBe('');
+        if (kind === 'regular') {
+          const preserved = fs.lstatSync(temporary);
+          expect(preserved.isFile()).toBe(true);
+          expect({ dev: preserved.dev, ino: preserved.ino }).toEqual({
+            dev: externalIdentity.dev,
+            ino: externalIdentity.ino,
+          });
+          expect(fs.existsSync(external)).toBe(false);
+          expect(fs.readFileSync(temporary, 'utf8')).toBe('foreign-sentinel\n');
+          expect(permissions(temporary)).toBe(0o664);
+        } else {
+          expect(fs.lstatSync(temporary).isSymbolicLink()).toBe(true);
+          expect(fs.readlinkSync(temporary)).toBe(external);
+          expect(fs.readFileSync(external, 'utf8')).toBe('foreign-sentinel\n');
+          expect(permissions(external)).toBe(0o664);
+        }
+        expect(fs.existsSync(path.join(ledger.directory, 'iter', '0', 'diff.patch'))).toBe(false);
+      },
+    );
+
     it('does not retry a temporary descriptor close with an ambiguous outcome', () => {
       const workspace = tempWorkspace();
       let closeAttempts = 0;
