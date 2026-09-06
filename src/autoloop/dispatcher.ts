@@ -375,6 +375,19 @@ function canonicalPersistedVerdictPayload(payload: PersistedReviewVerdictPayload
   };
 }
 
+function serializePersistedVerdictV1(iter: number, ts: string, payload: PersistedReviewVerdictPayload): string {
+  const persisted = Object.create(null) as Record<string, unknown>;
+  persisted.schema_version = LEDGER_SCHEMA_VERSION;
+  persisted.iter = iter;
+  persisted.ts = ts;
+  persisted.decision = payload.decision;
+  persisted.metric = payload.metric;
+  persisted.audit_notes = payload.audit_notes;
+  if (Object.hasOwn(payload, 'accepted')) persisted.accepted = payload.accepted;
+  if (Object.hasOwn(payload, 'evidence_id')) persisted.evidence_id = payload.evidence_id;
+  return JSON.stringify(persisted, null, 2);
+}
+
 function samePersistedVerdictPayload(stored: Record<string, unknown>, payload: PersistedReviewVerdictPayload): boolean {
   if (Object.keys(stored).some((key) => !STORED_REVIEW_VERDICT_KEYS.has(key))) return false;
   if (
@@ -399,26 +412,69 @@ function samePersistedVerdictPayload(stored: Record<string, unknown>, payload: P
 
 const DIRECTIVE_V1_PAYLOAD_KEYS = new Set(['goal', 'constraints', 'success_criteria', 'max_attempts']);
 
-function serializeDirectiveV1(env: Extract<AnyAutoloopMessage, { type: 'directive' }>, dispatchId: string): string {
-  const unsupportedKeys = Object.keys(env.payload).filter((key) => !DIRECTIVE_V1_PAYLOAD_KEYS.has(key));
-  if (unsupportedKeys.length > 0) {
-    throw new Error(`Directive payload contains unsupported schema-v1 fields: ${unsupportedKeys.join(', ')}`);
+function prototypeFreeArray<T>(values: readonly T[]): T[] {
+  const clone = Array.from(values);
+  Object.setPrototypeOf(clone, null);
+  return clone;
+}
+
+function ownDataProperty(payload: object, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(payload, key);
+  if (!descriptor || !Object.hasOwn(descriptor, 'value')) {
+    throw new Error(`Directive payload is invalid: ${key} must be an own data property`);
   }
-  return JSON.stringify(
-    {
-      schema_version: LEDGER_SCHEMA_VERSION,
-      iter: env.iter,
-      ts: env.ts,
-      message_id: env.msg_id,
-      dispatch_id: dispatchId,
-      goal: env.payload.goal,
-      constraints: env.payload.constraints,
-      success_criteria: env.payload.success_criteria,
-      max_attempts: env.payload.max_attempts,
-    },
-    null,
-    2,
+  return descriptor.value;
+}
+
+function directiveStringArray(value: unknown, key: 'constraints' | 'success_criteria'): string[] {
+  if (!Array.isArray(value)) {
+    throw new Error(`Directive payload is invalid: ${key} must be an array of strings`);
+  }
+  const clone: string[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor || !Object.hasOwn(descriptor, 'value') || typeof descriptor.value !== 'string') {
+      throw new Error(`Directive payload is invalid: ${key} must be an array of strings`);
+    }
+    clone.push(descriptor.value);
+  }
+  return prototypeFreeArray(clone);
+}
+
+function serializeDirectiveV1(env: Extract<AnyAutoloopMessage, { type: 'directive' }>, dispatchId: string): string {
+  if (typeof env.payload !== 'object' || env.payload === null || Array.isArray(env.payload)) {
+    throw new Error('Directive payload is invalid: expected an object');
+  }
+  const unsupportedKeys = Reflect.ownKeys(env.payload).filter(
+    (key) => typeof key !== 'string' || !DIRECTIVE_V1_PAYLOAD_KEYS.has(key),
   );
+  if (unsupportedKeys.length > 0) {
+    throw new Error(
+      `Directive payload contains unsupported schema-v1 fields: ${unsupportedKeys.map(String).join(', ')}`,
+    );
+  }
+  const goal = ownDataProperty(env.payload, 'goal');
+  const constraints = directiveStringArray(ownDataProperty(env.payload, 'constraints'), 'constraints');
+  const successCriteria = directiveStringArray(ownDataProperty(env.payload, 'success_criteria'), 'success_criteria');
+  const maxAttempts = ownDataProperty(env.payload, 'max_attempts');
+  if (typeof goal !== 'string') {
+    throw new Error('Directive payload is invalid: goal must be a string');
+  }
+  if (!Number.isSafeInteger(maxAttempts) || (maxAttempts as number) <= 0) {
+    throw new Error('Directive payload is invalid: max_attempts must be a positive safe integer');
+  }
+
+  const persisted = Object.create(null) as Record<string, unknown>;
+  persisted.schema_version = LEDGER_SCHEMA_VERSION;
+  persisted.iter = env.iter;
+  persisted.ts = env.ts;
+  persisted.message_id = env.msg_id;
+  persisted.dispatch_id = dispatchId;
+  persisted.goal = goal;
+  persisted.constraints = constraints;
+  persisted.success_criteria = successCriteria;
+  persisted.max_attempts = maxAttempts;
+  return JSON.stringify(persisted, null, 2);
 }
 
 function validatedPlannerControlEvidence(value: unknown): PlannerControlEvidence | undefined {
@@ -587,7 +643,7 @@ const MAX_RETAINED_DISPATCHES = 64;
  * inputs, so re-delivery in this or another dispatcher derives the same ID.
  */
 function deriveDispatchId(runId: string, env: AnyAutoloopMessage): string {
-  const identity = JSON.stringify([runId, env.msg_id, env.iter, env.from, env.to, env.type]);
+  const identity = JSON.stringify(prototypeFreeArray([runId, env.msg_id, env.iter, env.from, env.to, env.type]));
   return `dispatch_${createHash('sha256').update(identity).digest('hex')}`;
 }
 
@@ -2718,11 +2774,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     this.secureLedger.writeIterationArtifact(
       iter,
       'verdict.json',
-      JSON.stringify(
-        { schema_version: LEDGER_SCHEMA_VERSION, iter, ts: new Date().toISOString(), ...canonical },
-        null,
-        2,
-      ),
+      serializePersistedVerdictV1(iter, new Date().toISOString(), canonical),
     );
   }
 
