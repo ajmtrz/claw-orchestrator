@@ -2219,6 +2219,84 @@ describe('ClaudeAgentDispatcher — canonical immutable Reviewer verdicts', () =
     expect(fs.existsSync(verdictPath)).toBe(false);
   });
 
+  it.each(['decision', 'metric', 'audit_notes', 'accepted', 'evidence_id'] as const)(
+    'rejects an own accessor for Reviewer verdict field %s without invoking it',
+    (field) => {
+      const { dispatcher, ledgerDir } = makeDispatcher();
+      const { persistVerdict } = verdictMethods(dispatcher);
+      const verdictPath = path.join(ledgerDir, 'iter', '0', 'verdict.json');
+      const payload: Record<string, unknown> = {
+        decision: 'advance',
+        metric: 1,
+        audit_notes: 'accessors are not durable evidence',
+        accepted: true,
+        evidence_id: 'iter-0',
+      };
+      const accessorValue = payload[field];
+      let getterHits = 0;
+      Object.defineProperty(payload, field, {
+        configurable: true,
+        enumerable: true,
+        get() {
+          getterHits += 1;
+          return accessorValue;
+        },
+      });
+
+      expect(() => persistVerdict(0, payload as unknown as VerdictCandidate)).toThrow(/conflicting|immutable|invalid/i);
+
+      expect(getterHits).toBe(0);
+      expect(fs.existsSync(verdictPath)).toBe(false);
+    },
+  );
+
+  it('snapshots each Reviewer verdict data descriptor once without ordinary Proxy reads', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-06T01:00:00.000Z'));
+    const { dispatcher, ledgerDir } = makeDispatcher();
+    const { persistVerdict } = verdictMethods(dispatcher);
+    const target = {
+      decision: 'advance' as const,
+      metric: 1,
+      audit_notes: 'single immutable verdict snapshot',
+      accepted: true,
+      evidence_id: 'iter-0',
+    };
+    const descriptorReads = new Map<PropertyKey, number>();
+    let ordinaryReads = 0;
+    const payload = new Proxy(target, {
+      get(inner, key, receiver) {
+        ordinaryReads += 1;
+        return Reflect.get(inner, key, receiver);
+      },
+      getOwnPropertyDescriptor(inner, key) {
+        descriptorReads.set(key, (descriptorReads.get(key) ?? 0) + 1);
+        return Reflect.getOwnPropertyDescriptor(inner, key);
+      },
+    });
+
+    persistVerdict(0, payload);
+
+    expect(ordinaryReads).toBe(0);
+    for (const field of ['decision', 'metric', 'audit_notes', 'accepted', 'evidence_id']) {
+      expect(descriptorReads.get(field)).toBe(1);
+    }
+    expect(fs.readFileSync(path.join(ledgerDir, 'iter', '0', 'verdict.json'), 'utf8')).toBe(
+      [
+        '{',
+        '  "schema_version": 1,',
+        '  "iter": 0,',
+        '  "ts": "2026-09-06T01:00:00.000Z",',
+        '  "decision": "advance",',
+        '  "metric": 1,',
+        '  "audit_notes": "single immutable verdict snapshot",',
+        '  "accepted": true,',
+        '  "evidence_id": "iter-0"',
+        '}',
+      ].join('\n'),
+    );
+  });
+
   it.each([
     ['decision outside the verdict allowlist', { decision: 'pause', metric: 1, audit_notes: 'invalid decision' }],
     ['non-finite metric', { decision: 'hold', metric: Number.NaN, audit_notes: 'invalid metric' }],
@@ -2623,6 +2701,153 @@ describe('ClaudeAgentDispatcher — durable directive ordering and review iterat
     return payload as unknown as Parameters<typeof Msg.directive>[1];
   }
 
+  const envelopeIdentityFields = ['msg_id', 'iter', 'from', 'to', 'type', 'ts', 'payload'] as const;
+
+  it('rejects inherited envelope identity before persistence or any Coder effect', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'must not be sent' });
+    const valid = fixedIdentity(Msg.directive(0, directivePayload), 'inherited-envelope-identity');
+    const inherited = Object.create(valid) as AnyAutoloopMessage;
+
+    await expect(dispatcher.deliver(inherited)).rejects.toThrow(/envelope|identity|own data property/i);
+
+    expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'directive.json'))).toBe(false);
+    expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+    expect(calls.startSession).toHaveBeenCalledTimes(0);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(0);
+  });
+
+  it.each(envelopeIdentityFields)(
+    'rejects an own accessor for envelope identity field %s without invoking it',
+    async (field) => {
+      const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'must not be sent' });
+      const envelope = fixedIdentity(
+        Msg.directive(0, directivePayload),
+        `accessor-envelope-${field}`,
+      ) as unknown as Record<string, unknown>;
+      const accessorValue = envelope[field];
+      let getterHits = 0;
+      Object.defineProperty(envelope, field, {
+        configurable: true,
+        enumerable: true,
+        get() {
+          getterHits += 1;
+          return accessorValue;
+        },
+      });
+      let thrown: unknown;
+
+      try {
+        await dispatcher.deliver(envelope as unknown as AnyAutoloopMessage);
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(getterHits).toBe(0);
+      expect(thrown).toBeInstanceOf(Error);
+      expect((thrown as Error).message).toMatch(/envelope|identity|own data property/i);
+      expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'directive.json'))).toBe(false);
+      expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+      expect(calls.startSession).toHaveBeenCalledTimes(0);
+      expect(calls.sendMessage).toHaveBeenCalledTimes(0);
+    },
+  );
+
+  it.each([-1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1])(
+    'rejects invalid envelope iteration %s before persistence or any Coder effect',
+    async (iter) => {
+      const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'must not be sent' });
+      const envelope = fixedIdentity(Msg.directive(0, directivePayload), `invalid-envelope-iter-${String(iter)}`);
+      Object.defineProperty(envelope, 'iter', {
+        configurable: true,
+        enumerable: true,
+        value: iter,
+        writable: true,
+      });
+
+      await expect(dispatcher.deliver(envelope)).rejects.toThrow(/envelope|identity|iteration|iter/i);
+
+      expect(fs.existsSync(path.join(ledgerDir, 'iter', String(iter), 'directive.json'))).toBe(false);
+      expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+      expect(calls.startSession).toHaveBeenCalledTimes(0);
+      expect(calls.sendMessage).toHaveBeenCalledTimes(0);
+    },
+  );
+
+  it('uses one immutable envelope and directive snapshot across persistence and Coder startup', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'Coder acknowledged.' });
+    const payloadTarget = {
+      goal: 'stable goal',
+      constraints: ['stable constraint'],
+      success_criteria: ['stable success'],
+      max_attempts: 2,
+    };
+    const payloadDescriptorReads = new Map<PropertyKey, number>();
+    let payloadOrdinaryReads = 0;
+    const payload = new Proxy(payloadTarget, {
+      get(target, key, receiver) {
+        payloadOrdinaryReads += 1;
+        return Reflect.get(target, key, receiver);
+      },
+      getOwnPropertyDescriptor(target, key) {
+        payloadDescriptorReads.set(key, (payloadDescriptorReads.get(key) ?? 0) + 1);
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    const envelopeTarget = fixedIdentity(Msg.directive(2, payload), 'immutable-envelope-and-payload');
+    const envelopeDescriptorReads = new Map<PropertyKey, number>();
+    let envelopeOrdinaryReads = 0;
+    const envelope = new Proxy(envelopeTarget, {
+      get(target, key, receiver) {
+        envelopeOrdinaryReads += 1;
+        return Reflect.get(target, key, receiver);
+      },
+      getOwnPropertyDescriptor(target, key) {
+        envelopeDescriptorReads.set(key, (envelopeDescriptorReads.get(key) ?? 0) + 1);
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    const reserveAgentGeneration = calls.reserveAgentGeneration.getMockImplementation()!;
+    calls.reserveAgentGeneration.mockImplementation((generation: PhysicalAgentGeneration) => {
+      payloadTarget.goal = 'mutated goal';
+      payloadTarget.constraints[0] = 'mutated constraint';
+      payloadTarget.success_criteria[0] = 'mutated success';
+      payloadTarget.max_attempts = 99;
+      return reserveAgentGeneration(generation);
+    });
+
+    await dispatcher.deliver(envelope);
+
+    expect(envelopeOrdinaryReads).toBe(0);
+    for (const field of envelopeIdentityFields) expect(envelopeDescriptorReads.get(field)).toBe(1);
+    expect(payloadOrdinaryReads).toBe(0);
+    for (const field of requiredDirectiveFields) expect(payloadDescriptorReads.get(field)).toBe(1);
+    const persisted = JSON.parse(
+      fs.readFileSync(path.join(ledgerDir, 'iter', '2', 'directive.json'), 'utf8'),
+    ) as Record<string, unknown>;
+    expect(persisted).toEqual({
+      schema_version: LEDGER_SCHEMA_VERSION,
+      iter: 2,
+      ts: envelopeTarget.ts,
+      message_id: envelopeTarget.msg_id,
+      dispatch_id: expect.stringMatching(/^dispatch_[a-f0-9]{64}$/),
+      goal: 'stable goal',
+      constraints: ['stable constraint'],
+      success_criteria: ['stable success'],
+      max_attempts: 2,
+    });
+    const prompt = calls.sendMessage.mock.calls[0][1] as string;
+    expect(prompt).toContain(
+      [
+        '[directive iter=2]',
+        'goal: stable goal',
+        'constraints:\n  - stable constraint',
+        'success_criteria:\n  - stable success',
+        'max_attempts: 2',
+      ].join('\n'),
+    );
+    expect(prompt).not.toContain('mutated');
+  });
+
   it.each(
     requiredDirectiveFields.flatMap((field) =>
       (['none', 'data', 'getter'] as const).map((inherited) => [field, inherited] as const),
@@ -2685,6 +2910,117 @@ describe('ClaudeAgentDispatcher — durable directive ordering and review iterat
     },
   );
 
+  it.each(['constraints', 'success_criteria'] as const)(
+    'rejects sparse holes in directive %s before persistence or any Coder effect',
+    async (field) => {
+      const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'must not be sent' });
+      const sparse = ['present'];
+      sparse.length = 2;
+      const payload = { ...directivePayload, [field]: sparse };
+
+      await expect(dispatcher.deliver(Msg.directive(0, payload))).rejects.toThrow(/directive payload.*invalid/i);
+
+      expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'directive.json'))).toBe(false);
+      expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+      expect(calls.startSession).toHaveBeenCalledTimes(0);
+      expect(calls.sendMessage).toHaveBeenCalledTimes(0);
+    },
+  );
+
+  it.each(['constraints', 'success_criteria'] as const)(
+    'rejects an index accessor in directive %s without invoking it',
+    async (field) => {
+      const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'must not be sent' });
+      const values = ['stable'];
+      let getterHits = 0;
+      Object.defineProperty(values, '0', {
+        configurable: true,
+        enumerable: true,
+        get() {
+          getterHits += 1;
+          return 'attacker value';
+        },
+      });
+      const payload = { ...directivePayload, [field]: values };
+
+      await expect(dispatcher.deliver(Msg.directive(0, payload))).rejects.toThrow(/directive payload.*invalid/i);
+
+      expect(getterHits).toBe(0);
+      expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'directive.json'))).toBe(false);
+      expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+      expect(calls.startSession).toHaveBeenCalledTimes(0);
+      expect(calls.sendMessage).toHaveBeenCalledTimes(0);
+    },
+  );
+
+  it.each(['map', 'join', 'push', 'metadata'] as const)(
+    'rejects directive arrays with extra named own property %s without invoking it',
+    async (property) => {
+      const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'must not be sent' });
+      const constraints = ['stable constraint'] as string[] & Record<string, unknown>;
+      let methodHits = 0;
+      Object.defineProperty(constraints, property, {
+        configurable: true,
+        enumerable: false,
+        value() {
+          methodHits += 1;
+          return ['attacker constraint'];
+        },
+        writable: true,
+      });
+
+      await expect(dispatcher.deliver(Msg.directive(0, { ...directivePayload, constraints }))).rejects.toThrow(
+        /directive payload.*invalid/i,
+      );
+
+      expect(methodHits).toBe(0);
+      expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'directive.json'))).toBe(false);
+      expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+      expect(calls.startSession).toHaveBeenCalledTimes(0);
+      expect(calls.sendMessage).toHaveBeenCalledTimes(0);
+    },
+  );
+
+  it('rejects directive arrays with extra symbol own properties before persistence or Coder effects', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'must not be sent' });
+    const constraints = ['stable constraint'];
+    Object.defineProperty(constraints, Symbol('directive-array-metadata'), {
+      configurable: true,
+      enumerable: false,
+      value: 'must not be stripped',
+      writable: true,
+    });
+
+    await expect(dispatcher.deliver(Msg.directive(0, { ...directivePayload, constraints }))).rejects.toThrow(
+      /directive payload.*invalid/i,
+    );
+
+    expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'directive.json'))).toBe(false);
+    expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+    expect(calls.startSession).toHaveBeenCalledTimes(0);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(0);
+  });
+
+  it('rejects directive payload symbols before persistence or any Coder effect', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'must not be sent' });
+    const payload = { ...directivePayload };
+    Object.defineProperty(payload, Symbol('directive-payload-metadata'), {
+      configurable: true,
+      enumerable: false,
+      value: 'must not be stripped',
+      writable: true,
+    });
+
+    await expect(dispatcher.deliver(Msg.directive(0, payload))).rejects.toThrow(
+      /directive payload.*(?:additional|reserved|unsupported)/i,
+    );
+
+    expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'directive.json'))).toBe(false);
+    expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+    expect(calls.startSession).toHaveBeenCalledTimes(0);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(0);
+  });
+
   it.each([
     ['own undefined goal', { goal: undefined }],
     ['non-string goal', { goal: 1 }],
@@ -2716,6 +3052,182 @@ describe('ClaudeAgentDispatcher — durable directive ordering and review iterat
     expect(thrown).toBeInstanceOf(Error);
     expect((thrown as Error).message).toMatch(/directive payload.*invalid/i);
     expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'directive.json'))).toBe(false);
+    expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
+    expect(calls.startSession).toHaveBeenCalledTimes(0);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(0);
+  });
+
+  it('does not consult polluted array map, join, or push while freezing directive bytes and prompt text', async () => {
+    const constraints = ['stable constraint'];
+    const successCriteria = ['stable success'];
+    const payload = {
+      goal: 'stable goal',
+      constraints,
+      success_criteria: successCriteria,
+      max_attempts: 2,
+    };
+    const { dispatcher, calls, ledgerDir } = makeDispatcher(
+      { coderEngine: 'codex' },
+      { sendOutput: 'Coder acknowledged.' },
+    );
+    await dispatcher.deliver(fixedIdentity(Msg.directive(1, payload), 'polluted-array-methods-warmup'));
+    const originalMap = Array.prototype.map;
+    const originalJoin = Array.prototype.join;
+    const originalPush = Array.prototype.push;
+    const mappedPayloadArrays = new WeakSet<object>();
+    let mapHits = 0;
+    let joinHits = 0;
+    let pushHits = 0;
+
+    const { thrown } = await withPrototypeDescriptors(
+      [
+        {
+          target: Array.prototype,
+          key: 'map',
+          descriptor: {
+            configurable: true,
+            value: function pollutedMap(
+              this: unknown[],
+              callback: (value: unknown, index: number, array: unknown[]) => unknown,
+              thisArg?: unknown,
+            ): unknown[] {
+              const result = originalMap.call(this, callback, thisArg);
+              if (
+                this === constraints ||
+                this === successCriteria ||
+                (typeof this[0] === 'object' && this[0] !== null && 'who' in this[0])
+              ) {
+                mapHits += 1;
+                mappedPayloadArrays.add(result);
+              }
+              return result;
+            },
+            writable: true,
+          },
+        },
+        {
+          target: Array.prototype,
+          key: 'join',
+          descriptor: {
+            configurable: true,
+            value: function pollutedJoin(this: unknown[], separator?: string): string {
+              if (
+                mappedPayloadArrays.has(this) ||
+                this[0] === '<autoloop_role_instructions>' ||
+                this[0] === '<conversation_history>'
+              ) {
+                joinHits += 1;
+                return 'attacker-chosen-prompt-array';
+              }
+              return originalJoin.call(this, separator);
+            },
+            writable: true,
+          },
+        },
+        {
+          target: Array.prototype,
+          key: 'push',
+          descriptor: {
+            configurable: true,
+            value: function pollutedPush(this: unknown[], ...items: unknown[]): number {
+              if (
+                items[0] === 'stable constraint' ||
+                items[0] === 'stable success' ||
+                items[0] === '<autoloop_message>' ||
+                (typeof items[0] === 'object' && items[0] !== null && 'who' in items[0])
+              ) {
+                pushHits += 1;
+                return originalPush.call(this, 'attacker-chosen-persisted-array');
+              }
+              return originalPush.apply(this, items);
+            },
+            writable: true,
+          },
+        },
+      ],
+      () => dispatcher.deliver(fixedIdentity(Msg.directive(2, payload), 'polluted-array-methods')),
+    );
+
+    expect(thrown).toBeUndefined();
+    expect(mapHits).toBe(0);
+    expect(joinHits).toBe(0);
+    expect(pushHits).toBe(0);
+    expect(JSON.parse(fs.readFileSync(path.join(ledgerDir, 'iter', '2', 'directive.json'), 'utf8'))).toMatchObject(
+      payload,
+    );
+    const prompt = calls.sendMessage.mock.calls[1][1] as string;
+    expect(prompt).toContain(
+      [
+        '[directive iter=2]',
+        'goal: stable goal',
+        'constraints:\n  - stable constraint',
+        'success_criteria:\n  - stable success',
+        'max_attempts: 2',
+      ].join('\n'),
+    );
+    expect(prompt).not.toContain('attacker-chosen');
+  });
+
+  it('does not consult a polluted array iterator and preserves clean v1 bytes and distinct dispatch IDs', async () => {
+    const secureLedger = SecureAutoloopLedger.open(tmpRoot, 'r1', { create: true });
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({ secureLedger }, { sendOutput: 'must not be sent' });
+    const stopAfterPersistence = new Error('stop after observing iterator-safe persistence');
+    const writeIterationArtifact = secureLedger.writeIterationArtifact.bind(secureLedger);
+    secureLedger.writeIterationArtifact = ((iter, name, content) => {
+      const outcome = writeIterationArtifact(iter, name, content);
+      if (name === 'directive.json') throw stopAfterPersistence;
+      return outcome;
+    }) as typeof secureLedger.writeIterationArtifact;
+    const originalIterator = Array.prototype[Symbol.iterator];
+    let iteratorHits = 0;
+    let firstError: unknown;
+    let secondError: unknown;
+    const first = fixedIdentity(Msg.directive(2, directivePayload), v1DirectiveMessageId, v1DirectiveTimestamp);
+    const second = fixedIdentity(
+      Msg.directive(3, directivePayload),
+      'directive-iterator-distinct-3',
+      v1DirectiveTimestamp,
+    );
+
+    await withPrototypeDescriptors(
+      [
+        {
+          target: Array.prototype,
+          key: Symbol.iterator,
+          descriptor: {
+            configurable: true,
+            value: function pollutedIterator(this: unknown[]): ArrayIterator<unknown> {
+              iteratorHits += 1;
+              return originalIterator.call(this);
+            },
+            writable: true,
+          },
+        },
+      ],
+      async () => {
+        try {
+          await dispatcher.deliver(first);
+        } catch (error) {
+          firstError = error;
+        }
+        try {
+          await dispatcher.deliver(second);
+        } catch (error) {
+          secondError = error;
+        }
+      },
+    );
+
+    expect(firstError).toBe(stopAfterPersistence);
+    expect(secondError).toBe(stopAfterPersistence);
+    expect(iteratorHits).toBe(0);
+    expect(fs.readFileSync(path.join(ledgerDir, 'iter', '2', 'directive.json'), 'utf8')).toBe(v1DirectiveBytes);
+    const firstPersisted = JSON.parse(v1DirectiveBytes) as { dispatch_id: string };
+    const secondPersisted = JSON.parse(
+      fs.readFileSync(path.join(ledgerDir, 'iter', '3', 'directive.json'), 'utf8'),
+    ) as { dispatch_id: string };
+    expect(secondPersisted.dispatch_id).toMatch(/^dispatch_[a-f0-9]{64}$/);
+    expect(secondPersisted.dispatch_id).not.toBe(firstPersisted.dispatch_id);
     expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(0);
     expect(calls.startSession).toHaveBeenCalledTimes(0);
     expect(calls.sendMessage).toHaveBeenCalledTimes(0);
