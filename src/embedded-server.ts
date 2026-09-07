@@ -32,6 +32,21 @@ import {
 // SSE/keep-alive sockets are force-dropped (otherwise close() hangs forever).
 const SERVER_CLOSE_GRACE_MS = 5000;
 
+function safeOwnErrorMessage(error: unknown): string {
+  if (typeof error === 'string') return error;
+  if ((typeof error !== 'object' || error === null) && typeof error !== 'function') {
+    return 'unknown error';
+  }
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(error, 'message');
+    return descriptor && Object.hasOwn(descriptor, 'value') && typeof descriptor.value === 'string'
+      ? descriptor.value
+      : 'unknown error';
+  } catch {
+    return 'unknown error';
+  }
+}
+
 function autoloopErrorStatus(error: unknown): number {
   const message = error instanceof Error ? error.message : String(error);
   if (/^Autoloop run '.+' not found in registry$/.test(message)) return 404;
@@ -148,7 +163,10 @@ export const __rejectCustomEngineOverHttpForTest = rejectCustomEngineOverHttp;
  * hardened for exactly this and the other three were not, so the guard lives in
  * one place now rather than in each closure that remembers to have it.
  */
-function sseSender(res: http.ServerResponse): (event: string, data: unknown) => void {
+function sseSender(
+  res: http.ServerResponse,
+  serialize: (data: unknown) => string = JSON.stringify,
+): (event: string, data: unknown) => void {
   let closed = false;
   res.on('close', () => {
     closed = true;
@@ -157,7 +175,7 @@ function sseSender(res: http.ServerResponse): (event: string, data: unknown) => 
     if (closed || res.writableEnded || !res.writable) return;
     try {
       res.write(`event: ${event}\n`);
-      res.write(`data: ${JSON.stringify(data)}\n\n`);
+      res.write(`data: ${serialize(data)}\n\n`);
     } catch {
       // Connection broke mid-write; stop sending. The route's own `close`
       // handler detaches listeners and ends the response.
@@ -168,6 +186,55 @@ function sseSender(res: http.ServerResponse): (event: string, data: unknown) => 
 
 /** Test seam: the guard is invisible from outside, and an unguarded write throws where nothing catches it. */
 export const __sseSenderForTest = sseSender;
+
+/**
+ * Snapshot the public Autoloop state boundary without invoking inherited
+ * `toJSON` hooks or own accessors. Detached failures are already canonical
+ * data, but the surrounding persisted state and HTTP/SSE envelopes are plain
+ * objects and would otherwise let a polluted Object.prototype replace them.
+ */
+export function snapshotAutoloopPublicJsonValue(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (value === null || typeof value !== 'object') return typeof value === 'function' ? undefined : value;
+  if (seen.has(value)) return undefined;
+  seen.add(value);
+
+  let descriptors: PropertyDescriptorMap;
+  try {
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    seen.delete(value);
+    return undefined;
+  }
+
+  if (Array.isArray(value)) {
+    const snapshot: unknown[] = [];
+    Object.defineProperty(snapshot, 'toJSON', { value: undefined });
+    const length = descriptors.length;
+    const arrayLength = length && Object.hasOwn(length, 'value') && typeof length.value === 'number' ? length.value : 0;
+    snapshot.length = arrayLength;
+    for (let index = 0; index < arrayLength; index += 1) {
+      const descriptor = descriptors[String(index)];
+      snapshot[index] =
+        descriptor && descriptor.enumerable && Object.hasOwn(descriptor, 'value')
+          ? snapshotAutoloopPublicJsonValue(descriptor.value, seen)
+          : undefined;
+    }
+    seen.delete(value);
+    return Object.freeze(snapshot);
+  }
+
+  const snapshot = Object.create(null) as Record<string, unknown>;
+  for (const [key, descriptor] of Object.entries(descriptors)) {
+    if (!descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) continue;
+    snapshot[key] = snapshotAutoloopPublicJsonValue(descriptor.value, seen);
+  }
+  seen.delete(value);
+  return Object.freeze(snapshot);
+}
+
+function stringifyAutoloopPublicJson(value: unknown): string {
+  return JSON.stringify(snapshotAutoloopPublicJsonValue(value));
+}
 
 export class EmbeddedServer {
   private server: http.Server | null = null;
@@ -986,7 +1053,8 @@ export class EmbeddedServer {
       // Front-end contract used by the dashboard's 3-pane Orchestrator view.
 
       if (path === '/autoloop/list') {
-        json(200, { ok: true, runs: this.manager.autoloopList() });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(stringifyAutoloopPublicJson({ ok: true, runs: this.manager.autoloopList() }));
         return;
       }
 
@@ -1058,9 +1126,11 @@ export class EmbeddedServer {
       if (v2StateMatch) {
         const state = this.manager.autoloopStatus(v2StateMatch[1]);
         if (!state) {
-          json(404, { ok: false, error: 'run not found' });
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(stringifyAutoloopPublicJson({ ok: false, error: 'run not found' }));
         } else {
-          json(200, { ok: true, state });
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(stringifyAutoloopPublicJson({ ok: true, state }));
         }
         return;
       }
@@ -1142,10 +1212,15 @@ export class EmbeddedServer {
             'Cache-Control': 'no-cache',
             Connection: 'keep-alive',
           });
-          res.write(`event: snapshot\ndata: ${JSON.stringify({ state: histState })}\n\n`);
-          res.write(
-            `event: terminated\ndata: ${JSON.stringify({ reason: histState.status_reason ?? 'historical' })}\n\n`,
-          );
+          const safeHistState = snapshotAutoloopPublicJsonValue(histState);
+          const safeStatusReason =
+            typeof safeHistState === 'object' &&
+            safeHistState !== null &&
+            typeof (safeHistState as Record<string, unknown>).status_reason === 'string'
+              ? ((safeHistState as Record<string, unknown>).status_reason as string)
+              : 'historical';
+          res.write(`event: snapshot\ndata: ${stringifyAutoloopPublicJson({ state: safeHistState })}\n\n`);
+          res.write(`event: terminated\ndata: ${stringifyAutoloopPublicJson({ reason: safeStatusReason })}\n\n`);
           res.end();
           return;
         }
@@ -1154,7 +1229,7 @@ export class EmbeddedServer {
           'Cache-Control': 'no-cache',
           Connection: 'keep-alive',
         });
-        const send = sseSender(res);
+        const send = sseSender(res, stringifyAutoloopPublicJson);
         send('snapshot', { state: ctx.runner.state });
 
         const onMessage = (env: unknown): void => send('message', env);
@@ -1166,11 +1241,11 @@ export class EmbeddedServer {
           cleanup();
         };
         const onPlannerReply = (text: unknown): void => send('planner_reply', { text });
-        const onPlannerError = (err: unknown): void =>
-          send('planner_error', { message: err instanceof Error ? err.message : String(err) });
+        const onPlannerError = (err: unknown): void => send('planner_error', { message: safeOwnErrorMessage(err) });
         const onCoderReply = (text: unknown): void => send('coder_reply', { text });
         const onReviewerReply = (text: unknown): void => send('reviewer_reply', { text });
         const onCompact = (e: unknown): void => send('compact', e);
+        const onAutoloopFailure = (failure: unknown): void => send('autoloop_failure', failure);
         const cleanup = (): void => {
           // sseSender stops writing on its own `close` listener; this just
           // detaches the emitters so a long-lived run stops feeding a dead
@@ -1185,6 +1260,7 @@ export class EmbeddedServer {
           ctx.dispatcher.off('coder_reply', onCoderReply);
           ctx.dispatcher.off('reviewer_reply', onReviewerReply);
           ctx.dispatcher.off('compact', onCompact);
+          ctx.runner.off('autoloop_failure', onAutoloopFailure);
           try {
             res.end();
           } catch {
@@ -1201,6 +1277,7 @@ export class EmbeddedServer {
         ctx.dispatcher.on('coder_reply', onCoderReply);
         ctx.dispatcher.on('reviewer_reply', onReviewerReply);
         ctx.dispatcher.on('compact', onCompact);
+        ctx.runner.on('autoloop_failure', onAutoloopFailure);
         res.on('close', cleanup);
         return;
       }
@@ -1220,22 +1297,32 @@ export class EmbeddedServer {
         const id = v2ChatMatch[1];
         const text = (body as { text?: string }).text;
         if (typeof text !== 'string' || !text.trim()) {
-          json(400, { ok: false, error: 'text (non-empty string) required' });
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(stringifyAutoloopPublicJson({ ok: false, error: 'text (non-empty string) required' }));
           return;
         }
         // Validate run exists synchronously so 404 surfaces cleanly. After
         // this point we hand the message off to the runner and return.
         if (!this.manager.getAutoloop(id)) {
-          json(404, { ok: false, error: `Autoloop run '${id}' not found` });
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(stringifyAutoloopPublicJson({ ok: false, error: `Autoloop run '${id}' not found` }));
           return;
         }
-        this.manager.autoloopChat(id, text).catch((err) => {
-          // Late failures (planner errors, runner shutdown mid-dispatch) flow
-          // to SSE as planner_error events; this catch only exists to keep
-          // unhandled rejection from crashing the server.
-          console.warn(`[autoloop/${id}] chat dispatch failed: ${(err as Error).message}`);
-        });
-        json(202, { ok: true, queued: true });
+        void this.manager
+          .autoloopChat(id, text)
+          .catch((err) => this.manager.recordDetachedAutoloopChatFailure(id, err))
+          .catch((recordError) => {
+            try {
+              console.warn(
+                `[autoloop/${id}] failed to record detached chat rejection: ${safeOwnErrorMessage(recordError)}`,
+              );
+            } catch {
+              // This is the terminal containment boundary for the detached
+              // chain. Logging must never manufacture a replacement rejection.
+            }
+          });
+        res.writeHead(202, { 'Content-Type': 'application/json' });
+        res.end(stringifyAutoloopPublicJson({ ok: true, queued: true }));
         return;
       }
 
@@ -1326,7 +1413,8 @@ export class EmbeddedServer {
           if (sendTimeoutMs !== undefined) resumeOptions.sendTimeoutMs = sendTimeoutMs;
           if (pendingDispatchId !== undefined) resumeOptions.pendingDispatchId = pendingDispatchId;
           const state = await this.manager.autoloopResume(id, resumeOptions);
-          json(200, { ok: true, state });
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(stringifyAutoloopPublicJson({ ok: true, state }));
         } catch (err) {
           json(autoloopErrorStatus(err), { ok: false, error: (err as Error).message });
         }

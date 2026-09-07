@@ -9,7 +9,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { execFile, execFileSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -382,6 +382,7 @@ import { AutoloopRunner } from './autoloop/runner.js';
 import {
   AutoloopOperationError,
   ClaudeAgentDispatcher,
+  type AutoloopResetResult,
   type ClaudeAgentDispatcherConfig,
 } from './autoloop/dispatcher.js';
 import type {
@@ -399,7 +400,14 @@ import {
   isRecoverableAgentOwnerInstanceId,
   validateAutoloopTimeoutConfig,
 } from './autoloop/types.js';
-import { Msg as AutoloopMsg, type PushChannel, type PushLevel, type SendTimeoutPayload } from './autoloop/messages.js';
+import {
+  Msg as AutoloopMsg,
+  type AutoloopMessageType,
+  type AutoloopOperationErrorCode,
+  type PushChannel,
+  type PushLevel,
+  type SendTimeoutPayload,
+} from './autoloop/messages.js';
 import { appendPushLog, notifyUserFallbackChain } from './autoloop/notify.js';
 import {
   isCommittedSecureLedgerError,
@@ -520,6 +528,449 @@ class AutoloopChatStateError extends Error {
     super(message);
     this.name = 'AutoloopChatStateError';
   }
+}
+
+export type PublicAutoloopFailureCode =
+  | AutoloopOperationErrorCode
+  | 'AUTOLOOP_SEND_TIMEOUT'
+  | 'AUTOLOOP_RUN_PAUSED'
+  | 'AUTOLOOP_RUN_TERMINAL';
+
+/** Stable, data-only failure value shared by MCP and embedded HTTP/SSE. */
+export interface PublicAutoloopFailure {
+  readonly code: PublicAutoloopFailureCode;
+  readonly message: string;
+  readonly committed?: true;
+  readonly retryable: boolean;
+  readonly pending_dispatch?: Readonly<SendTimeoutPayload>;
+  readonly status_reason?: string | null;
+}
+
+export interface PublicAutoloopUnknownFailure {
+  readonly message: string;
+}
+
+interface DetachedAutoloopPhaseFailure {
+  readonly agent: 'planner';
+  readonly phase: 'planner_turn';
+  readonly code?: PublicAutoloopFailureCode;
+  readonly committed?: true;
+  readonly retryable?: boolean;
+  readonly pending_dispatch?: Readonly<SendTimeoutPayload>;
+  readonly status_reason?: string | null;
+  readonly error: string;
+}
+
+interface DurableDetachedAutoloopPhaseFailure extends DetachedAutoloopPhaseFailure {
+  readonly detached_failure_id?: string;
+}
+
+interface DurableDetachedAutoloopFailureRow {
+  readonly ts: string;
+  readonly payload: Readonly<DurableDetachedAutoloopPhaseFailure>;
+  readonly startByteOffset: number;
+}
+
+interface DetachedFailureLedgerCursor {
+  readonly version: 1;
+  readonly byteOffset: number;
+  readonly prefixSha256: string;
+}
+
+interface AutoloopChatFailureBinding {
+  readonly logicalId: string;
+  readonly preaudited?: DurableDetachedAutoloopFailureRow;
+  readonly runnerProjection?: AutoloopState['recent_phase_errors'][number];
+}
+
+const DETACHED_AUTOLOOP_FAILURE_ID = Symbol('detachedAutoloopFailureId');
+
+const AUTOLOOP_OPERATION_ERROR_RETRYABILITY = Object.freeze({
+  AUTOLOOP_EMPTY_REPLY: true,
+  AUTOLOOP_SESSION_NOT_CREATED: true,
+  AUTOLOOP_ENGINE_FAILURE: true,
+  AUTOLOOP_REQUIRED_TOOL_DENIED: true,
+  AUTOLOOP_CONTROL_MALFORMED: false,
+  AUTOLOOP_CONTROL_APPLICATION_FAILED: false,
+  AUTOLOOP_CONTROL_NOT_PERSISTED: true,
+  AUTOLOOP_RESET_POSTCONDITION_FAILED: false,
+  AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE: false,
+  AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE: false,
+  AUTOLOOP_LEDGER_DESCRIPTOR_CLOSE_INCOMPLETE: false,
+  AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID: false,
+} as const satisfies Record<AutoloopOperationErrorCode, boolean>);
+
+const AUTOLOOP_CHAT_STATE_RETRYABILITY = Object.freeze({
+  AUTOLOOP_SEND_TIMEOUT: true,
+  AUTOLOOP_RUN_PAUSED: false,
+  AUTOLOOP_RUN_TERMINAL: false,
+} as const);
+
+const COMMITTED_AUTOLOOP_LEDGER_ERROR_CODES = new Set<PublicAutoloopFailureCode>([
+  'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+  'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+  'AUTOLOOP_LEDGER_DESCRIPTOR_CLOSE_INCOMPLETE',
+  'AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID',
+]);
+
+function isAutoloopChatStateCode(value: unknown): value is keyof typeof AUTOLOOP_CHAT_STATE_RETRYABILITY {
+  return typeof value === 'string' && Object.hasOwn(AUTOLOOP_CHAT_STATE_RETRYABILITY, value);
+}
+
+function isPublicAutoloopFailureCode(value: unknown): value is PublicAutoloopFailureCode {
+  return isAutoloopOperationErrorCode(value) || isAutoloopChatStateCode(value);
+}
+
+function publicAutoloopFailureRetryable(code: PublicAutoloopFailureCode): boolean {
+  return isAutoloopOperationErrorCode(code)
+    ? AUTOLOOP_OPERATION_ERROR_RETRYABILITY[code]
+    : AUTOLOOP_CHAT_STATE_RETRYABILITY[code];
+}
+
+function isCommittedAutoloopLedgerErrorCode(code: PublicAutoloopFailureCode): boolean {
+  return COMMITTED_AUTOLOOP_LEDGER_ERROR_CODES.has(code);
+}
+
+function isAutoloopOperationErrorCode(value: unknown): value is AutoloopOperationErrorCode {
+  return typeof value === 'string' && Object.hasOwn(AUTOLOOP_OPERATION_ERROR_RETRYABILITY, value);
+}
+
+function ownDataValue(value: object, key: PropertyKey): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor && Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined;
+}
+
+function safeOwnErrorMessage(error: unknown): string {
+  if (typeof error === 'string') return error;
+  if ((typeof error !== 'object' || error === null) && typeof error !== 'function') return 'unknown error';
+  try {
+    const message = ownDataValue(error, 'message');
+    return typeof message === 'string' ? message : 'unknown error';
+  } catch {
+    return 'unknown error';
+  }
+}
+
+function publicData<T extends object>(fields: T): Readonly<T> {
+  return Object.freeze(Object.assign(Object.create(null) as T, fields));
+}
+
+function snapshotPendingDispatch(value: unknown): Readonly<SendTimeoutPayload> | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const status = ownDataValue(value, 'status');
+  const dispatchId = ownDataValue(value, 'dispatch_id');
+  const agent = ownDataValue(value, 'agent');
+  const messageId = ownDataValue(value, 'message_id');
+  const messageType = ownDataValue(value, 'message_type');
+  const iter = ownDataValue(value, 'iter');
+  const timeoutMs = ownDataValue(value, 'timeout_ms');
+  const pendingError = ownDataValue(value, 'error');
+  if (
+    status !== 'awaiting_resume' ||
+    typeof dispatchId !== 'string' ||
+    dispatchId.length === 0 ||
+    (agent !== 'planner' && agent !== 'coder' && agent !== 'reviewer') ||
+    typeof messageId !== 'string' ||
+    typeof messageType !== 'string' ||
+    !new Set<AutoloopMessageType>([
+      'chat',
+      'directive',
+      'directive_ack',
+      'iter_artifacts',
+      'review_request',
+      'review_verdict',
+      'iter_done',
+      'push_user',
+      'pause',
+      'resume',
+      'terminate',
+      'phase_error',
+      'send_timeout',
+    ]).has(messageType as AutoloopMessageType) ||
+    typeof iter !== 'number' ||
+    typeof timeoutMs !== 'number' ||
+    typeof pendingError !== 'string'
+  ) {
+    return undefined;
+  }
+  return publicData({
+    status,
+    dispatch_id: dispatchId,
+    agent,
+    message_id: messageId,
+    message_type: messageType as AutoloopMessageType,
+    iter,
+    timeout_ms: timeoutMs,
+    error: pendingError,
+  });
+}
+
+/**
+ * Convert only recognized typed Autoloop failures. Unknown errors intentionally
+ * return undefined so adapters retain their existing generic failure path.
+ */
+export function toPublicAutoloopFailure(error: unknown): Readonly<PublicAutoloopFailure> | undefined {
+  const committedLedgerError = isCommittedSecureLedgerError(error);
+  if (error instanceof AutoloopOperationError || committedLedgerError) {
+    const code = ownDataValue(error, 'code');
+    const messageValue = ownDataValue(error, 'message');
+    if (!isAutoloopOperationErrorCode(code)) return undefined;
+    const committed = committedLedgerError && isCommittedAutoloopLedgerErrorCode(code);
+    if (!committed && typeof messageValue !== 'string') return undefined;
+    return publicData({
+      code,
+      message: typeof messageValue === 'string' ? messageValue : 'unknown error',
+      ...(committed ? { committed: true as const } : {}),
+      retryable: AUTOLOOP_OPERATION_ERROR_RETRYABILITY[code],
+    });
+  }
+
+  if (error instanceof Error && ownDataValue(error, 'name') === 'AutoloopChatStateError') {
+    const codeValue = ownDataValue(error, 'code');
+    if (typeof codeValue !== 'string' || !Object.hasOwn(AUTOLOOP_CHAT_STATE_RETRYABILITY, codeValue)) {
+      return undefined;
+    }
+    const code = codeValue as keyof typeof AUTOLOOP_CHAT_STATE_RETRYABILITY;
+    const message = ownDataValue(error, 'message');
+    if (typeof message !== 'string') return undefined;
+    const pending = snapshotPendingDispatch(ownDataValue(error, 'pending_dispatch'));
+    const rawStatusReason = ownDataValue(error, 'status_reason');
+    const statusReason = typeof rawStatusReason === 'string' || rawStatusReason === null ? rawStatusReason : undefined;
+    return publicData({
+      code,
+      message,
+      retryable: AUTOLOOP_CHAT_STATE_RETRYABILITY[code],
+      ...(pending ? { pending_dispatch: pending } : {}),
+      ...(statusReason !== undefined ? { status_reason: statusReason } : {}),
+    });
+  }
+
+  if (
+    typeof error === 'object' &&
+    error !== null &&
+    ownDataValue(error, 'ok') === false &&
+    ownDataValue(error, 'code') === 'AUTOLOOP_RESET_POSTCONDITION_FAILED' &&
+    typeof ownDataValue(error, 'message') === 'string' &&
+    ownDataValue(error, 'retryable') === false
+  ) {
+    return publicData({
+      code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+      message: ownDataValue(error, 'message') as string,
+      retryable: false,
+    });
+  }
+
+  return undefined;
+}
+
+function detachedPhaseFailure(
+  failure: Readonly<PublicAutoloopFailure | PublicAutoloopUnknownFailure>,
+  detachedFailureId?: string,
+): Readonly<DurableDetachedAutoloopPhaseFailure> {
+  if ('code' in failure) {
+    return publicData({
+      agent: 'planner' as const,
+      phase: 'planner_turn' as const,
+      code: failure.code,
+      ...(failure.committed === true && isCommittedAutoloopLedgerErrorCode(failure.code)
+        ? { committed: true as const }
+        : {}),
+      retryable: publicAutoloopFailureRetryable(failure.code),
+      ...(failure.pending_dispatch ? { pending_dispatch: failure.pending_dispatch } : {}),
+      ...(failure.status_reason !== undefined ? { status_reason: failure.status_reason } : {}),
+      error: failure.message,
+      ...(detachedFailureId ? { detached_failure_id: detachedFailureId } : {}),
+    });
+  }
+  return publicData({
+    agent: 'planner' as const,
+    phase: 'planner_turn' as const,
+    error: failure.message,
+    ...(detachedFailureId ? { detached_failure_id: detachedFailureId } : {}),
+  });
+}
+
+function snapshotDurableDetachedPhaseFailure(
+  value: unknown,
+): Readonly<DurableDetachedAutoloopPhaseFailure> | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  if (
+    ownDataValue(value, 'agent') !== 'planner' ||
+    ownDataValue(value, 'phase') !== 'planner_turn' ||
+    typeof ownDataValue(value, 'error') !== 'string'
+  ) {
+    return undefined;
+  }
+  const error = ownDataValue(value, 'error') as string;
+  const codeValue = ownDataValue(value, 'code');
+  const detachedFailureIdValue = ownDataValue(value, 'detached_failure_id');
+  const detachedFailureId =
+    typeof detachedFailureIdValue === 'string' && detachedFailureIdValue.length > 0
+      ? detachedFailureIdValue
+      : undefined;
+  if (codeValue === undefined) {
+    return publicData({
+      agent: 'planner' as const,
+      phase: 'planner_turn' as const,
+      error,
+      ...(detachedFailureId ? { detached_failure_id: detachedFailureId } : {}),
+    });
+  }
+  if (!isPublicAutoloopFailureCode(codeValue)) return undefined;
+  const committed = ownDataValue(value, 'committed') === true && isCommittedAutoloopLedgerErrorCode(codeValue);
+  const pending = snapshotPendingDispatch(ownDataValue(value, 'pending_dispatch'));
+  const statusReasonValue = ownDataValue(value, 'status_reason');
+  const statusReason =
+    typeof statusReasonValue === 'string' || statusReasonValue === null ? statusReasonValue : undefined;
+  return publicData({
+    agent: 'planner' as const,
+    phase: 'planner_turn' as const,
+    code: codeValue,
+    ...(committed ? { committed: true as const } : {}),
+    retryable: publicAutoloopFailureRetryable(codeValue),
+    ...(pending ? { pending_dispatch: pending } : {}),
+    ...(statusReason !== undefined ? { status_reason: statusReason } : {}),
+    error,
+    ...(detachedFailureId ? { detached_failure_id: detachedFailureId } : {}),
+  });
+}
+
+function readDurableDetachedFailureRows(contents: string): DurableDetachedAutoloopFailureRow[] {
+  const rows: DurableDetachedAutoloopFailureRow[] = [];
+  let byteOffset = 0;
+  const lines = contents.split('\n');
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const startByteOffset = byteOffset;
+    const lineByteLength = Buffer.byteLength(line, 'utf8');
+    byteOffset = startByteOffset + lineByteLength + (index < lines.length - 1 ? 1 : 0);
+    if (!line.trim()) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line) as unknown;
+    } catch {
+      continue;
+    }
+    if (typeof parsed !== 'object' || parsed === null) continue;
+    const row = parsed as Record<string, unknown>;
+    if (ownDataValue(row, 'kind') !== 'phase_error' || ownDataValue(row, 'actor') !== 'dispatcher') continue;
+    const payload = snapshotDurableDetachedPhaseFailure(ownDataValue(row, 'payload'));
+    if (!payload) continue;
+    const tsValue = ownDataValue(row, 'ts');
+    rows.push(
+      publicData({
+        ts: typeof tsValue === 'string' ? tsValue : '',
+        payload,
+        startByteOffset,
+      }),
+    );
+  }
+  return rows;
+}
+
+function detachedFailureLedgerCursor(contents: string): Readonly<DetachedFailureLedgerCursor> {
+  return publicData({
+    version: 1 as const,
+    byteOffset: Buffer.byteLength(contents, 'utf8'),
+    prefixSha256: createHash('sha256').update(contents, 'utf8').digest('hex'),
+  });
+}
+
+function snapshotDetachedFailureLedgerCursor(value: unknown): Readonly<DetachedFailureLedgerCursor> | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const version = ownDataValue(value, 'version');
+  const byteOffset = ownDataValue(value, 'byteOffset');
+  const prefixSha256 = ownDataValue(value, 'prefixSha256');
+  if (
+    version !== 1 ||
+    typeof byteOffset !== 'number' ||
+    !Number.isSafeInteger(byteOffset) ||
+    byteOffset < 0 ||
+    typeof prefixSha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(prefixSha256)
+  ) {
+    return undefined;
+  }
+  return publicData({ version, byteOffset, prefixSha256 });
+}
+
+function validatedDetachedFailureCursorOffset(contents: string, cursor: Readonly<DetachedFailureLedgerCursor>): number {
+  const bytes = Buffer.from(contents, 'utf8');
+  if (cursor.byteOffset > bytes.length || (cursor.byteOffset > 0 && bytes[cursor.byteOffset - 1] !== 0x0a)) {
+    throw new Error('decisions.jsonl no longer contains the checkpointed detached-failure prefix boundary');
+  }
+  const prefixSha256 = createHash('sha256').update(bytes.subarray(0, cursor.byteOffset)).digest('hex');
+  if (prefixSha256 !== cursor.prefixSha256) {
+    throw new Error('decisions.jsonl no longer matches the checkpointed detached-failure prefix');
+  }
+  return cursor.byteOffset;
+}
+
+function detachedPhaseFailureKey(value: DetachedAutoloopPhaseFailure): string {
+  return JSON.stringify(
+    publicData({
+      code: value.code ?? null,
+      committed: value.code && value.committed === true && isCommittedAutoloopLedgerErrorCode(value.code) ? true : null,
+      retryable: value.code ? publicAutoloopFailureRetryable(value.code) : null,
+      pending_dispatch: value.pending_dispatch ?? null,
+      status_reason: value.status_reason ?? null,
+      error: value.error,
+    }),
+  );
+}
+
+function sameDetachedPhaseFailure(left: DetachedAutoloopPhaseFailure, right: DetachedAutoloopPhaseFailure): boolean {
+  return detachedPhaseFailureKey(left) === detachedPhaseFailureKey(right);
+}
+
+function newlyAppendedDispatcherPreaudit(
+  before: string,
+  after: string,
+  expected: DetachedAutoloopPhaseFailure,
+): DurableDetachedAutoloopFailureRow | undefined {
+  if (!after.startsWith(before)) return undefined;
+  const appendedLines = after
+    .slice(before.length)
+    .split('\n')
+    .filter((line) => line.trim().length > 0);
+  const lastLine = appendedLines.at(-1);
+  if (!lastLine) return undefined;
+  const rows = readDurableDetachedFailureRows(`${lastLine}\n`);
+  if (rows.length !== 1) return undefined;
+  const row = rows[0];
+  if (row.payload.detached_failure_id !== undefined || !sameDetachedPhaseFailure(row.payload, expected)) {
+    return undefined;
+  }
+  return row;
+}
+
+function rowIsAfterCheckpoint(rowTimestamp: string, checkpointTimestamp: string): boolean {
+  const rowTime = Date.parse(rowTimestamp);
+  const checkpointTime = Date.parse(checkpointTimestamp);
+  return Number.isFinite(rowTime) && Number.isFinite(checkpointTime) && rowTime > checkpointTime;
+}
+
+function detachedStateEntry(
+  ts: string,
+  payload: Readonly<DurableDetachedAutoloopPhaseFailure>,
+  detachedFailureId?: string,
+): AutoloopState['recent_phase_errors'][number] {
+  const entry = Object.assign(Object.create(null), {
+    ts,
+    agent: payload.agent,
+    phase: payload.phase,
+    ...(payload.code ? { code: payload.code, retryable: publicAutoloopFailureRetryable(payload.code) } : {}),
+    ...(payload.code && payload.committed === true && isCommittedAutoloopLedgerErrorCode(payload.code)
+      ? { committed: true as const }
+      : {}),
+    ...(payload.pending_dispatch ? { pending_dispatch: payload.pending_dispatch } : {}),
+    ...(payload.status_reason !== undefined ? { status_reason: payload.status_reason } : {}),
+    error: payload.error,
+  }) as AutoloopState['recent_phase_errors'][number];
+  if (detachedFailureId) {
+    Object.defineProperty(entry, DETACHED_AUTOLOOP_FAILURE_ID, { value: detachedFailureId });
+  }
+  return Object.freeze(entry);
 }
 
 function isSendTimeoutPayload(value: unknown): value is SendTimeoutPayload {
@@ -1816,7 +2267,16 @@ export class SessionManager implements AgentRuntimeProbe {
           unregisterPublisher: (runId) => this._autoloopPublishers.delete(runId),
           extra: (runId) => {
             const roleSelection = this._autoloopSelection.get(runId);
-            return roleSelection ? { roleSelection } : {};
+            const handle = kernel.handle<AutoloopHandle & { dispatcher: ClaudeAgentDispatcher }>(runId, LEGACY_NODE);
+            if (!handle) throw new Error(`Autoloop run '${runId}' has no live ledger while publishing its checkpoint`);
+            const decisionLog = handle.dispatcher.secureLedgerCapability.readFlatFile('decisions.jsonl') ?? '';
+            return {
+              ...(roleSelection ? { roleSelection } : {}),
+              // Internal recovery metadata, intentionally outside AutoloopState:
+              // the hash proves the saved byte boundary is still a prefix, and
+              // the byte offset supplies append causality without trusting time.
+              detachedFailureLedgerCursor: detachedFailureLedgerCursor(decisionLog),
+            };
           },
         }),
       );
@@ -3490,6 +3950,17 @@ export class SessionManager implements AgentRuntimeProbe {
    * own a run at a time.
    */
   private _autoloopChatTransactions = new Map<string, Promise<void>>();
+  /** Logical Planner chat identity and any causally observed Dispatcher audit. */
+  private _autoloopFailureBindings = new WeakMap<object, Readonly<AutoloopChatFailureBinding>>();
+  /** Successfully published logical bindings, including projections that later roll out of state. */
+  private _completedAutoloopFailureBindings = new WeakSet<object>();
+  /** Stable retry id for direct callers whose failure has no Planner chat id. */
+  private _detachedAutoloopFailureIds = new WeakMap<object, string>();
+  /** In-flight logical recordings; settled entries are always removed. */
+  private _detachedAutoloopFailureRecordings = new Map<
+    string,
+    Promise<Readonly<PublicAutoloopFailure | PublicAutoloopUnknownFailure>>
+  >();
 
   async ultraplanStart(
     task: string,
@@ -4063,9 +4534,76 @@ export class SessionManager implements AgentRuntimeProbe {
     }
   }
 
+  private _bindAutoloopChatFailure(
+    error: unknown,
+    logicalId: string,
+    ledger: SecureAutoloopLedger,
+    decisionLogBefore: string | undefined,
+    runnerEntriesBefore: ReadonlySet<object>,
+    recentRunnerEntries: readonly AutoloopState['recent_phase_errors'][number][],
+    relatedError?: unknown,
+  ): unknown {
+    let preaudited: DurableDetachedAutoloopFailureRow | undefined;
+    let runnerProjection: AutoloopState['recent_phase_errors'][number] | undefined;
+    const typed = toPublicAutoloopFailure(error);
+    if (typed && decisionLogBefore !== undefined) {
+      try {
+        const decisionLogAfter = ledger.readFlatFile('decisions.jsonl') ?? '';
+        preaudited = newlyAppendedDispatcherPreaudit(decisionLogBefore, decisionLogAfter, detachedPhaseFailure(typed));
+      } catch {
+        // No exact ledger proof means no preaudit suppression. The detached
+        // adapter will append its own identified row instead.
+      }
+    }
+    if (typed) {
+      const targetKey = detachedPhaseFailureKey(detachedPhaseFailure(typed));
+      for (let index = recentRunnerEntries.length - 1; index >= 0; index -= 1) {
+        const entry = recentRunnerEntries[index];
+        if (
+          !runnerEntriesBefore.has(entry as object) &&
+          ownDataValue(entry as object, DETACHED_AUTOLOOP_FAILURE_ID) === undefined &&
+          detachedPhaseFailureKey(entry as DetachedAutoloopPhaseFailure) === targetKey
+        ) {
+          runnerProjection = entry;
+          break;
+        }
+      }
+    }
+    const binding = publicData({
+      logicalId,
+      ...(preaudited ? { preaudited } : {}),
+      ...(runnerProjection ? { runnerProjection } : {}),
+    });
+    const pending = [error, relatedError];
+    const seen = new Set<object>();
+    while (pending.length > 0) {
+      const candidate = pending.pop();
+      if (!((typeof candidate === 'object' && candidate !== null) || typeof candidate === 'function')) continue;
+      const reference = candidate as object;
+      if (seen.has(reference)) continue;
+      seen.add(reference);
+      this._autoloopFailureBindings.set(reference, binding);
+      try {
+        pending.push(ownDataValue(reference, 'cause'));
+      } catch {
+        // A hostile cause descriptor cannot invalidate binding the surfaced
+        // error itself.
+      }
+    }
+    return error;
+  }
+
   private async _autoloopChatTransaction(runId: string, text: string): Promise<{ reply: string }> {
     const ctx = this._liveAutoloop(runId);
     const chatEnvelope = AutoloopMsg.chat(ctx.runner.state.iter, { text });
+    const runnerEntriesBefore = new Set<object>(ctx.runner.state.recent_phase_errors.map((entry) => entry as object));
+    let decisionLogBefore: string | undefined;
+    try {
+      decisionLogBefore = ctx.dispatcher.secureLedgerCapability.readFlatFile('decisions.jsonl') ?? '';
+    } catch {
+      // Failure to establish an exact pre-send prefix only disables reuse of a
+      // Dispatcher row; it must not block the Planner chat itself.
+    }
     let reply = '';
     const onReply = (...args: unknown[]) => {
       const t = args[0];
@@ -4077,48 +4615,277 @@ export class SessionManager implements AgentRuntimeProbe {
       try {
         await ctx.runner.send(chatEnvelope);
       } catch (error) {
-        const cause = (error as { cause?: unknown } | null)?.cause;
-        if (isCommittedSecureLedgerError(cause)) throw cause;
-        throw error;
+        let cause: unknown;
+        if ((typeof error === 'object' && error !== null) || typeof error === 'function') {
+          try {
+            cause = ownDataValue(error, 'cause');
+          } catch {
+            // An inaccessible descriptor is not safe evidence of a committed
+            // secure-ledger cause. Bind and surface the original rejection.
+          }
+        }
+        const surfaced = isCommittedSecureLedgerError(cause) ? cause : error;
+        throw this._bindAutoloopChatFailure(
+          surfaced,
+          chatEnvelope.msg_id,
+          ctx.dispatcher.secureLedgerCapability,
+          decisionLogBefore,
+          runnerEntriesBefore,
+          ctx.runner.state.recent_phase_errors,
+          error,
+        );
       }
     } finally {
       ctx.dispatcher.off('planner_reply', onReply);
     }
     const pending = ctx.runner.state.pending_dispatch;
     if (!reply.trim() && pending?.agent === 'planner' && pending.message_id === chatEnvelope.msg_id) {
-      throw new AutoloopChatStateError(
-        'AUTOLOOP_SEND_TIMEOUT',
-        `Planner send '${pending.dispatch_id}' reached its deadline and is awaiting explicit resume`,
-        true,
-        { ...pending },
-        ctx.runner.state.status_reason,
+      throw this._bindAutoloopChatFailure(
+        new AutoloopChatStateError(
+          'AUTOLOOP_SEND_TIMEOUT',
+          `Planner send '${pending.dispatch_id}' reached its deadline and is awaiting explicit resume`,
+          true,
+          { ...pending },
+          ctx.runner.state.status_reason,
+        ),
+        chatEnvelope.msg_id,
+        ctx.dispatcher.secureLedgerCapability,
+        decisionLogBefore,
+        runnerEntriesBefore,
+        ctx.runner.state.recent_phase_errors,
       );
     }
     if (!reply.trim() && (ctx.runner.state.status === 'terminated' || ctx.runner.state.status === 'crashed')) {
-      throw new AutoloopChatStateError(
-        'AUTOLOOP_RUN_TERMINAL',
-        `Autoloop run '${runId}' became ${ctx.runner.state.status} before Planner produced a reply`,
-        false,
-        undefined,
-        ctx.runner.state.status_reason,
+      throw this._bindAutoloopChatFailure(
+        new AutoloopChatStateError(
+          'AUTOLOOP_RUN_TERMINAL',
+          `Autoloop run '${runId}' became ${ctx.runner.state.status} before Planner produced a reply`,
+          false,
+          undefined,
+          ctx.runner.state.status_reason,
+        ),
+        chatEnvelope.msg_id,
+        ctx.dispatcher.secureLedgerCapability,
+        decisionLogBefore,
+        runnerEntriesBefore,
+        ctx.runner.state.recent_phase_errors,
       );
     }
     if (!reply.trim() && ctx.runner.state.status === 'paused') {
-      throw new AutoloopChatStateError(
-        'AUTOLOOP_RUN_PAUSED',
-        `Autoloop run '${runId}' is paused; Planner chat '${chatEnvelope.msg_id}' remains parked`,
-        false,
-        undefined,
-        ctx.runner.state.status_reason,
+      throw this._bindAutoloopChatFailure(
+        new AutoloopChatStateError(
+          'AUTOLOOP_RUN_PAUSED',
+          `Autoloop run '${runId}' is paused; Planner chat '${chatEnvelope.msg_id}' remains parked`,
+          false,
+          undefined,
+          ctx.runner.state.status_reason,
+        ),
+        chatEnvelope.msg_id,
+        ctx.dispatcher.secureLedgerCapability,
+        decisionLogBefore,
+        runnerEntriesBefore,
+        ctx.runner.state.recent_phase_errors,
       );
     }
     if (!reply.trim()) {
-      throw new AutoloopOperationError(
-        'AUTOLOOP_EMPTY_REPLY',
-        'Planner transport completed without a non-empty logical reply',
+      throw this._bindAutoloopChatFailure(
+        new AutoloopOperationError(
+          'AUTOLOOP_EMPTY_REPLY',
+          'Planner transport completed without a non-empty logical reply',
+        ),
+        chatEnvelope.msg_id,
+        ctx.dispatcher.secureLedgerCapability,
+        decisionLogBefore,
+        runnerEntriesBefore,
+        ctx.runner.state.recent_phase_errors,
       );
     }
     return { reply };
+  }
+
+  /**
+   * Complete the fire-and-forget HTTP boundary after its accepted chat rejects.
+   * Runner-originated operation failures are already durable; adapter-originated
+   * typed failures are recorded once without replaying the original chat.
+   */
+  async recordDetachedAutoloopChatFailure(
+    runId: string,
+    error: unknown,
+  ): Promise<Readonly<PublicAutoloopFailure | PublicAutoloopUnknownFailure>> {
+    const typedFailure = toPublicAutoloopFailure(error);
+    const unknownMessage =
+      error instanceof Error && typeof ownDataValue(error, 'message') === 'string'
+        ? (ownDataValue(error, 'message') as string)
+        : 'Autoloop chat failed after the request was accepted';
+    const failure = typedFailure ?? publicData({ message: unknownMessage });
+    const reference = (typeof error === 'object' && error !== null) || typeof error === 'function' ? error : undefined;
+    const binding = reference ? this._autoloopFailureBindings.get(reference) : undefined;
+    if (binding && this._completedAutoloopFailureBindings.has(binding)) return failure;
+    const transactionLogicalId = binding?.logicalId;
+    const phaseFailure = detachedPhaseFailure(failure);
+    const reservationKey = transactionLogicalId
+      ? `${runId}:logical:${transactionLogicalId}`
+      : `${runId}:fallback:${detachedPhaseFailureKey(phaseFailure)}`;
+    const existing = this._detachedAutoloopFailureRecordings.get(reservationKey);
+    if (existing) return await existing;
+    let detachedFailureId = transactionLogicalId;
+    if (!detachedFailureId && reference) detachedFailureId = this._detachedAutoloopFailureIds.get(reference);
+    if (!detachedFailureId) {
+      detachedFailureId = randomUUID();
+      if (reference) this._detachedAutoloopFailureIds.set(reference, detachedFailureId);
+    }
+
+    // Schedule after reservation publication. A synchronous append seam can
+    // re-enter this API, so invoking the recorder before Map.set would leave a
+    // check-then-write window even though appendFlatFile itself is synchronous.
+    const recording = Promise.resolve().then(() =>
+      this._recordDetachedAutoloopChatFailure(
+        runId,
+        failure,
+        detachedFailureId!,
+        binding?.preaudited,
+        binding?.runnerProjection,
+      ),
+    );
+    const settled = recording.then(
+      (value) => {
+        if (binding) this._completedAutoloopFailureBindings.add(binding);
+        if (this._detachedAutoloopFailureRecordings.get(reservationKey) === settled) {
+          this._detachedAutoloopFailureRecordings.delete(reservationKey);
+        }
+        return value;
+      },
+      (recordError: unknown) => {
+        if (this._detachedAutoloopFailureRecordings.get(reservationKey) === settled) {
+          this._detachedAutoloopFailureRecordings.delete(reservationKey);
+        }
+        throw recordError;
+      },
+    );
+    this._detachedAutoloopFailureRecordings.set(reservationKey, settled);
+    return await settled;
+  }
+
+  private _recordDetachedAutoloopChatFailure(
+    runId: string,
+    failure: Readonly<PublicAutoloopFailure | PublicAutoloopUnknownFailure>,
+    detachedFailureId: string,
+    preaudited: DurableDetachedAutoloopFailureRow | undefined,
+    boundRunnerProjection: AutoloopState['recent_phase_errors'][number] | undefined,
+  ): Readonly<PublicAutoloopFailure | PublicAutoloopUnknownFailure> {
+    const ctx = this.getAutoloop(runId);
+    const storedRecord = ctx ? undefined : loadRun(runId);
+    let ledger = ctx?.dispatcher.secureLedgerCapability;
+    if (!ledger && storedRecord?.workflow === 'autoloop') {
+      ledger = SecureAutoloopLedger.open(storedRecord.cwd, runId, {
+        validateExistingFlatFiles: ['decisions.jsonl'],
+      });
+    }
+    if (!ledger) throw new Error(`Autoloop run '${runId}' has no durable ledger for detached failure recording`);
+
+    const phasePayload = detachedPhaseFailure(failure, detachedFailureId);
+    const rows = readDurableDetachedFailureRows(ledger.readFlatFile('decisions.jsonl') ?? '');
+    const targetKey = detachedPhaseFailureKey(phasePayload);
+    const identifiedRow = [...rows]
+      .reverse()
+      .find(
+        (row) =>
+          row.payload.detached_failure_id === detachedFailureId && detachedPhaseFailureKey(row.payload) === targetKey,
+      );
+    const provenPreaudit =
+      preaudited &&
+      preaudited.payload.detached_failure_id === undefined &&
+      detachedPhaseFailureKey(preaudited.payload) === targetKey &&
+      rows.some(
+        (row) =>
+          row.ts === preaudited.ts &&
+          row.payload.detached_failure_id === undefined &&
+          detachedPhaseFailureKey(row.payload) === targetKey,
+      )
+        ? preaudited
+        : undefined;
+    const durableRow = identifiedRow ?? (ctx ? provenPreaudit : undefined);
+    const alreadyDurable = durableRow !== undefined;
+    const recordedAt = durableRow?.ts || provenPreaudit?.ts || new Date().toISOString();
+
+    if (!alreadyDurable) {
+      const envelope = publicData({
+        ts: recordedAt,
+        kind: 'phase_error' as const,
+        actor: 'dispatcher' as const,
+        payload: phasePayload,
+      });
+      ledger.appendFlatFile('decisions.jsonl', `${JSON.stringify(envelope)}\n`);
+    }
+
+    if (ctx) {
+      const recent = ctx.runner.state.recent_phase_errors as Array<
+        AutoloopState['recent_phase_errors'][number] & {
+          readonly code?: PublicAutoloopFailureCode;
+          readonly committed?: true;
+          readonly retryable?: boolean;
+          readonly pending_dispatch?: Readonly<SendTimeoutPayload>;
+          readonly status_reason?: string | null;
+          readonly [DETACHED_AUTOLOOP_FAILURE_ID]?: string;
+        }
+      >;
+      const alreadyInState = recent.some((entry) => entry[DETACHED_AUTOLOOP_FAILURE_ID] === detachedFailureId);
+      if (!alreadyInState) {
+        const runnerProjectionIndex = boundRunnerProjection ? recent.indexOf(boundRunnerProjection) : -1;
+        const runnerProjectionFailureId =
+          runnerProjectionIndex >= 0 ? recent[runnerProjectionIndex][DETACHED_AUTOLOOP_FAILURE_ID] : undefined;
+        const runnerProjectionHasForeignId =
+          runnerProjectionFailureId !== undefined && runnerProjectionFailureId !== detachedFailureId;
+
+        const observablePhasePayload = detachedPhaseFailure(failure);
+        if (runnerProjectionIndex >= 0 && recent[runnerProjectionIndex][DETACHED_AUTOLOOP_FAILURE_ID] === undefined) {
+          const runnerProjection = recent[runnerProjectionIndex];
+          recent[runnerProjectionIndex] = detachedStateEntry(runnerProjection.ts, phasePayload, detachedFailureId);
+          try {
+            ctx.runner.emit('state', ctx.runner.state);
+          } catch (publishError) {
+            try {
+              this.logger.warn?.(
+                `[autoloop/${runId}] detached failure listener threw: ${safeOwnErrorMessage(publishError)}`,
+              );
+            } catch {
+              // Durable append/state effects cannot be retried safely merely
+              // because diagnostic extraction or the warning sink failed.
+            }
+          }
+        } else if (boundRunnerProjection === undefined || runnerProjectionHasForeignId) {
+          ctx.runner.state.consecutive_phase_errors += 1;
+          recent.push(detachedStateEntry(recordedAt, phasePayload, detachedFailureId));
+          if (recent.length > 5) recent.splice(0, recent.length - 5);
+          try {
+            ctx.runner.emit('state', ctx.runner.state);
+            ctx.runner.emit('phase_error', observablePhasePayload);
+          } catch (publishError) {
+            try {
+              this.logger.warn?.(
+                `[autoloop/${runId}] detached failure listener threw: ${safeOwnErrorMessage(publishError)}`,
+              );
+            } catch {
+              // Durable append/state effects cannot be retried safely merely
+              // because diagnostic extraction or the warning sink failed.
+            }
+          }
+        }
+        try {
+          ctx.runner.emit('autoloop_failure', failure);
+        } catch (publishError) {
+          try {
+            this.logger.warn?.(
+              `[autoloop/${runId}] detached failure publication threw: ${safeOwnErrorMessage(publishError)}`,
+            );
+          } catch {
+            // Durable append/state effects cannot be retried safely merely
+            // because diagnostic extraction or the warning sink failed.
+          }
+        }
+      }
+    }
+    return failure;
   }
 
   /**
@@ -4151,7 +4918,71 @@ export class SessionManager implements AgentRuntimeProbe {
     // workspace instead of the all-zero stub the registry fallback produced.
     const record = loadRun(runId);
     if (!record || record.workflow !== 'autoloop') return undefined;
-    return autoloopStateFromRecord(record);
+    const state = autoloopStateFromRecord(record);
+    if (!state) return undefined;
+    // A detached HTTP rejection can arrive after the live node has published
+    // its terminal checkpoint and unregistered its handle. Recover those
+    // post-202 rows from the durable ledger so later status/SSE snapshots do
+    // not erase the failure merely because no runner remains in memory.
+    try {
+      const ledger = SecureAutoloopLedger.open(record.cwd, runId, {
+        validateExistingFlatFiles: ['decisions.jsonl'],
+      });
+      const decisionLog = ledger.readFlatFile('decisions.jsonl') ?? '';
+      const nodeData = record.nodes[LEGACY_NODE]?.data;
+      let checkpointCursorOffset: number | undefined;
+      if (typeof nodeData === 'object' && nodeData !== null && Object.hasOwn(nodeData, 'detachedFailureLedgerCursor')) {
+        const cursor = snapshotDetachedFailureLedgerCursor(ownDataValue(nodeData, 'detachedFailureLedgerCursor'));
+        if (!cursor) throw new Error('Autoloop checkpoint contains a malformed detached-failure ledger cursor');
+        checkpointCursorOffset = validatedDetachedFailureCursorOffset(decisionLog, cursor);
+      }
+      const recovered = readDurableDetachedFailureRows(decisionLog);
+      const checkpointPrefixEnd = checkpointCursorOffset ?? 0;
+      const hasAuthenticatedCheckpointPrefix = checkpointPrefixEnd > 0;
+      const checkpointCounts = new Map<string, number>();
+      for (const current of state.recent_phase_errors) {
+        const key = detachedPhaseFailureKey(current as DetachedAutoloopPhaseFailure);
+        checkpointCounts.set(key, (checkpointCounts.get(key) ?? 0) + 1);
+      }
+      const seenDetachedIds = new Set<string>();
+      let added = 0;
+      for (const row of recovered) {
+        const detachedFailureId = row.payload.detached_failure_id;
+        const key = detachedPhaseFailureKey(row.payload);
+
+        if (hasAuthenticatedCheckpointPrefix && row.startByteOffset < checkpointPrefixEnd) {
+          const checkpointCount = checkpointCounts.get(key) ?? 0;
+          if (checkpointCount > 0) checkpointCounts.set(key, checkpointCount - 1);
+          if (detachedFailureId) seenDetachedIds.add(detachedFailureId);
+          continue;
+        }
+
+        if (!detachedFailureId || seenDetachedIds.has(detachedFailureId)) continue;
+        seenDetachedIds.add(detachedFailureId);
+        if (!hasAuthenticatedCheckpointPrefix) {
+          const checkpointCount = checkpointCounts.get(key) ?? 0;
+          if (checkpointCount > 0) {
+            checkpointCounts.set(key, checkpointCount - 1);
+            continue;
+          }
+        }
+        const isAfterCheckpoint =
+          checkpointCursorOffset === undefined
+            ? rowIsAfterCheckpoint(row.ts, record.updatedAt)
+            : row.startByteOffset >= checkpointCursorOffset;
+        if (!isAfterCheckpoint) continue;
+        state.recent_phase_errors.push(detachedStateEntry(row.ts, row.payload, detachedFailureId));
+        added += 1;
+      }
+      state.consecutive_phase_errors += added;
+      if (state.recent_phase_errors.length > 5)
+        state.recent_phase_errors.splice(0, state.recent_phase_errors.length - 5);
+    } catch (error) {
+      this.logger.warn?.(
+        `[autoloop/${runId}] failed to recover detached failure status: ${safeOwnErrorMessage(error)}`,
+      );
+    }
+    return state;
   }
 
   autoloopList(): AutoloopState[] {
@@ -4166,10 +4997,18 @@ export class SessionManager implements AgentRuntimeProbe {
     agent: 'planner' | 'coder' | 'reviewer',
     opts: { force?: boolean; eagerRestart?: boolean } = {},
   ): Promise<boolean> {
+    const result = await this.autoloopResetAgentResult(runId, agent, opts);
+    return result?.ok ?? false;
+  }
+
+  async autoloopResetAgentResult(
+    runId: string,
+    agent: 'planner' | 'coder' | 'reviewer',
+    opts: { force?: boolean; eagerRestart?: boolean } = {},
+  ): Promise<AutoloopResetResult | undefined> {
     const ctx = this.kernel.handle<AutoloopHandle & { dispatcher: ClaudeAgentDispatcher }>(runId, LEGACY_NODE);
-    if (!ctx) return false;
-    const result = await ctx.dispatcher.resetAgent(agent, opts);
-    return result.ok;
+    if (!ctx) return undefined;
+    return await ctx.dispatcher.resetAgent(agent, opts);
   }
 
   async autoloopStop(runId: string, reason = 'user-stop'): Promise<boolean> {

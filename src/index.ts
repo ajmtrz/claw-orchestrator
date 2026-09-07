@@ -9,9 +9,9 @@
  * consumes no memory beyond the tool schema definitions.
  */
 
-import { SessionManager } from './session-manager.js';
+import { SessionManager, toPublicAutoloopFailure } from './session-manager.js';
 import { createProxyHandler } from './proxy/handler.js';
-import { EmbeddedServer } from './embedded-server.js';
+import { EmbeddedServer, snapshotAutoloopPublicJsonValue } from './embedded-server.js';
 import { sanitizeCwd, validateRegex } from './validation.js';
 import {
   ENGINE_TYPES,
@@ -31,7 +31,8 @@ import { AUTOLOOP_TIMEOUT_SCHEMA, validateAutoloopTimeoutConfig } from './autolo
 
 // ─── Standalone Export ───────────────────────────────────────────────────────
 
-export { SessionManager } from './session-manager.js';
+export { SessionManager, toPublicAutoloopFailure } from './session-manager.js';
+export type { PublicAutoloopFailure, PublicAutoloopFailureCode } from './session-manager.js';
 export { PersistentClaudeSession } from './persistent-session.js';
 export { BaseOneShotSession, type OneShotEngineConfig } from './base-oneshot-session.js';
 export { PersistentCodexSession } from './persistent-codex-session.js';
@@ -125,6 +126,15 @@ function normalizeToolResult(result: unknown): AgentToolResult {
     content: [{ type: 'text', text: text ?? 'null' }],
     details: result,
   };
+}
+
+function autoloopPublicToolResult(value: unknown): AgentToolResult {
+  const details = snapshotAutoloopPublicJsonValue(value);
+  const text = JSON.stringify(details, (_key, field) => (typeof field === 'bigint' ? field.toString() : field), 2);
+  const content = [Object.freeze(Object.assign(Object.create(null), { type: 'text', text: text ?? 'null' }))];
+  Object.defineProperty(content, 'toJSON', { value: undefined });
+  Object.freeze(content);
+  return Object.freeze(Object.assign(Object.create(null), { content, details })) as AgentToolResult;
 }
 
 const CUSTOM_ENGINE_SCHEMA = {
@@ -2009,8 +2019,14 @@ const plugin = {
         required: ['run_id', 'text'],
       },
       execute: async (_id, args) => {
-        const { reply } = await getManager().autoloopChat(args.run_id as string, args.text as string);
-        return { ok: true, reply };
+        try {
+          const { reply } = await getManager().autoloopChat(args.run_id as string, args.text as string);
+          return { ok: true, reply };
+        } catch (error) {
+          const failure = toPublicAutoloopFailure(error);
+          if (failure) return autoloopPublicToolResult({ ok: false, error: failure });
+          throw error;
+        }
       },
     });
 
@@ -2026,8 +2042,8 @@ const plugin = {
       },
       execute: async (_id, args) => {
         const state = getManager().autoloopStatus(args.run_id as string);
-        if (!state) return { ok: false, error: 'Run not found' };
-        return { ok: true, state };
+        if (!state) return autoloopPublicToolResult({ ok: false, error: 'Run not found' });
+        return autoloopPublicToolResult({ ok: true, state });
       },
     });
 
@@ -2038,8 +2054,7 @@ const plugin = {
       description: 'List all v2 autoloop runs in this manager process.',
       parameters: { type: 'object', properties: {} },
       execute: async () => {
-        if (!manager) return { ok: true, runs: [] };
-        return { ok: true, runs: getManager().autoloopList() };
+        return autoloopPublicToolResult({ ok: true, runs: manager ? getManager().autoloopList() : [] });
       },
     });
 
@@ -2063,7 +2078,7 @@ const plugin = {
         required: ['run_id', 'agent'],
       },
       execute: async (_id, args) => {
-        const ok = await getManager().autoloopResetAgent(
+        const result = await getManager().autoloopResetAgentResult(
           args.run_id as string,
           args.agent as 'planner' | 'coder' | 'reviewer',
           {
@@ -2071,8 +2086,14 @@ const plugin = {
             eagerRestart: args.eager_restart as boolean | undefined,
           },
         );
-        if (!ok) return { ok: false, error: 'Run not found' };
-        return { ok: true };
+        if (!result) return { ok: false, error: 'Run not found' };
+        if (result.ok === false) {
+          const failure = toPublicAutoloopFailure(result);
+          if (!failure) throw new Error('Autoloop reset returned a malformed structured reset result');
+          return autoloopPublicToolResult({ ok: false, error: failure });
+        }
+        if (result.ok === true) return { ok: true };
+        throw new Error('Autoloop reset returned a malformed structured reset result');
       },
     });
 
