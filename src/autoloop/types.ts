@@ -27,6 +27,20 @@ export type AutoloopAgentRole = 'planner' | 'coder' | 'reviewer';
 /** The three autoloop roles. Single source of truth — dispatcher and SessionManager both use it. */
 export type AutoloopRoleName = AutoloopAgentRole;
 
+export type AutoloopChatStateCode = 'AUTOLOOP_SEND_TIMEOUT' | 'AUTOLOOP_RUN_PAUSED' | 'AUTOLOOP_RUN_TERMINAL';
+
+export type PublicAutoloopFailureCode = AutoloopOperationErrorCode | AutoloopChatStateCode;
+
+/** Stable, data-only failure value shared by MCP and embedded HTTP/SSE. */
+export interface PublicAutoloopFailure {
+  readonly code: PublicAutoloopFailureCode;
+  readonly message: string;
+  readonly committed?: true;
+  readonly retryable: boolean;
+  readonly pending_dispatch?: Readonly<SendTimeoutPayload>;
+  readonly status_reason?: string | null;
+}
+
 export interface PhysicalAgentGeneration {
   role: AutoloopAgentRole;
   generation: number;
@@ -168,9 +182,11 @@ export interface AutoloopState {
     ts: string;
     agent: string;
     phase: string;
-    code?: AutoloopOperationErrorCode;
+    code?: PublicAutoloopFailureCode;
     committed?: true;
-    retryable?: false;
+    retryable?: boolean;
+    pending_dispatch?: Readonly<SendTimeoutPayload>;
+    status_reason?: string | null;
     error: string;
   }>;
   /** Recent metric history (most-recent last, capped at MAX_METRIC_HISTORY). */

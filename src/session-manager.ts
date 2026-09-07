@@ -389,8 +389,11 @@ import type {
   AgentReservationReleaseOptions,
   AgentRuntimeLiveness,
   AgentRuntimeProbe,
+  AutoloopChatStateCode,
   AutoloopState,
   PhysicalAgentGeneration,
+  PublicAutoloopFailure,
+  PublicAutoloopFailureCode,
   PushPolicy,
 } from './autoloop/types.js';
 import {
@@ -519,7 +522,7 @@ interface PreparedSendTimeoutMigrationAppend {
 
 class AutoloopChatStateError extends Error {
   constructor(
-    readonly code: 'AUTOLOOP_SEND_TIMEOUT' | 'AUTOLOOP_RUN_PAUSED' | 'AUTOLOOP_RUN_TERMINAL',
+    readonly code: AutoloopChatStateCode,
     message: string,
     readonly retryable: boolean,
     readonly pending_dispatch?: SendTimeoutPayload,
@@ -530,21 +533,7 @@ class AutoloopChatStateError extends Error {
   }
 }
 
-export type PublicAutoloopFailureCode =
-  | AutoloopOperationErrorCode
-  | 'AUTOLOOP_SEND_TIMEOUT'
-  | 'AUTOLOOP_RUN_PAUSED'
-  | 'AUTOLOOP_RUN_TERMINAL';
-
-/** Stable, data-only failure value shared by MCP and embedded HTTP/SSE. */
-export interface PublicAutoloopFailure {
-  readonly code: PublicAutoloopFailureCode;
-  readonly message: string;
-  readonly committed?: true;
-  readonly retryable: boolean;
-  readonly pending_dispatch?: Readonly<SendTimeoutPayload>;
-  readonly status_reason?: string | null;
-}
+export type { PublicAutoloopFailure, PublicAutoloopFailureCode };
 
 export interface PublicAutoloopUnknownFailure {
   readonly message: string;
@@ -604,7 +593,7 @@ const AUTOLOOP_CHAT_STATE_RETRYABILITY = Object.freeze({
   AUTOLOOP_SEND_TIMEOUT: true,
   AUTOLOOP_RUN_PAUSED: false,
   AUTOLOOP_RUN_TERMINAL: false,
-} as const);
+} as const satisfies Record<AutoloopChatStateCode, boolean>);
 
 const COMMITTED_AUTOLOOP_LEDGER_ERROR_CODES = new Set<PublicAutoloopFailureCode>([
   'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
@@ -613,7 +602,7 @@ const COMMITTED_AUTOLOOP_LEDGER_ERROR_CODES = new Set<PublicAutoloopFailureCode>
   'AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID',
 ]);
 
-function isAutoloopChatStateCode(value: unknown): value is keyof typeof AUTOLOOP_CHAT_STATE_RETRYABILITY {
+function isAutoloopChatStateCode(value: unknown): value is AutoloopChatStateCode {
   return typeof value === 'string' && Object.hasOwn(AUTOLOOP_CHAT_STATE_RETRYABILITY, value);
 }
 
@@ -730,7 +719,7 @@ export function toPublicAutoloopFailure(error: unknown): Readonly<PublicAutoloop
     if (typeof codeValue !== 'string' || !Object.hasOwn(AUTOLOOP_CHAT_STATE_RETRYABILITY, codeValue)) {
       return undefined;
     }
-    const code = codeValue as keyof typeof AUTOLOOP_CHAT_STATE_RETRYABILITY;
+    const code = codeValue as AutoloopChatStateCode;
     const message = ownDataValue(error, 'message');
     if (typeof message !== 'string') return undefined;
     const pending = snapshotPendingDispatch(ownDataValue(error, 'pending_dispatch'));

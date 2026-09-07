@@ -32,7 +32,6 @@ import { AUTOLOOP_TIMEOUT_SCHEMA, validateAutoloopTimeoutConfig } from './autolo
 // ─── Standalone Export ───────────────────────────────────────────────────────
 
 export { SessionManager, toPublicAutoloopFailure } from './session-manager.js';
-export type { PublicAutoloopFailure, PublicAutoloopFailureCode } from './session-manager.js';
 export { PersistentClaudeSession } from './persistent-session.js';
 export { BaseOneShotSession, type OneShotEngineConfig } from './base-oneshot-session.js';
 export { PersistentCodexSession } from './persistent-codex-session.js';
@@ -55,11 +54,14 @@ export type { AutoloopEnvelope, AnyAutoloopMessage, AutoloopMessageType, Autoloo
 export type {
   AgentDispatcher,
   AutoloopAgentRole,
+  AutoloopChatStateCode,
   AutoloopConfig,
   AutoloopPhase,
   AutoloopState,
   AutoloopStatus,
   PhysicalAgentGeneration,
+  PublicAutoloopFailure,
+  PublicAutoloopFailureCode,
   PushPolicy,
   RecoveryAgentEvidence,
   RecoveryArtifactName,

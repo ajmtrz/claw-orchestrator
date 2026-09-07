@@ -8,6 +8,7 @@ import { SecureAutoloopLedgerCommitError } from '../autoloop/secure-ledger.js';
 import { ENGINE_TYPES } from '../types.js';
 import { __rejectCustomEngineOverHttpForTest as rejectCustomEngineOverHttp } from '../embedded-server.js';
 import type { PluginConfig, PermissionMode, EffortLevel } from '../types.js';
+import type { AutoloopState, PublicAutoloopFailure, PublicAutoloopFailureCode } from '../index.js';
 
 const COMMITTED_LEDGER_CODES = [
   'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
@@ -103,6 +104,80 @@ describe('plugin tool registration', () => {
   const { tools, routes } = collectRegistration();
   const byName = new Map(tools.map((t) => [t.name, t]));
   const routePaths = new Set(routes.map((r) => r.path));
+
+  it('exports the complete public Autoloop phase-error contract', () => {
+    // Production mutation caught: narrowing recent phase errors back to only
+    // operation failures makes accepted chat-state JSON impossible to consume
+    // through the package's public TypeScript surface.
+    const pendingDispatch = {
+      status: 'awaiting_resume',
+      dispatch_id: 'dispatch-planner-public-contract',
+      agent: 'planner',
+      message_id: 'chat-public-contract',
+      message_type: 'chat',
+      iter: 4,
+      timeout_ms: 600_000,
+      error: 'Timeout waiting for response',
+    } as const;
+    const chatStateCodes = [
+      'AUTOLOOP_SEND_TIMEOUT',
+      'AUTOLOOP_RUN_PAUSED',
+      'AUTOLOOP_RUN_TERMINAL',
+    ] as const satisfies readonly PublicAutoloopFailureCode[];
+    const recentPhaseErrors: AutoloopState['recent_phase_errors'] = [
+      {
+        ts: '2026-09-07T20:00:00.000Z',
+        agent: 'planner',
+        phase: 'planner_turn',
+        code: 'AUTOLOOP_SEND_TIMEOUT',
+        retryable: true,
+        pending_dispatch: pendingDispatch,
+        status_reason: 'awaiting_resume:send_timeout:planner:dispatch-planner-public-contract',
+        error: 'Planner dispatch is awaiting explicit resume',
+      },
+      {
+        ts: '2026-09-07T20:01:00.000Z',
+        agent: 'planner',
+        phase: 'planner_turn',
+        code: 'AUTOLOOP_RUN_PAUSED',
+        retryable: false,
+        status_reason: null,
+        error: 'Autoloop run is paused',
+      },
+      {
+        ts: '2026-09-07T20:02:00.000Z',
+        agent: 'planner',
+        phase: 'planner_turn',
+        code: 'AUTOLOOP_RUN_TERMINAL',
+        retryable: false,
+        status_reason: 'goal completed',
+        error: 'Autoloop run is terminal',
+      },
+      {
+        ts: '2026-09-07T20:03:00.000Z',
+        agent: 'planner',
+        phase: 'planner_turn',
+        code: 'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+        committed: true,
+        retryable: false,
+        error: 'Ledger data committed before file sync completed',
+      },
+    ];
+    const publicFailure = {
+      code: 'AUTOLOOP_SEND_TIMEOUT',
+      message: 'Planner dispatch is awaiting explicit resume',
+      retryable: true,
+      pending_dispatch: pendingDispatch,
+      status_reason: 'awaiting_resume:send_timeout:planner:dispatch-planner-public-contract',
+    } as const satisfies PublicAutoloopFailure;
+
+    expect(chatStateCodes).toEqual(['AUTOLOOP_SEND_TIMEOUT', 'AUTOLOOP_RUN_PAUSED', 'AUTOLOOP_RUN_TERMINAL']);
+    expect(recentPhaseErrors.map(({ code }) => code)).toEqual([
+      ...chatStateCodes,
+      'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+    ]);
+    expect(publicFailure.pending_dispatch).toEqual(pendingDispatch);
+  });
 
   it('snapshots public failures without invoking accessors or inherited serialization hooks', () => {
     // Production mutation caught: reading typed fields more than once, accepting
