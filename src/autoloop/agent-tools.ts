@@ -11,6 +11,8 @@
  * Reviewer tools: review_complete, reviewer_log
  */
 
+import { canonicalizeExactStringArrayElements } from './messages.js';
+
 export type CoderToolName = 'iter_complete' | 'request_clarification' | 'coder_log';
 export type ReviewerToolName = 'review_complete' | 'reviewer_log';
 
@@ -77,17 +79,27 @@ export function extractIterComplete(calls: AgentToolCall[]): IterCompletePayload
 }
 
 export function extractReviewComplete(calls: AgentToolCall[]): ReviewCompletePayload | null {
-  const matches = calls.filter((c) => c.tool === 'review_complete');
-  if (matches.length === 0) return null;
-  const last = matches[matches.length - 1];
+  let last: AgentToolCall | undefined;
+  for (let index = 0; index < calls.length; index += 1) {
+    if (calls[index].tool === 'review_complete') last = calls[index];
+  }
+  if (!last) return null;
   const dec = String(last.args.decision ?? '');
   if (dec !== 'advance' && dec !== 'hold' && dec !== 'rollback') return null;
   const metricRaw = last.args.metric;
   const metric =
     typeof metricRaw === 'number' && Number.isFinite(metricRaw) ? metricRaw : metricRaw === null ? null : null;
   const audit_notes = String(last.args.audit_notes ?? '');
-  const flagsRaw = last.args.flags;
-  const flags = Array.isArray(flagsRaw) ? flagsRaw.filter((x) => typeof x === 'string') : undefined;
+  const flagsDescriptor = Object.getOwnPropertyDescriptor(last.args, 'flags');
+  let flags: string[] | undefined;
+  if (flagsDescriptor !== undefined) {
+    if (!Object.hasOwn(flagsDescriptor, 'value') || flagsDescriptor.value === undefined) return null;
+    try {
+      flags = canonicalizeExactStringArrayElements(flagsDescriptor.value);
+    } catch {
+      return null;
+    }
+  }
   return { decision: dec as ReviewCompletePayload['decision'], metric, audit_notes, flags };
 }
 

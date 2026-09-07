@@ -2140,6 +2140,55 @@ describe('ClaudeAgentDispatcher — canonical immutable Reviewer verdicts', () =
     });
   });
 
+  it('fails closed on malformed raw Reviewer flags before acceptance and never persists them', async () => {
+    const reviewerReply = [
+      'Independent review returned malformed runtime flags.',
+      '```autoloop',
+      JSON.stringify({
+        tool: 'review_complete',
+        args: {
+          decision: 'advance',
+          metric: 1,
+          audit_notes: 'must not reach acceptance',
+          flags: ['safe-looking', 7],
+        },
+      }),
+      '```',
+    ].join('\n');
+    const { dispatcher, ledgerDir } = makeDispatcher(
+      {
+        contract: {
+          id: 'malformed-flags-must-not-run',
+          checks: [{ id: 'workspace-exists', spec: { type: 'file', path: '.', exists: true } }],
+        },
+      },
+      { sendOutput: reviewerReply },
+    );
+    ensureCompleteReviewArtifacts(dispatcher, 0);
+    const targetHit = vi.fn();
+    dispatcher.on('target_hit', targetHit);
+
+    const delivered = await dispatcher.deliver(
+      Msg.reviewRequest(0, { iter: 0, ledger_path: ledgerDir, prior_metrics: [] }),
+    );
+
+    expect(delivered).toEqual([
+      expect.objectContaining({
+        type: 'review_verdict',
+        payload: expect.objectContaining({ decision: 'hold', metric: null }),
+      }),
+    ]);
+    expect(targetHit).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'evidence'))).toBe(false);
+    const verdict = JSON.parse(fs.readFileSync(path.join(ledgerDir, 'iter', '0', 'verdict.json'), 'utf8')) as Record<
+      string,
+      unknown
+    >;
+    expect(verdict.decision).toBe('hold');
+    expect(verdict.audit_notes).toContain('[no verdict emitted]');
+    expect(Object.hasOwn(verdict, 'flags')).toBe(false);
+  });
+
   it('replays calculated acceptance byte-stably across absent and different runtime flags', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-09-06T01:00:00.000Z'));

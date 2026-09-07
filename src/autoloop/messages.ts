@@ -510,6 +510,22 @@ export function hasExactStringArrayElements(value: unknown): value is string[] {
   }
 }
 
+/**
+ * Snapshot exact public string arrays before they reach a message boundary.
+ * The returned array is frozen and carries the same inert own `toJSON` shadow
+ * as every other canonical primitive array.
+ */
+export function canonicalizeExactStringArrayElements(value: unknown): string[] {
+  return canonicalPrimitiveArray(
+    value,
+    'review_verdict',
+    'flags',
+    (candidate): candidate is string => typeof candidate === 'string',
+    'an array of strings',
+    STRING_ARRAY_LIMITS,
+  );
+}
+
 function canonicalDirectiveStringArray(value: unknown, key: 'constraints' | 'success_criteria'): string[] {
   return canonicalPrimitiveArray(
     value,
