@@ -36,6 +36,7 @@ import type { AcceptanceContract } from '../verify/contract.js';
 import {
   type AnyAutoloopMessage,
   type AutoloopOperationErrorCode,
+  canonicalizeExactStringArrayElements,
   canonicalizeMessage,
   canonicalizeRequestReviewArgs,
   type CheckpointReviewRequestPayload,
@@ -63,6 +64,8 @@ import {
 
 import {
   applyValidatedPlannerToolCalls,
+  canonicalizePlannerControls,
+  canonicalPlannerControlsJson,
   parsePlannerReply,
   validatePlannerToolCalls,
   type PlannerToolCall,
@@ -298,7 +301,7 @@ interface PlannerControlEvidence {
 }
 
 function plannerControlsSha256(controls: readonly PlannerToolCall[]): string {
-  return createHash('sha256').update(JSON.stringify(controls)).digest('hex');
+  return createHash('sha256').update(canonicalPlannerControlsJson(controls)).digest('hex');
 }
 
 function plannerControlClaimMatches(
@@ -995,6 +998,10 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   private activeReviewRequestPreparations = 0;
   /** Planner's compatibility effect owns its commit hook after the configured handler returns. */
   private spawnCommitDeferralDepth = 0;
+  /** Failed start errors whose physical generation was reconciled as durable/live. */
+  private readonly reconciledStartFailures = new Map<AutoloopRoleName, unknown>();
+  /** Serializes selection, startup, and rollback as one observable subagent transition. */
+  private subagentSpawnTail: Promise<void> = Promise.resolve();
   /** Per-run FIFO gate for the Reviewer's one mutable sandbox and session. */
   private reviewerDispatchTail: Promise<void> = Promise.resolve();
 
@@ -1060,6 +1067,12 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     if (role === 'planner') this.plannerStarted = started;
     else if (role === 'coder') this.coderStarted = started;
     else this.reviewerStarted = started;
+  }
+
+  private takeReconciledStartFailure(role: AutoloopRoleName, error: unknown): boolean {
+    if (!this.reconciledStartFailures.has(role) || this.reconciledStartFailures.get(role) !== error) return false;
+    this.reconciledStartFailures.delete(role);
+    return true;
   }
 
   private readGenerationHistory(role: AutoloopRoleName): PhysicalAgentGeneration[] {
@@ -1370,7 +1383,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     start: (generation: PhysicalAgentGeneration) => Promise<void>,
   ): Promise<void> {
     if (this.terminal) return;
-    if (this.roleStarted(role)) return;
+    if (this.roleStarted(role) && this.currentGeneration(role)?.state === 'live') return;
     const operationKey = `${this.ownerInstanceId}\0${this.sessionNameFor(role)}`;
     const existing = AGENT_START_OPERATIONS.get(operationKey);
     if (existing) {
@@ -1436,6 +1449,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
             );
           }
         } else if (physicalStarted) {
+          let reconciled = false;
           try {
             const current = this.currentGeneration(role);
             if (
@@ -1454,12 +1468,14 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
               // A committed append can throw after writing the row. Re-flush
               // that authoritative row instead of appending duplicate evidence.
               this.secureLedger.flushFlatFile('agent-generations.jsonl');
+              reconciled = true;
             } else if (current.state === 'stale') {
               this.appendGenerationEvent('agent_generation_started', {
                 ...prepared.generation,
                 last_activity_at: this.now().toISOString(),
                 state: 'live',
               });
+              reconciled = true;
             } else {
               this.conflict(
                 'AUTOLOOP_AGENT_GENERATION_CONFLICT',
@@ -1476,6 +1492,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
               `[autoloop] failed to reconcile surviving generation ${prepared.generation.generation} after startup error: ${(cleanupErr as Error).message}`,
             );
           }
+          if (reconciled) this.reconciledStartFailures.set(role, err);
         }
         throw err;
       }
@@ -1806,6 +1823,20 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     }
   }
 
+  private async serializeSubagentSpawn<T>(operation: () => Promise<T>): Promise<T> {
+    const predecessor = this.subagentSpawnTail;
+    let release!: () => void;
+    this.subagentSpawnTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await predecessor;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
   private async spawnCoderPrimitive(args: SpawnCoderArgs, record: boolean): Promise<PhysicalAgentGeneration> {
     if (this.terminal) throw new Error('Cannot start Coder after the Autoloop run became terminal');
     const nextCoder = this.nextCoderSelection(args);
@@ -1824,9 +1855,13 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       if (record) {
         let restorePreviousSelection = true;
         if (!coderWasStarted && this.coderStarted) {
-          const stopped = await this.stopRolledBackSession('coder', this.coderName);
-          this.coderStarted = !stopped;
-          restorePreviousSelection = stopped;
+          if (this.takeReconciledStartFailure('coder', err)) {
+            restorePreviousSelection = false;
+          } else {
+            const stopped = await this.stopRolledBackSession('coder', this.coderName);
+            this.coderStarted = !stopped;
+            restorePreviousSelection = stopped;
+          }
         }
         if (restorePreviousSelection) this.coderSelection = previousCoder;
         else await this.persistSurvivingRoleSelection();
@@ -1865,10 +1900,14 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       if (record) {
         let restorePreviousSelection = true;
         if (!reviewerWasStarted && this.reviewerStarted) {
-          const stopped = await this.stopRolledBackSession('reviewer', this.reviewerName);
-          this.reviewerStarted = !stopped;
-          restorePreviousSelection = stopped;
-          if (stopped) this.reviewerSessionPrompt = null;
+          if (this.takeReconciledStartFailure('reviewer', err)) {
+            restorePreviousSelection = false;
+          } else {
+            const stopped = await this.stopRolledBackSession('reviewer', this.reviewerName);
+            this.reviewerStarted = !stopped;
+            restorePreviousSelection = stopped;
+            if (stopped) this.reviewerSessionPrompt = null;
+          }
         }
         if (restorePreviousSelection) this.reviewerSelection = previousReviewer;
         else await this.persistSurvivingRoleSelection();
@@ -1891,18 +1930,24 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
 
   /** Start only the Coder session. */
   async spawnCoder(args: SpawnCoderArgs = {}): Promise<PhysicalAgentGeneration> {
-    const wasStarted = this.coderStarted;
-    const generation = await this.spawnCoderPrimitive(args, true);
-    if (!wasStarted && this.spawnCommitDeferralDepth === 0) await this.config.onSpawnSubagentsCommitted?.();
-    return generation;
+    this.assertSelectionCanStart('coder', this.nextCoderSelection(args));
+    return await this.serializeSubagentSpawn(async () => {
+      const wasStarted = this.coderStarted;
+      const generation = await this.spawnCoderPrimitive(args, true);
+      if (!wasStarted && this.spawnCommitDeferralDepth === 0) await this.config.onSpawnSubagentsCommitted?.();
+      return generation;
+    });
   }
 
   /** Start only the Reviewer session. */
   async spawnReviewer(args: SpawnReviewerArgs = {}): Promise<PhysicalAgentGeneration> {
-    const wasStarted = this.reviewerStarted;
-    const generation = await this.spawnReviewerPrimitive(args, true);
-    if (!wasStarted && this.spawnCommitDeferralDepth === 0) await this.config.onSpawnSubagentsCommitted?.();
-    return generation;
+    this.assertSelectionCanStart('reviewer', this.nextReviewerSelection(args));
+    return await this.serializeSubagentSpawn(async () => {
+      const wasStarted = this.reviewerStarted;
+      const generation = await this.spawnReviewerPrimitive(args, true);
+      if (!wasStarted && this.spawnCommitDeferralDepth === 0) await this.config.onSpawnSubagentsCommitted?.();
+      return generation;
+    });
   }
 
   /**
@@ -1910,6 +1955,10 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
    * selections are validated before either independent primitive may start.
    */
   async spawnSubagents(args: SpawnSubagentsArgs = {}): Promise<void> {
+    await this.serializeSubagentSpawn(async () => await this.spawnSubagentsTransaction(args));
+  }
+
+  private async spawnSubagentsTransaction(args: SpawnSubagentsArgs): Promise<void> {
     if (this.terminal) return;
     const coderArgs: SpawnCoderArgs = { coder_engine: args.coder_engine, coder_model: args.coder_model };
     const reviewerArgs: SpawnReviewerArgs = {
@@ -1936,16 +1985,23 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       // silently bind to the surviving process under different metadata.
       let coderSurvivedRollback = false;
       let reviewerSurvivedRollback = false;
-      if (!coderWasStarted && this.coderStarted) {
-        const stopped = await this.stopRolledBackSession('coder', this.coderName);
-        this.coderStarted = !stopped;
-        coderSurvivedRollback = !stopped;
-      }
-      if (!reviewerWasStarted && this.reviewerStarted) {
-        const stopped = await this.stopRolledBackSession('reviewer', this.reviewerName);
-        this.reviewerStarted = !stopped;
-        reviewerSurvivedRollback = !stopped;
-        if (stopped) this.reviewerSessionPrompt = null;
+      const coderReconciled = this.takeReconciledStartFailure('coder', err);
+      const reviewerReconciled = this.takeReconciledStartFailure('reviewer', err);
+      if (coderReconciled || reviewerReconciled) {
+        coderSurvivedRollback = !coderWasStarted && this.coderStarted;
+        reviewerSurvivedRollback = !reviewerWasStarted && this.reviewerStarted;
+      } else {
+        if (!coderWasStarted && this.coderStarted) {
+          const stopped = await this.stopRolledBackSession('coder', this.coderName);
+          this.coderStarted = !stopped;
+          coderSurvivedRollback = !stopped;
+        }
+        if (!reviewerWasStarted && this.reviewerStarted) {
+          const stopped = await this.stopRolledBackSession('reviewer', this.reviewerName);
+          this.reviewerStarted = !stopped;
+          reviewerSurvivedRollback = !stopped;
+          if (stopped) this.reviewerSessionPrompt = null;
+        }
       }
       this.coderSelection = coderSurvivedRollback ? nextCoder : previousCoder;
       this.reviewerSelection = reviewerSurvivedRollback ? nextReviewer : previousReviewer;
@@ -2651,6 +2707,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     controls: readonly PlannerToolCall[],
     controlsSha256: string,
   ): PlannerControlEvidence {
+    const canonicalControls = canonicalizePlannerControls(controls);
     const evidence: PlannerControlEvidence = {
       control_id: `planner_control_${randomUUID()}`,
       persisted_at: this.now().toISOString(),
@@ -2660,8 +2717,8 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       generation: generation.generation,
       owner_instance_id: generation.owner_instance_id,
       session_id: generation.session_id,
-      tools: controls.map(({ tool }) => tool),
-      controls: controls.map(({ tool, args }) => ({ tool, args })),
+      tools: canonicalizeExactStringArrayElements(canonicalControls.map(({ tool }) => tool)) as PlannerToolName[],
+      controls: canonicalControls,
       controls_sha256: controlsSha256,
     };
     const decision = {
@@ -3142,7 +3199,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   // ─── Coder ──────────────────────────────────────────────────────────────
 
   private async ensureCoder(): Promise<void> {
-    if (this.coderStarted) return;
+    if (this.coderStarted && this.currentGeneration('coder')?.state === 'live') return;
     this.validateSelection('coder', this.coderSelection);
     await this.ensureAgentSession('coder', async (generation) => {
       await this.config.manager.startSession(
@@ -3353,7 +3410,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   }
 
   private async ensureReviewer(): Promise<void> {
-    if (this.reviewerStarted) return;
+    if (this.reviewerStarted && this.currentGeneration('reviewer')?.state === 'live') return;
     this.validateSelection('reviewer', this.reviewerSelection);
     this.secureLedger.ensureReviewerSandbox();
     const sessionPrompt = this.buildReviewerSystemPrompt();

@@ -51,6 +51,7 @@ function makeMockEffects(): {
         },
       };
     },
+    releaseReviewRequest: () => undefined,
     updatePushPolicy: (delta) => {
       Object.assign(policyDelta, delta);
       calls.push(`updatePushPolicy:${JSON.stringify(delta)}`);
@@ -227,6 +228,41 @@ describe('applyPlannerToolCalls', () => {
     expect(validation?.controls_json).toBe('[{"tool":"spawn_subagents","args":{}}]');
     expect(calls).toEqual(['spawnSubagents:{}']);
     expect(applied).toEqual({ emitted_messages: [], errors: [] });
+  });
+
+  it('serializes normalized control arrays without consulting inherited Array.prototype.toJSON', () => {
+    const original = Object.getOwnPropertyDescriptor(Array.prototype, 'toJSON');
+    let inheritedToJsonHits = 0;
+    let validation: ReturnType<typeof validatePlannerToolCalls> | undefined;
+    try {
+      Object.defineProperty(Array.prototype, 'toJSON', {
+        configurable: true,
+        value(this: unknown[]) {
+          inheritedToJsonHits += 1;
+          return this.length === 1 && this[0] === 'security' ? ['PWNED_SCOPE'] : this;
+        },
+      });
+      validation = validatePlannerToolCalls([
+        {
+          tool: 'request_review' as never,
+          args: {
+            checkpoint_sha: 'a'.repeat(40),
+            source_run_id: 'source-run',
+            source_iter: 3,
+            scope: ['security'],
+            idempotency_key: 'prototype-safe-review',
+          },
+        },
+      ]);
+    } finally {
+      if (original) Object.defineProperty(Array.prototype, 'toJSON', original);
+      else Reflect.deleteProperty(Array.prototype, 'toJSON');
+    }
+
+    expect(inheritedToJsonHits).toBe(0);
+    expect(validation?.errors).toEqual([]);
+    expect(JSON.parse(validation?.controls_json ?? 'null')).toEqual(validation?.calls);
+    expect(validation?.controls_json).not.toContain('PWNED_SCOPE');
   });
 
   it.each([
@@ -762,6 +798,28 @@ describe('applyPlannerToolCalls', () => {
       args.idempotency_key,
       expect.objectContaining({ idempotency_key: args.idempotency_key }),
     );
+  });
+
+  it('fails before durable review preparation when the reclaim hook is unavailable', async () => {
+    const { fx } = makeMockEffects();
+    const requestReview = vi.fn(fx.requestReview!);
+    fx.requestReview = requestReview;
+    delete fx.releaseReviewRequest;
+    const args = {
+      checkpoint_sha: 'a'.repeat(40),
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+      idempotency_key: 'missing-release-hook',
+    };
+
+    const result = await applyPlannerToolCalls([{ tool: 'request_review' as never, args }], fx, 0);
+
+    expect(result).toEqual({
+      emitted_messages: [],
+      errors: [{ tool: 'request_review', error: 'request_review release handler is not installed' }],
+    });
+    expect(requestReview).not.toHaveBeenCalled();
   });
 
   it('types a prepared review as the checkpoint-specific wire payload', () => {

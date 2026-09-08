@@ -545,6 +545,11 @@ export interface PlannerToolValidationResult {
   controls_json?: string;
 }
 
+function shadowInheritedArrayToJSON<T>(value: T[]): T[] {
+  Object.defineProperty(value, 'toJSON', { value: undefined });
+  return value;
+}
+
 function normalizePlannerControlValue(value: unknown): unknown {
   if (Array.isArray(value)) {
     const normalized = new Array<unknown>(value.length);
@@ -557,7 +562,7 @@ function normalizePlannerControlValue(value: unknown): unknown {
         writable: true,
       });
     }
-    return normalized;
+    return shadowInheritedArrayToJSON(normalized);
   }
   if (!value || typeof value !== 'object') return value;
   const normalized = Object.create(null) as Record<string, unknown>;
@@ -574,11 +579,17 @@ function normalizePlannerControlValue(value: unknown): unknown {
   return normalized;
 }
 
-function normalizePlannerControls(controls: readonly PlannerToolCall[]): PlannerToolCall[] {
-  return controls.map(({ tool, args }) => ({
-    tool,
-    args: normalizePlannerControlValue(args) as Record<string, unknown>,
-  }));
+export function canonicalizePlannerControls(controls: readonly PlannerToolCall[]): PlannerToolCall[] {
+  return shadowInheritedArrayToJSON(
+    controls.map(({ tool, args }) => ({
+      tool,
+      args: normalizePlannerControlValue(args) as Record<string, unknown>,
+    })),
+  );
+}
+
+export function canonicalPlannerControlsJson(controls: readonly PlannerToolCall[]): string {
+  return JSON.stringify(canonicalizePlannerControls(controls));
 }
 
 /** Validate and sanitize the complete batch without performing any effect. */
@@ -621,7 +632,7 @@ export function validatePlannerToolCalls(calls: readonly PlannerToolCall[]): Pla
       blocked_policy_silence: [],
     };
   }
-  const validated: PlannerToolCall[] = [];
+  const validated = shadowInheritedArrayToJSON<PlannerToolCall>([]);
   const errors: Array<{ tool: string; error: string }> = [];
   const blockedPolicySilence: string[] = [];
   // Exact JSON-array accounting lets us reject an oversized batch as soon as
@@ -638,7 +649,7 @@ export function validatePlannerToolCalls(calls: readonly PlannerToolCall[]): Pla
         blockedPolicySilence.length > blockedBefore &&
         Object.keys(sanitized.args).length === 0;
       if (!isBlockedSilenceOnlyControl) {
-        const normalized = normalizePlannerControls([sanitized])[0];
+        const normalized = canonicalizePlannerControls([sanitized])[0];
         const rowBytes = Buffer.byteLength(JSON.stringify(normalized), 'utf8');
         const nextBytes = normalizedBatchBytes + (validated.length > 0 ? 1 : 0) + rowBytes;
         if (nextBytes > MAX_PLANNER_CONTROL_BATCH_BYTES) {
@@ -794,6 +805,7 @@ function preparePlannerToolCall(call: PlannerToolCall, fx: PlannerToolEffects, i
         tool: call.tool,
         apply: async () => {
           if (!fx.requestReview) throw new Error('request_review handler is not installed');
+          if (!fx.releaseReviewRequest) throw new Error('request_review release handler is not installed');
           const result = await fx.requestReview(call.args as unknown as RequestReviewArgs, iter);
           return result.status === 'prepared' ? [Msg.reviewRequest(iter, result.payload)] : [];
         },

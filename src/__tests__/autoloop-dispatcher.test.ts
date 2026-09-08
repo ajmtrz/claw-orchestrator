@@ -1748,6 +1748,68 @@ describe('ClaudeAgentDispatcher — role engine configuration', () => {
     );
   });
 
+  it('does not let a same-selection Coder spawn resolve while compatibility rollback is stopping that generation', async () => {
+    const { dispatcher, calls, activeNames } = makeDispatcher();
+    const internal = dispatcher as unknown as {
+      requireLiveGeneration(role: 'coder' | 'reviewer'): PhysicalAgentGeneration;
+    };
+    const requireLiveGeneration = internal.requireLiveGeneration.bind(dispatcher);
+    let failCoderLate = true;
+    vi.spyOn(internal, 'requireLiveGeneration').mockImplementation((role) => {
+      if (role === 'coder' && failCoderLate) {
+        failCoderLate = false;
+        throw new Error('coder generation unavailable after startup');
+      }
+      return requireLiveGeneration(role);
+    });
+
+    let signalStopEntered!: () => void;
+    const stopEntered = new Promise<void>((resolve) => {
+      signalStopEntered = resolve;
+    });
+    let releaseStop!: () => void;
+    const stopHeld = new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    });
+    calls.stopSession.mockImplementation(async (name: string) => {
+      if (name === 'autoloop-r1-coder') {
+        signalStopEntered();
+        await stopHeld;
+      }
+      activeNames.delete(name);
+    });
+
+    const selected = { coder_engine: 'codex' as const, coder_model: 'gpt-coder' };
+    const failedCompatibilitySpawn = dispatcher.spawnSubagents(selected);
+    await stopEntered;
+    let concurrentSettled = false;
+    const concurrentSpawn = dispatcher.spawnCoder(selected).then(
+      (generation) => {
+        concurrentSettled = true;
+        return generation;
+      },
+      (error: unknown) => {
+        concurrentSettled = true;
+        throw error;
+      },
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const settledWhileStopWasHeld = concurrentSettled;
+    releaseStop();
+
+    const compatibilityFailure = await failedCompatibilitySpawn.catch((error: unknown) => error);
+    const concurrentGeneration = await concurrentSpawn;
+
+    expect(settledWhileStopWasHeld).toBe(false);
+    expect(compatibilityFailure).toEqual(
+      expect.objectContaining({ message: 'coder generation unavailable after startup' }),
+    );
+    expect(concurrentGeneration).toMatchObject({ role: 'coder', generation: 2, state: 'live' });
+    expect(
+      calls.startSession.mock.calls.filter(([config]) => (config as { name: string }).name.endsWith('-coder')),
+    ).toHaveLength(2);
+  });
+
   it('keeps the next Reviewer selection visible while compatibility rollback is still stopping it', async () => {
     const { dispatcher, calls, activeNames } = makeDispatcher();
     await dispatcher.spawnCoder();
@@ -1857,6 +1919,96 @@ describe('ClaudeAgentDispatcher — role engine configuration', () => {
     expect(
       calls.startSession.mock.calls.filter(([config]) => (config as { name: string }).name.endsWith('-coder')),
     ).toHaveLength(1);
+  });
+
+  it('does not undo a successfully reconciled Coder start when only the first cleanup stop fails', async () => {
+    const onRoleSelectionChanged = vi.fn();
+    const { dispatcher, calls, ledgerDir, activeNames } = makeDispatcher({ onRoleSelectionChanged });
+    const internal = dispatcher as unknown as {
+      coderStarted: boolean;
+      coderSelection: { engine: string; model?: string };
+    };
+    const appendFailure = injectStartedGenerationAppendFailure(dispatcher, 'coder');
+    const stopSession = calls.stopSession.getMockImplementation()!;
+    calls.stopSession.mockRejectedValueOnce(new Error('first cleanup stop failed')).mockImplementation(stopSession);
+    const selected = { coder_engine: 'codex' as const, coder_model: 'gpt-coder' };
+
+    const startupFailure = await dispatcher
+      .spawnCoder(selected)
+      .then(() => undefined)
+      .catch((error: unknown) => error);
+    const retry = await dispatcher.spawnCoder(selected);
+
+    expect(startupFailure).toBe(appendFailure);
+    expect(internal.coderStarted).toBe(true);
+    expect(internal.coderSelection).toMatchObject({ engine: 'codex', model: 'gpt-coder' });
+    expect(activeNames.has('autoloop-r1-coder')).toBe(true);
+    expect(readGenerationEvents(ledgerDir).map((entry) => entry.kind)).toEqual([
+      'agent_generation_reserved',
+      'agent_generation_started',
+    ]);
+    expect(retry).toMatchObject({ role: 'coder', generation: 1, state: 'live' });
+    expect(calls.stopSession).toHaveBeenCalledTimes(1);
+    expect(calls.releaseReservation).not.toHaveBeenCalledWith('autoloop-r1-coder', 1, expect.anything());
+    expect(
+      calls.startSession.mock.calls.filter(([config]) => (config as { name: string }).name.endsWith('-coder')),
+    ).toHaveLength(1);
+    expect(onRoleSelectionChanged).toHaveBeenCalledWith({
+      coder: { engine: 'codex', model: 'gpt-coder' },
+      reviewer: { engine: 'claude', model: undefined },
+    });
+  });
+
+  it('reconciles the same Coder selection after both started-event appends fail while the process survives', async () => {
+    const onRoleSelectionChanged = vi.fn();
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({ onRoleSelectionChanged });
+    const internal = dispatcher as unknown as {
+      appendGenerationEvent(kind: AgentGenerationEventKind, generation: PhysicalAgentGeneration): void;
+      coderStarted: boolean;
+      coderSelection: { engine: string; model?: string };
+    };
+    const appendGenerationEvent = internal.appendGenerationEvent.bind(dispatcher);
+    const appendFailure = new Error('injected repeated Coder started-event append failure');
+    let startedAppendFailures = 2;
+    vi.spyOn(internal, 'appendGenerationEvent').mockImplementation((kind, generation) => {
+      if (kind === 'agent_generation_started' && generation.role === 'coder' && startedAppendFailures > 0) {
+        startedAppendFailures -= 1;
+        throw appendFailure;
+      }
+      appendGenerationEvent(kind, generation);
+    });
+    calls.stopSession.mockRejectedValue(new Error('cleanup stop failed'));
+    const selected = { coder_engine: 'codex' as const, coder_model: 'gpt-coder' };
+
+    const startupFailure = await dispatcher
+      .spawnCoder(selected)
+      .then(() => undefined)
+      .catch((error: unknown) => error);
+    const stateAfterFailure = {
+      started: internal.coderStarted,
+      selection: { ...internal.coderSelection },
+      events: readGenerationEvents(ledgerDir).map((entry) => entry.kind),
+    };
+    const retry = await dispatcher.spawnCoder(selected);
+
+    expect(startupFailure).toBe(appendFailure);
+    expect(stateAfterFailure).toEqual({
+      started: true,
+      selection: { engine: 'codex', model: 'gpt-coder', customEngine: undefined },
+      events: ['agent_generation_reserved'],
+    });
+    expect(retry).toMatchObject({ role: 'coder', generation: 1, state: 'live' });
+    expect(readGenerationEvents(ledgerDir).map((entry) => entry.kind)).toEqual([
+      'agent_generation_reserved',
+      'agent_generation_lease_renewed',
+    ]);
+    expect(
+      calls.startSession.mock.calls.filter(([config]) => (config as { name: string }).name.endsWith('-coder')),
+    ).toHaveLength(1);
+    expect(onRoleSelectionChanged).toHaveBeenCalledWith({
+      coder: { engine: 'codex', model: 'gpt-coder' },
+      reviewer: { engine: 'claude', model: undefined },
+    });
   });
 
   it('keeps direct Reviewer metadata and frozen prompt when its started-event append fails live', async () => {
@@ -4530,6 +4682,70 @@ describe('AutoloopRunner — recoverable dispatcher timeout state', () => {
 });
 
 describe('ClaudeAgentDispatcher — updatePushPolicy guard', () => {
+  it('keeps durable Planner-control bytes aligned with applied arrays under inherited Array toJSON pollution', async () => {
+    const reply = [
+      'OK',
+      '```autoloop',
+      JSON.stringify({
+        tool: 'send_directive',
+        args: {
+          goal: 'ship the bounded slice',
+          constraints: ['safe constraint'],
+          success_criteria: [],
+          max_attempts: 1,
+        },
+      }),
+      '```',
+    ].join('\n');
+    const { dispatcher, ledgerDir } = makeDispatcher({}, { sendOutput: reply });
+    let inheritedToJsonHits = 0;
+
+    const { result, thrown } = await withPrototypeDescriptors(
+      [
+        {
+          target: Array.prototype,
+          key: 'toJSON',
+          descriptor: {
+            configurable: true,
+            value(this: unknown[]) {
+              inheritedToJsonHits += 1;
+              return this.length === 1 && this[0] === 'safe constraint' ? ['PWNED_SCOPE'] : this;
+            },
+          },
+        },
+      ],
+      async () => await dispatcher.deliver(Msg.chat(0, { text: 'persist and apply one directive' })),
+    );
+    const persisted = decisionRows(ledgerDir, 'planner_turn_control')[0]?.payload as
+      | {
+          controls: PlannerToolCall[];
+          controls_sha256: string;
+        }
+      | undefined;
+    const expectedControls = [
+      {
+        tool: 'send_directive',
+        args: {
+          constraints: ['safe constraint'],
+          goal: 'ship the bounded slice',
+          max_attempts: 1,
+          success_criteria: [],
+        },
+      },
+    ];
+    const expectedControlsJson = JSON.stringify(expectedControls);
+
+    expect(thrown).toBeUndefined();
+    expect(inheritedToJsonHits).toBe(0);
+    expect(result).toHaveLength(1);
+    expect(result?.[0]).toMatchObject({
+      type: 'directive',
+      payload: { constraints: ['safe constraint'] },
+    });
+    expect(persisted?.controls).toEqual(expectedControls);
+    expect(persisted?.controls_sha256).toBe(createHash('sha256').update(expectedControlsJson).digest('hex'));
+  });
+
   it('rejects an atomic policy batch that weakens required decision severity without persisting controls or effects', async () => {
     const policyRef: PushPolicy = JSON.parse(JSON.stringify(DEFAULT_PUSH_POLICY));
     const policyBefore = JSON.stringify(policyRef);
