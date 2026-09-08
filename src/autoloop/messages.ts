@@ -46,11 +46,23 @@ export interface IterArtifactsPayload {
   files_changed: string[];
 }
 
-export interface ReviewRequestPayload {
+export interface LegacyReviewRequestPayload {
   iter: number;
   ledger_path: string;
   prior_metrics: number[];
 }
+
+export interface RequestReviewArgs {
+  checkpoint_sha: string;
+  source_run_id: string;
+  source_iter: number;
+  scope: string[];
+  idempotency_key: string;
+}
+
+export interface CheckpointReviewRequestPayload extends LegacyReviewRequestPayload, RequestReviewArgs {}
+
+export type ReviewRequestPayload = LegacyReviewRequestPayload | CheckpointReviewRequestPayload;
 
 export interface ReviewVerdictPayload {
   decision: 'advance' | 'hold' | 'rollback';
@@ -524,6 +536,109 @@ export function canonicalizeExactStringArrayElements(value: unknown): string[] {
     'an array of strings',
     STRING_ARRAY_LIMITS,
   );
+}
+
+const FULL_CHECKPOINT_SHA_RE = /^[0-9a-fA-F]{40}$/;
+const SOURCE_RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+/** Shared Task 4 Reviewer-only scope bound; Planner validation uses the same value. */
+export const MAX_REQUEST_REVIEW_SCOPE_ITEMS = 128;
+/** Shared Task 4 Reviewer-only per-string UTF-8 byte bound. */
+export const MAX_REQUEST_REVIEW_METADATA_BYTES = 8_192;
+const REQUEST_REVIEW_SCOPE_LIMITS: PrimitiveArrayLimits = {
+  maxItems: MAX_REQUEST_REVIEW_SCOPE_ITEMS,
+};
+
+function canonicalizeRequestReviewFields(
+  value: unknown,
+  label: 'request_review' | 'review_request',
+): RequestReviewArgs {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    invalidDeliveryPayload(label, 'expected an object');
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    invalidDeliveryPayload(label, 'objects must not contain inherited data');
+  }
+  const fields = canonicalPayloadFields(
+    value,
+    label,
+    ['checkpoint_sha', 'source_run_id', 'source_iter', 'scope', 'idempotency_key'],
+    ['checkpoint_sha', 'source_run_id', 'source_iter', 'scope', 'idempotency_key'],
+  );
+  if (typeof fields.checkpoint_sha !== 'string' || !FULL_CHECKPOINT_SHA_RE.test(fields.checkpoint_sha)) {
+    invalidDeliveryPayload(label, 'checkpoint_sha must be a full 40-character hexadecimal SHA');
+  }
+  if (
+    typeof fields.source_run_id !== 'string' ||
+    !fields.source_run_id.trim() ||
+    fields.source_run_id.trim() !== fields.source_run_id ||
+    fields.source_run_id === '.' ||
+    fields.source_run_id === '..' ||
+    !SOURCE_RUN_ID_RE.test(fields.source_run_id) ||
+    Buffer.byteLength(fields.source_run_id, 'utf8') > MAX_REQUEST_REVIEW_METADATA_BYTES
+  ) {
+    invalidDeliveryPayload(
+      label,
+      'source_run_id must be one unpadded non-path component using letters, digits, dot, underscore, or hyphen',
+    );
+  }
+  if (!Number.isSafeInteger(fields.source_iter) || (fields.source_iter as number) < 0) {
+    invalidDeliveryPayload(label, 'source_iter must be a nonnegative safe integer');
+  }
+  if (Array.isArray(fields.scope)) {
+    const scopePrototype = Object.getPrototypeOf(fields.scope);
+    if (scopePrototype !== Array.prototype && scopePrototype !== null) {
+      invalidDeliveryPayload(label, 'scope arrays must not contain inherited data');
+    }
+  }
+  const scope = canonicalPrimitiveArray(
+    fields.scope,
+    label,
+    'scope',
+    (candidate): candidate is string =>
+      typeof candidate === 'string' && !!candidate.trim() && candidate.trim() === candidate,
+    'a non-empty array of non-empty unpadded strings',
+    REQUEST_REVIEW_SCOPE_LIMITS,
+  );
+  if (scope.length === 0) {
+    invalidDeliveryPayload(label, 'scope must be a non-empty array of non-empty strings');
+  }
+  for (let index = 0; index < scope.length; index += 1) {
+    if (Buffer.byteLength(scope[index], 'utf8') > MAX_REQUEST_REVIEW_METADATA_BYTES) {
+      invalidDeliveryPayload(
+        label,
+        `scope[${index}] exceeds the ${MAX_REQUEST_REVIEW_METADATA_BYTES}-byte UTF-8 limit`,
+      );
+    }
+  }
+  if (
+    typeof fields.idempotency_key !== 'string' ||
+    !fields.idempotency_key.trim() ||
+    fields.idempotency_key.trim() !== fields.idempotency_key ||
+    Buffer.byteLength(fields.idempotency_key, 'utf8') > MAX_REQUEST_REVIEW_METADATA_BYTES
+  ) {
+    invalidDeliveryPayload(
+      label,
+      `idempotency_key must be a non-empty unpadded string within ${MAX_REQUEST_REVIEW_METADATA_BYTES} UTF-8 bytes`,
+    );
+  }
+
+  const canonical = Object.create(null) as RequestReviewArgs;
+  Object.defineProperty(canonical, 'checkpoint_sha', {
+    enumerable: true,
+    value: fields.checkpoint_sha.toLowerCase(),
+  });
+  Object.defineProperty(canonical, 'source_run_id', { enumerable: true, value: fields.source_run_id });
+  Object.defineProperty(canonical, 'source_iter', { enumerable: true, value: fields.source_iter });
+  Object.defineProperty(canonical, 'scope', { enumerable: true, value: scope });
+  Object.defineProperty(canonical, 'idempotency_key', { enumerable: true, value: fields.idempotency_key });
+  Object.freeze(canonical);
+  return canonical;
+}
+
+/** Validate and snapshot the Planner-facing Reviewer-only request fields. */
+export function canonicalizeRequestReviewArgs(value: unknown): RequestReviewArgs {
+  return canonicalizeRequestReviewFields(value, 'request_review');
 }
 
 function canonicalDirectiveStringArray(value: unknown, key: 'constraints' | 'success_criteria'): string[] {
@@ -1050,7 +1165,16 @@ function canonicalReviewRequestPayload(payload: unknown, envelopeIter: number): 
   const fields = canonicalPayloadFields(
     payload,
     'review_request',
-    ['iter', 'ledger_path', 'prior_metrics'],
+    [
+      'iter',
+      'ledger_path',
+      'prior_metrics',
+      'checkpoint_sha',
+      'source_run_id',
+      'source_iter',
+      'scope',
+      'idempotency_key',
+    ],
     ['iter', 'ledger_path', 'prior_metrics'],
   );
   if (!Number.isSafeInteger(fields.iter) || (fields.iter as number) < 0) {
@@ -1064,6 +1188,12 @@ function canonicalReviewRequestPayload(payload: unknown, envelopeIter: number): 
   if (typeof fields.ledger_path !== 'string') {
     invalidDeliveryPayload('review_request', 'ledger_path must be a string');
   }
+  if (Buffer.byteLength(fields.ledger_path, 'utf8') > MAX_REQUEST_REVIEW_METADATA_BYTES) {
+    invalidDeliveryPayload(
+      'review_request',
+      `ledger_path exceeds the ${MAX_REQUEST_REVIEW_METADATA_BYTES}-byte UTF-8 limit`,
+    );
+  }
   const priorMetrics = canonicalPrimitiveArray(
     fields.prior_metrics,
     'review_request',
@@ -1076,6 +1206,27 @@ function canonicalReviewRequestPayload(payload: unknown, envelopeIter: number): 
   Object.defineProperty(canonical, 'iter', { enumerable: true, value: fields.iter });
   Object.defineProperty(canonical, 'ledger_path', { enumerable: true, value: fields.ledger_path });
   Object.defineProperty(canonical, 'prior_metrics', { enumerable: true, value: priorMetrics });
+  const checkpointKeys = ['checkpoint_sha', 'source_run_id', 'source_iter', 'scope', 'idempotency_key'] as const;
+  let hasCheckpointRequest = false;
+  for (let index = 0; index < checkpointKeys.length; index += 1) {
+    if (Object.hasOwn(fields, checkpointKeys[index])) hasCheckpointRequest = true;
+  }
+  if (hasCheckpointRequest) {
+    const prototype = Object.getPrototypeOf(payload);
+    if (prototype !== Object.prototype && prototype !== null) {
+      invalidDeliveryPayload('review_request', 'checkpoint request objects must not contain inherited data');
+    }
+    const request = Object.create(null) as Record<string, unknown>;
+    for (let index = 0; index < checkpointKeys.length; index += 1) {
+      const key = checkpointKeys[index];
+      if (Object.hasOwn(fields, key)) Object.defineProperty(request, key, { enumerable: true, value: fields[key] });
+    }
+    const checkpoint = canonicalizeRequestReviewFields(request, 'review_request');
+    for (let index = 0; index < checkpointKeys.length; index += 1) {
+      const key = checkpointKeys[index];
+      Object.defineProperty(canonical, key, { enumerable: true, value: checkpoint[key] });
+    }
+  }
   Object.freeze(canonical);
   return canonical;
 }

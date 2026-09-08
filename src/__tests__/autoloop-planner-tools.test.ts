@@ -2,14 +2,21 @@
  * Tests for the Planner tool-call parser + handler.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, expectTypeOf, vi } from 'vitest';
 import {
   applyPlannerToolCalls,
+  applyValidatedPlannerToolCalls,
   parsePlannerReply,
   validatePlannerToolCalls,
+  type PreparedReviewRequest,
   type PlannerToolEffects,
 } from '../autoloop/planner-tools.js';
-import type { AnyAutoloopMessage } from '../autoloop/messages.js';
+import {
+  Msg,
+  validateMessage,
+  type AnyAutoloopMessage,
+  type CheckpointReviewRequestPayload,
+} from '../autoloop/messages.js';
 
 function makeMockEffects(): {
   fx: PlannerToolEffects;
@@ -21,8 +28,28 @@ function makeMockEffects(): {
   const policyDelta: Record<string, unknown> = {};
   const writes: Array<{ file: string; content: string; msg?: string }> = [];
   const fx: PlannerToolEffects = {
+    spawnCoder: async (args) => {
+      calls.push(`spawnCoder:${JSON.stringify(args)}`);
+    },
+    spawnReviewer: async (args) => {
+      calls.push(`spawnReviewer:${JSON.stringify(args)}`);
+    },
     spawnSubagents: async (args) => {
       calls.push(`spawnSubagents:${JSON.stringify(args)}`);
+    },
+    requestReview: async (args, targetIter) => {
+      calls.push(`requestReview:${JSON.stringify(args)}`);
+      return {
+        status: 'prepared' as const,
+        target: 'reviewer' as const,
+        idempotency_key: args.idempotency_key as string,
+        payload: {
+          iter: targetIter,
+          ledger_path: '/trusted/run',
+          prior_metrics: [],
+          ...args,
+        },
+      };
     },
     updatePushPolicy: (delta) => {
       Object.assign(policyDelta, delta);
@@ -154,6 +181,782 @@ describe('applyPlannerToolCalls', () => {
 
     expect(r.errors).toEqual([]);
     expect(calls).toEqual(['spawnSubagents:{"coder_engine":"codex","reviewer_engine":"gemini"}']);
+  });
+
+  it('keeps inherited spawn fields out of validated controls, effects, and emitted directives without invoking accessors', async () => {
+    const inherited = {
+      coder_engine: 'codex',
+      coder_model: 'inherited-coder-model',
+      reviewer_engine: 'gemini',
+      reviewer_model: 'inherited-reviewer-model',
+      initial_directive: { goal: 'inherited directive' },
+    } as const;
+    const originals = Object.keys(inherited).map((field) => ({
+      field,
+      descriptor: Object.getOwnPropertyDescriptor(Object.prototype, field),
+    }));
+    let accessorCalls = 0;
+    let validation: ReturnType<typeof validatePlannerToolCalls> | undefined;
+    let applied: Awaited<ReturnType<typeof applyValidatedPlannerToolCalls>> | undefined;
+    const { fx, calls } = makeMockEffects();
+
+    try {
+      for (const [field, value] of Object.entries(inherited)) {
+        Object.defineProperty(Object.prototype, field, {
+          configurable: true,
+          get() {
+            accessorCalls += 1;
+            return value;
+          },
+          set() {
+            accessorCalls += 1;
+          },
+        });
+      }
+      validation = validatePlannerToolCalls([{ tool: 'spawn_subagents', args: {} }]);
+      applied = await applyValidatedPlannerToolCalls(validation, fx, 4);
+    } finally {
+      for (const { field, descriptor } of originals) {
+        if (descriptor) Object.defineProperty(Object.prototype, field, descriptor);
+        else Reflect.deleteProperty(Object.prototype, field);
+      }
+    }
+
+    expect(accessorCalls).toBe(0);
+    expect(validation?.errors).toEqual([]);
+    expect(validation?.controls_json).toBe('[{"tool":"spawn_subagents","args":{}}]');
+    expect(calls).toEqual(['spawnSubagents:{}']);
+    expect(applied).toEqual({ emitted_messages: [], errors: [] });
+  });
+
+  it.each([
+    ['coder_engine', 'codex'],
+    ['customEngine', { name: 'inherited-custom-engine' }],
+  ] as const)('ignores inherited spawn_subagents field %s', (field, value) => {
+    const original = Object.getOwnPropertyDescriptor(Object.prototype, field);
+    Object.defineProperty(Object.prototype, field, { configurable: true, value });
+    try {
+      const result = validatePlannerToolCalls([{ tool: 'spawn_subagents', args: {} }]);
+      expect(result.errors).toEqual([]);
+      expect(result.calls).toEqual([{ tool: 'spawn_subagents', args: {} }]);
+    } finally {
+      if (original) Object.defineProperty(Object.prototype, field, original);
+      else Reflect.deleteProperty(Object.prototype, field);
+    }
+  });
+
+  it.each([
+    ['coder_engine', 'codex'],
+    ['coder_model', 'gpt-coder'],
+    ['reviewer_engine', 'gemini'],
+    ['reviewer_model', 'gemini-review'],
+    ['initial_directive', { goal: 'must not be read' }],
+  ] as const)('rejects an own spawn_subagents accessor for %s without invoking it', (field, value) => {
+    let getterCalls = 0;
+    const args: Record<string, unknown> = {};
+    Object.defineProperty(args, field, {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        return value;
+      },
+    });
+
+    const result = validatePlannerToolCalls([{ tool: 'spawn_subagents', args }]);
+
+    expect(result.errors).toEqual([
+      expect.objectContaining({
+        tool: 'spawn_subagents',
+        error: expect.stringMatching(new RegExp(`${field}.*own data property`, 'i')),
+      }),
+    ]);
+    expect(result.calls).toEqual([]);
+    expect(getterCalls).toBe(0);
+  });
+
+  it('accepts all valid own spawn_subagents data properties', () => {
+    const result = validatePlannerToolCalls([
+      {
+        tool: 'spawn_subagents',
+        args: {
+          coder_engine: 'codex',
+          coder_model: 'gpt-coder',
+          reviewer_engine: 'gemini',
+          reviewer_model: 'gemini-review',
+          initial_directive: { goal: 'ship it' },
+        },
+      },
+    ]);
+
+    expect(result.errors).toEqual([]);
+    expect(result.calls).toEqual([
+      {
+        tool: 'spawn_subagents',
+        args: {
+          coder_engine: 'codex',
+          coder_model: 'gpt-coder',
+          reviewer_engine: 'gemini',
+          reviewer_model: 'gemini-review',
+          initial_directive: {
+            goal: 'ship it',
+            constraints: [],
+            success_criteria: [],
+            max_attempts: 1,
+          },
+        },
+      },
+    ]);
+  });
+
+  it('does not inherit nested initial_directive fields from Object.prototype', () => {
+    const fields = {
+      goal: 'inherited goal',
+      constraints: ['inherited constraint'],
+      success_criteria: ['inherited success'],
+      max_attempts: 9,
+    } as const;
+    const originals = Object.fromEntries(
+      Object.keys(fields).map((field) => [field, Object.getOwnPropertyDescriptor(Object.prototype, field)]),
+    );
+    try {
+      for (const [field, value] of Object.entries(fields)) {
+        Object.defineProperty(Object.prototype, field, { configurable: true, value });
+      }
+
+      const missingGoal = validatePlannerToolCalls([{ tool: 'spawn_subagents', args: { initial_directive: {} } }]);
+      const ownGoal = validatePlannerToolCalls([
+        { tool: 'spawn_subagents', args: { initial_directive: { goal: 'own goal' } } },
+      ]);
+
+      expect(missingGoal.calls).toEqual([]);
+      expect(missingGoal.errors).toEqual([
+        expect.objectContaining({
+          tool: 'spawn_subagents',
+          error: expect.stringMatching(/initial_directive goal.*non-empty string/i),
+        }),
+      ]);
+      expect(ownGoal.errors).toEqual([]);
+      expect(ownGoal.calls).toEqual([
+        {
+          tool: 'spawn_subagents',
+          args: {
+            initial_directive: {
+              goal: 'own goal',
+              constraints: [],
+              success_criteria: [],
+              max_attempts: 1,
+            },
+          },
+        },
+      ]);
+    } finally {
+      for (const field of Object.keys(fields)) {
+        const original = originals[field];
+        if (original) Object.defineProperty(Object.prototype, field, original);
+        else Reflect.deleteProperty(Object.prototype, field);
+      }
+    }
+  });
+
+  it.each([
+    ['goal', 'accessor goal'],
+    ['constraints', ['accessor constraint']],
+    ['success_criteria', ['accessor success']],
+    ['max_attempts', 4],
+  ] as const)('rejects an own nested initial_directive accessor for %s without invoking it', (field, value) => {
+    let getterCalls = 0;
+    const initialDirective: Record<string, unknown> = { goal: 'own goal' };
+    Object.defineProperty(initialDirective, field, {
+      configurable: true,
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        return value;
+      },
+    });
+
+    const result = validatePlannerToolCalls([
+      { tool: 'spawn_subagents', args: { initial_directive: initialDirective } },
+    ]);
+
+    expect(result.calls).toEqual([]);
+    expect(result.errors).toEqual([
+      expect.objectContaining({
+        tool: 'spawn_subagents',
+        error: expect.stringMatching(new RegExp(`initial_directive ${field}.*own data property`, 'i')),
+      }),
+    ]);
+    expect(getterCalls).toBe(0);
+  });
+
+  it('does not inherit send_directive fields from Object.prototype', () => {
+    const fields = {
+      goal: 'inherited goal',
+      constraints: ['inherited constraint'],
+      success_criteria: ['inherited success'],
+      max_attempts: 9,
+    } as const;
+    const originals = Object.fromEntries(
+      Object.keys(fields).map((field) => [field, Object.getOwnPropertyDescriptor(Object.prototype, field)]),
+    );
+    try {
+      for (const [field, value] of Object.entries(fields)) {
+        Object.defineProperty(Object.prototype, field, { configurable: true, value });
+      }
+
+      const missingGoal = validatePlannerToolCalls([{ tool: 'send_directive', args: {} }]);
+      const ownGoal = validatePlannerToolCalls([{ tool: 'send_directive', args: { goal: 'own goal' } }]);
+
+      expect(missingGoal.calls).toEqual([]);
+      expect(missingGoal.errors).toEqual([
+        expect.objectContaining({
+          tool: 'send_directive',
+          error: expect.stringMatching(/send_directive goal.*non-empty string/i),
+        }),
+      ]);
+      expect(ownGoal.errors).toEqual([]);
+      expect(ownGoal.calls).toEqual([
+        {
+          tool: 'send_directive',
+          args: {
+            goal: 'own goal',
+            constraints: [],
+            success_criteria: [],
+            max_attempts: 1,
+          },
+        },
+      ]);
+    } finally {
+      for (const field of Object.keys(fields)) {
+        const original = originals[field];
+        if (original) Object.defineProperty(Object.prototype, field, original);
+        else Reflect.deleteProperty(Object.prototype, field);
+      }
+    }
+  });
+
+  it.each([
+    ['goal', 'accessor goal'],
+    ['constraints', ['accessor constraint']],
+    ['success_criteria', ['accessor success']],
+    ['max_attempts', 4],
+  ] as const)('rejects an own send_directive accessor for %s without invoking it', (field, value) => {
+    let getterCalls = 0;
+    const args: Record<string, unknown> = { goal: 'own goal' };
+    Object.defineProperty(args, field, {
+      configurable: true,
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        return value;
+      },
+    });
+
+    const result = validatePlannerToolCalls([{ tool: 'send_directive', args }]);
+
+    expect(result.calls).toEqual([]);
+    expect(result.errors).toEqual([
+      expect.objectContaining({
+        tool: 'send_directive',
+        error: expect.stringMatching(new RegExp(`send_directive ${field}.*own data property`, 'i')),
+      }),
+    ]);
+    expect(getterCalls).toBe(0);
+  });
+
+  it('accepts valid own send_directive data properties and preserves optional defaults', () => {
+    const goalOnly = validatePlannerToolCalls([{ tool: 'send_directive', args: { goal: 'ship it' } }]);
+    const allFields = validatePlannerToolCalls([
+      {
+        tool: 'send_directive',
+        args: {
+          goal: 'ship it',
+          constraints: ['no new deps'],
+          success_criteria: ['focused tests pass'],
+          max_attempts: 3,
+        },
+      },
+    ]);
+
+    expect(goalOnly.errors).toEqual([]);
+    expect(goalOnly.calls).toEqual([
+      {
+        tool: 'send_directive',
+        args: {
+          goal: 'ship it',
+          constraints: [],
+          success_criteria: [],
+          max_attempts: 1,
+        },
+      },
+    ]);
+    expect(allFields.errors).toEqual([]);
+    expect(allFields.calls).toEqual([
+      {
+        tool: 'send_directive',
+        args: {
+          goal: 'ship it',
+          constraints: ['no new deps'],
+          success_criteria: ['focused tests pass'],
+          max_attempts: 3,
+        },
+      },
+    ]);
+  });
+
+  it.each([
+    ['send_directive', 'constraints'],
+    ['send_directive', 'success_criteria'],
+    ['spawn_subagents', 'constraints'],
+    ['spawn_subagents', 'success_criteria'],
+  ] as const)('rejects a %s %s element accessor without invoking it or effects', async (tool, field) => {
+    let getterCalls = 0;
+    const entries: string[] = [];
+    Object.defineProperty(entries, '0', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        return 'must not be read';
+      },
+    });
+    const directive = { goal: 'ship it', [field]: entries };
+    const control =
+      tool === 'send_directive' ? { tool, args: directive } : { tool, args: { initial_directive: directive } };
+    const { fx, calls } = makeMockEffects();
+
+    const result = await applyPlannerToolCalls([control], fx, 0);
+
+    expect(result.errors).toEqual([
+      expect.objectContaining({ tool, error: expect.stringMatching(new RegExp(`${field}.*own data property`, 'i')) }),
+    ]);
+    expect(result.emitted_messages).toEqual([]);
+    expect(calls).toEqual([]);
+    expect(getterCalls).toBe(0);
+  });
+
+  it.each([
+    ['send_directive', 'constraints', 'hole'],
+    ['send_directive', 'success_criteria', 'prototype index'],
+    ['spawn_subagents', 'constraints', 'prototype index'],
+    ['spawn_subagents', 'success_criteria', 'hole'],
+  ] as const)('rejects a %s %s array with a %s before effects', async (tool, field, shape) => {
+    const entries: string[] = [];
+    entries.length = 1;
+    const original = Object.getOwnPropertyDescriptor(Array.prototype, '0');
+    if (shape === 'prototype index') {
+      Object.defineProperty(Array.prototype, '0', {
+        configurable: true,
+        enumerable: false,
+        value: 'inherited entry',
+        writable: true,
+      });
+    }
+    const directive = { goal: 'ship it', [field]: entries };
+    const control =
+      tool === 'send_directive' ? { tool, args: directive } : { tool, args: { initial_directive: directive } };
+    const { fx, calls } = makeMockEffects();
+    let result: Awaited<ReturnType<typeof applyPlannerToolCalls>> | undefined;
+
+    try {
+      result = await applyPlannerToolCalls([control], fx, 0);
+    } finally {
+      if (original) Object.defineProperty(Array.prototype, '0', original);
+      else Reflect.deleteProperty(Array.prototype, '0');
+    }
+
+    expect(result?.errors).toEqual([
+      expect.objectContaining({ tool, error: expect.stringMatching(new RegExp(`${field}.*own data property`, 'i')) }),
+    ]);
+    expect(result?.emitted_messages).toEqual([]);
+    expect(calls).toEqual([]);
+  });
+
+  it.each([
+    ['send_directive', 'constraints'],
+    ['spawn_subagents', 'success_criteria'],
+  ] as const)('rejects an over-limit %s %s array before visiting any element', async (tool, field) => {
+    let getterCalls = 0;
+    const entries: string[] = [];
+    Object.defineProperty(entries, '0', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        throw new Error('over-limit array element must not be visited');
+      },
+    });
+    entries.length = 0xffff_ffff;
+    const directive = { goal: 'ship it', [field]: entries };
+    const control =
+      tool === 'send_directive' ? { tool, args: directive } : { tool, args: { initial_directive: directive } };
+    const { fx, calls } = makeMockEffects();
+
+    const result = await applyPlannerToolCalls([control], fx, 0);
+
+    expect(result.errors).toEqual([
+      expect.objectContaining({ tool, error: expect.stringMatching(new RegExp(`${field}.*128-item limit`, 'i')) }),
+    ]);
+    expect(result.emitted_messages).toEqual([]);
+    expect(calls).toEqual([]);
+    expect(getterCalls).toBe(0);
+  });
+
+  it.each([
+    ['Coder then Reviewer', ['spawn_coder', 'spawn_reviewer']],
+    ['Coder then notification', ['spawn_coder', 'notify_user']],
+    ['notification then Reviewer', ['notify_user', 'spawn_reviewer']],
+  ] as const)('rejects a non-atomic %s batch before either control has an effect', async (_label, order) => {
+    const { fx, calls } = makeMockEffects();
+    const controls = order.map((tool) => {
+      if (tool === 'spawn_coder') {
+        return { tool, args: { coder_engine: 'codex', coder_model: 'gpt-coder' } };
+      }
+      if (tool === 'spawn_reviewer') {
+        return { tool, args: { reviewer_engine: 'gemini', reviewer_model: 'gemini-review' } };
+      }
+      return { tool, args: { summary: 'must not emit' } };
+    });
+    const result = await applyPlannerToolCalls(controls as never, fx, 4);
+
+    expect(result.emitted_messages).toEqual([]);
+    expect(result.errors).toEqual([
+      expect.objectContaining({
+        tool: expect.stringMatching(/^spawn_(coder|reviewer)$/),
+        error: expect.stringMatching(/only|single|batch|atomic/i),
+      }),
+    ]);
+    expect(calls).toEqual([]);
+  });
+
+  it('keeps each independent Coder and Reviewer spawn usable as a standalone control', async () => {
+    const { fx, calls } = makeMockEffects();
+
+    const coder = await applyPlannerToolCalls(
+      [{ tool: 'spawn_coder' as never, args: { coder_engine: 'codex', coder_model: 'gpt-coder' } }],
+      fx,
+      4,
+    );
+    const reviewer = await applyPlannerToolCalls(
+      [{ tool: 'spawn_reviewer' as never, args: { reviewer_engine: 'gemini', reviewer_model: 'gemini-review' } }],
+      fx,
+      4,
+    );
+
+    expect(coder).toEqual({ emitted_messages: [], errors: [] });
+    expect(reviewer).toEqual({ emitted_messages: [], errors: [] });
+    expect(calls).toEqual([
+      'spawnCoder:{"coder_engine":"codex","coder_model":"gpt-coder"}',
+      'spawnReviewer:{"reviewer_engine":"gemini","reviewer_model":"gemini-review"}',
+    ]);
+  });
+
+  it('canonicalizes and applies a Reviewer-only request for an existing checkpoint', async () => {
+    const { fx, calls } = makeMockEffects();
+    const checkpoint = 'A'.repeat(40);
+    const control = {
+      tool: 'request_review' as never,
+      args: {
+        checkpoint_sha: checkpoint,
+        source_run_id: 'source-run',
+        source_iter: 7,
+        scope: ['security', 'regression'],
+        idempotency_key: 'review-source-run-7',
+      },
+    };
+
+    const validation = validatePlannerToolCalls([control]);
+    expect(validation.errors).toEqual([]);
+    expect(validation.calls).toEqual([
+      {
+        tool: 'request_review',
+        args: {
+          checkpoint_sha: checkpoint.toLowerCase(),
+          idempotency_key: 'review-source-run-7',
+          scope: ['security', 'regression'],
+          source_iter: 7,
+          source_run_id: 'source-run',
+        },
+      },
+    ]);
+
+    const result = await applyPlannerToolCalls([control], fx, 0);
+    expect(result.errors).toEqual([]);
+    expect(result.emitted_messages).toHaveLength(1);
+    expect(validateMessage(result.emitted_messages[0])).toMatchObject({
+      iter: 0,
+      from: 'runner',
+      to: 'reviewer',
+      type: 'review_request',
+      payload: {
+        iter: 0,
+        ledger_path: '/trusted/run',
+        prior_metrics: [],
+        checkpoint_sha: checkpoint.toLowerCase(),
+        source_run_id: 'source-run',
+        source_iter: 7,
+        scope: ['security', 'regression'],
+        idempotency_key: 'review-source-run-7',
+      },
+    });
+    expect(calls).toEqual([
+      `requestReview:{"checkpoint_sha":"${checkpoint.toLowerCase()}","idempotency_key":"review-source-run-7","scope":["security","regression"],"source_iter":7,"source_run_id":"source-run"}`,
+    ]);
+  });
+
+  it('emits one canonical review_request after preparation and no message for a successful duplicate', async () => {
+    const { fx } = makeMockEffects();
+    const args = {
+      checkpoint_sha: 'a'.repeat(40),
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+      idempotency_key: 'review-source-run-3',
+    };
+
+    const first = await applyPlannerToolCalls([{ tool: 'request_review' as never, args }], fx, 0);
+    fx.requestReview = async (request) => ({
+      status: 'duplicate' as const,
+      target: 'reviewer' as const,
+      idempotency_key: request.idempotency_key,
+    });
+    const duplicate = await applyPlannerToolCalls([{ tool: 'request_review' as never, args }], fx, 0);
+
+    expect(first.errors).toEqual([]);
+    expect(first.emitted_messages).toHaveLength(1);
+    expect(validateMessage(first.emitted_messages[0])).toMatchObject({
+      iter: 0,
+      type: 'review_request',
+      payload: expect.objectContaining({ iter: 0, source_iter: 3 }),
+    });
+    expect(duplicate).toEqual({ emitted_messages: [], errors: [] });
+  });
+
+  it('releases a prepared request when the post-preparation active fence rejects the handoff', async () => {
+    const { fx } = makeMockEffects();
+    const releaseReviewRequest = vi.fn();
+    let activeChecks = 0;
+    fx.assertActive = () => {
+      activeChecks += 1;
+      if (activeChecks === 2) throw new Error('run became terminal after preparation');
+    };
+    (
+      fx as PlannerToolEffects & {
+        releaseReviewRequest?: (idempotencyKey: string, payload: CheckpointReviewRequestPayload) => void;
+      }
+    ).releaseReviewRequest = releaseReviewRequest;
+    const args = {
+      checkpoint_sha: 'a'.repeat(40),
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+      idempotency_key: 'release-after-active-fence',
+    };
+
+    const result = await applyPlannerToolCalls([{ tool: 'request_review' as never, args }], fx, 0);
+
+    expect(result.emitted_messages).toEqual([]);
+    expect(result.errors).toEqual([{ tool: 'request_review', error: 'run became terminal after preparation' }]);
+    expect(releaseReviewRequest).toHaveBeenCalledOnce();
+    expect(releaseReviewRequest).toHaveBeenCalledWith(
+      args.idempotency_key,
+      expect.objectContaining({ idempotency_key: args.idempotency_key }),
+    );
+  });
+
+  it('types a prepared review as the checkpoint-specific wire payload', () => {
+    expectTypeOf<PreparedReviewRequest['payload']>().toEqualTypeOf<CheckpointReviewRequestPayload>();
+  });
+
+  it.each([
+    ['before', ['request_review', 'notify_user']],
+    ['after', ['notify_user', 'request_review']],
+    ['another request_review', ['request_review', 'request_review']],
+  ] as const)('rejects a request_review with a %s sibling before any batch effect', async (_label, order) => {
+    const { fx, calls, policyDelta, writes } = makeMockEffects();
+    const requestReview = {
+      tool: 'request_review' as never,
+      args: {
+        checkpoint_sha: 'a'.repeat(40),
+        source_run_id: 'source-run',
+        source_iter: 3,
+        scope: ['correctness'],
+        idempotency_key: 'singleton-review',
+      },
+    };
+    const notify = { tool: 'notify_user' as const, args: { summary: 'must not emit' } };
+    const controls = order.map((tool, index) =>
+      tool === 'request_review'
+        ? {
+            ...requestReview,
+            args: { ...requestReview.args, idempotency_key: `singleton-review-${index}` },
+          }
+        : notify,
+    );
+
+    const validation = validatePlannerToolCalls(controls);
+    const result = await applyPlannerToolCalls(controls, fx, 0);
+
+    expect(validation.calls).toEqual([]);
+    expect(validation.errors).toEqual([
+      expect.objectContaining({
+        tool: 'request_review',
+        error: expect.stringMatching(/only|singleton|sibling/i),
+      }),
+    ]);
+    expect(result).toEqual({ emitted_messages: [], errors: validation.errors });
+    expect(calls).toEqual([]);
+    expect(policyDelta).toEqual({});
+    expect(writes).toEqual([]);
+  });
+
+  it.each([
+    ['short checkpoint', { checkpoint_sha: 'abc' }, 'checkpoint_sha'],
+    ['empty source run', { source_run_id: '   ' }, 'source_run_id'],
+    ['parent traversal source run', { source_run_id: '../source-run' }, 'source_run_id'],
+    ['forward-slash source run', { source_run_id: 'source/run' }, 'source_run_id'],
+    ['backslash source run', { source_run_id: 'source\\run' }, 'source_run_id'],
+    ['leading-whitespace source run', { source_run_id: ' source-run' }, 'source_run_id'],
+    ['trailing-whitespace source run', { source_run_id: 'source-run ' }, 'source_run_id'],
+    ['negative iteration', { source_iter: -1 }, 'source_iter'],
+    ['unsafe iteration', { source_iter: Number.MAX_SAFE_INTEGER + 1 }, 'source_iter'],
+    ['empty scope', { scope: [] }, 'scope'],
+    ['blank scope member', { scope: ['security', '  '] }, 'scope'],
+    ['leading-whitespace scope member', { scope: [' security'] }, 'scope'],
+    ['trailing-whitespace scope member', { scope: ['security '] }, 'scope'],
+    ['too many scope members', { scope: Array.from({ length: 129 }, () => 'security') }, 'scope'],
+    ['oversized UTF-8 scope member', { scope: ['é'.repeat(4_097)] }, 'scope'],
+    ['empty idempotency key', { idempotency_key: '' }, 'idempotency_key'],
+    ['leading-whitespace idempotency key', { idempotency_key: ' review-source-run-7' }, 'idempotency_key'],
+    ['trailing-whitespace idempotency key', { idempotency_key: 'review-source-run-7 ' }, 'idempotency_key'],
+    ['oversized UTF-8 idempotency key', { idempotency_key: 'é'.repeat(4_097) }, 'idempotency_key'],
+  ])('rejects request_review with %s before any effect', async (_label, override, expectedField) => {
+    const { fx, calls } = makeMockEffects();
+    const args = {
+      checkpoint_sha: 'a'.repeat(40),
+      source_run_id: 'source-run',
+      source_iter: 7,
+      scope: ['security'],
+      idempotency_key: 'review-source-run-7',
+      ...override,
+    };
+
+    const result = await applyPlannerToolCalls([{ tool: 'request_review' as never, args }], fx, 7);
+
+    expect(result.emitted_messages).toEqual([]);
+    expect(result.errors).toEqual([
+      expect.objectContaining({ tool: 'request_review', error: expect.stringContaining(expectedField) }),
+    ]);
+    expect(calls).toEqual([]);
+  });
+
+  it('enforces the same request_review scope and UTF-8 metadata limits at the message boundary', () => {
+    const base = {
+      iter: 0,
+      ledger_path: '/trusted/run',
+      prior_metrics: [],
+      checkpoint_sha: 'a'.repeat(40),
+      source_run_id: 'source-run',
+      source_iter: 7,
+      scope: ['security'],
+      idempotency_key: 'review-source-run-7',
+    };
+    const message = (payload: Record<string, unknown>) =>
+      ({
+        v: 2,
+        msg_id: 'm-request-review-limits',
+        run_id: 'r1',
+        iter: 0,
+        ts: new Date().toISOString(),
+        from: 'runner',
+        to: 'reviewer',
+        type: 'review_request',
+        payload,
+      }) as unknown as AnyAutoloopMessage;
+
+    expect(() => validateMessage(message({ ...base, scope: [' security'] }))).toThrow(/scope/i);
+    expect(() => validateMessage(message({ ...base, scope: Array.from({ length: 129 }, () => 'security') }))).toThrow(
+      /scope.*128|128.*scope/i,
+    );
+    expect(() => validateMessage(message({ ...base, scope: ['é'.repeat(4_097)] }))).toThrow(
+      /scope.*8192|8192.*scope|scope.*oversized/i,
+    );
+    expect(() => validateMessage(message({ ...base, idempotency_key: 'é'.repeat(4_097) }))).toThrow(
+      /idempotency_key.*8192|8192.*idempotency_key|idempotency_key.*bounded/i,
+    );
+    expect(() => validateMessage(message({ ...base, ledger_path: 'é'.repeat(4_097) }))).toThrow(
+      /ledger_path.*8192|8192.*ledger_path|ledger_path.*bounded/i,
+    );
+
+    expect(() =>
+      validateMessage(
+        message({
+          ...base,
+          ledger_path: 'é'.repeat(4_096),
+          scope: Array.from({ length: 128 }, () => 'x'.repeat(8_192)),
+          idempotency_key: 'x'.repeat(8_192),
+        }),
+      ),
+    ).not.toThrow();
+  });
+
+  it('names Planner request_review args separately from wire review_request payload errors', () => {
+    const invalid = {
+      checkpoint_sha: 'a'.repeat(40),
+      source_run_id: 'source-run',
+      source_iter: -1,
+      scope: ['correctness'],
+      idempotency_key: 'separate-validator-labels',
+    };
+
+    const planner = validatePlannerToolCalls([{ tool: 'request_review' as never, args: invalid }]);
+    expect(planner.errors).toEqual([
+      expect.objectContaining({ error: expect.stringMatching(/^Request_review payload is invalid:/) }),
+    ]);
+    expect(() =>
+      validateMessage(
+        Msg.reviewRequest(0, {
+          iter: 0,
+          ledger_path: '/trusted/run',
+          prior_metrics: [],
+          ...invalid,
+        }),
+      ),
+    ).toThrow(/^Review_request payload is invalid:/);
+  });
+
+  it('rejects hostile request_review accessors and sparse scope arrays without invoking them or effects', async () => {
+    let getterCalls = 0;
+    const hostileScope: string[] = [];
+    Object.defineProperty(hostileScope, '0', {
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        throw new Error('scope getter must not run');
+      },
+    });
+    hostileScope.length = 1;
+    const args = Object.create(null) as Record<string, unknown>;
+    Object.defineProperties(args, {
+      checkpoint_sha: { enumerable: true, value: 'a'.repeat(40) },
+      source_run_id: { enumerable: true, value: 'source-run' },
+      source_iter: { enumerable: true, value: 7 },
+      scope: { enumerable: true, value: hostileScope },
+      idempotency_key: { enumerable: true, value: 'review-source-run-7' },
+    });
+    const { fx, calls } = makeMockEffects();
+
+    const result = await applyPlannerToolCalls([{ tool: 'request_review' as never, args }], fx, 7);
+
+    expect(result.errors).toEqual([
+      expect.objectContaining({
+        tool: 'request_review',
+        error: expect.stringMatching(/scope.*array|scope.*own|scope.*data/i),
+      }),
+    ]);
+    expect(result.emitted_messages).toEqual([]);
+    expect(getterCalls).toBe(0);
+    expect(calls).toEqual([]);
   });
 
   it('only forwards the documented spawn fields to the effect', async () => {

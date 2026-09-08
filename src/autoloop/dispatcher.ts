@@ -22,12 +22,13 @@ import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { TextDecoder } from 'node:util';
 
 import type { SessionManager } from '../session-manager.js';
 import type { Logger } from '../logger.js';
 import { ENGINE_TYPES, engineHasNativeConversation, type CustomEngineConfig, type EngineType } from '../types.js';
 import { nullLogger } from '../logger.js';
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { capturePatch, changedFilesSince } from '../verify/baseline.js';
 import { runContract } from '../verify/runner.js';
 import { writeEvidence } from '../verify/evidence.js';
@@ -36,8 +37,11 @@ import {
   type AnyAutoloopMessage,
   type AutoloopOperationErrorCode,
   canonicalizeMessage,
+  canonicalizeRequestReviewArgs,
+  type CheckpointReviewRequestPayload,
   hasExactStringArrayElements,
   Msg,
+  type RequestReviewArgs,
   type SendTimeoutPayload,
 } from './messages.js';
 import {
@@ -49,6 +53,7 @@ import {
   isRecoverableAgentOwnerInstanceId,
   validateAutoloopTimeoutConfig,
   type AgentRuntimeProbe,
+  type AgentRuntimeLiveness,
   type AgentDispatcher,
   type AutoloopRoleName,
   type AutoloopState,
@@ -63,7 +68,11 @@ import {
   type PlannerToolCall,
   type PlannerToolEffects,
   type PlannerToolName,
+  type PreparedReviewRequest,
+  type ReviewRequestPreparationResult,
   MAX_PLANNER_CONTROL_BATCH_BYTES,
+  type SpawnCoderArgs,
+  type SpawnReviewerArgs,
   type SpawnSubagentsArgs,
 } from './planner-tools.js';
 import { extractIterComplete, extractReviewComplete, parseAgentReply } from './agent-tools.js';
@@ -338,6 +347,21 @@ function plannerControlEvidenceFromTail(line: string): PlannerControlEvidence | 
 
 const MAX_DECISION_LEDGER_BYTES = 64 * 1024 * 1024;
 const MAX_DECISION_LEDGER_ROW_BYTES = MAX_PLANNER_CONTROL_BATCH_BYTES + 256 * 1024;
+const MAX_REVIEW_REQUEST_IDENTITIES = 4_096;
+const MAX_CONCURRENT_REVIEW_REQUEST_PREPARATIONS = 64;
+const REVIEW_REQUEST_DECISION_KEYS = [
+  'checkpoint_sha',
+  'source_run_id',
+  'source_iter',
+  'target_iter',
+  'scope',
+  'idempotency_key',
+  'request_digest',
+] as const;
+type ReviewEvidenceArtifact = 'directive.json' | 'eval_output.json' | 'coder_summary.txt' | 'diff.patch';
+const MAX_GIT_EVIDENCE_STDERR_BYTES = 64 * 1024;
+const MAX_GIT_HEAD_STDOUT_BYTES = 256;
+const GIT_EVIDENCE_TIMEOUT_MS = 10_000;
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -545,8 +569,15 @@ function readBoundedDecisionLedger(ledger: SecureAutoloopLedger): Array<{ kind: 
       throw new Error('decisions.jsonl changed while its recovery snapshot was being validated');
     }
     if (bytes.at(-1) !== 0x0a) throw new Error('decisions.jsonl has an incomplete final record');
-    const text = bytes.toString('utf8');
-    if (!Buffer.from(text, 'utf8').equals(bytes)) throw new Error('decisions.jsonl is not valid UTF-8');
+    let text: string;
+    try {
+      // `fatal` rejects replacement-character decoding without allocating a
+      // second full-size Buffer. `ignoreBOM` keeps a leading BOM visible so
+      // the JSON parser rejects it exactly as the previous decoder did.
+      text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+    } catch (error) {
+      throw new Error('decisions.jsonl is not valid UTF-8', { cause: error });
+    }
     return text
       .slice(0, -1)
       .split('\n')
@@ -585,6 +616,136 @@ function findCommittedPlannerControl(
   if (claims.length === 0) return 'none';
   if (claims.length === 1 && plannerControlClaimMatches(claims[0], expected)) return 'matching';
   return 'conflicting';
+}
+
+interface IndexedReviewRequestClaim {
+  signature?: string;
+  conflicting: boolean;
+}
+
+interface CanonicalReviewRequestClaim {
+  identityHash: string;
+  signature?: string;
+}
+
+function reviewRequestClaim(payload: unknown): CanonicalReviewRequestClaim | undefined {
+  if (!isPlainRecord(payload)) return undefined;
+  const idempotencyDescriptor = Object.getOwnPropertyDescriptor(payload, 'idempotency_key');
+  if (
+    !idempotencyDescriptor ||
+    !Object.hasOwn(idempotencyDescriptor, 'value') ||
+    typeof idempotencyDescriptor.value !== 'string'
+  ) {
+    return undefined;
+  }
+  const identityHash = createHash('sha256').update(idempotencyDescriptor.value).digest('hex');
+  const ownKeys = Reflect.ownKeys(payload);
+  if (ownKeys.length !== REVIEW_REQUEST_DECISION_KEYS.length) return { identityHash };
+  for (let index = 0; index < ownKeys.length; index += 1) {
+    const ownKey = ownKeys[index];
+    let allowed = false;
+    for (let allowedIndex = 0; allowedIndex < REVIEW_REQUEST_DECISION_KEYS.length; allowedIndex += 1) {
+      if (ownKey === REVIEW_REQUEST_DECISION_KEYS[allowedIndex]) {
+        allowed = true;
+        break;
+      }
+    }
+    if (!allowed) return { identityHash };
+  }
+
+  const values = Object.create(null) as Record<(typeof REVIEW_REQUEST_DECISION_KEYS)[number], unknown>;
+  for (const key of REVIEW_REQUEST_DECISION_KEYS) {
+    const descriptor = Object.getOwnPropertyDescriptor(payload, key);
+    if (!descriptor || !Object.hasOwn(descriptor, 'value')) return { identityHash };
+    values[key] = descriptor.value;
+  }
+  if (
+    typeof values.checkpoint_sha !== 'string' ||
+    typeof values.source_run_id !== 'string' ||
+    !Number.isSafeInteger(values.source_iter) ||
+    !Number.isSafeInteger(values.target_iter) ||
+    !hasExactStringArrayElements(values.scope) ||
+    typeof values.request_digest !== 'string'
+  ) {
+    return { identityHash };
+  }
+
+  const hash = createHash('sha256');
+  const appendString = (value: string): void => {
+    hash.update(`${Buffer.byteLength(value, 'utf8')}:`);
+    hash.update(value, 'utf8');
+  };
+  appendString(values.checkpoint_sha);
+  appendString(values.source_run_id);
+  hash.update(`n:${values.source_iter};n:${values.target_iter};`);
+  hash.update(`a:${values.scope.length};`);
+  for (let index = 0; index < values.scope.length; index += 1) appendString(values.scope[index]);
+  appendString(idempotencyDescriptor.value);
+  appendString(values.request_digest);
+  return { identityHash, signature: hash.digest('hex') };
+}
+
+function indexReviewRequestClaims(
+  rows: ReadonlyArray<{ kind: string; payload?: unknown }>,
+): Map<string, IndexedReviewRequestClaim> {
+  const index = new Map<string, IndexedReviewRequestClaim>();
+  for (const row of rows) {
+    if (row.kind !== 'request_review') continue;
+    const claim = reviewRequestClaim(row.payload);
+    if (!claim) continue;
+    const existing = index.get(claim.identityHash);
+    if (!existing) {
+      if (index.size >= MAX_REVIEW_REQUEST_IDENTITIES) {
+        throw new Error(
+          `request_review durable identity index reached its ${MAX_REVIEW_REQUEST_IDENTITIES}-entry capacity`,
+        );
+      }
+      index.set(claim.identityHash, {
+        signature: claim.signature,
+        conflicting: claim.signature === undefined,
+      });
+      continue;
+    }
+    if (existing.conflicting || claim.signature === undefined || existing.signature !== claim.signature) {
+      index.set(claim.identityHash, { conflicting: true });
+    }
+  }
+  return index;
+}
+
+function mergeReviewRequestClaimIndexes(
+  loaded: Map<string, IndexedReviewRequestClaim>,
+  cached: ReadonlyMap<string, IndexedReviewRequestClaim> | undefined,
+): Map<string, IndexedReviewRequestClaim> {
+  if (!cached) return loaded;
+  const merged = new Map(loaded);
+  for (const [identityHash, cachedClaim] of cached) {
+    const loadedClaim = merged.get(identityHash);
+    if (!loadedClaim) {
+      merged.set(identityHash, cachedClaim);
+    } else if (loadedClaim.conflicting || cachedClaim.conflicting || loadedClaim.signature !== cachedClaim.signature) {
+      merged.set(identityHash, { conflicting: true });
+    }
+  }
+  return merged;
+}
+
+function reviewRequestDecisionPayload(
+  request: RequestReviewArgs,
+  targetIter: number,
+  digest: string,
+): Readonly<Record<string, unknown>> {
+  const payload = Object.create(null) as Record<string, unknown>;
+  Object.defineProperties(payload, {
+    checkpoint_sha: { enumerable: true, value: request.checkpoint_sha },
+    source_run_id: { enumerable: true, value: request.source_run_id },
+    source_iter: { enumerable: true, value: request.source_iter },
+    target_iter: { enumerable: true, value: targetIter },
+    scope: { enumerable: true, value: request.scope },
+    idempotency_key: { enumerable: true, value: request.idempotency_key },
+    request_digest: { enumerable: true, value: digest },
+  });
+  return Object.freeze(payload);
 }
 
 function assertPlannerTurnSucceeded(result: PlannerTurnResult, expected: PlannerTurnExpectation): void {
@@ -685,7 +846,10 @@ interface DecisionLogEntry {
     | 'reset_agent'
     | 'update_push_policy'
     | 'compact'
+    | 'spawn_coder'
+    | 'spawn_reviewer'
     | 'spawn_subagents'
+    | 'request_review'
     | 'planner_turn_control'
     | 'phase_error'
     | 'send_timeout'
@@ -798,6 +962,39 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
    */
   private logicalDispatches = new Map<string, Promise<AnyAutoloopMessage[]>>();
   private readonly settledDispatches = new Set<string>();
+  /**
+   * Bounded heavy preparation state. Settled entries retain no Promise or
+   * PreparedReviewRequest payload; Task 5 replaces this with the durable outbox.
+   */
+  private readonly reviewRequests = new Map<
+    string,
+    { digest: string; pending?: Promise<PreparedReviewRequest>; settled: boolean }
+  >();
+  /**
+   * Prepared messages whose first in-process queue handoff was interrupted.
+   * Task 5 replaces this bounded retry bridge with a restart-durable outbox.
+   */
+  private readonly releasedReviewRequests = new Map<
+    string,
+    {
+      digest: string;
+      prepared: PreparedReviewRequest;
+      claimed: boolean;
+      reconcileDecision?: Readonly<Record<string, unknown>>;
+    }
+  >();
+  /**
+   * Run-local accepted identity claims, keyed only by SHA-256(idempotency_key).
+   * At capacity a new identity fails closed so an accepted identity is never
+   * forgotten during this process lifetime. Task 5 owns restart durability.
+   */
+  private readonly reviewRequestIdentityHistory = new Map<string, string>();
+  /** Lazy bounded view of durable request_review claims in decisions.jsonl. */
+  private durableReviewRequestClaims: Map<string, IndexedReviewRequestClaim> | undefined;
+  /** Distinct checkpoint preparations currently holding heavyweight process and artifact state. */
+  private activeReviewRequestPreparations = 0;
+  /** Planner's compatibility effect owns its commit hook after the configured handler returns. */
+  private spawnCommitDeferralDepth = 0;
   /** Per-run FIFO gate for the Reviewer's one mutable sandbox and session. */
   private reviewerDispatchTail: Promise<void> = Promise.resolve();
 
@@ -1209,6 +1406,11 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         });
         this.setRoleStarted(role, true);
       } catch (err) {
+        // start() returned successfully, so this exact generation was
+        // physically created even when its started-event append failed. Freeze
+        // the role before any awaited cleanup so concurrent selection changes
+        // cannot rebind that process while its survival is being determined.
+        if (physicalStarted) this.setRoleStarted(role, true);
         if (physicalStarted) {
           try {
             await this.config.manager.stopSession(prepared.generation.session_name);
@@ -1216,17 +1418,64 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
             // The runtime probe below decides whether release is safe.
           }
         }
+        let runtime: AgentRuntimeLiveness = 'unknown';
         try {
-          if (
-            (await this.runtimeProbe.inspect(prepared.generation.session_name, prepared.generation.session_id)) ===
-            'absent'
-          ) {
-            await this.releaseGeneration(prepared.generation, true);
-          }
+          runtime = await this.runtimeProbe.inspect(prepared.generation.session_name, prepared.generation.session_id);
         } catch (cleanupErr) {
           this.logger.warn?.(
-            `[autoloop] failed to release generation ${prepared.generation.generation} after startup error: ${(cleanupErr as Error).message}`,
+            `[autoloop] failed to inspect generation ${prepared.generation.generation} after startup error: ${(cleanupErr as Error).message}`,
           );
+        }
+        if (runtime === 'absent') {
+          try {
+            await this.releaseGeneration(prepared.generation, true);
+            if (physicalStarted) this.setRoleStarted(role, false);
+          } catch (cleanupErr) {
+            this.logger.warn?.(
+              `[autoloop] failed to release generation ${prepared.generation.generation} after startup error: ${(cleanupErr as Error).message}`,
+            );
+          }
+        } else if (physicalStarted) {
+          try {
+            const current = this.currentGeneration(role);
+            if (
+              !current ||
+              current.generation !== prepared.generation.generation ||
+              current.owner_instance_id !== prepared.generation.owner_instance_id ||
+              current.session_id !== prepared.generation.session_id
+            ) {
+              this.conflict(
+                'AUTOLOOP_AGENT_GENERATION_CONFLICT',
+                role,
+                `changed while generation ${prepared.generation.generation} startup was being reconciled`,
+              );
+            }
+            if (current.state === 'live') {
+              // A committed append can throw after writing the row. Re-flush
+              // that authoritative row instead of appending duplicate evidence.
+              this.secureLedger.flushFlatFile('agent-generations.jsonl');
+            } else if (current.state === 'stale') {
+              this.appendGenerationEvent('agent_generation_started', {
+                ...prepared.generation,
+                last_activity_at: this.now().toISOString(),
+                state: 'live',
+              });
+            } else {
+              this.conflict(
+                'AUTOLOOP_AGENT_GENERATION_CONFLICT',
+                role,
+                `has invalid ${current.state} evidence while generation ${current.generation} startup is surviving`,
+              );
+            }
+          } catch (cleanupErr) {
+            // The original startup error remains the public failure. Keeping
+            // roleStarted=true preserves the exact in-memory selection and
+            // prevents a duplicate or cross-engine rebind until reconciliation
+            // can be completed safely.
+            this.logger.warn?.(
+              `[autoloop] failed to reconcile surviving generation ${prepared.generation.generation} after startup error: ${(cleanupErr as Error).message}`,
+            );
+          }
         }
         throw err;
       }
@@ -1488,16 +1737,9 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     return `${prompt}\n<autoloop_message>\n${message}\n</autoloop_message>`;
   }
 
-  /**
-   * Start Coder + Reviewer sessions. Idempotent. Called in response to a
-   * Planner spawn_subagents tool (the SessionManager wires this via
-   * onSpawnSubagents).
-   */
-  async spawnSubagents(args: SpawnSubagentsArgs = {}): Promise<void> {
-    if (this.terminal) return;
+  private nextCoderSelection(args: SpawnCoderArgs): AutoloopRoleSelection {
     const nextCoderEngine = args.coder_engine ?? this.coderSelection.engine;
-    const nextReviewerEngine = args.reviewer_engine ?? this.reviewerSelection.engine;
-    const nextCoder: AutoloopRoleSelection = {
+    return {
       ...this.coderSelection,
       engine: nextCoderEngine,
       model:
@@ -1507,7 +1749,11 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
             ? undefined
             : this.coderSelection.model,
     };
-    const nextReviewer: AutoloopRoleSelection = {
+  }
+
+  private nextReviewerSelection(args: SpawnReviewerArgs): AutoloopRoleSelection {
+    const nextReviewerEngine = args.reviewer_engine ?? this.reviewerSelection.engine;
+    return {
       ...this.reviewerSelection,
       engine: nextReviewerEngine,
       model:
@@ -1517,50 +1763,193 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
             ? undefined
             : this.reviewerSelection.model,
     };
-    this.validateSelection('coder', nextCoder);
-    this.validateSelection('reviewer', nextReviewer);
+  }
 
-    const coderChanged =
-      nextCoder.engine !== this.coderSelection.engine ||
-      this.roleModel('coder', nextCoder) !== this.roleModel('coder', this.coderSelection);
-    const reviewerChanged =
-      nextReviewer.engine !== this.reviewerSelection.engine ||
-      this.roleModel('reviewer', nextReviewer) !== this.roleModel('reviewer', this.reviewerSelection);
-    if (this.coderStarted && coderChanged) {
+  private assertSelectionCanStart(role: 'coder' | 'reviewer', next: AutoloopRoleSelection): void {
+    this.validateSelection(role, next);
+    const current = role === 'coder' ? this.coderSelection : this.reviewerSelection;
+    const changed = next.engine !== current.engine || this.roleModel(role, next) !== this.roleModel(role, current);
+    if (role === 'coder' && this.coderStarted && changed) {
       throw new Error('Cannot change Coder engine or model after its session has started');
     }
-    if (this.reviewerStarted && reviewerChanged) {
+    if (role === 'reviewer' && this.reviewerStarted && changed) {
       throw new Error('Cannot change Reviewer engine or model after its session has started');
     }
+  }
+
+  private requireLiveGeneration(role: 'coder' | 'reviewer'): PhysicalAgentGeneration {
+    const generation = this.currentGeneration(role);
+    if (!generation || generation.state !== 'live') {
+      throw new Error(`Autoloop ${role} session did not create or reuse a live generation`);
+    }
+    return generation;
+  }
+
+  private async persistCurrentRoleSelection(): Promise<void> {
+    await this.config.onRoleSelectionChanged?.({
+      coder: { engine: this.coderSelection.engine, model: this.coderSelection.model },
+      reviewer: { engine: this.reviewerSelection.engine, model: this.reviewerSelection.model },
+    });
+  }
+
+  private async persistSurvivingRoleSelection(): Promise<void> {
+    try {
+      await this.persistCurrentRoleSelection();
+    } catch (persistError) {
+      // Rollback has already proved the physical session may still be live, so
+      // retaining the in-memory selection is mandatory. Selection persistence
+      // is secondary to the startup failure that led here and must not replace
+      // that original public error.
+      this.logger.error?.(
+        `[autoloop] failed to persist a surviving role selection after startup error: ${(persistError as Error).message}`,
+      );
+    }
+  }
+
+  private async spawnCoderPrimitive(args: SpawnCoderArgs, record: boolean): Promise<PhysicalAgentGeneration> {
+    if (this.terminal) throw new Error('Cannot start Coder after the Autoloop run became terminal');
+    const nextCoder = this.nextCoderSelection(args);
+    this.assertSelectionCanStart('coder', nextCoder);
+    const previousCoder = this.coderSelection;
+    const coderWasStarted = this.coderStarted;
+    this.coderSelection = nextCoder;
+    let generation: PhysicalAgentGeneration;
+    try {
+      await this.ensureCoder();
+      if (this.terminal) throw new Error('Autoloop terminated while starting Coder');
+      generation = this.requireLiveGeneration('coder');
+    } catch (err) {
+      // Direct primitives clean up their own failed start. The compatibility
+      // wrapper passes record=false and owns every rollback attempt itself.
+      if (record) {
+        let restorePreviousSelection = true;
+        if (!coderWasStarted && this.coderStarted) {
+          const stopped = await this.stopRolledBackSession('coder', this.coderName);
+          this.coderStarted = !stopped;
+          restorePreviousSelection = stopped;
+        }
+        if (restorePreviousSelection) this.coderSelection = previousCoder;
+        else await this.persistSurvivingRoleSelection();
+      }
+      throw err;
+    }
+    if (record && !coderWasStarted) {
+      this.appendDecisionLog({
+        kind: 'spawn_coder',
+        actor: 'planner',
+        payload: {
+          coder_engine: nextCoder.engine,
+          coder_model: this.roleModel('coder', nextCoder),
+        },
+      });
+      await this.persistCurrentRoleSelection();
+    }
+    return generation;
+  }
+
+  private async spawnReviewerPrimitive(args: SpawnReviewerArgs, record: boolean): Promise<PhysicalAgentGeneration> {
+    if (this.terminal) throw new Error('Cannot start Reviewer after the Autoloop run became terminal');
+    const nextReviewer = this.nextReviewerSelection(args);
+    this.assertSelectionCanStart('reviewer', nextReviewer);
+    const previousReviewer = this.reviewerSelection;
+    const reviewerWasStarted = this.reviewerStarted;
+    this.reviewerSelection = nextReviewer;
+    let generation: PhysicalAgentGeneration;
+    try {
+      await this.ensureReviewer();
+      if (this.terminal) throw new Error('Autoloop terminated while starting Reviewer');
+      generation = this.requireLiveGeneration('reviewer');
+    } catch (err) {
+      // Direct primitives clean up their own failed start. The compatibility
+      // wrapper passes record=false and owns every rollback attempt itself.
+      if (record) {
+        let restorePreviousSelection = true;
+        if (!reviewerWasStarted && this.reviewerStarted) {
+          const stopped = await this.stopRolledBackSession('reviewer', this.reviewerName);
+          this.reviewerStarted = !stopped;
+          restorePreviousSelection = stopped;
+          if (stopped) this.reviewerSessionPrompt = null;
+        }
+        if (restorePreviousSelection) this.reviewerSelection = previousReviewer;
+        else await this.persistSurvivingRoleSelection();
+      }
+      throw err;
+    }
+    if (record && !reviewerWasStarted) {
+      this.appendDecisionLog({
+        kind: 'spawn_reviewer',
+        actor: 'planner',
+        payload: {
+          reviewer_engine: nextReviewer.engine,
+          reviewer_model: this.roleModel('reviewer', nextReviewer),
+        },
+      });
+      await this.persistCurrentRoleSelection();
+    }
+    return generation;
+  }
+
+  /** Start only the Coder session. */
+  async spawnCoder(args: SpawnCoderArgs = {}): Promise<PhysicalAgentGeneration> {
+    const wasStarted = this.coderStarted;
+    const generation = await this.spawnCoderPrimitive(args, true);
+    if (!wasStarted && this.spawnCommitDeferralDepth === 0) await this.config.onSpawnSubagentsCommitted?.();
+    return generation;
+  }
+
+  /** Start only the Reviewer session. */
+  async spawnReviewer(args: SpawnReviewerArgs = {}): Promise<PhysicalAgentGeneration> {
+    const wasStarted = this.reviewerStarted;
+    const generation = await this.spawnReviewerPrimitive(args, true);
+    if (!wasStarted && this.spawnCommitDeferralDepth === 0) await this.config.onSpawnSubagentsCommitted?.();
+    return generation;
+  }
+
+  /**
+   * Start Coder + Reviewer sessions. Idempotent compatibility wrapper. Both
+   * selections are validated before either independent primitive may start.
+   */
+  async spawnSubagents(args: SpawnSubagentsArgs = {}): Promise<void> {
+    if (this.terminal) return;
+    const coderArgs: SpawnCoderArgs = { coder_engine: args.coder_engine, coder_model: args.coder_model };
+    const reviewerArgs: SpawnReviewerArgs = {
+      reviewer_engine: args.reviewer_engine,
+      reviewer_model: args.reviewer_model,
+    };
+    const nextCoder = this.nextCoderSelection(coderArgs);
+    const nextReviewer = this.nextReviewerSelection(reviewerArgs);
+    this.assertSelectionCanStart('coder', nextCoder);
+    this.assertSelectionCanStart('reviewer', nextReviewer);
 
     const previousCoder = this.coderSelection;
     const previousReviewer = this.reviewerSelection;
     const coderWasStarted = this.coderStarted;
     const reviewerWasStarted = this.reviewerStarted;
-    this.coderSelection = nextCoder;
-    this.reviewerSelection = nextReviewer;
     try {
-      await this.ensureCoder();
+      await this.spawnCoderPrimitive(coderArgs, false);
       if (this.terminal) throw new Error('Autoloop terminated while starting subagents');
-      await this.ensureReviewer();
+      await this.spawnReviewerPrimitive(reviewerArgs, false);
       if (this.terminal) throw new Error('Autoloop terminated while starting subagents');
     } catch (err) {
-      // Roll back only what THIS call started. Crucially, `<role>Started` may be
-      // cleared only when the stop actually succeeded: SessionManager.startSession
-      // returns the EXISTING session for a name that is still live and ignores the
-      // new engine/model. So if we lied about the session being gone, the next
-      // spawn_subagents would sail past the "engine cannot change after start"
-      // guard, silently reuse the old engine's process, and still record the new
-      // engine in decisions.jsonl and the registry — the exact divergence that
-      // guard exists to prevent.
+      // Roll back only sessions started by this compatibility call. A failed
+      // stop leaves the role marked started so later selection changes cannot
+      // silently bind to the surviving process under different metadata.
+      let coderSurvivedRollback = false;
+      let reviewerSurvivedRollback = false;
       if (!coderWasStarted && this.coderStarted) {
-        this.coderStarted = !(await this.stopRolledBackSession('coder', this.coderName));
+        const stopped = await this.stopRolledBackSession('coder', this.coderName);
+        this.coderStarted = !stopped;
+        coderSurvivedRollback = !stopped;
       }
       if (!reviewerWasStarted && this.reviewerStarted) {
-        this.reviewerStarted = !(await this.stopRolledBackSession('reviewer', this.reviewerName));
+        const stopped = await this.stopRolledBackSession('reviewer', this.reviewerName);
+        this.reviewerStarted = !stopped;
+        reviewerSurvivedRollback = !stopped;
+        if (stopped) this.reviewerSessionPrompt = null;
       }
-      this.coderSelection = previousCoder;
-      this.reviewerSelection = previousReviewer;
+      this.coderSelection = coderSurvivedRollback ? nextCoder : previousCoder;
+      this.reviewerSelection = reviewerSurvivedRollback ? nextReviewer : previousReviewer;
+      if (coderSurvivedRollback || reviewerSurvivedRollback) await this.persistSurvivingRoleSelection();
       throw err;
     }
     const effectiveSelection = {
@@ -1578,6 +1967,374 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       },
     });
     await this.config.onRoleSelectionChanged?.(effectiveSelection);
+    if (this.spawnCommitDeferralDepth === 0) await this.config.onSpawnSubagentsCommitted?.();
+  }
+
+  private async assertWorkspaceHead(request: RequestReviewArgs): Promise<void> {
+    const head = await this.runGitEvidence(
+      ['git', 'rev-parse', '--verify', 'HEAD'],
+      MAX_GIT_HEAD_STDOUT_BYTES,
+      'workspace HEAD',
+    );
+    const headDetail = (head.err.length > 0 ? head.err : head.out).toString('utf8').trim().slice(0, 300);
+    if (head.code !== 0) {
+      throw new Error(
+        `Reviewer-only checkpoint could not verify workspace HEAD (code=${head.code}): ${headDetail || 'no output'}`,
+      );
+    }
+    const workspaceHead = head.out.toString('ascii').trim();
+    if (workspaceHead !== request.checkpoint_sha) {
+      throw new Error(
+        `Reviewer-only checkpoint ${request.checkpoint_sha} does not match workspace HEAD ${workspaceHead || '(empty)'}`,
+      );
+    }
+  }
+
+  private async assertCheckpointPatch(request: RequestReviewArgs, importedPatch: Buffer): Promise<void> {
+    const shown = await this.runGitEvidence(
+      [
+        'git',
+        'show',
+        '--no-ext-diff',
+        '--no-textconv',
+        '--format=',
+        '--unified=3',
+        '--no-renames',
+        request.checkpoint_sha,
+        '--',
+      ],
+      importedPatch.length,
+      'checkpoint patch',
+      importedPatch,
+    );
+    const showDetail = (shown.err.length > 0 ? shown.err : shown.out).toString('utf8').trim().slice(0, 300);
+    if (shown.code !== 0) {
+      throw new Error(
+        `Reviewer-only checkpoint patch could not be read (code=${shown.code}): ${showDetail || 'no output'}`,
+      );
+    }
+  }
+
+  private preparedCheckpointReview(request: RequestReviewArgs, targetIter: number): PreparedReviewRequest {
+    const payload = canonicalizeMessage(
+      Msg.reviewRequest(targetIter, {
+        iter: targetIter,
+        ledger_path: this.ledgerDir,
+        prior_metrics: [],
+        ...request,
+      }),
+    ).payload as CheckpointReviewRequestPayload;
+    return Object.freeze({
+      status: 'prepared',
+      target: 'reviewer',
+      idempotency_key: request.idempotency_key,
+      payload,
+    });
+  }
+
+  private async prepareCheckpointReview(
+    request: RequestReviewArgs,
+    targetIter: number,
+    digest: string,
+  ): Promise<PreparedReviewRequest> {
+    if (this.terminal) throw new Error('Cannot request review after the Autoloop run became terminal');
+
+    // Establish repository identity before opening any caller-selected source
+    // run. A wrong checkpoint cannot trigger source-ledger inspection.
+    await this.assertWorkspaceHead(request);
+    if (this.terminal) throw new Error('Autoloop terminated while preparing the Reviewer-only request');
+
+    const sourceLedger =
+      request.source_run_id === this.config.runId
+        ? this.secureLedger
+        : SecureAutoloopLedger.openReadOnly(this.config.workspace, request.source_run_id);
+    const artifacts = new Map<ReviewEvidenceArtifact, Buffer>();
+    const importedPatch = sourceLedger.readIterationArtifact(request.source_iter, 'diff.patch');
+    if (importedPatch === undefined) {
+      throw new Error(
+        `Reviewer-only request requires source run '${request.source_run_id}' iter ${request.source_iter}/diff.patch`,
+      );
+    }
+    await this.assertCheckpointPatch(request, importedPatch);
+    artifacts.set('diff.patch', importedPatch);
+
+    for (const name of ['directive.json', 'eval_output.json', 'coder_summary.txt'] as const) {
+      const content = sourceLedger.readIterationArtifact(request.source_iter, name);
+      if (content === undefined) {
+        throw new Error(
+          `Reviewer-only request requires source run '${request.source_run_id}' iter ${request.source_iter}/${name}`,
+        );
+      }
+      artifacts.set(name, content);
+    }
+    if (this.terminal) throw new Error('Autoloop terminated while preparing the Reviewer-only request');
+
+    const prepared = this.preparedCheckpointReview(request, targetIter);
+
+    // Import exact source bytes into this run's immutable iteration boundary.
+    // This gives the existing Reviewer sandbox staging path a complete local
+    // artifact set without creating or directing a Coder.
+    for (const [name, content] of artifacts) {
+      this.secureLedger.writeIterationArtifact(targetIter, name, content);
+    }
+    const decisionPayload = reviewRequestDecisionPayload(request, targetIter, digest);
+    this.persistReviewRequestDecision(decisionPayload);
+
+    return prepared;
+  }
+
+  private trimReviewRequests(): void {
+    if (this.reviewRequests.size <= MAX_RETAINED_DISPATCHES) return;
+    for (const [key, entry] of this.reviewRequests) {
+      if (this.reviewRequests.size <= MAX_RETAINED_DISPATCHES) break;
+      if (!entry.settled) continue;
+      this.reviewRequests.delete(key);
+    }
+  }
+
+  private reviewRequestIdentityHash(idempotencyKey: string): string {
+    return createHash('sha256').update(idempotencyKey).digest('hex');
+  }
+
+  private loadDurableReviewRequestClaims(forceRefresh = false): Map<string, IndexedReviewRequestClaim> {
+    if (!forceRefresh && this.durableReviewRequestClaims) return this.durableReviewRequestClaims;
+    const index = indexReviewRequestClaims(readBoundedDecisionLedger(this.secureLedger));
+    if (index.size > 0) {
+      // A cold process must establish the file + parent-directory barrier
+      // before treating an existing request_review row as authority.
+      this.secureLedger.flushFlatFile('decisions.jsonl');
+    }
+    const complete = mergeReviewRequestClaimIndexes(index, this.durableReviewRequestClaims);
+    this.durableReviewRequestClaims = complete;
+    return complete;
+  }
+
+  private findDurableReviewRequest(
+    expected: Readonly<Record<string, unknown>>,
+    forceRefresh = false,
+  ): 'none' | 'matching' | 'conflicting' {
+    const wanted = reviewRequestClaim(expected);
+    if (!wanted?.signature) throw new Error('request_review durable claim is not canonical');
+    const observed = this.loadDurableReviewRequestClaims(forceRefresh).get(wanted.identityHash);
+    if (!observed) return 'none';
+    if (observed.conflicting || observed.signature !== wanted.signature) return 'conflicting';
+    return 'matching';
+  }
+
+  private cacheDurableReviewRequest(expected: Readonly<Record<string, unknown>>): void {
+    const claim = reviewRequestClaim(expected);
+    if (!claim?.signature) throw new Error('request_review durable claim is not canonical');
+    const current = this.durableReviewRequestClaims;
+    if (!current) throw new Error('request_review durable claim cache is unavailable');
+    const index = new Map(current);
+    const existing = index.get(claim.identityHash);
+    if (existing && (existing.conflicting || existing.signature !== claim.signature)) {
+      index.set(claim.identityHash, { conflicting: true });
+    } else {
+      index.set(claim.identityHash, { signature: claim.signature, conflicting: false });
+    }
+    this.durableReviewRequestClaims = index;
+  }
+
+  private durableReviewRequestIdentityCount(): number {
+    const durable = this.durableReviewRequestClaims;
+    let count = durable?.size ?? 0;
+    for (const identityHash of this.reviewRequestIdentityHistory.keys()) {
+      if (!durable?.has(identityHash)) count += 1;
+    }
+    return count;
+  }
+
+  private persistReviewRequestDecision(decisionPayload: Readonly<Record<string, unknown>>): void {
+    const decision = {
+      ts: this.now().toISOString(),
+      kind: 'request_review',
+      actor: 'planner',
+      payload: decisionPayload,
+    } satisfies DecisionLogEntry;
+    try {
+      this.secureLedger.appendFlatFile('decisions.jsonl', `${JSON.stringify(decision)}\n`, true);
+      this.cacheDurableReviewRequest(decisionPayload);
+    } catch (error) {
+      if (!isCommittedSecureLedgerError(error) || error.operation !== 'secure_ledger_append') throw error;
+      try {
+        if (this.findDurableReviewRequest(decisionPayload, true) !== 'matching') throw error;
+      } catch (reconciliationError) {
+        if (reconciliationError !== error) {
+          error.secondaryErrors.push(
+            reconciliationError instanceof Error ? reconciliationError : new Error(String(reconciliationError)),
+          );
+        }
+        throw error;
+      }
+    }
+  }
+
+  /** Re-arm one prepared message when its current queue handoff aborts. */
+  private releaseReviewRequest(idempotencyKey: string, payload: CheckpointReviewRequestPayload): void {
+    const identityHash = this.reviewRequestIdentityHash(idempotencyKey);
+    const digest = this.reviewRequestIdentityHistory.get(identityHash);
+    if (digest === undefined) return;
+    const existing = this.releasedReviewRequests.get(identityHash);
+    if (existing) {
+      if (existing.digest === digest) existing.claimed = false;
+      return;
+    }
+    this.releasedReviewRequests.set(identityHash, {
+      digest,
+      prepared: Object.freeze({
+        status: 'prepared',
+        target: 'reviewer',
+        idempotency_key: idempotencyKey,
+        payload,
+      }),
+      claimed: false,
+    });
+  }
+
+  /** Complete the in-process handoff; later same-key calls are duplicates. */
+  private acceptReviewRequest(idempotencyKey: string): void {
+    this.releasedReviewRequests.delete(this.reviewRequestIdentityHash(idempotencyKey));
+  }
+
+  /** Prepare an existing checkpoint for one Runner-routed Reviewer delivery. */
+  async requestReview(args: RequestReviewArgs, targetIter: number): Promise<ReviewRequestPreparationResult> {
+    if (this.terminal) throw new Error('Cannot request review after the Autoloop run became terminal');
+    const request = canonicalizeRequestReviewArgs(args);
+    if (!Number.isSafeInteger(targetIter) || targetIter < 0) {
+      throw new Error('request_review target iteration must be a nonnegative safe integer');
+    }
+    const digestMaterial = Object.create(null) as Record<string, unknown>;
+    Object.defineProperty(digestMaterial, 'target_iter', { enumerable: true, value: targetIter });
+    Object.defineProperty(digestMaterial, 'request', { enumerable: true, value: request });
+    const digest = createHash('sha256').update(JSON.stringify(digestMaterial)).digest('hex');
+    const identityHash = this.reviewRequestIdentityHash(request.idempotency_key);
+    const released = this.releasedReviewRequests.get(identityHash);
+    if (released) {
+      if (released.digest !== digest) {
+        throw new Error(`request_review idempotency key '${request.idempotency_key}' conflicts with another request`);
+      }
+      if (released.reconcileDecision) {
+        const durableClaim = this.findDurableReviewRequest(released.reconcileDecision, true);
+        if (durableClaim === 'conflicting') {
+          throw new Error(`request_review idempotency key '${request.idempotency_key}' conflicts with another request`);
+        }
+        if (durableClaim !== 'matching') {
+          throw new Error(
+            `request_review idempotency key '${request.idempotency_key}' has an unresolved committed decision`,
+          );
+        }
+        delete released.reconcileDecision;
+      }
+      if (!released.claimed) {
+        released.claimed = true;
+        return released.prepared;
+      }
+      return Object.freeze({
+        status: 'duplicate',
+        target: 'reviewer',
+        idempotency_key: request.idempotency_key,
+      });
+    }
+    const inFlight = this.reviewRequests.get(identityHash);
+    if (inFlight && !inFlight.settled && inFlight.pending) {
+      if (inFlight.digest !== digest) {
+        throw new Error(`request_review idempotency key '${request.idempotency_key}' conflicts with another request`);
+      }
+      await inFlight.pending;
+      return Object.freeze({
+        status: 'duplicate',
+        target: 'reviewer',
+        idempotency_key: request.idempotency_key,
+      });
+    }
+
+    const decisionPayload = reviewRequestDecisionPayload(request, targetIter, digest);
+    const durableClaim = this.findDurableReviewRequest(decisionPayload);
+    if (durableClaim === 'matching') {
+      this.reviewRequestIdentityHistory.set(identityHash, digest);
+      return Object.freeze({
+        status: 'duplicate',
+        target: 'reviewer',
+        idempotency_key: request.idempotency_key,
+      });
+    }
+    if (durableClaim === 'conflicting') {
+      throw new Error(`request_review idempotency key '${request.idempotency_key}' conflicts with another request`);
+    }
+    const acceptedDigest = this.reviewRequestIdentityHistory.get(identityHash);
+    if (acceptedDigest !== undefined) {
+      if (acceptedDigest !== digest) {
+        throw new Error(`request_review idempotency key '${request.idempotency_key}' conflicts with another request`);
+      }
+      return Object.freeze({
+        status: 'duplicate',
+        target: 'reviewer',
+        idempotency_key: request.idempotency_key,
+      });
+    }
+    if (this.durableReviewRequestIdentityCount() >= MAX_REVIEW_REQUEST_IDENTITIES) {
+      throw new Error(
+        `request_review identity history reached its ${MAX_REVIEW_REQUEST_IDENTITIES}-entry capacity; refusing a new identity`,
+      );
+    }
+    if (this.activeReviewRequestPreparations >= MAX_CONCURRENT_REVIEW_REQUEST_PREPARATIONS) {
+      throw new Error(
+        `request_review simultaneous preparation capacity is ${MAX_CONCURRENT_REVIEW_REQUEST_PREPARATIONS}; refusing a new identity`,
+      );
+    }
+    if (this.releasedReviewRequests.size >= MAX_RETAINED_DISPATCHES) {
+      throw new Error(
+        `request_review interrupted handoff capacity is ${MAX_RETAINED_DISPATCHES}; retry an existing identity first`,
+      );
+    }
+
+    this.reviewRequestIdentityHistory.set(identityHash, digest);
+    this.activeReviewRequestPreparations += 1;
+    const pending = this.prepareCheckpointReview(request, targetIter, digest);
+    const entry: { digest: string; pending?: Promise<PreparedReviewRequest>; settled: boolean } = {
+      digest,
+      pending,
+      settled: false,
+    };
+    this.reviewRequests.set(identityHash, entry);
+    try {
+      const result = await pending;
+      entry.settled = true;
+      delete entry.pending;
+      this.trimReviewRequests();
+      return result;
+    } catch (error) {
+      if (this.reviewRequests.get(identityHash) === entry) {
+        this.reviewRequests.delete(identityHash);
+      }
+      let retainIdentity = false;
+      let requiresReconciliation = false;
+      if (isCommittedSecureLedgerError(error) && error.operation === 'secure_ledger_append') {
+        try {
+          retainIdentity = this.findDurableReviewRequest(decisionPayload, true) === 'matching';
+        } catch {
+          // A committed decision append with an unreadable ledger remains
+          // ambiguous. Fail closed until a later in-process retry can reconcile it.
+          retainIdentity = true;
+          requiresReconciliation = true;
+        }
+      }
+      if (retainIdentity) {
+        this.releasedReviewRequests.set(identityHash, {
+          digest,
+          prepared: this.preparedCheckpointReview(request, targetIter),
+          claimed: false,
+          ...(requiresReconciliation ? { reconcileDecision: decisionPayload } : {}),
+        });
+      }
+      if (!retainIdentity && this.reviewRequestIdentityHistory.get(identityHash) === digest) {
+        this.reviewRequestIdentityHistory.delete(identityHash);
+      }
+      throw error;
+    } finally {
+      this.activeReviewRequestPreparations -= 1;
+    }
   }
 
   /**
@@ -2224,16 +2981,25 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       assertActive: () => {
         if (this.terminal) throw new Error('Autoloop run became terminal during Planner control application');
       },
+      spawnCoder: async (args) => await this.spawnCoder(args),
+      spawnReviewer: async (args) => await this.spawnReviewer(args),
       spawnSubagents: async (args) => {
         if (this.terminal) return;
         if (this.config.onSpawnSubagents) {
-          await this.config.onSpawnSubagents(args);
+          this.spawnCommitDeferralDepth += 1;
+          try {
+            await this.config.onSpawnSubagents(args);
+          } finally {
+            this.spawnCommitDeferralDepth -= 1;
+          }
           if (this.terminal) return;
           await this.config.onSpawnSubagentsCommitted?.();
         } else {
           this.logger.warn?.('[autoloop] spawn_subagents called but no handler is installed');
         }
       },
+      requestReview: async (args, targetIter) => await this.requestReview(args, targetIter),
+      releaseReviewRequest: (idempotencyKey, payload) => this.releaseReviewRequest(idempotencyKey, payload),
       updatePushPolicy: (delta) => {
         if (this.terminal) return;
         if (!this.config.pushPolicyRef) return;
@@ -2337,27 +3103,40 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
           .join('; ')}`,
       );
     }
-    if (this.terminal) return [];
-    // Replay history is accepted-turn state. Commit both sides together only
-    // after parse, validation, durable evidence, and all control application
-    // have passed; rejected Planner output must not be replayed on retry.
-    this.recordTurn('planner', 'user', promptText);
-    this.recordTurn('planner', 'agent', replyText);
-    // Emit cleaned reply (without raw JSON blocks) for the chat tool to surface.
-    const surfacedReply =
-      parsed.cleaned_reply ||
-      (persistedControl ? `Planner controls persisted: ${persistedControl.tools.join(', ')}` : '');
-    if (surfacedReply) {
-      this.emit('planner_reply', surfacedReply, {
-        message_id: env.msg_id,
-        dispatch_id: dispatchId,
-        iter: env.iter,
-      });
-      this.appendChatEntry({ who: 'planner', text: surfacedReply, ts: new Date().toISOString() });
+    const reviewPayloads = handlerResult.emitted_messages
+      .filter((message) => message.type === 'review_request' && 'idempotency_key' in message.payload)
+      .map((message) => message.payload as CheckpointReviewRequestPayload);
+    let handoffAccepted = reviewPayloads.length === 0;
+    try {
+      if (this.terminal) return [];
+      // Replay history is accepted-turn state. Commit both sides together only
+      // after parse, validation, durable evidence, and all control application
+      // have passed; rejected Planner output must not be replayed on retry.
+      this.recordTurn('planner', 'user', promptText);
+      this.recordTurn('planner', 'agent', replyText);
+      // Emit cleaned reply (without raw JSON blocks) for the chat tool to surface.
+      const surfacedReply =
+        parsed.cleaned_reply ||
+        (persistedControl ? `Planner controls persisted: ${persistedControl.tools.join(', ')}` : '');
+      if (surfacedReply) {
+        this.emit('planner_reply', surfacedReply, {
+          message_id: env.msg_id,
+          dispatch_id: dispatchId,
+          iter: env.iter,
+        });
+        this.appendChatEntry({ who: 'planner', text: surfacedReply, ts: new Date().toISOString() });
+      }
+      // Auto-compact after each Planner turn if context is filling up.
+      await this.maybeCompact('planner', this.plannerName);
+      if (this.terminal) return [];
+      for (const payload of reviewPayloads) this.acceptReviewRequest(payload.idempotency_key);
+      handoffAccepted = true;
+      return handlerResult.emitted_messages;
+    } finally {
+      if (!handoffAccepted) {
+        for (const payload of reviewPayloads) this.releaseReviewRequest(payload.idempotency_key, payload);
+      }
     }
-    // Auto-compact after each Planner turn if context is filling up.
-    await this.maybeCompact('planner', this.plannerName);
-    return handlerResult.emitted_messages;
   }
 
   // ─── Coder ──────────────────────────────────────────────────────────────
@@ -2596,7 +3375,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         );
       });
     } catch (err) {
-      this.reviewerSessionPrompt = null;
+      if (!this.reviewerStarted) this.reviewerSessionPrompt = null;
       throw err;
     }
   }
@@ -2624,7 +3403,19 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     await this.ensureReviewer();
     if (this.terminal) return [];
 
-    const promptText = `[review_request iter=${iter}]\nArtifacts staged at: iter-${iter}/ (directive.json, diff.patch, eval_output.json)\nprior_verdict: ${staged.priorVerdict ? 'prior_verdict.json' : '(none)'}\nprior_metrics: ${JSON.stringify(env.payload.prior_metrics)}\n\nAudit and emit \`review_complete\`.`;
+    const promptText =
+      'checkpoint_sha' in env.payload
+        ? [
+            `[review_request iter=${iter}]`,
+            `Artifacts staged from run ${env.payload.source_run_id} iter ${env.payload.source_iter} at: iter-${iter}/ (directive.json, diff.patch, eval_output.json)`,
+            `checkpoint_sha: ${env.payload.checkpoint_sha}`,
+            `scope: ${JSON.stringify(env.payload.scope)}`,
+            `prior_verdict: ${staged.priorVerdict ? 'prior_verdict.json' : '(none)'}`,
+            `prior_metrics: ${JSON.stringify(env.payload.prior_metrics)}`,
+            '',
+            'Audit and emit `review_complete`.',
+          ].join('\n')
+        : `[review_request iter=${iter}]\nArtifacts staged at: iter-${iter}/ (directive.json, diff.patch, eval_output.json)\nprior_verdict: ${staged.priorVerdict ? 'prior_verdict.json' : '(none)'}\nprior_metrics: ${JSON.stringify(env.payload.prior_metrics)}\n\nAudit and emit \`review_complete\`.`;
 
     // Heartbeat so the dashboard's Reviewer pane shows "auditing" the moment
     // a review_request lands, instead of staying blank until the verdict.
@@ -2802,6 +3593,150 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       child.stderr?.on('data', (b) => (err += b.toString()));
       child.on('error', (e) => resolve({ code: 127, out: '', err: (e as Error).message }));
       child.on('exit', (code) => resolve({ code: code ?? 0, out, err }));
+    });
+  }
+
+  /** Internal deterministic test seam; production always uses argv-safe spawn. */
+  private spawnGitEvidenceProcess(argv: string[]): ChildProcess {
+    const environment = Object.create(null) as NodeJS.ProcessEnv;
+    for (const [name, value] of Object.entries(process.env)) {
+      if (!name.toUpperCase().startsWith('GIT_')) environment[name] = value;
+    }
+    return spawn(argv[0], argv.slice(1), {
+      cwd: this.config.workspace,
+      detached: process.platform !== 'win32',
+      env: environment,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+  }
+
+  /** Kill the complete evidence command tree, not merely its immediate shell-free child. */
+  private killGitEvidenceProcess(child: ChildProcess): void {
+    const pid = child.pid;
+    if (pid !== undefined && process.platform !== 'win32') {
+      try {
+        process.kill(-pid, 'SIGKILL');
+        return;
+      } catch {
+        // The group may already have exited; fall through to the child handle.
+      }
+    } else if (pid !== undefined) {
+      try {
+        const killer = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], {
+          detached: false,
+          stdio: 'ignore',
+          windowsHide: true,
+        });
+        killer.unref();
+      } catch {
+        // Fall through to ChildProcess.kill when taskkill could not start.
+      }
+    }
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      // Best effort after the promise has already been deterministically settled.
+    }
+  }
+
+  /**
+   * Run one bounded read-only Git evidence command. When expectedStdout is
+   * provided, stdout is compared chunk-by-chunk and never accumulated.
+   */
+  private async runGitEvidence(
+    argv: string[],
+    maxStdoutBytes: number,
+    label: string,
+    expectedStdout?: Buffer,
+  ): Promise<{ code: number; out: Buffer; err: Buffer }> {
+    return await new Promise((resolve, reject) => {
+      const child = this.spawnGitEvidenceProcess(argv);
+      const stdout: Buffer[] = [];
+      const stderr: Buffer[] = [];
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      let comparedBytes = 0;
+      let settled = false;
+
+      const cleanup = (): void => {
+        clearTimeout(timeout);
+        child.stdout?.removeListener('data', onStdout);
+        child.stderr?.removeListener('data', onStderr);
+        child.removeListener('error', onError);
+        child.removeListener('close', onClose);
+      };
+      const fail = (error: Error): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        this.killGitEvidenceProcess(child);
+        reject(error);
+      };
+      const onStdout = (value: Buffer | string): void => {
+        if (settled) return;
+        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        stdoutBytes += chunk.length;
+        if (stdoutBytes > maxStdoutBytes) {
+          fail(
+            new Error(
+              expectedStdout
+                ? `Reviewer-only checkpoint Git ${label} output is longer than source diff.patch (${maxStdoutBytes} bytes)`
+                : `Reviewer-only Git ${label} output is longer than the ${maxStdoutBytes}-byte limit`,
+            ),
+          );
+          return;
+        }
+        if (expectedStdout) {
+          if (
+            comparedBytes + chunk.length > expectedStdout.length ||
+            !chunk.equals(expectedStdout.subarray(comparedBytes, comparedBytes + chunk.length))
+          ) {
+            fail(new Error(`Reviewer-only source diff.patch does not match checkpoint Git ${label} output`));
+            return;
+          }
+          comparedBytes += chunk.length;
+          return;
+        }
+        stdout.push(chunk);
+      };
+      const onStderr = (value: Buffer | string): void => {
+        if (settled) return;
+        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        stderrBytes += chunk.length;
+        if (stderrBytes > MAX_GIT_EVIDENCE_STDERR_BYTES) {
+          fail(new Error(`Reviewer-only Git ${label} stderr exceeds the ${MAX_GIT_EVIDENCE_STDERR_BYTES}-byte limit`));
+          return;
+        }
+        stderr.push(chunk);
+      };
+      const onError = (error: Error): void => {
+        fail(new Error(`Reviewer-only Git ${label} could not start: ${error.message}`, { cause: error }));
+      };
+      const onClose = (code: number | null, signal: NodeJS.Signals | null): void => {
+        if (settled) return;
+        const exitCode = code ?? (signal ? 1 : 0);
+        if (exitCode === 0 && expectedStdout && comparedBytes !== expectedStdout.length) {
+          fail(new Error(`Reviewer-only source diff.patch does not match checkpoint Git ${label} output`));
+          return;
+        }
+        settled = true;
+        cleanup();
+        resolve({
+          code: exitCode,
+          out: expectedStdout ? Buffer.alloc(0) : Buffer.concat(stdout, stdoutBytes),
+          err: Buffer.concat(stderr, stderrBytes),
+        });
+      };
+      const timeout = setTimeout(() => {
+        fail(new Error(`Reviewer-only Git evidence ${label} timed out after ${GIT_EVIDENCE_TIMEOUT_MS}ms`));
+      }, GIT_EVIDENCE_TIMEOUT_MS);
+      timeout.unref();
+
+      child.stdout?.on('data', onStdout);
+      child.stderr?.on('data', onStderr);
+      child.once('error', onError);
+      child.once('close', onClose);
     });
   }
 

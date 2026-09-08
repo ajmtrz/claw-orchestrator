@@ -9,6 +9,7 @@ import {
   openPrivateAutoloopDecisions,
   SecureAutoloopLedger,
   SecureAutoloopLedgerCommitError,
+  type SecureAutoloopLedgerOptions,
   type SecureAutoloopIterationArtifact,
   type SecureAutoloopFlatFile,
 } from '../autoloop/secure-ledger.js';
@@ -130,6 +131,43 @@ describe('SecureAutoloopLedger', () => {
     }
   });
 
+  it('opens a foreign ledger read-only without repairing directory or flat-file permissions', () => {
+    const workspace = tempWorkspace();
+    const writer = SecureAutoloopLedger.open(workspace, 'foreign-run', { create: true });
+    seedCompleteReviewerArtifacts(writer, 3);
+    writer.appendFlatFile('decisions.jsonl', '{"preserved":true}\n');
+    const tasksDir = path.join(workspace, 'tasks');
+    const runDir = writer.directory;
+    const iterRoot = path.join(runDir, 'iter');
+    const iterDir = path.join(iterRoot, '3');
+    const decisions = path.join(runDir, 'decisions.jsonl');
+    const directive = path.join(iterDir, 'directive.json');
+    fs.chmodSync(tasksDir, 0o755);
+    fs.chmodSync(runDir, 0o751);
+    fs.chmodSync(iterRoot, 0o755);
+    fs.chmodSync(iterDir, 0o751);
+    fs.chmodSync(decisions, 0o644);
+    fs.chmodSync(directive, 0o640);
+    const before = {
+      modes: [tasksDir, runDir, iterRoot, iterDir, decisions, directive].map(permissions),
+      decisions: fs.readFileSync(decisions),
+      directive: fs.readFileSync(directive),
+    };
+    const readOnly = (
+      SecureAutoloopLedger as unknown as {
+        openReadOnly(workspacePath: string, runId: string): SecureAutoloopLedger;
+      }
+    ).openReadOnly(workspace, 'foreign-run');
+
+    expect(readOnly.readIterationArtifact(3, 'directive.json')).toEqual(before.directive);
+    expect(readOnly.readFlatFile('decisions.jsonl')).toBe(before.decisions.toString('utf8'));
+    expect([tasksDir, runDir, iterRoot, iterDir, decisions, directive].map(permissions)).toEqual(before.modes);
+    expect(fs.readFileSync(decisions)).toEqual(before.decisions);
+    expect(fs.readFileSync(directive)).toEqual(before.directive);
+    expect(() => readOnly.writeIterationArtifact(3, 'directive.json', before.directive)).toThrow(/read-only/i);
+    expect(() => readOnly.appendFlatFile('decisions.jsonl', '{}\n')).toThrow(/read-only/i);
+  });
+
   it.each(['symlink', 'file'] as const)('rejects a %s tasks parent', (kind) => {
     const workspace = tempWorkspace();
     const tasksDir = path.join(workspace, 'tasks');
@@ -229,6 +267,41 @@ describe('SecureAutoloopLedger', () => {
 
     expect(ledger.readFlatFile('chat.jsonl')).toBe('{"n":1}\n{"n":2}\n');
     expect(permissions(path.join(ledger.directory, 'chat.jsonl'))).toBe(0o600);
+  });
+
+  it('classifies a descriptor-close failure after a complete flat-file append as committed', () => {
+    const workspace = tempWorkspace();
+    const closeFailure = new Error('injected post-write descriptor close failure');
+    let failClose = true;
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+      create: true,
+      testHooks: {
+        closeFlatFileDescriptor: (fd) => {
+          fs.closeSync(fd);
+          if (failClose) {
+            failClose = false;
+            throw closeFailure;
+          }
+        },
+      },
+    });
+
+    let observed: unknown;
+    try {
+      ledger.appendFlatFile('decisions.jsonl', '{"kind":"request_review"}\n');
+    } catch (error) {
+      observed = error;
+    }
+
+    expect(observed).toBeInstanceOf(SecureAutoloopLedgerCommitError);
+    expect(observed).toMatchObject({
+      code: 'AUTOLOOP_LEDGER_DESCRIPTOR_CLOSE_INCOMPLETE',
+      committed: true,
+      retryable: false,
+      operation: 'secure_ledger_append',
+    });
+    expect((observed as Error & { cause?: unknown }).cause).toBe(closeFailure);
+    expect(fs.readFileSync(path.join(ledger.directory, 'decisions.jsonl'), 'utf8')).toBe('{"kind":"request_review"}\n');
   });
 
   it('rejects a hardlink inserted immediately before permission mutation', () => {
@@ -913,6 +986,204 @@ describe('SecureAutoloopLedger', () => {
       expect(permissions(path.join(iterDir, 'directive.json'))).toBe(0o600);
       expect(fs.readFileSync(path.join(iterDir, 'directive.json'))).toEqual(bytes);
     });
+
+    it('rejects an oversized bounded artifact from the opened descriptor before reading its contents', () => {
+      const workspace = tempWorkspace();
+      const beforeContentRead = vi.fn();
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: { beforeNestedChildContentRead: beforeContentRead },
+      });
+      ledger.writeIterationArtifact(0, 'directive.json', 'seed iteration directory\n');
+      const target = path.join(ledger.directory, 'iter', '0', 'diff.patch');
+      const fd = fs.openSync(target, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+      try {
+        fs.ftruncateSync(fd, 1_025);
+      } finally {
+        fs.closeSync(fd);
+      }
+      beforeContentRead.mockClear();
+
+      expect(() => ledger.readIterationArtifact(0, 'diff.patch', 1_024)).toThrow(/diff\.patch.*1024-byte limit/i);
+      expect(beforeContentRead).not.toHaveBeenCalled();
+
+      expect(ledger.readIterationArtifact(0, 'diff.patch')).toHaveLength(1_025);
+      expect(beforeContentRead).toHaveBeenCalledTimes(1);
+      expect(beforeContentRead).toHaveBeenCalledWith(
+        expect.objectContaining({
+          filePath: target,
+          label: expect.stringMatching(/iteration 0 artifact/i),
+          size: 1_025,
+        }),
+      );
+    });
+
+    it.each(['directive.json', 'eval_output.json', 'coder_summary.txt', 'diff.patch'] as const)(
+      'enforces the Reviewer evidence limit automatically while staging %s after import',
+      (artifactName) => {
+        const workspace = tempWorkspace();
+        const contentReads = vi.fn();
+        const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+          create: true,
+          testHooks: {
+            beforeNestedChildContentRead: (event) => contentReads(event),
+          },
+        });
+        seedCompleteReviewerArtifacts(ledger, 0);
+        ledger.stageReviewerSandbox(0);
+        const target = path.join(ledger.directory, 'iter', '0', artifactName);
+        fs.truncateSync(target, 4_194_305);
+        contentReads.mockClear();
+
+        expect(() => ledger.stageReviewerSandbox(0)).toThrow(
+          new RegExp(`${artifactName.replace('.', '\\.')}.*4194304-byte limit`, 'i'),
+        );
+        expect(contentReads.mock.calls.some(([event]) => (event as { filePath: string }).filePath === target)).toBe(
+          false,
+        );
+      },
+    );
+
+    it.each(['directive.json', 'eval_output.json', 'coder_summary.txt', 'diff.patch'] as const)(
+      'enforces the Reviewer evidence limit automatically while reconciling an existing %s write',
+      (artifactName) => {
+        const workspace = tempWorkspace();
+        const contentReads = vi.fn();
+        const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+          create: true,
+          testHooks: {
+            beforeNestedChildContentRead: (event) => contentReads(event),
+          },
+        });
+        ledger.writeIterationArtifact(0, artifactName, 'original\n');
+        const target = path.join(ledger.directory, 'iter', '0', artifactName);
+        fs.truncateSync(target, 4_194_305);
+        contentReads.mockClear();
+
+        expect(() => ledger.writeIterationArtifact(0, artifactName, 'original\n')).toThrow(
+          new RegExp(`${artifactName.replace('.', '\\.')}.*4194304-byte limit`, 'i'),
+        );
+        expect(contentReads).not.toHaveBeenCalled();
+      },
+    );
+
+    it('bounds descriptor reads and rejects an artifact that grows after its opened-size check', () => {
+      const workspace = tempWorkspace();
+      type DescriptorReadEvent = {
+        filePath: string;
+        label: string;
+        fd: number;
+        phase: 'content' | 'growth-probe';
+        bufferLength: number;
+        offset: number;
+        length: number;
+      };
+      const descriptorReads: DescriptorReadEvent[] = [];
+      let growBeforeRead = false;
+      const testHooks: NonNullable<SecureAutoloopLedgerOptions['testHooks']> & {
+        beforeNestedChildDescriptorRead: (event: DescriptorReadEvent) => void;
+      } = {
+        beforeNestedChildContentRead: ({ filePath }) => {
+          if (!growBeforeRead) return;
+          growBeforeRead = false;
+          fs.appendFileSync(filePath, Buffer.alloc(4_096, 0x78));
+        },
+        beforeNestedChildDescriptorRead: (event) => descriptorReads.push(event),
+      };
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', { create: true, testHooks });
+      ledger.writeIterationArtifact(0, 'diff.patch', 'safe');
+      descriptorReads.length = 0;
+      growBeforeRead = true;
+
+      expect(() => ledger.readIterationArtifact(0, 'diff.patch', 4)).toThrow(/grew.*4-byte limit/i);
+
+      const contentReads = descriptorReads.filter(({ phase }) => phase === 'content');
+      const probes = descriptorReads.filter(({ phase }) => phase === 'growth-probe');
+      expect(contentReads.length).toBeGreaterThan(0);
+      expect(contentReads.every(({ bufferLength, offset, length }) => bufferLength <= 4 && offset + length <= 4)).toBe(
+        true,
+      );
+      expect(probes).toHaveLength(1);
+      expect(probes[0]).toMatchObject({ bufferLength: 1, offset: 0, length: 1 });
+    });
+
+    it('rejects a bounded artifact that becomes shorter during its descriptor read', () => {
+      const workspace = tempWorkspace();
+      type DescriptorReadEvent = {
+        filePath: string;
+        label: string;
+        fd: number;
+        phase: 'content' | 'growth-probe';
+        bufferLength: number;
+        offset: number;
+        length: number;
+      };
+      const descriptorReads: DescriptorReadEvent[] = [];
+      let truncateBeforeRead = false;
+      const testHooks: NonNullable<SecureAutoloopLedgerOptions['testHooks']> & {
+        beforeNestedChildDescriptorRead: (event: DescriptorReadEvent) => void;
+      } = {
+        beforeNestedChildContentRead: ({ filePath }) => {
+          if (!truncateBeforeRead) return;
+          truncateBeforeRead = false;
+          fs.truncateSync(filePath, 2);
+        },
+        beforeNestedChildDescriptorRead: (event) => descriptorReads.push(event),
+      };
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', { create: true, testHooks });
+      ledger.writeIterationArtifact(0, 'diff.patch', 'safe');
+      descriptorReads.length = 0;
+      truncateBeforeRead = true;
+
+      expect(() => ledger.readIterationArtifact(0, 'diff.patch', 4)).toThrow(/shorter.*4-byte opened size/i);
+      expect(descriptorReads.filter(({ phase }) => phase === 'growth-probe')).toHaveLength(1);
+      expect(
+        descriptorReads
+          .filter(({ phase }) => phase === 'content')
+          .every(({ bufferLength, offset, length }) => bufferLength <= 4 && offset + length <= 4),
+      ).toBe(true);
+    });
+
+    it('reports concurrent growth against the opened size when it remains below the byte limit', () => {
+      const workspace = tempWorkspace();
+      let growBeforeRead = false;
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', {
+        create: true,
+        testHooks: {
+          beforeNestedChildContentRead: ({ filePath }) => {
+            if (!growBeforeRead) return;
+            growBeforeRead = false;
+            fs.appendFileSync(filePath, 'x');
+          },
+        },
+      });
+      ledger.writeIterationArtifact(0, 'diff.patch', 'ok');
+      growBeforeRead = true;
+
+      expect(() => ledger.readIterationArtifact(0, 'diff.patch', 4)).toThrow(/grew.*2-byte opened size/i);
+    });
+
+    it('preserves exact bounded reads for ordinary and empty artifacts', () => {
+      const workspace = tempWorkspace();
+      const ledger = SecureAutoloopLedger.open(workspace, 'run-1', { create: true });
+      const ordinary = Buffer.from('ordinary bounded bytes\n');
+      ledger.writeIterationArtifact(0, 'diff.patch', ordinary);
+      ledger.writeIterationArtifact(0, 'eval_output.json', Buffer.alloc(0));
+
+      expect(ledger.readIterationArtifact(0, 'diff.patch', ordinary.length)).toEqual(ordinary);
+      expect(ledger.readIterationArtifact(0, 'eval_output.json', 0)).toEqual(Buffer.alloc(0));
+    });
+
+    it.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1])(
+      'rejects unsafe bounded artifact byte limit %s',
+      (maxBytes) => {
+        const workspace = tempWorkspace();
+        const ledger = SecureAutoloopLedger.open(workspace, 'run-1', { create: true });
+        ledger.writeIterationArtifact(0, 'diff.patch', 'safe');
+
+        expect(() => ledger.readIterationArtifact(0, 'diff.patch', maxBytes)).toThrow(/nonnegative safe integer/i);
+      },
+    );
 
     it.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
       'rejects invalid iteration %s before creating nested paths',

@@ -20,11 +20,24 @@
  */
 
 import { ENGINE_TYPES, type EngineType } from '../types.js';
-import { type AnyAutoloopMessage, Msg, type PushChannel, type PushLevel } from './messages.js';
+import {
+  type AnyAutoloopMessage,
+  canonicalizeRequestReviewArgs,
+  type CheckpointReviewRequestPayload,
+  MAX_REQUEST_REVIEW_METADATA_BYTES,
+  MAX_REQUEST_REVIEW_SCOPE_ITEMS,
+  Msg,
+  type PushChannel,
+  type PushLevel,
+  type RequestReviewArgs,
+} from './messages.js';
 
 export type PlannerToolName =
   | 'notify_user'
+  | 'spawn_coder'
+  | 'spawn_reviewer'
   | 'spawn_subagents'
+  | 'request_review'
   | 'send_directive'
   | 'pause_loop'
   | 'resume_loop'
@@ -99,11 +112,45 @@ export interface SpawnSubagentsArgs {
   };
 }
 
+export interface SpawnCoderArgs {
+  coder_model?: string;
+  coder_engine?: EngineType;
+}
+
+export interface SpawnReviewerArgs {
+  reviewer_model?: string;
+  reviewer_engine?: EngineType;
+}
+
+export interface PreparedReviewRequest {
+  status: 'prepared';
+  target: 'reviewer';
+  idempotency_key: string;
+  payload: CheckpointReviewRequestPayload;
+}
+
+export interface DuplicateReviewRequest {
+  status: 'duplicate';
+  target: 'reviewer';
+  idempotency_key: string;
+}
+
+/** Task 4 preparation result; Reviewer delivery remains owned by the Runner queue. */
+export type ReviewRequestPreparationResult = PreparedReviewRequest | DuplicateReviewRequest;
+
 export interface PlannerToolEffects {
   /** Abort the batch when its owning run can no longer accept effects. */
   assertActive?: () => void;
   /** Start Coder + Reviewer persistent sessions. */
   spawnSubagents: (args: SpawnSubagentsArgs) => Promise<void>;
+  /** Start only the Coder persistent session. */
+  spawnCoder?: (args: SpawnCoderArgs) => Promise<unknown>;
+  /** Start only the Reviewer persistent session. */
+  spawnReviewer?: (args: SpawnReviewerArgs) => Promise<unknown>;
+  /** Prepare an existing checkpoint for a Runner-routed Reviewer request. */
+  requestReview?: (args: RequestReviewArgs, targetIter: number) => Promise<ReviewRequestPreparationResult>;
+  /** Release a prepared request when the current handoff aborts before queue acceptance. */
+  releaseReviewRequest?: (idempotencyKey: string, payload: CheckpointReviewRequestPayload) => void;
   /** Apply an already validated/canonical in-memory push-policy delta. */
   updatePushPolicy: (delta: Record<string, unknown>) => void;
   /**
@@ -197,13 +244,25 @@ function optionalString(value: unknown, label: string): string | undefined {
 
 function optionalStringArray(value: unknown, label: string): string[] | undefined {
   if (value === undefined) return undefined;
-  if (!Array.isArray(value) || !value.every((entry) => typeof entry === 'string')) {
-    throw new Error(`${label} must be an array of strings`);
-  }
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array of strings`);
   if (value.length > MAX_PLANNER_CONTROL_ARRAY_ITEMS) {
     throw new Error(`${label} exceeds the ${MAX_PLANNER_CONTROL_ARRAY_ITEMS}-item limit`);
   }
-  return value.map((entry, index) => boundedString(entry, `${label}[${index}]`));
+  const result = new Array<string>(value.length);
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor || !Object.hasOwn(descriptor, 'value')) {
+      throw new Error(`${label}[${index}] must be an own data property`);
+    }
+    if (typeof descriptor.value !== 'string') throw new Error(`${label} must be an array of strings`);
+    Object.defineProperty(result, String(index), {
+      configurable: true,
+      enumerable: true,
+      value: boundedString(descriptor.value, `${label}[${index}]`),
+      writable: true,
+    });
+  }
+  return result;
 }
 
 function optionalPositiveInteger(value: unknown, label: string): number | undefined {
@@ -218,15 +277,22 @@ function sanitizeDirectiveArgs(
   raw: Record<string, unknown>,
   label: 'spawn_subagents initial_directive' | 'send_directive',
 ): NonNullable<SpawnSubagentsArgs['initial_directive']> {
+  const valueFor = (field: 'goal' | 'constraints' | 'success_criteria' | 'max_attempts'): unknown => {
+    const descriptor = Object.getOwnPropertyDescriptor(raw, field);
+    if (descriptor && !Object.hasOwn(descriptor, 'value')) {
+      throw new Error(`${label} ${field} must be an own data property`);
+    }
+    return descriptor?.value;
+  };
   const directive: NonNullable<SpawnSubagentsArgs['initial_directive']> = {
-    goal: nonEmptyString(raw.goal, `${label} goal`),
+    goal: nonEmptyString(valueFor('goal'), `${label} goal`),
     constraints: [],
     success_criteria: [],
     max_attempts: 1,
   };
-  const constraints = optionalStringArray(raw.constraints, `${label} constraints`);
-  const successCriteria = optionalStringArray(raw.success_criteria, `${label} success_criteria`);
-  const maxAttempts = optionalPositiveInteger(raw.max_attempts, `${label} max_attempts`);
+  const constraints = optionalStringArray(valueFor('constraints'), `${label} constraints`);
+  const successCriteria = optionalStringArray(valueFor('success_criteria'), `${label} success_criteria`);
+  const maxAttempts = optionalPositiveInteger(valueFor('max_attempts'), `${label} max_attempts`);
   if (constraints !== undefined) directive.constraints = constraints;
   if (successCriteria !== undefined) directive.success_criteria = successCriteria;
   if (maxAttempts !== undefined) directive.max_attempts = maxAttempts;
@@ -320,37 +386,108 @@ function sanitizePlannerToolCall(call: PlannerToolCall, blockedPolicySilence: st
       return { tool: call.tool, args };
     }
     case 'spawn_subagents': {
-      if (
-        'coder_custom_engine' in raw ||
-        'reviewer_custom_engine' in raw ||
-        'coderCustomEngine' in raw ||
-        'reviewerCustomEngine' in raw ||
-        'customEngine' in raw
-      ) {
-        throw new Error('spawn_subagents cannot include custom engine config; configure it at autoloop_start');
+      for (const field of [
+        'coder_custom_engine',
+        'reviewer_custom_engine',
+        'coderCustomEngine',
+        'reviewerCustomEngine',
+        'customEngine',
+      ] as const) {
+        if (Object.hasOwn(raw, field)) {
+          throw new Error('spawn_subagents cannot include custom engine config; configure it at autoloop_start');
+        }
       }
-      const args: Record<string, unknown> = {};
+      const ownDataValue = (field: keyof SpawnSubagentsArgs): unknown => {
+        const descriptor = Object.getOwnPropertyDescriptor(raw, field);
+        if (descriptor && !Object.hasOwn(descriptor, 'value')) {
+          throw new Error(`spawn_subagents ${field} must be an own data property`);
+        }
+        return descriptor?.value;
+      };
+      const args = Object.create(null) as Record<string, unknown>;
       for (const field of ['coder_engine', 'reviewer_engine'] as const) {
-        const value = raw[field];
+        const value = ownDataValue(field);
         if (value !== undefined && (typeof value !== 'string' || !ENGINE_TYPES.includes(value as EngineType))) {
           throw new Error(`spawn_subagents ${field} has unknown engine '${String(value)}'`);
         }
         if (value !== undefined) args[field] = value;
       }
       for (const field of ['coder_model', 'reviewer_model'] as const) {
-        const value = optionalString(raw[field], `spawn_subagents ${field}`);
+        const value = optionalString(ownDataValue(field), `spawn_subagents ${field}`);
         if (value !== undefined) args[field] = value;
       }
-      if (raw.initial_directive !== undefined) {
-        if (!isPlainObject(raw.initial_directive)) {
+      const initialDirective = ownDataValue('initial_directive');
+      if (initialDirective !== undefined) {
+        if (!isPlainObject(initialDirective)) {
           throw new Error('spawn_subagents initial_directive must be an object');
         }
-        args.initial_directive = sanitizeDirectiveArgs(
-          raw.initial_directive as Record<string, unknown>,
-          'spawn_subagents initial_directive',
-        );
+        args.initial_directive = sanitizeDirectiveArgs(initialDirective, 'spawn_subagents initial_directive');
       }
       return { tool: call.tool, args };
+    }
+    case 'spawn_coder': {
+      if (
+        Object.hasOwn(raw, 'coder_custom_engine') ||
+        Object.hasOwn(raw, 'coderCustomEngine') ||
+        Object.hasOwn(raw, 'customEngine')
+      ) {
+        throw new Error('spawn_coder cannot include custom engine config; configure it at autoloop_start');
+      }
+      const args: Record<string, unknown> = {};
+      const engineDescriptor = Object.getOwnPropertyDescriptor(raw, 'coder_engine');
+      if (engineDescriptor && !Object.hasOwn(engineDescriptor, 'value')) {
+        throw new Error('spawn_coder coder_engine must be an own data property');
+      }
+      const engine = engineDescriptor?.value;
+      if (engine !== undefined && (typeof engine !== 'string' || !ENGINE_TYPES.includes(engine as EngineType))) {
+        throw new Error(`spawn_coder coder_engine has unknown engine '${String(engine)}'`);
+      }
+      if (engine !== undefined) args.coder_engine = engine;
+      const modelDescriptor = Object.getOwnPropertyDescriptor(raw, 'coder_model');
+      if (modelDescriptor && !Object.hasOwn(modelDescriptor, 'value')) {
+        throw new Error('spawn_coder coder_model must be an own data property');
+      }
+      const model = optionalString(modelDescriptor?.value, 'spawn_coder coder_model');
+      if (model !== undefined) args.coder_model = model;
+      return { tool: call.tool, args };
+    }
+    case 'spawn_reviewer': {
+      if (
+        Object.hasOwn(raw, 'reviewer_custom_engine') ||
+        Object.hasOwn(raw, 'reviewerCustomEngine') ||
+        Object.hasOwn(raw, 'customEngine')
+      ) {
+        throw new Error('spawn_reviewer cannot include custom engine config; configure it at autoloop_start');
+      }
+      const args: Record<string, unknown> = {};
+      const engineDescriptor = Object.getOwnPropertyDescriptor(raw, 'reviewer_engine');
+      if (engineDescriptor && !Object.hasOwn(engineDescriptor, 'value')) {
+        throw new Error('spawn_reviewer reviewer_engine must be an own data property');
+      }
+      const engine = engineDescriptor?.value;
+      if (engine !== undefined && (typeof engine !== 'string' || !ENGINE_TYPES.includes(engine as EngineType))) {
+        throw new Error(`spawn_reviewer reviewer_engine has unknown engine '${String(engine)}'`);
+      }
+      if (engine !== undefined) args.reviewer_engine = engine;
+      const modelDescriptor = Object.getOwnPropertyDescriptor(raw, 'reviewer_model');
+      if (modelDescriptor && !Object.hasOwn(modelDescriptor, 'value')) {
+        throw new Error('spawn_reviewer reviewer_model must be an own data property');
+      }
+      const model = optionalString(modelDescriptor?.value, 'spawn_reviewer reviewer_model');
+      if (model !== undefined) args.reviewer_model = model;
+      return { tool: call.tool, args };
+    }
+    case 'request_review': {
+      const canonical = canonicalizeRequestReviewArgs(raw);
+      boundedString(canonical.source_run_id, 'request_review source_run_id');
+      boundedString(canonical.idempotency_key, 'request_review idempotency_key');
+      if (canonical.scope.length > MAX_REQUEST_REVIEW_SCOPE_ITEMS) {
+        throw new Error(`request_review scope exceeds the ${MAX_REQUEST_REVIEW_SCOPE_ITEMS}-item limit`);
+      }
+      for (let index = 0; index < canonical.scope.length; index += 1) {
+        boundedString(canonical.scope[index], `request_review scope[${index}]`, MAX_REQUEST_REVIEW_METADATA_BYTES);
+      }
+      return { tool: call.tool, args: canonical as unknown as Record<string, unknown> };
     }
     case 'send_directive':
       return { tool: call.tool, args: sanitizeDirectiveArgs(raw, 'send_directive') };
@@ -409,13 +546,32 @@ export interface PlannerToolValidationResult {
 }
 
 function normalizePlannerControlValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(normalizePlannerControlValue);
+  if (Array.isArray(value)) {
+    const normalized = new Array<unknown>(value.length);
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      Object.defineProperty(normalized, String(index), {
+        configurable: true,
+        enumerable: true,
+        value: normalizePlannerControlValue(descriptor?.value),
+        writable: true,
+      });
+    }
+    return normalized;
+  }
   if (!value || typeof value !== 'object') return value;
-  return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>)
-      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
-      .map(([key, entry]) => [key, normalizePlannerControlValue(entry)]),
-  );
+  const normalized = Object.create(null) as Record<string, unknown>;
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>).sort(([left], [right]) =>
+    left < right ? -1 : left > right ? 1 : 0,
+  )) {
+    Object.defineProperty(normalized, key, {
+      configurable: true,
+      enumerable: true,
+      value: normalizePlannerControlValue(entry),
+      writable: true,
+    });
+  }
+  return normalized;
 }
 
 function normalizePlannerControls(controls: readonly PlannerToolCall[]): PlannerToolCall[] {
@@ -434,6 +590,21 @@ export function validatePlannerToolCalls(calls: readonly PlannerToolCall[]): Pla
         {
           tool: 'batch',
           error: `Planner control batch exceeds the ${MAX_PLANNER_CONTROL_CALLS}-control limit`,
+        },
+      ],
+      blocked_policy_silence: [],
+    };
+  }
+  const singletonControl = calls.find(
+    ({ tool }) => tool === 'request_review' || tool === 'spawn_coder' || tool === 'spawn_reviewer',
+  );
+  if (calls.length !== 1 && singletonControl) {
+    return {
+      calls: [],
+      errors: [
+        {
+          tool: singletonControl.tool,
+          error: `${singletonControl.tool} must be the only Planner control in its batch`,
         },
       ],
       blocked_policy_silence: [],
@@ -555,13 +726,19 @@ function preparePlannerToolCall(call: PlannerToolCall, fx: PlannerToolEffects, i
     }
     case 'spawn_subagents': {
       const raw = call.args;
-      const args: SpawnSubagentsArgs = {};
-      if (raw.coder_engine !== undefined) args.coder_engine = raw.coder_engine as EngineType;
-      if (raw.coder_model !== undefined) args.coder_model = raw.coder_model as string;
-      if (raw.reviewer_engine !== undefined) args.reviewer_engine = raw.reviewer_engine as EngineType;
-      if (raw.reviewer_model !== undefined) args.reviewer_model = raw.reviewer_model as string;
-      if (raw.initial_directive !== undefined)
-        args.initial_directive = raw.initial_directive as SpawnSubagentsArgs['initial_directive'];
+      const ownValue = (field: keyof SpawnSubagentsArgs): unknown => Object.getOwnPropertyDescriptor(raw, field)?.value;
+      const args = Object.create(null) as SpawnSubagentsArgs;
+      const coderEngine = ownValue('coder_engine');
+      const coderModel = ownValue('coder_model');
+      const reviewerEngine = ownValue('reviewer_engine');
+      const reviewerModel = ownValue('reviewer_model');
+      const initialDirective = ownValue('initial_directive');
+      if (coderEngine !== undefined) args.coder_engine = coderEngine as EngineType;
+      if (coderModel !== undefined) args.coder_model = coderModel as string;
+      if (reviewerEngine !== undefined) args.reviewer_engine = reviewerEngine as EngineType;
+      if (reviewerModel !== undefined) args.reviewer_model = reviewerModel as string;
+      if (initialDirective !== undefined)
+        args.initial_directive = initialDirective as SpawnSubagentsArgs['initial_directive'];
       return {
         tool: call.tool,
         apply: async () => {
@@ -580,6 +757,47 @@ function preparePlannerToolCall(call: PlannerToolCall, fx: PlannerToolEffects, i
         },
       };
     }
+    case 'spawn_coder': {
+      const raw = call.args;
+      const args = Object.create(null) as SpawnCoderArgs;
+      const coderEngine = Object.getOwnPropertyDescriptor(raw, 'coder_engine')?.value;
+      const coderModel = Object.getOwnPropertyDescriptor(raw, 'coder_model')?.value;
+      if (coderEngine !== undefined) args.coder_engine = coderEngine as EngineType;
+      if (coderModel !== undefined) args.coder_model = coderModel as string;
+      return {
+        tool: call.tool,
+        apply: async () => {
+          if (!fx.spawnCoder) throw new Error('spawn_coder handler is not installed');
+          await fx.spawnCoder(args);
+          return [];
+        },
+      };
+    }
+    case 'spawn_reviewer': {
+      const raw = call.args;
+      const args = Object.create(null) as SpawnReviewerArgs;
+      const reviewerEngine = Object.getOwnPropertyDescriptor(raw, 'reviewer_engine')?.value;
+      const reviewerModel = Object.getOwnPropertyDescriptor(raw, 'reviewer_model')?.value;
+      if (reviewerEngine !== undefined) args.reviewer_engine = reviewerEngine as EngineType;
+      if (reviewerModel !== undefined) args.reviewer_model = reviewerModel as string;
+      return {
+        tool: call.tool,
+        apply: async () => {
+          if (!fx.spawnReviewer) throw new Error('spawn_reviewer handler is not installed');
+          await fx.spawnReviewer(args);
+          return [];
+        },
+      };
+    }
+    case 'request_review':
+      return {
+        tool: call.tool,
+        apply: async () => {
+          if (!fx.requestReview) throw new Error('request_review handler is not installed');
+          const result = await fx.requestReview(call.args as unknown as RequestReviewArgs, iter);
+          return result.status === 'prepared' ? [Msg.reviewRequest(iter, result.payload)] : [];
+        },
+      };
     case 'send_directive': {
       const { goal, constraints, success_criteria, max_attempts } = call.args as {
         goal: string;
@@ -658,8 +876,10 @@ function preparePlannerToolCall(call: PlannerToolCall, fx: PlannerToolEffects, i
  *
  * Note: notify_user / pause_loop / resume_loop / terminate / send_directive
  * become v2 messages and flow through the runner's normal queue (so policy,
- * dedup, push_log accounting all apply). Only spawn_subagents / commit /
- * push-policy mutation are direct side effects.
+ * dedup, push_log accounting all apply). `request_review` first prepares its
+ * durable checkpoint evidence, then becomes a routed v2 message. Only
+ * spawn_coder / spawn_reviewer / spawn_subagents / commit / push-policy
+ * mutation are direct side effects.
  */
 export async function applyPlannerToolCalls(
   calls: PlannerToolCall[],
@@ -695,12 +915,20 @@ export async function applyValidatedPlannerToolCalls(
   for (const call of validation.calls) prepared.push(preparePlannerToolCall(call, fx, iter));
 
   for (const control of prepared) {
+    let messages: AnyAutoloopMessage[] = [];
     try {
       fx.assertActive?.();
-      const messages = await control.apply();
+      messages = await control.apply();
       fx.assertActive?.();
       emitted_messages.push(...messages);
     } catch (err) {
+      for (const message of messages) {
+        if (message.type !== 'review_request') continue;
+        const payload = message.payload as Partial<CheckpointReviewRequestPayload>;
+        if (typeof payload.idempotency_key === 'string') {
+          fx.releaseReviewRequest?.(payload.idempotency_key, payload as CheckpointReviewRequestPayload);
+        }
+      }
       errors.push({ tool: control.tool, error: (err as Error).message });
       break;
     }

@@ -6,10 +6,14 @@
  * silencing guard) is exercised.
  */
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { execFileSync, type ChildProcess } from 'node:child_process';
+import { PassThrough } from 'node:stream';
 
 import { ClaudeAgentDispatcher } from '../autoloop/dispatcher.js';
 import { SecureAutoloopLedger } from '../autoloop/secure-ledger.js';
@@ -18,10 +22,18 @@ import {
   parsePlannerReply,
   type PlannerToolCall,
   type PlannerToolEffects,
+  type PreparedReviewRequest,
+  type ReviewRequestPreparationResult,
   validatePlannerToolCalls,
 } from '../autoloop/planner-tools.js';
 import { AutoloopRunner } from '../autoloop/runner.js';
-import { AutoloopRoutingError, type AnyAutoloopMessage, Msg, validateMessage } from '../autoloop/messages.js';
+import {
+  AutoloopRoutingError,
+  type AnyAutoloopMessage,
+  type CheckpointReviewRequestPayload,
+  Msg,
+  validateMessage,
+} from '../autoloop/messages.js';
 import type { SessionManager } from '../session-manager.js';
 import type {
   AgentReservationReleaseOptions,
@@ -198,6 +210,12 @@ function permissions(target: string): number {
   return fs.statSync(target).mode & 0o777;
 }
 
+function replaceWithSameBytes(target: string): void {
+  const replacement = `${target}.same-content-replacement`;
+  fs.writeFileSync(replacement, fs.readFileSync(target), { mode: 0o600 });
+  fs.renameSync(replacement, target);
+}
+
 beforeEach(() => {
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'autoloop-disp-'));
 });
@@ -279,6 +297,145 @@ function ensureCompleteReviewArtifacts(dispatcher: ClaudeAgentDispatcher, iter: 
   }
 }
 
+function commitCheckpoint(workspace: string, content: string): { sha: string; patch: Buffer } {
+  const target = path.join(workspace, 'checkpoint.txt');
+  fs.writeFileSync(target, content);
+  execFileSync('git', ['add', '--', 'checkpoint.txt'], { cwd: workspace });
+  execFileSync('git', ['commit', '-q', '-m', `checkpoint ${content.trim()}`], { cwd: workspace });
+  const sha = execFileSync('git', ['rev-parse', '--verify', 'HEAD'], { cwd: workspace, encoding: 'utf8' }).trim();
+  const patch = execFileSync('git', ['show', '--format=', '--unified=3', '--no-renames', sha, '--'], {
+    cwd: workspace,
+  });
+  return { sha, patch };
+}
+
+function initializeEmptyRootCheckpointRepository(workspace: string): { sha: string; patch: Buffer } {
+  execFileSync('git', ['init', '-q'], { cwd: workspace });
+  execFileSync('git', ['config', 'user.email', 'autoloop-test@example.invalid'], { cwd: workspace });
+  execFileSync('git', ['config', 'user.name', 'Autoloop Test'], { cwd: workspace });
+  execFileSync('git', ['commit', '-q', '--allow-empty', '-m', 'empty root checkpoint'], { cwd: workspace });
+  const sha = execFileSync('git', ['rev-parse', '--verify', 'HEAD'], { cwd: workspace, encoding: 'utf8' }).trim();
+  const patch = execFileSync('git', ['show', '--format=', '--unified=3', '--no-renames', sha, '--'], {
+    cwd: workspace,
+  });
+  return { sha, patch };
+}
+
+function initializeCheckpointRepository(
+  workspace: string,
+  content = 'checkpoint one\n',
+): { sha: string; patch: Buffer } {
+  execFileSync('git', ['init', '-q'], { cwd: workspace });
+  execFileSync('git', ['config', 'user.email', 'autoloop-test@example.invalid'], { cwd: workspace });
+  execFileSync('git', ['config', 'user.name', 'Autoloop Test'], { cwd: workspace });
+  return commitCheckpoint(workspace, content);
+}
+
+function writeSourceReviewArtifacts(
+  workspace: string,
+  sourceRunId: string,
+  sourceIter: number,
+  patch: Buffer,
+  options: {
+    omit?: 'directive.json' | 'eval_output.json' | 'coder_summary.txt' | 'diff.patch';
+    directive?: string | Buffer;
+  } = {},
+): SecureAutoloopLedger {
+  const sourceLedger = SecureAutoloopLedger.open(workspace, sourceRunId, { create: true });
+  const artifacts = {
+    'directive.json': options.directive ?? '{"goal":"already implemented"}\n',
+    'eval_output.json': '{"metric":1}\n',
+    'coder_summary.txt': 'existing checkpoint\n',
+    'diff.patch': patch,
+  } as const;
+  for (const [name, content] of Object.entries(artifacts)) {
+    if (name !== options.omit) {
+      sourceLedger.writeIterationArtifact(
+        sourceIter,
+        name as 'directive.json' | 'eval_output.json' | 'coder_summary.txt' | 'diff.patch',
+        content,
+      );
+    }
+  }
+  return sourceLedger;
+}
+
+function reviewIdentityHash(idempotencyKey: string): string {
+  return createHash('sha256').update(idempotencyKey).digest('hex');
+}
+
+function durableReviewDecisionPayload(
+  idempotencyKey: string,
+  overrides: Partial<{
+    checkpoint_sha: string;
+    source_run_id: string;
+    source_iter: number;
+    target_iter: number;
+    scope: string[];
+    request_digest: string;
+  }> = {},
+): Readonly<Record<string, unknown>> {
+  return {
+    checkpoint_sha: 'a'.repeat(40),
+    source_run_id: 'source-run',
+    source_iter: 3,
+    target_iter: 0,
+    scope: ['correctness'],
+    idempotency_key: idempotencyKey,
+    request_digest: createHash('sha256').update(`request:${idempotencyKey}`).digest('hex'),
+    ...overrides,
+  };
+}
+
+function durableReviewDecisionRow(payload: Readonly<Record<string, unknown>>): string {
+  return JSON.stringify({
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'request_review',
+    actor: 'planner',
+    payload,
+  });
+}
+
+interface FakeGitChild extends EventEmitter {
+  stdout: PassThrough;
+  stderr: PassThrough;
+  pid: number | undefined;
+  kill: ReturnType<typeof vi.fn>;
+}
+
+function fakeGitChild(pid?: number): FakeGitChild {
+  const child = new EventEmitter() as FakeGitChild;
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.pid = pid;
+  child.kill = vi.fn(() => true);
+  return child;
+}
+
+function requestReviewDecisions(ledgerDir: string): Array<Record<string, unknown>> {
+  const target = path.join(ledgerDir, 'decisions.jsonl');
+  if (!fs.existsSync(target)) return [];
+  return fs
+    .readFileSync(target, 'utf8')
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .filter((entry) => entry.kind === 'request_review');
+}
+
+function decisionRows(ledgerDir: string, kind: string): Array<Record<string, unknown>> {
+  const target = path.join(ledgerDir, 'decisions.jsonl');
+  if (!fs.existsSync(target)) return [];
+  return fs
+    .readFileSync(target, 'utf8')
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .filter((entry) => entry.kind === kind);
+}
+
 describe('Planner control argument shape', () => {
   it.each([
     'notify_user',
@@ -314,6 +471,8 @@ describe('Planner control argument shape', () => {
 describe('Planner control batch application', () => {
   it('stops after a failed spawn without applying later file, policy, or message effects', async () => {
     const effects: PlannerToolEffects = {
+      spawnCoder: vi.fn(async () => undefined),
+      spawnReviewer: vi.fn(async () => undefined),
       spawnSubagents: vi.fn(async () => {
         throw new Error('spawn failed before completion');
       }),
@@ -403,6 +562,8 @@ describe('Planner durable control content bounds', () => {
 
   it('prevalidates an oversized mixed batch before applying any effect or emitting any message', async () => {
     const effects: PlannerToolEffects = {
+      spawnCoder: vi.fn(async () => undefined),
+      spawnReviewer: vi.fn(async () => undefined),
       spawnSubagents: vi.fn(async () => undefined),
       updatePushPolicy: vi.fn(),
       writePlanFile: vi.fn(async () => undefined),
@@ -520,6 +681,23 @@ function readGenerationEvents(ledgerDir: string): AgentGenerationEvent[] {
     .filter(Boolean)
     .map((line) => JSON.parse(line) as { kind?: string; payload?: unknown })
     .filter((entry): entry is AgentGenerationEvent => entry.kind?.startsWith('agent_generation_') === true);
+}
+
+function injectStartedGenerationAppendFailure(dispatcher: ClaudeAgentDispatcher, role: 'coder' | 'reviewer'): Error {
+  const failure = new Error(`injected ${role} started-event append failure`);
+  const internal = dispatcher as unknown as {
+    appendGenerationEvent(kind: AgentGenerationEventKind, generation: PhysicalAgentGeneration): void;
+  };
+  const appendGenerationEvent = internal.appendGenerationEvent.bind(dispatcher);
+  let pending = true;
+  vi.spyOn(internal, 'appendGenerationEvent').mockImplementation((kind, generation) => {
+    if (pending && kind === 'agent_generation_started' && generation.role === role) {
+      pending = false;
+      throw failure;
+    }
+    appendGenerationEvent(kind, generation);
+  });
+  return failure;
 }
 
 describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
@@ -1009,6 +1187,74 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
 });
 
 describe('ClaudeAgentDispatcher — role engine configuration', () => {
+  it('spawnReviewer starts only a Reviewer generation', async () => {
+    const { dispatcher, calls } = makeDispatcher();
+
+    const generation = await (
+      dispatcher as unknown as {
+        spawnReviewer(args?: Record<string, unknown>): Promise<PhysicalAgentGeneration>;
+      }
+    ).spawnReviewer({ reviewer_engine: 'gemini', reviewer_model: 'gemini-review' });
+
+    expect(generation).toMatchObject({ role: 'reviewer', state: 'live' });
+    expect(calls.startSession.mock.calls.map(([config]) => (config as { name: string }).name)).toEqual([
+      'autoloop-r1-reviewer',
+    ]);
+    expect(findStart(calls, 'reviewer')).toMatchObject({ engine: 'gemini', model: 'gemini-review' });
+    expect(calls.startSession.mock.calls.some(([config]) => (config as { name: string }).name.endsWith('-coder'))).toBe(
+      false,
+    );
+  });
+
+  it('spawnCoder starts only a Coder generation', async () => {
+    const { dispatcher, calls } = makeDispatcher();
+
+    const generation = await (
+      dispatcher as unknown as {
+        spawnCoder(args?: Record<string, unknown>): Promise<PhysicalAgentGeneration>;
+      }
+    ).spawnCoder({ coder_engine: 'codex', coder_model: 'gpt-coder' });
+
+    expect(generation).toMatchObject({ role: 'coder', state: 'live' });
+    expect(calls.startSession.mock.calls.map(([config]) => (config as { name: string }).name)).toEqual([
+      'autoloop-r1-coder',
+    ]);
+    expect(findStart(calls, 'coder')).toMatchObject({ engine: 'codex', model: 'gpt-coder' });
+    expect(
+      calls.startSession.mock.calls.some(([config]) => (config as { name: string }).name.endsWith('-reviewer')),
+    ).toBe(false);
+  });
+
+  it('makes a repeated standalone Coder spawn an idempotent lifecycle no-op', async () => {
+    const onSpawnSubagentsCommitted = vi.fn();
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({ onSpawnSubagentsCommitted });
+
+    const first = await dispatcher.spawnCoder({ coder_engine: 'codex', coder_model: 'gpt-coder' });
+    const duplicate = await dispatcher.spawnCoder({ coder_engine: 'codex', coder_model: 'gpt-coder' });
+
+    expect(duplicate).toEqual(first);
+    expect(
+      calls.startSession.mock.calls.filter(([config]) => (config as { name: string }).name.endsWith('-coder')),
+    ).toHaveLength(1);
+    expect(decisionRows(ledgerDir, 'spawn_coder')).toHaveLength(1);
+    expect(onSpawnSubagentsCommitted).toHaveBeenCalledOnce();
+  });
+
+  it('makes a repeated standalone Reviewer spawn an idempotent lifecycle no-op', async () => {
+    const onSpawnSubagentsCommitted = vi.fn();
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({ onSpawnSubagentsCommitted });
+
+    const first = await dispatcher.spawnReviewer({ reviewer_engine: 'gemini', reviewer_model: 'gemini-review' });
+    const duplicate = await dispatcher.spawnReviewer({ reviewer_engine: 'gemini', reviewer_model: 'gemini-review' });
+
+    expect(duplicate).toEqual(first);
+    expect(
+      calls.startSession.mock.calls.filter(([config]) => (config as { name: string }).name.endsWith('-reviewer')),
+    ).toHaveLength(1);
+    expect(decisionRows(ledgerDir, 'spawn_reviewer')).toHaveLength(1);
+    expect(onSpawnSubagentsCommitted).toHaveBeenCalledOnce();
+  });
+
   it('keeps the legacy Claude model defaults when no role overrides are provided', async () => {
     const { dispatcher, calls } = makeDispatcher({}, { sendOutput: 'Planner reply' });
 
@@ -1212,6 +1458,79 @@ describe('ClaudeAgentDispatcher — role engine configuration', () => {
     expect(coderStarts[1]).toMatchObject({ engine: 'claude', model: 'sonnet' });
   });
 
+  it('commits the Runner lifecycle exactly once for each independent spawn effect', async () => {
+    const onSpawnSubagentsCommitted = vi.fn();
+    const { dispatcher } = makeDispatcher({ onSpawnSubagentsCommitted });
+
+    await dispatcher.spawnCoder();
+    expect(onSpawnSubagentsCommitted).toHaveBeenCalledTimes(1);
+    await dispatcher.spawnReviewer();
+    expect(onSpawnSubagentsCommitted).toHaveBeenCalledTimes(2);
+  });
+
+  it('commits the Runner lifecycle exactly once for the joint compatibility wrapper', async () => {
+    const onSpawnSubagentsCommitted = vi.fn();
+    const { dispatcher } = makeDispatcher({ onSpawnSubagentsCommitted });
+
+    await dispatcher.spawnSubagents();
+
+    expect(onSpawnSubagentsCommitted).toHaveBeenCalledTimes(1);
+  });
+
+  it('orders configured nested compatibility lifecycle as spawn-start, spawn-finish, then one commit', async () => {
+    const order: string[] = [];
+    const dispatcherRef: { current?: ClaudeAgentDispatcher } = {};
+    const configured = makeDispatcher(
+      {
+        onSpawnSubagents: async (args) => {
+          order.push('spawn-start');
+          await dispatcherRef.current!.spawnSubagents(args);
+          order.push('spawn-finish');
+        },
+        onSpawnSubagentsCommitted: () => {
+          order.push('mark-committed');
+        },
+      },
+      {
+        sendOutput: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+      },
+    );
+    const dispatcher = configured.dispatcher;
+    dispatcherRef.current = dispatcher;
+
+    await expect(dispatcher.deliver(Msg.chat(0, { text: 'start subagents' }))).resolves.toEqual([]);
+
+    expect(order).toEqual(['spawn-start', 'spawn-finish', 'mark-committed']);
+  });
+
+  it('suppresses the configured compatibility commit when the run becomes terminal during its handler', async () => {
+    const order: string[] = [];
+    const dispatcherRef: { current?: ClaudeAgentDispatcher } = {};
+    const configured = makeDispatcher(
+      {
+        onSpawnSubagents: async () => {
+          order.push('spawn-start');
+          (dispatcherRef.current as unknown as { terminal: boolean }).terminal = true;
+          order.push('spawn-finish');
+        },
+        onSpawnSubagentsCommitted: () => {
+          order.push('mark-committed');
+        },
+      },
+      {
+        sendOutput: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+      },
+    );
+    const dispatcher = configured.dispatcher;
+    dispatcherRef.current = dispatcher;
+
+    await expect(dispatcher.deliver(Msg.chat(0, { text: 'start subagents' }))).rejects.toMatchObject({
+      code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+    });
+
+    expect(order).toEqual(['spawn-start', 'spawn-finish']);
+  });
+
   it('stops a newly started Coder when Reviewer startup fails', async () => {
     const { dispatcher, calls } = makeDispatcher({}, { startThrowsFor: 'reviewer' });
 
@@ -1222,6 +1541,2573 @@ describe('ClaudeAgentDispatcher — role engine configuration', () => {
     await dispatcher.spawnSubagents();
     expect(findStart(calls, 'coder')).toBeDefined();
     expect(findStart(calls, 'reviewer')).toBeDefined();
+  });
+
+  it('spawn_subagents makes only the legacy single rollback attempt when stopping a new Coder fails', async () => {
+    const { dispatcher, calls } = makeDispatcher({}, { startThrowsFor: 'reviewer' });
+    calls.stopSession.mockRejectedValue(new Error('rollback stop failed'));
+
+    await expect(dispatcher.spawnSubagents()).rejects.toThrow('reviewer failed to start');
+
+    expect(calls.stopSession).toHaveBeenCalledTimes(1);
+    expect(calls.stopSession).toHaveBeenCalledWith('autoloop-r1-coder');
+  });
+
+  it('keeps a newly started Coder selection when direct rollback cannot stop its live session', async () => {
+    const onRoleSelectionChanged = vi.fn();
+    const { dispatcher, calls } = makeDispatcher({ onRoleSelectionChanged });
+    const internal = dispatcher as unknown as {
+      requireLiveGeneration(role: 'coder' | 'reviewer'): PhysicalAgentGeneration;
+    };
+    const requireLiveGeneration = internal.requireLiveGeneration.bind(dispatcher);
+    let failLate = true;
+    vi.spyOn(internal, 'requireLiveGeneration').mockImplementation((role) => {
+      if (role === 'coder' && failLate) {
+        failLate = false;
+        throw new Error('coder generation unavailable after startup');
+      }
+      return requireLiveGeneration(role);
+    });
+    calls.stopSession.mockRejectedValue(new Error('rollback stop failed'));
+
+    await expect(dispatcher.spawnCoder({ coder_engine: 'codex', coder_model: 'gpt-coder' })).rejects.toThrow(
+      'coder generation unavailable after startup',
+    );
+
+    await expect(dispatcher.spawnCoder({ coder_engine: 'gemini' })).rejects.toThrow(
+      'Cannot change Coder engine or model after its session has started',
+    );
+    await expect(dispatcher.spawnCoder({ coder_engine: 'codex', coder_model: 'gpt-coder' })).resolves.toMatchObject({
+      role: 'coder',
+      state: 'live',
+    });
+    expect(
+      calls.startSession.mock.calls.filter(([config]) => (config as { name: string }).name.endsWith('-coder')),
+    ).toHaveLength(1);
+    expect(onRoleSelectionChanged).toHaveBeenCalledWith({
+      coder: { engine: 'codex', model: 'gpt-coder' },
+      reviewer: { engine: 'claude', model: undefined },
+    });
+  });
+
+  it('keeps a newly started Reviewer selection and frozen prompt when direct rollback cannot stop it', async () => {
+    const onRoleSelectionChanged = vi.fn();
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({ onRoleSelectionChanged });
+    const sandbox = path.join(ledgerDir, 'reviewer_sandbox');
+    fs.mkdirSync(sandbox, { recursive: true });
+    fs.writeFileSync(path.join(sandbox, 'reviewer_memory.md'), 'surviving reviewer memory\n');
+    const internal = dispatcher as unknown as {
+      requireLiveGeneration(role: 'coder' | 'reviewer'): PhysicalAgentGeneration;
+      reviewerSessionPrompt: string | null;
+    };
+    const requireLiveGeneration = internal.requireLiveGeneration.bind(dispatcher);
+    let failLate = true;
+    vi.spyOn(internal, 'requireLiveGeneration').mockImplementation((role) => {
+      if (role === 'reviewer' && failLate) {
+        failLate = false;
+        throw new Error('reviewer generation unavailable after startup');
+      }
+      return requireLiveGeneration(role);
+    });
+    calls.stopSession.mockRejectedValue(new Error('rollback stop failed'));
+
+    await expect(
+      dispatcher.spawnReviewer({ reviewer_engine: 'gemini', reviewer_model: 'gemini-review' }),
+    ).rejects.toThrow('reviewer generation unavailable after startup');
+
+    expect(internal.reviewerSessionPrompt).toContain('surviving reviewer memory');
+    await expect(dispatcher.spawnReviewer({ reviewer_engine: 'cursor' })).rejects.toThrow(
+      'Cannot change Reviewer engine or model after its session has started',
+    );
+    await expect(
+      dispatcher.spawnReviewer({ reviewer_engine: 'gemini', reviewer_model: 'gemini-review' }),
+    ).resolves.toMatchObject({ role: 'reviewer', state: 'live' });
+    expect(
+      calls.startSession.mock.calls.filter(([config]) => (config as { name: string }).name.endsWith('-reviewer')),
+    ).toHaveLength(1);
+    expect(onRoleSelectionChanged).toHaveBeenCalledWith({
+      coder: { engine: 'claude', model: undefined },
+      reviewer: { engine: 'gemini', model: 'gemini-review' },
+    });
+  });
+
+  it('keeps both new compatibility selections when late failure survives both rollback stops', async () => {
+    const onRoleSelectionChanged = vi.fn();
+    const { dispatcher, calls } = makeDispatcher({ onRoleSelectionChanged });
+    const internal = dispatcher as unknown as {
+      requireLiveGeneration(role: 'coder' | 'reviewer'): PhysicalAgentGeneration;
+    };
+    const requireLiveGeneration = internal.requireLiveGeneration.bind(dispatcher);
+    let failReviewerLate = true;
+    vi.spyOn(internal, 'requireLiveGeneration').mockImplementation((role) => {
+      if (role === 'reviewer' && failReviewerLate) {
+        failReviewerLate = false;
+        throw new Error('reviewer generation unavailable after startup');
+      }
+      return requireLiveGeneration(role);
+    });
+    calls.stopSession.mockRejectedValue(new Error('rollback stop failed'));
+    const selected = {
+      coder_engine: 'codex' as const,
+      coder_model: 'gpt-coder',
+      reviewer_engine: 'gemini' as const,
+      reviewer_model: 'gemini-review',
+    };
+
+    await expect(dispatcher.spawnSubagents(selected)).rejects.toThrow('reviewer generation unavailable after startup');
+
+    await expect(dispatcher.spawnSubagents({ ...selected, coder_engine: 'cursor' })).rejects.toThrow(
+      'Cannot change Coder engine or model after its session has started',
+    );
+    await expect(dispatcher.spawnSubagents({ ...selected, reviewer_engine: 'cursor' })).rejects.toThrow(
+      'Cannot change Reviewer engine or model after its session has started',
+    );
+    await expect(dispatcher.spawnSubagents(selected)).resolves.toBeUndefined();
+    expect(
+      calls.startSession.mock.calls.filter(([config]) => (config as { name: string }).name.endsWith('-coder')),
+    ).toHaveLength(1);
+    expect(
+      calls.startSession.mock.calls.filter(([config]) => (config as { name: string }).name.endsWith('-reviewer')),
+    ).toHaveLength(1);
+    expect(onRoleSelectionChanged).toHaveBeenCalledWith({
+      coder: { engine: 'codex', model: 'gpt-coder' },
+      reviewer: { engine: 'gemini', model: 'gemini-review' },
+    });
+  });
+
+  it('keeps outer rollback ownership when a nested primitive fails after startup and each stop attempt fails', async () => {
+    const { dispatcher, calls } = makeDispatcher();
+    const internal = dispatcher as unknown as {
+      requireLiveGeneration(role: 'coder' | 'reviewer'): PhysicalAgentGeneration;
+    };
+    const requireLiveGeneration = internal.requireLiveGeneration.bind(dispatcher);
+    vi.spyOn(internal, 'requireLiveGeneration').mockImplementation((role) => {
+      if (role === 'reviewer') throw new Error('reviewer generation unavailable after startup');
+      return requireLiveGeneration(role);
+    });
+    calls.stopSession.mockRejectedValue(new Error('rollback stop failed'));
+
+    await expect(dispatcher.spawnSubagents()).rejects.toThrow('reviewer generation unavailable after startup');
+
+    const stoppedNames = calls.stopSession.mock.calls.map(([name]) => name as string);
+    expect(stoppedNames.filter((name) => name === 'autoloop-r1-coder')).toHaveLength(1);
+    expect(stoppedNames.filter((name) => name === 'autoloop-r1-reviewer')).toHaveLength(1);
+  });
+
+  it('keeps the next Coder selection visible while compatibility rollback is still stopping it', async () => {
+    const { dispatcher, calls, activeNames } = makeDispatcher();
+    const internal = dispatcher as unknown as {
+      requireLiveGeneration(role: 'coder' | 'reviewer'): PhysicalAgentGeneration;
+      coderSelection: { engine: string; model?: string };
+    };
+    const requireLiveGeneration = internal.requireLiveGeneration.bind(dispatcher);
+    let failCoderLate = true;
+    vi.spyOn(internal, 'requireLiveGeneration').mockImplementation((role) => {
+      if (role === 'coder' && failCoderLate) {
+        failCoderLate = false;
+        throw new Error('coder generation unavailable after startup');
+      }
+      return requireLiveGeneration(role);
+    });
+
+    let signalStopEntered!: () => void;
+    const stopEntered = new Promise<void>((resolve) => {
+      signalStopEntered = resolve;
+    });
+    let releaseStop!: () => void;
+    const stopHeld = new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    });
+    calls.stopSession.mockImplementation(async (name: string) => {
+      if (name === 'autoloop-r1-coder') {
+        signalStopEntered();
+        await stopHeld;
+      }
+      activeNames.delete(name);
+    });
+
+    const failedCompatibilitySpawn = dispatcher.spawnSubagents({
+      coder_engine: 'codex',
+      coder_model: 'gpt-coder',
+    });
+    await stopEntered;
+    const selectionDuringStop = { ...internal.coderSelection };
+    const concurrentOldSelection = await dispatcher
+      .spawnCoder({ coder_engine: 'claude' })
+      .then(() => undefined)
+      .catch((error: unknown) => error);
+    releaseStop();
+    const compatibilityFailure = await failedCompatibilitySpawn.catch((error: unknown) => error);
+
+    expect(selectionDuringStop).toEqual({ engine: 'codex', model: 'gpt-coder', customEngine: undefined });
+    expect(concurrentOldSelection).toEqual(
+      expect.objectContaining({ message: 'Cannot change Coder engine or model after its session has started' }),
+    );
+    expect(compatibilityFailure).toEqual(
+      expect.objectContaining({ message: 'coder generation unavailable after startup' }),
+    );
+  });
+
+  it('keeps the next Reviewer selection visible while compatibility rollback is still stopping it', async () => {
+    const { dispatcher, calls, activeNames } = makeDispatcher();
+    await dispatcher.spawnCoder();
+    const internal = dispatcher as unknown as {
+      requireLiveGeneration(role: 'coder' | 'reviewer'): PhysicalAgentGeneration;
+      reviewerSelection: { engine: string; model?: string };
+    };
+    const requireLiveGeneration = internal.requireLiveGeneration.bind(dispatcher);
+    let failReviewerLate = true;
+    vi.spyOn(internal, 'requireLiveGeneration').mockImplementation((role) => {
+      if (role === 'reviewer' && failReviewerLate) {
+        failReviewerLate = false;
+        throw new Error('reviewer generation unavailable after startup');
+      }
+      return requireLiveGeneration(role);
+    });
+
+    let signalStopEntered!: () => void;
+    const stopEntered = new Promise<void>((resolve) => {
+      signalStopEntered = resolve;
+    });
+    let releaseStop!: () => void;
+    const stopHeld = new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    });
+    calls.stopSession.mockImplementation(async (name: string) => {
+      if (name === 'autoloop-r1-reviewer') {
+        signalStopEntered();
+        await stopHeld;
+      }
+      activeNames.delete(name);
+    });
+
+    const failedCompatibilitySpawn = dispatcher.spawnSubagents({
+      reviewer_engine: 'gemini',
+      reviewer_model: 'gemini-review',
+    });
+    await stopEntered;
+    const selectionDuringStop = { ...internal.reviewerSelection };
+    const concurrentOldSelection = await dispatcher
+      .spawnReviewer({ reviewer_engine: 'claude' })
+      .then(() => undefined)
+      .catch((error: unknown) => error);
+    releaseStop();
+    const compatibilityFailure = await failedCompatibilitySpawn.catch((error: unknown) => error);
+
+    expect(selectionDuringStop).toEqual({ engine: 'gemini', model: 'gemini-review', customEngine: undefined });
+    expect(concurrentOldSelection).toEqual(
+      expect.objectContaining({ message: 'Cannot change Reviewer engine or model after its session has started' }),
+    );
+    expect(compatibilityFailure).toEqual(
+      expect.objectContaining({ message: 'reviewer generation unavailable after startup' }),
+    );
+  });
+
+  it('keeps direct Coder metadata bound when its started-event append fails and liveness is unknown', async () => {
+    const onRoleSelectionChanged = vi.fn();
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({ onRoleSelectionChanged });
+    const internal = dispatcher as unknown as {
+      coderStarted: boolean;
+      coderSelection: { engine: string; model?: string };
+    };
+    const appendFailure = injectStartedGenerationAppendFailure(dispatcher, 'coder');
+    calls.stopSession.mockRejectedValue(new Error('cleanup stop failed'));
+    calls.inspect.mockResolvedValueOnce('absent').mockResolvedValue('unknown');
+    const selected = { coder_engine: 'codex' as const, coder_model: 'gpt-coder' };
+
+    const startupFailure = await dispatcher
+      .spawnCoder(selected)
+      .then(() => undefined)
+      .catch((error: unknown) => error);
+    const stateAfterFailure = {
+      started: internal.coderStarted,
+      selection: { ...internal.coderSelection },
+      events: readGenerationEvents(ledgerDir).map((entry) => entry.kind),
+      persistedSelections: structuredClone(onRoleSelectionChanged.mock.calls),
+    };
+    const retry = await dispatcher.spawnCoder(selected);
+    const changedSelectionFailure = await dispatcher
+      .spawnCoder({ coder_engine: 'gemini' })
+      .then(() => undefined)
+      .catch((error: unknown) => error);
+
+    expect(startupFailure).toBe(appendFailure);
+    expect(stateAfterFailure).toEqual({
+      started: true,
+      selection: { engine: 'codex', model: 'gpt-coder', customEngine: undefined },
+      events: ['agent_generation_reserved', 'agent_generation_started'],
+      persistedSelections: [
+        [
+          {
+            coder: { engine: 'codex', model: 'gpt-coder' },
+            reviewer: { engine: 'claude', model: undefined },
+          },
+        ],
+      ],
+    });
+    expect(retry).toMatchObject({ role: 'coder', generation: 1, state: 'live' });
+    expect(changedSelectionFailure).toEqual(
+      expect.objectContaining({ message: 'Cannot change Coder engine or model after its session has started' }),
+    );
+    expect(
+      calls.releaseReservation.mock.calls.filter(
+        ([name, generation]) => name === 'autoloop-r1-coder' && generation === 1,
+      ),
+    ).toHaveLength(0);
+    expect(
+      calls.startSession.mock.calls.filter(([config]) => (config as { name: string }).name.endsWith('-coder')),
+    ).toHaveLength(1);
+  });
+
+  it('keeps direct Reviewer metadata and frozen prompt when its started-event append fails live', async () => {
+    const onRoleSelectionChanged = vi.fn();
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({ onRoleSelectionChanged });
+    const reviewerSandbox = path.join(ledgerDir, 'reviewer_sandbox');
+    fs.mkdirSync(reviewerSandbox, { recursive: true });
+    fs.writeFileSync(path.join(reviewerSandbox, 'reviewer_memory.md'), 'started append survival memory\n');
+    const internal = dispatcher as unknown as {
+      reviewerStarted: boolean;
+      reviewerSelection: { engine: string; model?: string };
+      reviewerSessionPrompt: string | null;
+    };
+    const appendFailure = injectStartedGenerationAppendFailure(dispatcher, 'reviewer');
+    calls.stopSession.mockRejectedValue(new Error('cleanup stop failed'));
+    const selected = { reviewer_engine: 'gemini' as const, reviewer_model: 'gemini-review' };
+
+    const startupFailure = await dispatcher
+      .spawnReviewer(selected)
+      .then(() => undefined)
+      .catch((error: unknown) => error);
+    const stateAfterFailure = {
+      started: internal.reviewerStarted,
+      selection: { ...internal.reviewerSelection },
+      prompt: internal.reviewerSessionPrompt,
+      events: readGenerationEvents(ledgerDir).map((entry) => entry.kind),
+      persistedSelections: structuredClone(onRoleSelectionChanged.mock.calls),
+    };
+    const retry = await dispatcher.spawnReviewer(selected);
+    const changedSelectionFailure = await dispatcher
+      .spawnReviewer({ reviewer_engine: 'cursor' })
+      .then(() => undefined)
+      .catch((error: unknown) => error);
+
+    expect(startupFailure).toBe(appendFailure);
+    expect(stateAfterFailure).toMatchObject({
+      started: true,
+      selection: { engine: 'gemini', model: 'gemini-review', customEngine: undefined },
+      events: ['agent_generation_reserved', 'agent_generation_started'],
+      persistedSelections: [
+        [
+          {
+            coder: { engine: 'claude', model: undefined },
+            reviewer: { engine: 'gemini', model: 'gemini-review' },
+          },
+        ],
+      ],
+    });
+    expect(stateAfterFailure.prompt).toContain('started append survival memory');
+    expect(retry).toMatchObject({ role: 'reviewer', generation: 1, state: 'live' });
+    expect(changedSelectionFailure).toEqual(
+      expect.objectContaining({ message: 'Cannot change Reviewer engine or model after its session has started' }),
+    );
+    expect(
+      calls.startSession.mock.calls.filter(([config]) => (config as { name: string }).name.endsWith('-reviewer')),
+    ).toHaveLength(1);
+  });
+
+  it('keeps compatibility selections bound when Reviewer started-event append fails live', async () => {
+    const onRoleSelectionChanged = vi.fn();
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({ onRoleSelectionChanged });
+    const internal = dispatcher as unknown as {
+      coderStarted: boolean;
+      reviewerStarted: boolean;
+      coderSelection: { engine: string; model?: string };
+      reviewerSelection: { engine: string; model?: string };
+    };
+    const appendFailure = injectStartedGenerationAppendFailure(dispatcher, 'reviewer');
+    calls.stopSession.mockRejectedValue(new Error('cleanup stop failed'));
+    const selected = {
+      coder_engine: 'codex' as const,
+      coder_model: 'gpt-coder',
+      reviewer_engine: 'gemini' as const,
+      reviewer_model: 'gemini-review',
+    };
+
+    const startupFailure = await dispatcher
+      .spawnSubagents(selected)
+      .then(() => undefined)
+      .catch((error: unknown) => error);
+    const stateAfterFailure = {
+      coderStarted: internal.coderStarted,
+      reviewerStarted: internal.reviewerStarted,
+      coderSelection: { ...internal.coderSelection },
+      reviewerSelection: { ...internal.reviewerSelection },
+      events: readGenerationEvents(ledgerDir).map((entry) => [entry.payload.role, entry.kind]),
+      persistedSelections: structuredClone(onRoleSelectionChanged.mock.calls),
+    };
+    await dispatcher.spawnSubagents(selected);
+    const changedCoderFailure = await dispatcher
+      .spawnSubagents({ ...selected, coder_engine: 'cursor' })
+      .then(() => undefined)
+      .catch((error: unknown) => error);
+    const changedReviewerFailure = await dispatcher
+      .spawnSubagents({ ...selected, reviewer_engine: 'cursor' })
+      .then(() => undefined)
+      .catch((error: unknown) => error);
+
+    expect(startupFailure).toBe(appendFailure);
+    expect(stateAfterFailure).toEqual({
+      coderStarted: true,
+      reviewerStarted: true,
+      coderSelection: { engine: 'codex', model: 'gpt-coder', customEngine: undefined },
+      reviewerSelection: { engine: 'gemini', model: 'gemini-review', customEngine: undefined },
+      events: [
+        ['coder', 'agent_generation_reserved'],
+        ['coder', 'agent_generation_started'],
+        ['reviewer', 'agent_generation_reserved'],
+        ['reviewer', 'agent_generation_started'],
+      ],
+      persistedSelections: [
+        [
+          {
+            coder: { engine: 'codex', model: 'gpt-coder' },
+            reviewer: { engine: 'gemini', model: 'gemini-review' },
+          },
+        ],
+      ],
+    });
+    expect(changedCoderFailure).toEqual(
+      expect.objectContaining({ message: 'Cannot change Coder engine or model after its session has started' }),
+    );
+    expect(changedReviewerFailure).toEqual(
+      expect.objectContaining({ message: 'Cannot change Reviewer engine or model after its session has started' }),
+    );
+    expect(
+      calls.startSession.mock.calls.filter(([config]) => (config as { name: string }).name.endsWith('-coder')),
+    ).toHaveLength(1);
+    expect(
+      calls.startSession.mock.calls.filter(([config]) => (config as { name: string }).name.endsWith('-reviewer')),
+    ).toHaveLength(1);
+  });
+
+  it('keeps the started-event append failure primary when surviving-selection persistence also fails', async () => {
+    const persistenceFailure = new Error('surviving selection persistence failed');
+    const onRoleSelectionChanged = vi.fn().mockRejectedValue(persistenceFailure);
+    const { dispatcher, calls } = makeDispatcher({ onRoleSelectionChanged });
+    const appendFailure = injectStartedGenerationAppendFailure(dispatcher, 'coder');
+    calls.stopSession.mockRejectedValue(new Error('cleanup stop failed'));
+
+    const startupFailure = await dispatcher
+      .spawnCoder({ coder_engine: 'codex', coder_model: 'gpt-coder' })
+      .then(() => undefined)
+      .catch((error: unknown) => error);
+
+    expect(startupFailure).toBe(appendFailure);
+    expect(onRoleSelectionChanged).toHaveBeenCalledWith({
+      coder: { engine: 'codex', model: 'gpt-coder' },
+      reviewer: { engine: 'claude', model: undefined },
+    });
+  });
+
+  it('spawn_subagents rolls back only sessions started by that call and restores failed selections', async () => {
+    const { dispatcher, calls } = makeDispatcher();
+    await (
+      dispatcher as unknown as {
+        spawnCoder(args?: Record<string, unknown>): Promise<PhysicalAgentGeneration>;
+      }
+    ).spawnCoder();
+    calls.startSession.mockImplementation(async (config: { name: string }) => {
+      if (config.name.endsWith('-reviewer')) throw new Error('reviewer failed to start');
+      return { name: config.name, state: 'ready' };
+    });
+
+    await expect(dispatcher.spawnSubagents({ reviewer_engine: 'gemini' })).rejects.toThrow('reviewer failed to start');
+
+    expect(calls.stopSession).not.toHaveBeenCalledWith('autoloop-r1-coder');
+    calls.startSession.mockImplementation(async (config: { name: string }) => ({ name: config.name, state: 'ready' }));
+    await (
+      dispatcher as unknown as {
+        spawnReviewer(args?: Record<string, unknown>): Promise<PhysicalAgentGeneration>;
+      }
+    ).spawnReviewer();
+    const reviewerStarts = calls.startSession.mock.calls
+      .map(([config]) => config as Record<string, unknown>)
+      .filter((config) => config.name === 'autoloop-r1-reviewer');
+    expect(reviewerStarts.at(-1)).toMatchObject({ engine: 'claude', model: 'sonnet' });
+  });
+
+  it('spawn_subagents validates both selections before starting either independent primitive', async () => {
+    const { dispatcher, calls } = makeDispatcher();
+
+    await expect(dispatcher.spawnSubagents({ coder_engine: 'codex', reviewer_engine: 'custom' })).rejects.toThrow(
+      'Reviewer custom engine config is required',
+    );
+
+    expect(calls.startSession).not.toHaveBeenCalled();
+    await (
+      dispatcher as unknown as {
+        spawnCoder(args?: Record<string, unknown>): Promise<PhysicalAgentGeneration>;
+      }
+    ).spawnCoder();
+    expect(findStart(calls, 'coder')).toMatchObject({ engine: 'claude', model: 'sonnet' });
+  });
+
+  it('rejects a combined independent lifecycle batch before state, then accepts idempotent standalone retries', async () => {
+    const onSpawnSubagentsCommitted = vi.fn();
+    const combined = [
+      '```autoloop',
+      JSON.stringify({ tool: 'spawn_coder', args: { coder_engine: 'codex', coder_model: 'gpt-coder' } }),
+      '```',
+      '```autoloop',
+      JSON.stringify({
+        tool: 'spawn_reviewer',
+        args: { reviewer_engine: 'gemini', reviewer_model: 'gemini-review' },
+      }),
+      '```',
+    ].join('\n');
+    const standaloneCoder = [
+      '```autoloop',
+      JSON.stringify({ tool: 'spawn_coder', args: { coder_engine: 'codex', coder_model: 'gpt-coder' } }),
+      '```',
+    ].join('\n');
+    const standaloneReviewer = [
+      '```autoloop',
+      JSON.stringify({
+        tool: 'spawn_reviewer',
+        args: { reviewer_engine: 'gemini', reviewer_model: 'gemini-review' },
+      }),
+      '```',
+    ].join('\n');
+    const { dispatcher, calls, ledgerDir, activeNames } = makeDispatcher(
+      { onSpawnSubagentsCommitted },
+      {
+        sendOutputs: [combined, standaloneCoder, standaloneReviewer, standaloneCoder],
+        startThrowsFor: 'reviewer',
+      },
+    );
+
+    await expect(dispatcher.deliver(Msg.chat(0, { text: 'start both independently' }))).rejects.toMatchObject({
+      code: 'AUTOLOOP_CONTROL_MALFORMED',
+    });
+    expect([...activeNames].filter((name) => name.endsWith('-coder') || name.endsWith('-reviewer'))).toEqual([]);
+    expect(decisionRows(ledgerDir, 'spawn_coder')).toEqual([]);
+    expect(decisionRows(ledgerDir, 'spawn_reviewer')).toEqual([]);
+    expect(onSpawnSubagentsCommitted).not.toHaveBeenCalled();
+
+    calls.startSession.mockImplementation(async (config: { name: string }) => {
+      activeNames.add(config.name);
+      return { name: config.name, state: 'ready' };
+    });
+    await dispatcher.deliver(Msg.chat(0, { text: 'start Coder alone' }));
+    await dispatcher.deliver(Msg.chat(0, { text: 'start Reviewer alone' }));
+    await dispatcher.deliver(Msg.chat(0, { text: 'retry Coder alone' }));
+
+    expect(
+      calls.startSession.mock.calls
+        .map(([config]) => (config as { name: string }).name)
+        .filter((name) => name.endsWith('-coder') || name.endsWith('-reviewer')),
+    ).toEqual(['autoloop-r1-coder', 'autoloop-r1-reviewer']);
+    expect(decisionRows(ledgerDir, 'spawn_coder')).toHaveLength(1);
+    expect(decisionRows(ledgerDir, 'spawn_reviewer')).toHaveLength(1);
+    expect(onSpawnSubagentsCommitted).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('ClaudeAgentDispatcher — Reviewer-only checkpoint requests', () => {
+  const reviewerReply = [
+    'Independent review complete.',
+    '```autoloop',
+    JSON.stringify({
+      tool: 'review_complete',
+      args: { decision: 'advance', metric: 1, audit_notes: 'existing checkpoint reviewed' },
+    }),
+    '```',
+  ].join('\n');
+
+  it('exposes checkpoint-specific preparation types without the deprecated delivery alias', () => {
+    expectTypeOf<PreparedReviewRequest['payload']>().toEqualTypeOf<CheckpointReviewRequestPayload>();
+    expectTypeOf<
+      Awaited<ReturnType<ClaudeAgentDispatcher['requestReview']>>
+    >().toEqualTypeOf<ReviewRequestPreparationResult>();
+  });
+
+  it('prepares source iter 3 into target iter 0, leaves local iter 3 free, and delivers only through the emitted message', async () => {
+    const { dispatcher, calls, workspace, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(workspace);
+    const sourceLedger = writeSourceReviewArtifacts(workspace, 'source-run', 3, checkpoint.patch);
+    sourceLedger.writeIterationArtifact(2, 'verdict.json', '{"source":"prior verdict must not be imported"}\n');
+    const args = {
+      checkpoint_sha: checkpoint.sha,
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['security', 'regression'],
+      idempotency_key: 'review-source-run-3',
+    };
+    const api = dispatcher as unknown as {
+      requestReview(
+        input: typeof args,
+        targetIter: number,
+      ): Promise<{
+        status: 'prepared' | 'duplicate';
+        target: 'reviewer';
+        idempotency_key: string;
+        payload?: Parameters<typeof Msg.reviewRequest>[1];
+      }>;
+    };
+
+    const first = await api.requestReview(args, 0);
+
+    expect(first).toMatchObject({
+      status: 'prepared',
+      target: 'reviewer',
+      idempotency_key: 'review-source-run-3',
+      payload: { iter: 0, source_iter: 3, checkpoint_sha: checkpoint.sha },
+    });
+    expect(calls.startSession).not.toHaveBeenCalled();
+    expect(calls.sendMessage).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(ledgerDir, 'iter', '0', 'diff.patch'))).toEqual(checkpoint.patch);
+    expect(fs.existsSync(path.join(ledgerDir, 'iter', '3'))).toBe(false);
+
+    const replies = await dispatcher.deliver(Msg.reviewRequest(0, first.payload!));
+
+    expect(replies).toHaveLength(1);
+    expect(replies[0].type).toBe('review_verdict');
+    expect(calls.startSession.mock.calls.map(([config]) => (config as { name: string }).name)).toEqual([
+      'autoloop-r1-reviewer',
+    ]);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(1);
+    expect(calls.sendMessage.mock.calls[0][1]).toBe(
+      [
+        '[review_request iter=0]',
+        'Artifacts staged from run source-run iter 3 at: iter-0/ (directive.json, diff.patch, eval_output.json)',
+        `checkpoint_sha: ${checkpoint.sha}`,
+        'scope: ["security","regression"]',
+        'prior_verdict: (none)',
+        'prior_metrics: []',
+        '',
+        'Audit and emit `review_complete`.',
+      ].join('\n'),
+    );
+    expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'verdict.json'))).toBe(true);
+    expect(fs.existsSync(path.join(ledgerDir, 'iter', '3'))).toBe(false);
+
+    const duplicate = await api.requestReview({ ...args }, 0);
+    expect(duplicate).toEqual({
+      status: 'duplicate',
+      target: 'reviewer',
+      idempotency_key: 'review-source-run-3',
+    });
+    expect(calls.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('crosses the request_review file and directory durability barriers before returning prepared', async () => {
+    const barriers: string[] = [];
+    const secureLedger = SecureAutoloopLedger.open(tmpRoot, 'r1', {
+      create: true,
+      testHooks: {
+        beforeFileMutation: ({ name, operation }) => {
+          if (name === 'decisions.jsonl' && (operation === 'append' || operation === 'flush')) {
+            barriers.push(operation);
+          }
+        },
+        beforeDirectorySync: ({ name }) => {
+          if (name === 'decisions.jsonl') barriers.push('directory-sync');
+        },
+      },
+    });
+    const { dispatcher, workspace, ledgerDir } = makeDispatcher({ secureLedger }, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(workspace);
+    writeSourceReviewArtifacts(workspace, 'source-run', 3, checkpoint.patch);
+
+    await expect(
+      dispatcher.requestReview(
+        {
+          checkpoint_sha: checkpoint.sha,
+          source_run_id: 'source-run',
+          source_iter: 3,
+          scope: ['durability'],
+          idempotency_key: 'durable-review-claim',
+        },
+        0,
+      ),
+    ).resolves.toMatchObject({ status: 'prepared' });
+
+    expect(barriers).toEqual(['append', 'flush', 'directory-sync']);
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+  });
+
+  it.each(['file sync', 'directory sync', 'descriptor close'] as const)(
+    'reconciles a committed request_review after one %s ambiguity without appending twice',
+    async (boundary) => {
+      let injected = false;
+      let decisionAppends = 0;
+      let directorySyncs = 0;
+      const secureLedger = SecureAutoloopLedger.open(tmpRoot, 'r1', {
+        create: true,
+        testHooks: {
+          beforeFileMutation: ({ name, operation }) => {
+            if (name !== 'decisions.jsonl') return;
+            if (operation === 'append') decisionAppends += 1;
+            if (boundary === 'file sync' && operation === 'flush' && !injected) {
+              injected = true;
+              throw new Error('injected request_review file sync ambiguity');
+            }
+          },
+          beforeDirectorySync: ({ name }) => {
+            if (name !== 'decisions.jsonl') return;
+            directorySyncs += 1;
+            if (boundary === 'directory sync' && !injected) {
+              injected = true;
+              throw new Error('injected request_review directory sync ambiguity');
+            }
+          },
+          closeFlatFileDescriptor: (fd) => {
+            fs.closeSync(fd);
+            if (boundary === 'descriptor close' && !injected) {
+              injected = true;
+              throw new Error('injected request_review descriptor close ambiguity');
+            }
+          },
+        },
+      });
+      const { dispatcher, workspace, ledgerDir } = makeDispatcher({ secureLedger }, { sendOutput: reviewerReply });
+      const checkpoint = initializeCheckpointRepository(workspace);
+      writeSourceReviewArtifacts(workspace, 'source-run', 3, checkpoint.patch);
+      const args = {
+        checkpoint_sha: checkpoint.sha,
+        source_run_id: 'source-run',
+        source_iter: 3,
+        scope: ['durability'],
+        idempotency_key: `durable-${boundary.replace(' ', '-')}`,
+      };
+
+      await expect(dispatcher.requestReview(args, 0)).resolves.toMatchObject({ status: 'prepared' });
+      await expect(dispatcher.requestReview({ ...args }, 0)).resolves.toMatchObject({ status: 'duplicate' });
+
+      expect(injected).toBe(true);
+      expect(decisionAppends).toBe(1);
+      expect(directorySyncs).toBeGreaterThan(0);
+      expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    { label: 'successful', omit: undefined },
+    { label: 'failed', omit: 'coder_summary.txt' as const },
+  ])('keeps foreign ledger permissions and bytes unchanged after a $label read-only import', async ({ omit }) => {
+    const { dispatcher, workspace } = makeDispatcher({}, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(workspace);
+    const sourceLedger = writeSourceReviewArtifacts(workspace, 'foreign-source', 3, checkpoint.patch, { omit });
+    sourceLedger.appendFlatFile('decisions.jsonl', '{"foreign":"preserved"}\n');
+    const paths = {
+      tasks: path.join(workspace, 'tasks'),
+      run: sourceLedger.directory,
+      iterRoot: path.join(sourceLedger.directory, 'iter'),
+      iter: path.join(sourceLedger.directory, 'iter', '3'),
+      decisions: path.join(sourceLedger.directory, 'decisions.jsonl'),
+      directive: path.join(sourceLedger.directory, 'iter', '3', 'directive.json'),
+    };
+    fs.chmodSync(paths.tasks, 0o755);
+    fs.chmodSync(paths.run, 0o751);
+    fs.chmodSync(paths.iterRoot, 0o755);
+    fs.chmodSync(paths.iter, 0o751);
+    fs.chmodSync(paths.decisions, 0o644);
+    fs.chmodSync(paths.directive, 0o640);
+    const beforeModes = Object.fromEntries(Object.entries(paths).map(([name, target]) => [name, permissions(target)]));
+    const beforeBytes = {
+      decisions: fs.readFileSync(paths.decisions),
+      directive: fs.readFileSync(paths.directive),
+    };
+    const request = dispatcher.requestReview(
+      {
+        checkpoint_sha: checkpoint.sha,
+        source_run_id: 'foreign-source',
+        source_iter: 3,
+        scope: ['immutability'],
+        idempotency_key: `foreign-read-only-${omit ?? 'success'}`,
+      },
+      0,
+    );
+
+    if (omit) await expect(request).rejects.toThrow(/coder_summary\.txt/i);
+    else await expect(request).resolves.toMatchObject({ status: 'prepared' });
+
+    expect(Object.fromEntries(Object.entries(paths).map(([name, target]) => [name, permissions(target)]))).toEqual(
+      beforeModes,
+    );
+    expect(fs.readFileSync(paths.decisions)).toEqual(beforeBytes.decisions);
+    expect(fs.readFileSync(paths.directive)).toEqual(beforeBytes.directive);
+  });
+
+  it('removes only a failed matching cache entry so same-digest retry succeeds while conflicting reuse rejects', async () => {
+    const { dispatcher, calls, workspace, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(workspace);
+    const sourceLedger = writeSourceReviewArtifacts(workspace, 'source-run', 3, checkpoint.patch, {
+      omit: 'coder_summary.txt',
+    });
+    const args = {
+      checkpoint_sha: checkpoint.sha,
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+      idempotency_key: 'retryable-review',
+    };
+    const api = dispatcher as unknown as {
+      requestReview(input: typeof args, targetIter: number): Promise<{ status: string }>;
+      reviewRequestIdentityHistory: Map<string, string>;
+    };
+
+    const failed = api.requestReview(args, 0);
+    await expect(api.requestReview({ ...args, scope: ['different'] }, 0)).rejects.toThrow(/idempotency.*conflict/i);
+    await expect(failed).rejects.toThrow(/coder_summary\.txt/i);
+    expect(api.reviewRequestIdentityHistory.has(reviewIdentityHash(args.idempotency_key))).toBe(false);
+    sourceLedger.writeIterationArtifact(3, 'coder_summary.txt', 'existing checkpoint\n');
+
+    await expect(api.requestReview({ ...args }, 0)).resolves.toMatchObject({ status: 'prepared' });
+    expect(api.reviewRequestIdentityHistory.get(reviewIdentityHash(args.idempotency_key))).toMatch(/^[0-9a-f]{64}$/);
+    await expect(api.requestReview({ ...args, scope: ['different'] }, 0)).rejects.toThrow(/idempotency.*conflict/i);
+
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+    expect(calls.startSession).not.toHaveBeenCalled();
+    expect(calls.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('releases an identity when a committed nested import precedes its durable request claim', async () => {
+    let failCommittedImport = true;
+    const secureLedger = SecureAutoloopLedger.open(tmpRoot, 'r1', {
+      create: true,
+      testHooks: {
+        afterNestedTemporaryUnlink: ({ relativePath }) => {
+          if (!failCommittedImport || relativePath !== 'iter/0/diff.patch') return;
+          failCommittedImport = false;
+          throw new Error('injected committed import failure before request_review append');
+        },
+      },
+    });
+    const { dispatcher, workspace, ledgerDir } = makeDispatcher({ secureLedger }, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(workspace);
+    writeSourceReviewArtifacts(workspace, 'source-run', 3, checkpoint.patch);
+    const args = {
+      checkpoint_sha: checkpoint.sha,
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+      idempotency_key: 'committed-import-before-claim',
+    };
+    const internal = dispatcher as unknown as { reviewRequestIdentityHistory: Map<string, string> };
+
+    await expect(dispatcher.requestReview(args, 0)).rejects.toMatchObject({
+      name: 'SecureAutoloopLedgerCommitError',
+      committed: true,
+      operation: 'secure_nested_artifact_write',
+    });
+    expect(requestReviewDecisions(ledgerDir)).toEqual([]);
+    expect(fs.readFileSync(path.join(ledgerDir, 'iter', '0', 'diff.patch'))).toEqual(checkpoint.patch);
+    expect(internal.reviewRequestIdentityHistory.has(reviewIdentityHash(args.idempotency_key))).toBe(false);
+
+    await expect(dispatcher.requestReview({ ...args }, 0)).resolves.toMatchObject({ status: 'prepared' });
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+    await expect(dispatcher.requestReview({ ...args, scope: ['different'] }, 0)).rejects.toThrow(
+      /idempotency.*conflict/i,
+    );
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+  });
+
+  it('releases an identity when a nested artifact commits before claim and the decisions lookup is unreadable', async () => {
+    let blockDecisionReads = false;
+    let failCommittedImport = true;
+    const secureLedger = SecureAutoloopLedger.open(tmpRoot, 'r1', {
+      create: true,
+      testHooks: {
+        afterNestedTemporaryUnlink: ({ relativePath }) => {
+          if (!failCommittedImport || relativePath !== 'iter/0/diff.patch') return;
+          failCommittedImport = false;
+          blockDecisionReads = true;
+          throw new Error('injected committed nested write before an unreadable decision lookup');
+        },
+      },
+    });
+    const openFlatFile = secureLedger.openFlatFile.bind(secureLedger);
+    vi.spyOn(secureLedger, 'openFlatFile').mockImplementation((name, mode, create) => {
+      if (blockDecisionReads && name === 'decisions.jsonl' && mode === 'read') {
+        throw new Error('injected unreadable decisions ledger after nested commit');
+      }
+      return openFlatFile(name, mode, create);
+    });
+    const { dispatcher, workspace, ledgerDir } = makeDispatcher({ secureLedger }, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(workspace);
+    writeSourceReviewArtifacts(workspace, 'source-run', 3, checkpoint.patch);
+    const args = {
+      checkpoint_sha: checkpoint.sha,
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+      idempotency_key: 'nested-commit-unreadable-decisions',
+    };
+    const internal = dispatcher as unknown as { reviewRequestIdentityHistory: Map<string, string> };
+    const identityHash = reviewIdentityHash(args.idempotency_key);
+
+    await expect(dispatcher.requestReview(args, 0)).rejects.toMatchObject({
+      name: 'SecureAutoloopLedgerCommitError',
+      committed: true,
+      operation: 'secure_nested_artifact_write',
+    });
+    expect(internal.reviewRequestIdentityHistory.has(identityHash)).toBe(false);
+    expect(requestReviewDecisions(ledgerDir)).toEqual([]);
+
+    blockDecisionReads = false;
+    await expect(dispatcher.requestReview({ ...args }, 0)).resolves.toMatchObject({ status: 'prepared' });
+    await expect(dispatcher.requestReview({ ...args }, 0)).resolves.toMatchObject({ status: 'duplicate' });
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+  });
+
+  it('reconciles a request_review row committed before descriptor-close failure without releasing or appending twice', async () => {
+    const closeFailure = new Error('injected post-write close failure');
+    let closeFailures = 0;
+    const secureLedger = SecureAutoloopLedger.open(tmpRoot, 'r1', {
+      create: true,
+      testHooks: {
+        closeFlatFileDescriptor: (fd) => {
+          fs.closeSync(fd);
+          if (closeFailures === 0) {
+            closeFailures += 1;
+            throw closeFailure;
+          }
+        },
+      },
+    });
+    const { dispatcher, workspace, ledgerDir } = makeDispatcher({ secureLedger }, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(workspace);
+    writeSourceReviewArtifacts(workspace, 'source-run', 3, checkpoint.patch);
+    const args = {
+      checkpoint_sha: checkpoint.sha,
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+      idempotency_key: 'post-write-close-review',
+    };
+
+    await expect(dispatcher.requestReview(args, 0)).resolves.toMatchObject({ status: 'prepared' });
+    expect(closeFailures).toBe(1);
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+    await expect(dispatcher.requestReview({ ...args }, 0)).resolves.toMatchObject({ status: 'duplicate' });
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+  });
+
+  it('reclaims one Planner review_request after a committed row is temporarily unreadable', async () => {
+    let blockReconciliationRead = false;
+    let failRequestReviewClose = false;
+    let decisionAppends = 0;
+    const secureLedger = SecureAutoloopLedger.open(tmpRoot, 'r1', {
+      create: true,
+      testHooks: {
+        beforeFileMutation: ({ name, operation }) => {
+          if (name !== 'decisions.jsonl' || operation !== 'append') return;
+          decisionAppends += 1;
+          if (decisionAppends === 1) failRequestReviewClose = true;
+        },
+        closeFlatFileDescriptor: (fd) => {
+          fs.closeSync(fd);
+          if (failRequestReviewClose) {
+            failRequestReviewClose = false;
+            blockReconciliationRead = true;
+            throw new Error('injected post-write close failure');
+          }
+        },
+      },
+    });
+    const openFlatFile = secureLedger.openFlatFile.bind(secureLedger);
+    vi.spyOn(secureLedger, 'openFlatFile').mockImplementation((name, mode, create) => {
+      if (blockReconciliationRead && name === 'decisions.jsonl' && mode === 'read') {
+        throw new Error('injected reconciliation read failure');
+      }
+      return openFlatFile(name, mode, create);
+    });
+    const checkpoint = initializeCheckpointRepository(tmpRoot);
+    writeSourceReviewArtifacts(tmpRoot, 'source-run', 3, checkpoint.patch);
+    const args = {
+      checkpoint_sha: checkpoint.sha,
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+      idempotency_key: 'unreadable-committed-review',
+    };
+    const plannerReply = ['```autoloop', JSON.stringify({ tool: 'request_review', args }), '```'].join('\n');
+    const { dispatcher, ledgerDir } = makeDispatcher({ secureLedger }, { sendOutputs: [plannerReply, plannerReply] });
+    const internal = dispatcher as unknown as {
+      reviewRequestIdentityHistory: Map<string, string>;
+      releasedReviewRequests: Map<string, unknown>;
+    };
+
+    await expect(dispatcher.requestReview(args, 0)).rejects.toMatchObject({
+      name: 'SecureAutoloopLedgerCommitError',
+      code: 'AUTOLOOP_LEDGER_DESCRIPTOR_CLOSE_INCOMPLETE',
+      committed: true,
+      operation: 'secure_ledger_append',
+    });
+    expect(internal.reviewRequestIdentityHistory.has(reviewIdentityHash(args.idempotency_key))).toBe(true);
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+
+    blockReconciliationRead = false;
+    const reclaimed = await dispatcher.deliver(Msg.chat(0, { text: 'retry exact review' }));
+
+    expect(reclaimed).toHaveLength(1);
+    expect(validateMessage(reclaimed[0])).toMatchObject({
+      type: 'review_request',
+      payload: expect.objectContaining({
+        checkpoint_sha: checkpoint.sha,
+        idempotency_key: args.idempotency_key,
+      }),
+    });
+    expect(internal.releasedReviewRequests.size).toBe(0);
+    await expect(dispatcher.deliver(Msg.chat(0, { text: 'retry accepted review' }))).resolves.toEqual([]);
+    await expect(dispatcher.requestReview({ ...args, scope: ['different'] }, 0)).rejects.toThrow(
+      /idempotency.*conflict/i,
+    );
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+  });
+
+  it('preserves the complete prior durable snapshot when a sibling caches success during a failed committed refresh', async () => {
+    let failCommittedClose = false;
+    let blockRefreshReads = false;
+    let injectSibling = false;
+    const secureLedger = SecureAutoloopLedger.open(tmpRoot, 'r1', {
+      create: true,
+      testHooks: {
+        closeFlatFileDescriptor: (fd) => {
+          fs.closeSync(fd);
+          if (failCommittedClose) {
+            failCommittedClose = false;
+            blockRefreshReads = true;
+            injectSibling = true;
+            throw new Error('injected committed append close ambiguity');
+          }
+        },
+      },
+    });
+    const historical = ['historical-review-one', 'historical-review-two'].map((idempotencyKey) =>
+      durableReviewDecisionPayload(idempotencyKey),
+    );
+    secureLedger.appendFlatFile(
+      'decisions.jsonl',
+      `${historical.map((payload) => durableReviewDecisionRow(payload)).join('\n')}\n`,
+    );
+    const { dispatcher, workspace } = makeDispatcher({ secureLedger }, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(workspace);
+    writeSourceReviewArtifacts(workspace, 'source-run', 3, checkpoint.patch);
+    const sibling = durableReviewDecisionPayload('sibling-success');
+    const internal = dispatcher as unknown as {
+      durableReviewRequestClaims?: Map<string, unknown>;
+      findDurableReviewRequest(
+        expected: Readonly<Record<string, unknown>>,
+        forceRefresh?: boolean,
+      ): 'none' | 'matching' | 'conflicting';
+      persistReviewRequestDecision(payload: Readonly<Record<string, unknown>>): void;
+    };
+    const openFlatFile = secureLedger.openFlatFile.bind(secureLedger);
+    vi.spyOn(secureLedger, 'openFlatFile').mockImplementation((name, mode, create) => {
+      if (blockRefreshReads && name === 'decisions.jsonl' && mode === 'read') {
+        if (injectSibling) {
+          injectSibling = false;
+          internal.persistReviewRequestDecision(sibling);
+        }
+        throw new Error('injected committed refresh read failure');
+      }
+      return openFlatFile(name, mode, create);
+    });
+    const args = {
+      checkpoint_sha: checkpoint.sha,
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+      idempotency_key: 'ambiguous-primary-review',
+    };
+
+    const pending = dispatcher.requestReview(args, 0);
+    failCommittedClose = true;
+    await expect(pending).rejects.toMatchObject({
+      name: 'SecureAutoloopLedgerCommitError',
+      committed: true,
+      operation: 'secure_ledger_append',
+    });
+
+    expect(internal.durableReviewRequestClaims?.size).toBe(3);
+    for (const payload of [...historical, sibling]) {
+      expect(internal.findDurableReviewRequest(payload)).toBe('matching');
+    }
+  });
+
+  it('retains fail-closed durable identity capacity when a failed committed refresh is reordered with sibling success', async () => {
+    let failCommittedClose = false;
+    let blockRefreshReads = false;
+    let injectSibling = false;
+    const secureLedger = SecureAutoloopLedger.open(tmpRoot, 'r1', {
+      create: true,
+      testHooks: {
+        closeFlatFileDescriptor: (fd) => {
+          fs.closeSync(fd);
+          if (failCommittedClose) {
+            failCommittedClose = false;
+            blockRefreshReads = true;
+            injectSibling = true;
+            throw new Error('injected committed append close ambiguity at capacity');
+          }
+        },
+      },
+    });
+    const historicalRows = Array.from({ length: 4_094 }, (_, index) =>
+      durableReviewDecisionRow(durableReviewDecisionPayload(`capacity-history-${index}`)),
+    );
+    secureLedger.appendFlatFile('decisions.jsonl', `${historicalRows.join('\n')}\n`);
+    const { dispatcher, workspace } = makeDispatcher({ secureLedger }, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(workspace);
+    writeSourceReviewArtifacts(workspace, 'source-run', 3, checkpoint.patch);
+    const sibling = durableReviewDecisionPayload('capacity-sibling-success');
+    const internal = dispatcher as unknown as {
+      persistReviewRequestDecision(payload: Readonly<Record<string, unknown>>): void;
+      prepareCheckpointReview(request: Record<string, unknown>, targetIter: number, digest: string): Promise<unknown>;
+    };
+    const openFlatFile = secureLedger.openFlatFile.bind(secureLedger);
+    vi.spyOn(secureLedger, 'openFlatFile').mockImplementation((name, mode, create) => {
+      if (blockRefreshReads && name === 'decisions.jsonl' && mode === 'read') {
+        if (injectSibling) {
+          injectSibling = false;
+          internal.persistReviewRequestDecision(sibling);
+        }
+        throw new Error('injected committed refresh read failure at capacity');
+      }
+      return openFlatFile(name, mode, create);
+    });
+    const ambiguous = {
+      checkpoint_sha: checkpoint.sha,
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+      idempotency_key: 'capacity-ambiguous-primary',
+    };
+
+    const pending = dispatcher.requestReview(ambiguous, 0);
+    failCommittedClose = true;
+    await expect(pending).rejects.toMatchObject({ committed: true, operation: 'secure_ledger_append' });
+
+    const prepare = vi.spyOn(internal, 'prepareCheckpointReview');
+    await expect(
+      dispatcher.requestReview(
+        {
+          checkpoint_sha: checkpoint.sha,
+          source_run_id: 'source-run',
+          source_iter: 3,
+          scope: ['correctness'],
+          idempotency_key: 'capacity-must-fail-closed',
+        },
+        1,
+      ),
+    ).rejects.toThrow(/identity.*4096|4096.*identity|identity.*capacity/i);
+    expect(prepare).not.toHaveBeenCalled();
+  });
+
+  it('deduplicates an exact durable request across a cold dispatcher and rejects a changed payload before preparation', async () => {
+    const first = makeDispatcher({}, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(first.workspace);
+    writeSourceReviewArtifacts(first.workspace, 'source-run', 3, checkpoint.patch);
+    const args = {
+      checkpoint_sha: checkpoint.sha,
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+      idempotency_key: 'cold-dispatcher-review',
+    };
+    await expect(first.dispatcher.requestReview(args, 0)).resolves.toMatchObject({ status: 'prepared' });
+    expect(requestReviewDecisions(first.ledgerDir)).toHaveLength(1);
+
+    const cold = makeDispatcher({}, { sendOutput: reviewerReply });
+    const internal = cold.dispatcher as unknown as {
+      prepareCheckpointReview(request: typeof args, targetIter: number, digest: string): Promise<unknown>;
+    };
+    const prepare = vi.spyOn(internal, 'prepareCheckpointReview');
+    const openFlatFile = vi.spyOn(cold.dispatcher.secureLedgerCapability, 'openFlatFile');
+
+    await expect(cold.dispatcher.requestReview({ ...args }, 0)).resolves.toMatchObject({ status: 'duplicate' });
+    await expect(cold.dispatcher.requestReview({ ...args, scope: ['different'] }, 0)).rejects.toThrow(
+      /idempotency.*conflict/i,
+    );
+    await expect(cold.dispatcher.requestReview({ ...args }, 0)).resolves.toMatchObject({ status: 'duplicate' });
+    expect(prepare).not.toHaveBeenCalled();
+    expect(
+      openFlatFile.mock.calls.filter(([name, mode]) => name === 'decisions.jsonl' && mode === 'read'),
+    ).toHaveLength(1);
+    expect(requestReviewDecisions(first.ledgerDir)).toHaveLength(1);
+  });
+
+  it('treats repeated identical legacy request rows as one durable claim while any differing row conflicts', async () => {
+    const first = makeDispatcher({}, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(first.workspace);
+    writeSourceReviewArtifacts(first.workspace, 'source-run', 3, checkpoint.patch);
+    const args = {
+      checkpoint_sha: checkpoint.sha,
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+      idempotency_key: 'legacy-duplicate-review',
+    };
+    await first.dispatcher.requestReview(args, 0);
+    const committed = requestReviewDecisions(first.ledgerDir)[0];
+    first.dispatcher.secureLedgerCapability.appendFlatFile('decisions.jsonl', `${JSON.stringify(committed)}\n`);
+
+    const compatible = makeDispatcher({}, { sendOutput: reviewerReply });
+    await expect(compatible.dispatcher.requestReview({ ...args }, 0)).resolves.toMatchObject({ status: 'duplicate' });
+    expect(requestReviewDecisions(first.ledgerDir)).toHaveLength(2);
+
+    const conflictingRow = structuredClone(committed) as { payload: Record<string, unknown> };
+    conflictingRow.payload.scope = ['different'];
+    first.dispatcher.secureLedgerCapability.appendFlatFile('decisions.jsonl', `${JSON.stringify(conflictingRow)}\n`);
+    const conflicted = makeDispatcher({}, { sendOutput: reviewerReply });
+
+    await expect(conflicted.dispatcher.requestReview({ ...args }, 0)).rejects.toThrow(/idempotency.*conflict/i);
+    expect(requestReviewDecisions(first.ledgerDir)).toHaveLength(3);
+  });
+
+  it('loads at most 4096 durable request identities and rejects the next unique claim before heavy preparation', async () => {
+    const { dispatcher, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+    const decisions = Array.from({ length: 4_097 }, (_, index) => {
+      const idempotencyKey = `persisted-capacity-${index}`;
+      return JSON.stringify({
+        ts: '2026-01-01T00:00:00.000Z',
+        kind: 'request_review',
+        actor: 'planner',
+        payload: {
+          checkpoint_sha: 'a'.repeat(40),
+          source_run_id: 'source-run',
+          source_iter: 3,
+          target_iter: 0,
+          scope: ['correctness'],
+          idempotency_key: idempotencyKey,
+          request_digest: createHash('sha256').update(idempotencyKey).digest('hex'),
+        },
+      });
+    }).join('\n');
+    dispatcher.secureLedgerCapability.appendFlatFile('decisions.jsonl', `${decisions}\n`);
+    const internal = dispatcher as unknown as {
+      prepareCheckpointReview(request: Record<string, unknown>, targetIter: number, digest: string): Promise<unknown>;
+    };
+    const prepare = vi.spyOn(internal, 'prepareCheckpointReview');
+    const openFlatFile = vi.spyOn(dispatcher.secureLedgerCapability, 'openFlatFile');
+
+    await expect(
+      dispatcher.requestReview(
+        {
+          checkpoint_sha: 'a'.repeat(40),
+          source_run_id: 'source-run',
+          source_iter: 3,
+          scope: ['correctness'],
+          idempotency_key: 'persisted-capacity-overflow',
+        },
+        0,
+      ),
+    ).rejects.toThrow(/durable.*identity.*4096|4096.*durable.*identity|identity.*capacity/i);
+
+    expect(prepare).not.toHaveBeenCalled();
+    expect(
+      openFlatFile.mock.calls.filter(([name, mode]) => name === 'decisions.jsonl' && mode === 'read'),
+    ).toHaveLength(1);
+    expect(fs.existsSync(path.join(ledgerDir, 'iter'))).toBe(false);
+  });
+
+  it('allocates exactly one full-size Buffer snapshot and no equivalent whole-ledger byte copy during cold lookup', async () => {
+    const first = makeDispatcher({}, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(first.workspace);
+    writeSourceReviewArtifacts(first.workspace, 'source-run', 3, checkpoint.patch);
+    const args = {
+      checkpoint_sha: checkpoint.sha,
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+      idempotency_key: 'no-second-full-buffer',
+    };
+    await first.dispatcher.requestReview(args, 0);
+    first.dispatcher.secureLedgerCapability.appendFlatFile(
+      'decisions.jsonl',
+      `${JSON.stringify({ kind: 'allocation-oracle-padding', payload: 'x'.repeat(256 * 1024) })}\n`,
+    );
+    const ledgerBytes = fs.statSync(path.join(first.ledgerDir, 'decisions.jsonl')).size;
+    const cold = makeDispatcher({}, { sendOutput: reviewerReply });
+    const bufferAlloc = vi.spyOn(Buffer, 'alloc');
+    const bufferAllocUnsafe = vi.spyOn(Buffer, 'allocUnsafe');
+    const bufferAllocUnsafeSlow = vi.spyOn(Buffer, 'allocUnsafeSlow');
+    const bufferFrom = vi.spyOn(Buffer, 'from');
+    const bufferConcat = vi.spyOn(Buffer, 'concat');
+    const bufferCopyBytesFrom = vi.spyOn(Buffer, 'copyBytesFrom');
+
+    try {
+      await expect(cold.dispatcher.requestReview({ ...args }, 0)).resolves.toMatchObject({ status: 'duplicate' });
+      const wholeLedgerAllocations = [
+        ...bufferAlloc.mock.calls.map(([size]) => ({ method: 'alloc', size })),
+        ...bufferAllocUnsafe.mock.calls.map(([size]) => ({ method: 'allocUnsafe', size })),
+        ...bufferAllocUnsafeSlow.mock.calls.map(([size]) => ({ method: 'allocUnsafeSlow', size })),
+        ...bufferFrom.mock.calls.map(([value]) => ({
+          method: 'from',
+          size:
+            typeof value === 'string'
+              ? Buffer.byteLength(value)
+              : ArrayBuffer.isView(value)
+                ? value.byteLength
+                : value instanceof ArrayBuffer
+                  ? value.byteLength
+                  : Array.isArray(value)
+                    ? value.length
+                    : 0,
+        })),
+        ...bufferConcat.mock.calls.map(([values, totalLength]) => ({
+          method: 'concat',
+          size: totalLength ?? values.reduce((total, value) => total + value.byteLength, 0),
+        })),
+        ...bufferCopyBytesFrom.mock.calls.map(([view, offset = 0, length]) => ({
+          method: 'copyBytesFrom',
+          size: length ?? view.length - offset,
+        })),
+      ].filter(({ size }) => size >= ledgerBytes);
+
+      expect(wholeLedgerAllocations).toEqual([{ method: 'allocUnsafe', size: ledgerBytes }]);
+    } finally {
+      bufferCopyBytesFrom.mockRestore();
+      bufferConcat.mockRestore();
+      bufferFrom.mockRestore();
+      bufferAllocUnsafeSlow.mockRestore();
+      bufferAllocUnsafe.mockRestore();
+      bufferAlloc.mockRestore();
+    }
+  });
+
+  it('rejects malformed UTF-8 and a leading BOM in the durable decision ledger before effects', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+    const target = path.join(ledgerDir, 'decisions.jsonl');
+    const args = {
+      checkpoint_sha: 'a'.repeat(40),
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+      idempotency_key: 'malformed-decision-ledger',
+    };
+    fs.writeFileSync(
+      target,
+      Buffer.concat([Buffer.from('{"kind":"request_review","payload":'), Buffer.from([0xff]), Buffer.from('}\n')]),
+      { mode: 0o600 },
+    );
+
+    await expect(dispatcher.requestReview(args, 0)).rejects.toThrow(/decisions\.jsonl.*valid UTF-8/i);
+    expect(calls.startSession).not.toHaveBeenCalled();
+    expect(calls.sendMessage).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(ledgerDir, 'iter'))).toBe(false);
+
+    fs.writeFileSync(
+      target,
+      Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('{"kind":"request_review","payload":{}}\n')]),
+    );
+    await expect(dispatcher.requestReview(args, 0)).rejects.toThrow(/decisions\.jsonl record 1.*malformed/i);
+    expect(fs.existsSync(path.join(ledgerDir, 'iter'))).toBe(false);
+  });
+
+  it('coalesces concurrent same-key same-digest preparation into one effect and one duplicate result', async () => {
+    const { dispatcher, calls, workspace, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(workspace);
+    writeSourceReviewArtifacts(workspace, 'source-run', 3, checkpoint.patch);
+    const args = {
+      checkpoint_sha: checkpoint.sha,
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+      idempotency_key: 'concurrent-review',
+    };
+    const api = dispatcher as unknown as {
+      requestReview(input: typeof args, targetIter: number): Promise<{ status: string }>;
+    };
+
+    const results = await Promise.all([api.requestReview(args, 0), api.requestReview({ ...args }, 0)]);
+
+    expect(results.map((result) => result.status).sort()).toEqual(['duplicate', 'prepared']);
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+    expect(calls.startSession).not.toHaveBeenCalled();
+    expect(calls.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('coalesces a real same-key preparation failure, clears its slot and identity, and prepares one exact retry', async () => {
+    const { dispatcher, workspace, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(workspace);
+    const sourceLedger = writeSourceReviewArtifacts(workspace, 'source-run', 3, checkpoint.patch, {
+      omit: 'coder_summary.txt',
+    });
+    const args = {
+      checkpoint_sha: checkpoint.sha,
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+      idempotency_key: 'concurrent-failing-review',
+    };
+    const api = dispatcher as unknown as {
+      requestReview(input: typeof args, targetIter: number): Promise<{ status: string }>;
+      prepareCheckpointReview(request: typeof args, targetIter: number, digest: string): Promise<unknown>;
+      activeReviewRequestPreparations: number;
+      reviewRequests: Map<string, unknown>;
+      reviewRequestIdentityHistory: Map<string, string>;
+    };
+    const prepare = vi.spyOn(api, 'prepareCheckpointReview');
+
+    const results = await Promise.allSettled([api.requestReview(args, 0), api.requestReview({ ...args }, 0)]);
+
+    expect(results).toEqual([
+      expect.objectContaining({
+        status: 'rejected',
+        reason: expect.objectContaining({ message: expect.stringMatching(/coder_summary\.txt/i) }),
+      }),
+      expect.objectContaining({
+        status: 'rejected',
+        reason: expect.objectContaining({ message: expect.stringMatching(/coder_summary\.txt/i) }),
+      }),
+    ]);
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(api.activeReviewRequestPreparations).toBe(0);
+    expect(api.reviewRequests.has(reviewIdentityHash(args.idempotency_key))).toBe(false);
+    expect(api.reviewRequestIdentityHistory.has(reviewIdentityHash(args.idempotency_key))).toBe(false);
+    expect(requestReviewDecisions(ledgerDir)).toEqual([]);
+
+    sourceLedger.writeIterationArtifact(3, 'coder_summary.txt', 'existing checkpoint\n');
+    await expect(api.requestReview({ ...args }, 0)).resolves.toMatchObject({ status: 'prepared' });
+    expect(prepare).toHaveBeenCalledTimes(2);
+    expect(api.activeReviewRequestPreparations).toBe(0);
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+  });
+
+  it('bounds 64 real preparations before artifact I/O while coalescing and releasing success/failure slots', async () => {
+    const { dispatcher, workspace } = makeDispatcher({}, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(workspace);
+    writeSourceReviewArtifacts(workspace, 'source-run', 3, checkpoint.patch);
+    const base = {
+      checkpoint_sha: checkpoint.sha,
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+    };
+    type Request = typeof base & { idempotency_key: string };
+    const api = dispatcher as unknown as {
+      requestReview(input: Request, targetIter: number): Promise<{ status: string }>;
+      prepareCheckpointReview(request: Request, targetIter: number, digest: string): Promise<unknown>;
+      spawnGitEvidenceProcess(argv: string[]): ChildProcess;
+      activeReviewRequestPreparations: number;
+      reviewRequests: Map<string, unknown>;
+      reviewRequestIdentityHistory: Map<string, string>;
+    };
+    const originalSpawn = api.spawnGitEvidenceProcess.bind(dispatcher);
+    const headGates: FakeGitChild[] = [];
+    const spawnGit = vi.spyOn(api, 'spawnGitEvidenceProcess').mockImplementation((argv) => {
+      if (argv[1] === 'rev-parse' && headGates.length < 64) {
+        const child = fakeGitChild();
+        headGates.push(child);
+        return child as unknown as ChildProcess;
+      }
+      return originalSpawn(argv);
+    });
+    const prepare = vi.spyOn(api, 'prepareCheckpointReview');
+    const artifactReads = vi.spyOn(SecureAutoloopLedger.prototype, 'readIterationArtifact');
+    const openFlatFile = vi.spyOn(dispatcher.secureLedgerCapability, 'openFlatFile');
+    const decisionLedgerReads = () =>
+      openFlatFile.mock.calls.filter(([name, mode]) => name === 'decisions.jsonl' && mode === 'read').length;
+    const pending = Array.from({ length: 64 }, (_, index) =>
+      api.requestReview({ ...base, idempotency_key: `simultaneous-${index}` }, 0),
+    );
+
+    try {
+      expect(headGates).toHaveLength(64);
+      expect(prepare).toHaveBeenCalledTimes(64);
+      expect(api.activeReviewRequestPreparations).toBe(64);
+      expect(artifactReads).not.toHaveBeenCalled();
+      expect(decisionLedgerReads()).toBe(1);
+
+      const overflowKey = 'capacity-overflow';
+      await expect(api.requestReview({ ...base, idempotency_key: overflowKey }, 0)).rejects.toThrow(
+        /simultaneous.*64|64.*simultaneous|preparation.*capacity/i,
+      );
+      expect(prepare).toHaveBeenCalledTimes(64);
+      expect(artifactReads).not.toHaveBeenCalled();
+      expect(decisionLedgerReads()).toBe(1);
+      expect(api.reviewRequestIdentityHistory.has(reviewIdentityHash(overflowKey))).toBe(false);
+
+      const coalesced = api.requestReview({ ...base, idempotency_key: 'simultaneous-0' }, 0);
+      expect(prepare).toHaveBeenCalledTimes(64);
+      headGates[0].stdout.write(`${checkpoint.sha}\n`);
+      headGates[0].emit('close', 0, null);
+      await expect(Promise.all([pending[0], coalesced])).resolves.toEqual([
+        expect.objectContaining({ status: 'prepared' }),
+        expect.objectContaining({ status: 'duplicate' }),
+      ]);
+      expect(api.activeReviewRequestPreparations).toBe(63);
+
+      await expect(api.requestReview({ ...base, idempotency_key: overflowKey }, 0)).resolves.toMatchObject({
+        status: 'prepared',
+      });
+
+      headGates[1].stdout.write(`${'b'.repeat(40)}\n`);
+      headGates[1].emit('close', 0, null);
+      await expect(pending[1]).rejects.toThrow(/does not match workspace HEAD/i);
+      expect(api.reviewRequestIdentityHistory.has(reviewIdentityHash('simultaneous-1'))).toBe(false);
+      expect(api.activeReviewRequestPreparations).toBe(62);
+      await expect(api.requestReview({ ...base, idempotency_key: 'simultaneous-1' }, 0)).resolves.toMatchObject({
+        status: 'prepared',
+      });
+
+      for (let index = 2; index < headGates.length; index += 1) {
+        headGates[index].stdout.write(`${checkpoint.sha}\n`);
+        headGates[index].emit('close', 0, null);
+        await expect(pending[index]).resolves.toMatchObject({ status: 'prepared' });
+      }
+      expect(api.activeReviewRequestPreparations).toBe(0);
+    } finally {
+      for (const child of headGates) child.emit('close', 1, null);
+      await Promise.allSettled(pending);
+      artifactReads.mockRestore();
+      openFlatFile.mockRestore();
+      prepare.mockRestore();
+      spawnGit.mockRestore();
+    }
+  });
+
+  it('retains at most 64 successful review preparations and never evicts the active preparation', async () => {
+    const { dispatcher, workspace } = makeDispatcher({}, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(workspace);
+    writeSourceReviewArtifacts(workspace, 'source-run', 3, checkpoint.patch);
+    const api = dispatcher as unknown as {
+      requestReview(input: Record<string, unknown>, targetIter: number): Promise<{ status: string }>;
+      reviewRequests: Map<string, { pending?: Promise<unknown>; settled: boolean }>;
+    };
+    const base = {
+      checkpoint_sha: checkpoint.sha,
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+    };
+    for (let index = 0; index < 64; index += 1) {
+      await api.requestReview({ ...base, idempotency_key: `bounded-review-${index}` }, 0);
+    }
+    expect(api.reviewRequests.size).toBe(64);
+
+    const active = api.requestReview({ ...base, idempotency_key: 'bounded-review-64' }, 0);
+    expect(api.reviewRequests.size).toBe(65);
+    const retainedActivePreparation = api.reviewRequests.has(reviewIdentityHash('bounded-review-64'));
+    await active;
+
+    expect(retainedActivePreparation).toBe(true);
+    expect(api.reviewRequests.size).toBe(64);
+    expect(api.reviewRequests.has(reviewIdentityHash('bounded-review-0'))).toBe(false);
+    expect(api.reviewRequests.has(reviewIdentityHash('bounded-review-64'))).toBe(true);
+    expect([...api.reviewRequests.keys()]).toEqual(expect.arrayContaining([expect.stringMatching(/^[0-9a-f]{64}$/)]));
+    expect([...api.reviewRequests.values()].every((entry) => entry.settled && entry.pending === undefined)).toBe(true);
+
+    const decisionsBeforeRetry = requestReviewDecisions(path.join(workspace, 'tasks', 'r1')).length;
+    await expect(api.requestReview({ ...base, idempotency_key: 'bounded-review-0' }, 0)).resolves.toMatchObject({
+      status: 'duplicate',
+    });
+    await expect(
+      api.requestReview({ ...base, scope: ['different'], idempotency_key: 'bounded-review-0' }, 0),
+    ).rejects.toThrow(/idempotency.*conflict/i);
+    expect(requestReviewDecisions(path.join(workspace, 'tasks', 'r1'))).toHaveLength(decisionsBeforeRetry);
+  });
+
+  it('bounds interrupted handoffs while allowing one reclaim and freeing capacity only after acceptance', async () => {
+    const { dispatcher, workspace, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(workspace);
+    writeSourceReviewArtifacts(workspace, 'source-run', 3, checkpoint.patch);
+    const base = {
+      checkpoint_sha: checkpoint.sha,
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+    };
+    type Request = typeof base & { idempotency_key: string };
+    const api = dispatcher as unknown as {
+      requestReview(input: Request, targetIter: number): Promise<ReviewRequestPreparationResult>;
+      prepareCheckpointReview(request: Request, targetIter: number, digest: string): Promise<PreparedReviewRequest>;
+      releaseReviewRequest(idempotencyKey: string, payload: CheckpointReviewRequestPayload): void;
+      acceptReviewRequest(idempotencyKey: string): void;
+      releasedReviewRequests: Map<string, unknown>;
+    };
+
+    for (let index = 0; index < 64; index += 1) {
+      const idempotencyKey = `released-capacity-${index}`;
+      const prepared = await api.requestReview({ ...base, idempotency_key: idempotencyKey }, 0);
+      expect(prepared.status).toBe('prepared');
+      api.releaseReviewRequest(idempotencyKey, (prepared as PreparedReviewRequest).payload);
+    }
+    expect(api.releasedReviewRequests.size).toBe(64);
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(64);
+
+    const prepare = vi.spyOn(api, 'prepareCheckpointReview');
+    await expect(api.requestReview({ ...base, idempotency_key: 'released-capacity-overflow' }, 0)).rejects.toThrow(
+      /interrupted handoff.*capacity|capacity.*interrupted handoff/i,
+    );
+    expect(prepare).not.toHaveBeenCalled();
+
+    const reclaimed = await Promise.all([
+      api.requestReview({ ...base, idempotency_key: 'released-capacity-0' }, 0),
+      api.requestReview({ ...base, idempotency_key: 'released-capacity-0' }, 0),
+    ]);
+    expect(reclaimed.map((result) => result.status).sort()).toEqual(['duplicate', 'prepared']);
+    expect(reclaimed.filter((result) => result.status === 'prepared')).toHaveLength(1);
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(64);
+
+    api.acceptReviewRequest('released-capacity-0');
+    await expect(
+      api.requestReview({ ...base, idempotency_key: 'released-capacity-after-accept' }, 0),
+    ).resolves.toMatchObject({ status: 'prepared' });
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(65);
+  });
+
+  it('rejects new identities at the 4096-entry history cap while retaining old duplicate and conflict semantics', async () => {
+    const { dispatcher, workspace, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(workspace);
+    writeSourceReviewArtifacts(workspace, 'source-run', 3, checkpoint.patch);
+    const oldRequest = {
+      checkpoint_sha: checkpoint.sha,
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+      idempotency_key: 'history-old',
+    };
+    const api = dispatcher as unknown as {
+      requestReview(input: Record<string, unknown>, targetIter: number): Promise<{ status: string }>;
+      reviewRequests: Map<string, unknown>;
+      reviewRequestIdentityHistory: Map<string, string>;
+    };
+
+    await expect(api.requestReview(oldRequest, 0)).resolves.toMatchObject({ status: 'prepared' });
+    api.reviewRequests.clear();
+    for (let index = 0; api.reviewRequestIdentityHistory.size < 4_096; index += 1) {
+      api.reviewRequestIdentityHistory.set(
+        reviewIdentityHash(`synthetic-identity-${index}`),
+        reviewIdentityHash(`synthetic-digest-${index}`),
+      );
+    }
+
+    expect(api.reviewRequestIdentityHistory.size).toBe(4_096);
+    expect([...api.reviewRequestIdentityHistory.keys()].every((key) => /^[0-9a-f]{64}$/.test(key))).toBe(true);
+    await expect(api.requestReview({ ...oldRequest, idempotency_key: 'history-new' }, 0)).rejects.toThrow(
+      /identity history.*capacity|capacity.*identity history/i,
+    );
+    await expect(api.requestReview({ ...oldRequest }, 0)).resolves.toMatchObject({ status: 'duplicate' });
+    await expect(api.requestReview({ ...oldRequest, scope: ['different'] }, 0)).rejects.toThrow(
+      /idempotency.*conflict/i,
+    );
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+  });
+
+  it('does not let ambient GIT_DIR and GIT_WORK_TREE authenticate a foreign checkpoint', async () => {
+    const { dispatcher, workspace, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+    const workspaceCheckpoint = initializeCheckpointRepository(workspace, 'workspace checkpoint\n');
+    const foreignWorkspace = path.join(workspace, 'foreign-repository');
+    fs.mkdirSync(foreignWorkspace);
+    const foreignCheckpoint = initializeCheckpointRepository(foreignWorkspace, 'foreign checkpoint\n');
+    writeSourceReviewArtifacts(workspace, 'foreign-source', 3, foreignCheckpoint.patch);
+    expect(foreignCheckpoint.sha).not.toBe(workspaceCheckpoint.sha);
+    const priorGitDir = process.env.GIT_DIR;
+    const priorGitWorkTree = process.env.GIT_WORK_TREE;
+    process.env.GIT_DIR = path.join(foreignWorkspace, '.git');
+    process.env.GIT_WORK_TREE = foreignWorkspace;
+
+    try {
+      await expect(
+        dispatcher.requestReview(
+          {
+            checkpoint_sha: foreignCheckpoint.sha,
+            source_run_id: 'foreign-source',
+            source_iter: 3,
+            scope: ['authenticity'],
+            idempotency_key: 'foreign-git-environment',
+          },
+          0,
+        ),
+      ).rejects.toThrow(/checkpoint.*does not match workspace HEAD|workspace HEAD.*checkpoint/i);
+    } finally {
+      if (priorGitDir === undefined) delete process.env.GIT_DIR;
+      else process.env.GIT_DIR = priorGitDir;
+      if (priorGitWorkTree === undefined) delete process.env.GIT_WORK_TREE;
+      else process.env.GIT_WORK_TREE = priorGitWorkTree;
+    }
+
+    expect(fs.existsSync(path.join(ledgerDir, 'iter'))).toBe(false);
+    expect(requestReviewDecisions(ledgerDir)).toEqual([]);
+  });
+
+  it.skipIf(process.platform === 'win32')('does not invoke an ambient GIT_EXTERNAL_DIFF helper', async () => {
+    const { dispatcher, workspace, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+    const internal = dispatcher as unknown as { spawnGitEvidenceProcess(argv: string[]): ChildProcess };
+    const spawnGit = vi.spyOn(internal, 'spawnGitEvidenceProcess');
+    const checkpoint = initializeCheckpointRepository(workspace);
+    writeSourceReviewArtifacts(workspace, 'source-run', 3, checkpoint.patch);
+    const marker = path.join(workspace, 'external-diff-invoked');
+    const helper = path.join(workspace, 'external-diff-helper.sh');
+    fs.writeFileSync(helper, `#!/bin/sh\nprintf 'invoked\\n' >> '${marker}'\nexit 91\n`, { mode: 0o700 });
+    const priorExternalDiff = process.env.GIT_EXTERNAL_DIFF;
+    process.env.GIT_EXTERNAL_DIFF = helper;
+
+    try {
+      await expect(
+        dispatcher.requestReview(
+          {
+            checkpoint_sha: checkpoint.sha,
+            source_run_id: 'source-run',
+            source_iter: 3,
+            scope: ['no-external-helper'],
+            idempotency_key: 'external-diff-disabled',
+          },
+          0,
+        ),
+      ).resolves.toMatchObject({ status: 'prepared' });
+    } finally {
+      if (priorExternalDiff === undefined) delete process.env.GIT_EXTERNAL_DIFF;
+      else process.env.GIT_EXTERNAL_DIFF = priorExternalDiff;
+    }
+
+    const showArgv = spawnGit.mock.calls.find(([argv]) => argv[1] === 'show')?.[0];
+    expect(showArgv).toEqual(expect.arrayContaining(['--no-ext-diff', '--no-textconv']));
+    expect(fs.existsSync(marker)).toBe(false);
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+  });
+
+  it.skipIf(process.platform === 'win32')('does not invoke a repository textconv helper', async () => {
+    const { dispatcher, workspace, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+    initializeCheckpointRepository(workspace);
+    fs.writeFileSync(path.join(workspace, '.gitattributes'), 'checkpoint.txt diff=review-evidence\n');
+    execFileSync('git', ['add', '--', '.gitattributes'], { cwd: workspace });
+    const checkpoint = commitCheckpoint(workspace, 'checkpoint with attributed diff\n');
+    writeSourceReviewArtifacts(workspace, 'source-run', 3, checkpoint.patch);
+    const marker = path.join(workspace, 'textconv-invoked');
+    const helper = path.join(workspace, 'textconv-helper.sh');
+    fs.writeFileSync(helper, `#!/bin/sh\nprintf 'invoked\\n' >> '${marker}'\nexec cat "$1"\n`, { mode: 0o700 });
+    execFileSync('git', ['config', 'diff.review-evidence.textconv', helper], { cwd: workspace });
+
+    await expect(
+      dispatcher.requestReview(
+        {
+          checkpoint_sha: checkpoint.sha,
+          source_run_id: 'source-run',
+          source_iter: 3,
+          scope: ['no-textconv-helper'],
+          idempotency_key: 'textconv-disabled',
+        },
+        0,
+      ),
+    ).resolves.toMatchObject({ status: 'prepared' });
+
+    expect(fs.existsSync(marker)).toBe(false);
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+  });
+
+  it('rejects a checkpoint that is not workspace HEAD before local writes, audit, session, or send effects', async () => {
+    const { dispatcher, calls, workspace, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+    const first = initializeCheckpointRepository(workspace, 'checkpoint one\n');
+    commitCheckpoint(workspace, 'checkpoint two\n');
+    writeSourceReviewArtifacts(workspace, 'source-run', 3, first.patch);
+    const openSourceLedger = vi.spyOn(SecureAutoloopLedger, 'openReadOnly');
+
+    try {
+      await expect(
+        dispatcher.requestReview(
+          {
+            checkpoint_sha: first.sha,
+            source_run_id: 'source-run',
+            source_iter: 3,
+            scope: ['correctness'],
+            idempotency_key: 'wrong-head',
+          },
+          0,
+        ),
+      ).rejects.toThrow(/checkpoint.*HEAD|HEAD.*checkpoint/i);
+      expect(openSourceLedger).not.toHaveBeenCalled();
+    } finally {
+      openSourceLedger.mockRestore();
+    }
+
+    expect(fs.existsSync(path.join(ledgerDir, 'iter'))).toBe(false);
+    expect(requestReviewDecisions(ledgerDir)).toEqual([]);
+    expect(calls.startSession).not.toHaveBeenCalled();
+    expect(calls.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('rejects a source patch that differs from the checkpoint commit before any target effect', async () => {
+    const { dispatcher, calls, workspace, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(workspace);
+    writeSourceReviewArtifacts(workspace, 'source-run', 3, Buffer.from('not the checkpoint patch\n'));
+
+    await expect(
+      dispatcher.requestReview(
+        {
+          checkpoint_sha: checkpoint.sha,
+          source_run_id: 'source-run',
+          source_iter: 3,
+          scope: ['correctness'],
+          idempotency_key: 'wrong-patch',
+        },
+        0,
+      ),
+    ).rejects.toThrow(/diff\.patch.*checkpoint|checkpoint.*diff\.patch/i);
+
+    expect(fs.existsSync(path.join(ledgerDir, 'iter'))).toBe(false);
+    expect(requestReviewDecisions(ledgerDir)).toEqual([]);
+    expect(calls.startSession).not.toHaveBeenCalled();
+    expect(calls.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('accepts an empty patch from an empty root checkpoint', async () => {
+    const { dispatcher, workspace, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+    const checkpoint = initializeEmptyRootCheckpointRepository(workspace);
+    expect(checkpoint.patch).toHaveLength(0);
+    writeSourceReviewArtifacts(workspace, 'source-run', 0, checkpoint.patch);
+
+    await expect(
+      dispatcher.requestReview(
+        {
+          checkpoint_sha: checkpoint.sha,
+          source_run_id: 'source-run',
+          source_iter: 0,
+          scope: ['correctness'],
+          idempotency_key: 'empty-root-checkpoint',
+        },
+        0,
+      ),
+    ).resolves.toMatchObject({ status: 'prepared' });
+
+    expect(fs.readFileSync(path.join(ledgerDir, 'iter', '0', 'diff.patch'))).toHaveLength(0);
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+  });
+
+  it.skipIf(process.platform === 'win32')(
+    'kills a POSIX Git evidence process group and falls back to the child handle when group kill fails',
+    () => {
+      const { dispatcher } = makeDispatcher();
+      const internal = dispatcher as unknown as { killGitEvidenceProcess(child: ChildProcess): void };
+      const processKill = vi.spyOn(process, 'kill');
+      const grouped = fakeGitChild(424_242);
+      const fallback = fakeGitChild(424_243);
+
+      try {
+        processKill.mockReturnValueOnce(true).mockImplementationOnce(() => {
+          throw new Error('process group already unavailable');
+        });
+
+        internal.killGitEvidenceProcess(grouped as unknown as ChildProcess);
+        internal.killGitEvidenceProcess(fallback as unknown as ChildProcess);
+
+        expect(processKill).toHaveBeenNthCalledWith(1, -424_242, 'SIGKILL');
+        expect(grouped.kill).not.toHaveBeenCalled();
+        expect(processKill).toHaveBeenNthCalledWith(2, -424_243, 'SIGKILL');
+        expect(fallback.kill).toHaveBeenCalledTimes(1);
+        expect(fallback.kill).toHaveBeenCalledWith('SIGKILL');
+      } finally {
+        processKill.mockRestore();
+      }
+    },
+  );
+
+  it('does not copy Buffer chunks while collecting bounded Git evidence', async () => {
+    const { dispatcher } = makeDispatcher();
+    const child = fakeGitChild();
+    const internal = dispatcher as unknown as {
+      spawnGitEvidenceProcess(argv: string[]): ChildProcess;
+      runGitEvidence(argv: string[], maxStdoutBytes: number, label: string): Promise<{ out: Buffer }>;
+    };
+    const spawnGit = vi.spyOn(internal, 'spawnGitEvidenceProcess').mockReturnValue(child as unknown as ChildProcess);
+    const chunk = Buffer.from('bounded evidence\n');
+    const run = internal.runGitEvidence(['git', 'rev-parse', 'HEAD'], 128, 'buffer identity');
+    const bufferFrom = vi.spyOn(Buffer, 'from');
+
+    try {
+      child.stdout.write(chunk);
+      child.emit('close', 0, null);
+      const result = await run;
+
+      expect(result.out).toEqual(chunk);
+      expect(bufferFrom.mock.calls.some(([value]) => value === chunk)).toBe(false);
+    } finally {
+      bufferFrom.mockRestore();
+      spawnGit.mockRestore();
+    }
+  });
+
+  it('times out and kills a hung Git evidence command without effects, then releases the identity for retry', async () => {
+    const { dispatcher, calls, workspace, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(workspace);
+    writeSourceReviewArtifacts(workspace, 'source-run', 3, checkpoint.patch);
+    const args = {
+      checkpoint_sha: checkpoint.sha,
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+      idempotency_key: 'hung-git-retry',
+    };
+    const internal = dispatcher as unknown as {
+      spawnGitEvidenceProcess(argv: string[]): ChildProcess;
+      reviewRequestIdentityHistory: Map<string, string>;
+    };
+    const hung = fakeGitChild();
+    const spawnGit = vi.spyOn(internal, 'spawnGitEvidenceProcess').mockReturnValue(hung as unknown as ChildProcess);
+    vi.useFakeTimers();
+
+    try {
+      const failure = expect(dispatcher.requestReview(args, 0)).rejects.toThrow(
+        /Git evidence.*timed out|timed out.*Git/i,
+      );
+      await vi.advanceTimersByTimeAsync(30_001);
+      await failure;
+
+      expect(hung.kill).toHaveBeenCalled();
+      expect(internal.reviewRequestIdentityHistory.has(reviewIdentityHash(args.idempotency_key))).toBe(false);
+      expect(fs.existsSync(path.join(ledgerDir, 'iter'))).toBe(false);
+      expect(requestReviewDecisions(ledgerDir)).toEqual([]);
+      expect(calls.startSession).not.toHaveBeenCalled();
+      expect(calls.sendMessage).not.toHaveBeenCalled();
+    } finally {
+      spawnGit.mockRestore();
+      vi.useRealTimers();
+    }
+    await expect(dispatcher.requestReview(args, 0)).resolves.toMatchObject({ status: 'prepared' });
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+  });
+
+  it('aborts excess Git patch output without effects and allows the same request to retry', async () => {
+    const { dispatcher, calls, workspace, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(workspace);
+    writeSourceReviewArtifacts(workspace, 'source-run', 3, checkpoint.patch);
+    const args = {
+      checkpoint_sha: checkpoint.sha,
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+      idempotency_key: 'excess-git-output-retry',
+    };
+    const internal = dispatcher as unknown as {
+      spawnGitEvidenceProcess(argv: string[]): ChildProcess;
+      reviewRequestIdentityHistory: Map<string, string>;
+    };
+    const originalSpawn = internal.spawnGitEvidenceProcess.bind(dispatcher);
+    const excess = fakeGitChild();
+    const spawnGit = vi.spyOn(internal, 'spawnGitEvidenceProcess').mockImplementation((argv) => {
+      if (argv[1] !== 'show') return originalSpawn(argv);
+      queueMicrotask(() => {
+        excess.stdout.write(Buffer.concat([checkpoint.patch, Buffer.from('excess')]));
+      });
+      return excess as unknown as ChildProcess;
+    });
+
+    await expect(dispatcher.requestReview(args, 0)).rejects.toThrow(
+      /checkpoint Git checkpoint patch output is longer than source diff\.patch/i,
+    );
+
+    expect(excess.kill).toHaveBeenCalled();
+    expect(internal.reviewRequestIdentityHistory.has(reviewIdentityHash(args.idempotency_key))).toBe(false);
+    expect(fs.existsSync(path.join(ledgerDir, 'iter'))).toBe(false);
+    expect(requestReviewDecisions(ledgerDir)).toEqual([]);
+    expect(calls.startSession).not.toHaveBeenCalled();
+    expect(calls.sendMessage).not.toHaveBeenCalled();
+
+    spawnGit.mockRestore();
+    await expect(dispatcher.requestReview(args, 0)).resolves.toMatchObject({ status: 'prepared' });
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+  });
+
+  it('rejects excess Git stderr without effects, kills the command, releases identity, and permits exact retry', async () => {
+    const { dispatcher, calls, workspace, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(workspace);
+    writeSourceReviewArtifacts(workspace, 'source-run', 3, checkpoint.patch);
+    const args = {
+      checkpoint_sha: checkpoint.sha,
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+      idempotency_key: 'excess-git-stderr-retry',
+    };
+    const internal = dispatcher as unknown as {
+      spawnGitEvidenceProcess(argv: string[]): ChildProcess;
+      reviewRequestIdentityHistory: Map<string, string>;
+    };
+    const originalSpawn = internal.spawnGitEvidenceProcess.bind(dispatcher);
+    const excess = fakeGitChild();
+    const spawnGit = vi.spyOn(internal, 'spawnGitEvidenceProcess').mockImplementation((argv) => {
+      if (argv[1] !== 'show') return originalSpawn(argv);
+      queueMicrotask(() => excess.stderr.write(Buffer.alloc(64 * 1024 + 1, 0x65)));
+      return excess as unknown as ChildProcess;
+    });
+
+    try {
+      await expect(dispatcher.requestReview(args, 0)).rejects.toThrow(/stderr.*65536|65536.*stderr/i);
+      expect(excess.kill).toHaveBeenCalled();
+      expect(internal.reviewRequestIdentityHistory.has(reviewIdentityHash(args.idempotency_key))).toBe(false);
+      expect(fs.existsSync(path.join(ledgerDir, 'iter'))).toBe(false);
+      expect(requestReviewDecisions(ledgerDir)).toEqual([]);
+      expect(calls.startSession).not.toHaveBeenCalled();
+      expect(calls.sendMessage).not.toHaveBeenCalled();
+    } finally {
+      spawnGit.mockRestore();
+    }
+
+    await expect(dispatcher.requestReview(args, 0)).resolves.toMatchObject({ status: 'prepared' });
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+  });
+
+  it.each(['diff.patch', 'directive.json', 'eval_output.json', 'coder_summary.txt'] as const)(
+    'rejects oversized %s before target effects and lets the same key prepare once from a corrected source',
+    async (artifactName) => {
+      const { dispatcher, calls, workspace, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+      const checkpoint = initializeCheckpointRepository(workspace);
+      const oversizedRunId = `oversized-${artifactName.replace('.', '-')}`;
+      const correctedRunId = `corrected-${artifactName.replace('.', '-')}`;
+      const sourceLedger = writeSourceReviewArtifacts(workspace, oversizedRunId, 3, checkpoint.patch, {
+        omit: artifactName,
+      });
+      const oversizedPath = path.join(sourceLedger.directory, 'iter', '3', artifactName);
+      const fd = fs.openSync(oversizedPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+      try {
+        fs.ftruncateSync(fd, 4_194_305);
+      } finally {
+        fs.closeSync(fd);
+      }
+      writeSourceReviewArtifacts(workspace, correctedRunId, 3, checkpoint.patch);
+      const args = {
+        checkpoint_sha: checkpoint.sha,
+        source_run_id: oversizedRunId,
+        source_iter: 3,
+        scope: ['correctness'],
+        idempotency_key: `oversized-${artifactName}`,
+      };
+      const internal = dispatcher as unknown as {
+        activeReviewRequestPreparations: number;
+        reviewRequests: Map<string, unknown>;
+        reviewRequestIdentityHistory: Map<string, string>;
+      };
+      const identityHash = reviewIdentityHash(args.idempotency_key);
+
+      await expect(dispatcher.requestReview(args, 0)).rejects.toThrow(
+        new RegExp(`${artifactName.replace('.', '\\.')}.*4194304-byte limit`, 'i'),
+      );
+
+      expect(fs.existsSync(path.join(ledgerDir, 'iter', '0'))).toBe(false);
+      expect(requestReviewDecisions(ledgerDir)).toEqual([]);
+      expect(internal.reviewRequests.has(identityHash)).toBe(false);
+      expect(internal.reviewRequestIdentityHistory.has(identityHash)).toBe(false);
+      expect(internal.activeReviewRequestPreparations).toBe(0);
+
+      const corrected = { ...args, source_run_id: correctedRunId };
+      await expect(dispatcher.requestReview(corrected, 0)).resolves.toMatchObject({ status: 'prepared' });
+      await expect(dispatcher.requestReview({ ...corrected }, 0)).resolves.toMatchObject({ status: 'duplicate' });
+
+      expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+      expect(calls.startSession).not.toHaveBeenCalled();
+      expect(calls.sendMessage).not.toHaveBeenCalled();
+    },
+  );
+
+  it('rejects an imported Reviewer artifact made oversized before sandbox staging without reading its content', async () => {
+    const contentReads = vi.fn();
+    const secureLedger = SecureAutoloopLedger.open(tmpRoot, 'r1', {
+      create: true,
+      testHooks: { beforeNestedChildContentRead: (event) => contentReads(event) },
+    });
+    const { dispatcher, workspace } = makeDispatcher({ secureLedger }, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(workspace);
+    writeSourceReviewArtifacts(workspace, 'source-run', 3, checkpoint.patch);
+    await dispatcher.requestReview(
+      {
+        checkpoint_sha: checkpoint.sha,
+        source_run_id: 'source-run',
+        source_iter: 3,
+        scope: ['bounded-stage'],
+        idempotency_key: 'bounded-stage-after-import',
+      },
+      0,
+    );
+    const target = path.join(secureLedger.directory, 'iter', '0', 'directive.json');
+    fs.truncateSync(target, 4_194_305);
+    contentReads.mockClear();
+
+    expect(() => secureLedger.stageReviewerSandbox(0)).toThrow(/directive\.json.*4194304-byte limit/i);
+    expect(contentReads.mock.calls.some(([event]) => (event as { filePath: string }).filePath === target)).toBe(false);
+  });
+
+  it('uses bounded descriptor reads when an imported Reviewer artifact grows during immutable reconciliation', async () => {
+    type DescriptorRead = {
+      filePath: string;
+      phase: 'content' | 'growth-probe';
+      bufferLength: number;
+      offset: number;
+      length: number;
+    };
+    const descriptorReads: DescriptorRead[] = [];
+    let target = '';
+    let grow = false;
+    const secureLedger = SecureAutoloopLedger.open(tmpRoot, 'r1', {
+      create: true,
+      testHooks: {
+        beforeNestedChildContentRead: ({ filePath }) => {
+          if (!grow || filePath !== target) return;
+          grow = false;
+          fs.appendFileSync(filePath, Buffer.alloc(4_194_305, 0x78));
+        },
+        beforeNestedChildDescriptorRead: (event) => descriptorReads.push(event),
+      },
+    });
+    const { dispatcher, workspace } = makeDispatcher({ secureLedger }, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(workspace);
+    writeSourceReviewArtifacts(workspace, 'source-run', 3, checkpoint.patch);
+    await dispatcher.requestReview(
+      {
+        checkpoint_sha: checkpoint.sha,
+        source_run_id: 'source-run',
+        source_iter: 3,
+        scope: ['bounded-reconcile'],
+        idempotency_key: 'bounded-reconcile-after-import',
+      },
+      0,
+    );
+    target = path.join(secureLedger.directory, 'iter', '0', 'directive.json');
+    const exact = fs.readFileSync(target);
+    descriptorReads.length = 0;
+    grow = true;
+
+    expect(() => secureLedger.writeIterationArtifact(0, 'directive.json', exact)).toThrow(
+      /directive\.json.*(?:grew|4194304-byte limit)/i,
+    );
+    expect(descriptorReads.some(({ phase }) => phase === 'growth-probe')).toBe(true);
+    expect(
+      descriptorReads
+        .filter(({ phase }) => phase === 'content')
+        .every(({ bufferLength, offset, length }) => bufferLength <= 4_194_304 && offset + length <= 4_194_304),
+    ).toBe(true);
+  });
+
+  it('rejects same-byte replacement of an imported Reviewer artifact before staging', async () => {
+    let target = '';
+    let replace = false;
+    const secureLedger = SecureAutoloopLedger.open(tmpRoot, 'r1', {
+      create: true,
+      testHooks: {
+        afterNestedChildLstat: ({ filePath }) => {
+          if (!replace || filePath !== target) return;
+          replace = false;
+          replaceWithSameBytes(target);
+        },
+      },
+    });
+    const { dispatcher, workspace } = makeDispatcher({ secureLedger }, { sendOutput: reviewerReply });
+    const checkpoint = initializeCheckpointRepository(workspace);
+    writeSourceReviewArtifacts(workspace, 'source-run', 3, checkpoint.patch);
+    await dispatcher.requestReview(
+      {
+        checkpoint_sha: checkpoint.sha,
+        source_run_id: 'source-run',
+        source_iter: 3,
+        scope: ['replacement-defense'],
+        idempotency_key: 'replacement-after-import',
+      },
+      0,
+    );
+    target = path.join(secureLedger.directory, 'iter', '0', 'directive.json');
+    replace = true;
+
+    expect(() => secureLedger.stageReviewerSandbox(0)).toThrow(/directive\.json.*identity changed/i);
+  });
+
+  it('routes a real Planner request through dispatcher preparation and suppresses its post-cache duplicate', async () => {
+    const checkpoint = initializeCheckpointRepository(tmpRoot);
+    writeSourceReviewArtifacts(tmpRoot, 'source-run', 3, checkpoint.patch);
+    const args = {
+      checkpoint_sha: checkpoint.sha,
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+      idempotency_key: 'integrated-planner-review',
+    };
+    const plannerReply = ['```autoloop', JSON.stringify({ tool: 'request_review', args }), '```'].join('\n');
+    const { dispatcher, ledgerDir } = makeDispatcher({}, { sendOutputs: [plannerReply, plannerReply] });
+    const internal = dispatcher as unknown as { reviewRequests: Map<string, unknown> };
+
+    const first = await dispatcher.deliver(Msg.chat(0, { text: 'review the checkpoint' }));
+    internal.reviewRequests.clear();
+    const duplicate = await dispatcher.deliver(Msg.chat(0, { text: 'retry the same review request' }));
+
+    expect(first).toHaveLength(1);
+    expect(validateMessage(first[0])).toMatchObject({
+      type: 'review_request',
+      iter: 0,
+      payload: expect.objectContaining({
+        iter: 0,
+        checkpoint_sha: checkpoint.sha,
+        idempotency_key: args.idempotency_key,
+      }),
+    });
+    expect(duplicate).toEqual([]);
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+  });
+
+  it.each(['post-preparation active fence', 'post-application terminal fence'] as const)(
+    're-arms a prepared identity across the %s and lets concurrent retries emit exactly once',
+    async (boundary) => {
+      const checkpoint = initializeCheckpointRepository(tmpRoot);
+      writeSourceReviewArtifacts(tmpRoot, 'source-run', 3, checkpoint.patch);
+      const args = {
+        checkpoint_sha: checkpoint.sha,
+        source_run_id: 'source-run',
+        source_iter: 3,
+        scope: ['correctness'],
+        idempotency_key: `rearm-${boundary.replaceAll(' ', '-')}`,
+      };
+      const plannerReply = ['```autoloop', JSON.stringify({ tool: 'request_review', args }), '```'].join('\n');
+      const { dispatcher, ledgerDir } = makeDispatcher(
+        {},
+        { sendOutputs: [plannerReply, plannerReply, plannerReply, plannerReply] },
+      );
+      const internal = dispatcher as unknown as {
+        terminal: boolean;
+        requestReview(input: typeof args, targetIter: number): Promise<ReviewRequestPreparationResult>;
+        prepareCheckpointReview(input: typeof args, targetIter: number, digest: string): Promise<PreparedReviewRequest>;
+      };
+      const prepare = vi.spyOn(internal, 'prepareCheckpointReview');
+      const requestReview = internal.requestReview.bind(dispatcher);
+      let injectBoundary = true;
+      vi.spyOn(internal, 'requestReview').mockImplementation(async (request, targetIter) => {
+        const result = await requestReview(request, targetIter);
+        if (!injectBoundary || result.status !== 'prepared') return result;
+        injectBoundary = false;
+        if (boundary === 'post-preparation active fence') {
+          internal.terminal = true;
+        } else {
+          let terminalReads = 0;
+          Object.defineProperty(internal, 'terminal', {
+            configurable: true,
+            get: () => {
+              terminalReads += 1;
+              return terminalReads >= 2;
+            },
+            set: () => undefined,
+          });
+        }
+        return result;
+      });
+
+      const interrupted = dispatcher.deliver(Msg.chat(0, { text: 'prepare then interrupt handoff' }));
+      if (boundary === 'post-preparation active fence') {
+        await expect(interrupted).rejects.toMatchObject({ code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED' });
+      } else {
+        await expect(interrupted).resolves.toEqual([]);
+      }
+      expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+
+      Object.defineProperty(internal, 'terminal', {
+        configurable: true,
+        enumerable: true,
+        value: false,
+        writable: true,
+      });
+      const concurrent = await Promise.all([
+        dispatcher.deliver(Msg.chat(0, { text: 'retry prepared review A' })),
+        dispatcher.deliver(Msg.chat(0, { text: 'retry prepared review B' })),
+      ]);
+      const emitted = concurrent.flat();
+
+      expect(concurrent.map((messages) => messages.length).sort()).toEqual([0, 1]);
+      expect(emitted).toHaveLength(1);
+      expect(validateMessage(emitted[0])).toMatchObject({
+        type: 'review_request',
+        payload: expect.objectContaining({ idempotency_key: args.idempotency_key }),
+      });
+      await expect(dispatcher.deliver(Msg.chat(0, { text: 'retry after accepted handoff' }))).resolves.toEqual([]);
+      expect(prepare).toHaveBeenCalledOnce();
+      expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+    },
+  );
+
+  it('rejects a combined Planner review batch before preparation and lets the same standalone key emit exactly once', async () => {
+    const checkpoint = initializeCheckpointRepository(tmpRoot);
+    writeSourceReviewArtifacts(tmpRoot, 'source-run', 3, checkpoint.patch);
+    const args = {
+      checkpoint_sha: checkpoint.sha,
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+      idempotency_key: 'singleton-integrated-review',
+    };
+    const reviewControl = { tool: 'request_review', args };
+    const combinedReply = [
+      '```autoloop',
+      JSON.stringify(reviewControl),
+      '```',
+      '```autoloop',
+      JSON.stringify({ tool: 'notify_user', args: { summary: 'must not emit' } }),
+      '```',
+    ].join('\n');
+    const standaloneReply = ['```autoloop', JSON.stringify(reviewControl), '```'].join('\n');
+    const { dispatcher, calls, ledgerDir } = makeDispatcher(
+      {},
+      { sendOutputs: [combinedReply, standaloneReply, standaloneReply] },
+    );
+    const internal = dispatcher as unknown as {
+      reviewRequests: Map<string, unknown>;
+      reviewRequestIdentityHistory: Map<string, string>;
+    };
+
+    await expect(dispatcher.deliver(Msg.chat(0, { text: 'invalid combined review' }))).rejects.toMatchObject({
+      code: 'AUTOLOOP_CONTROL_MALFORMED',
+    });
+    expect(internal.reviewRequests.size).toBe(0);
+    expect(internal.reviewRequestIdentityHistory.size).toBe(0);
+    expect(fs.existsSync(path.join(ledgerDir, 'iter'))).toBe(false);
+    expect(requestReviewDecisions(ledgerDir)).toEqual([]);
+
+    const first = await dispatcher.deliver(Msg.chat(0, { text: 'standalone review' }));
+    const duplicate = await dispatcher.deliver(Msg.chat(0, { text: 'duplicate standalone review' }));
+
+    expect(first).toHaveLength(1);
+    expect(validateMessage(first[0])).toMatchObject({
+      type: 'review_request',
+      payload: expect.objectContaining({ idempotency_key: args.idempotency_key }),
+    });
+    expect(duplicate).toEqual([]);
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+    expect(calls.startSession.mock.calls.map(([config]) => (config as { name: string }).name)).toEqual([
+      'autoloop-r1-planner',
+    ]);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(3);
+  });
+
+  it('keeps immutable imports on audit append failure, emits nothing, and succeeds exactly once on retry', async () => {
+    let decisionAppends = 0;
+    let failRequestAudit = true;
+    const secureLedger = SecureAutoloopLedger.open(tmpRoot, 'r1', {
+      create: true,
+      testHooks: {
+        beforeFileMutation: ({ name, operation }) => {
+          if (name !== 'decisions.jsonl' || operation !== 'append') return;
+          decisionAppends += 1;
+          if (failRequestAudit && decisionAppends === 2) {
+            failRequestAudit = false;
+            throw new Error('deterministic request_review audit append failure');
+          }
+        },
+      },
+    });
+    const checkpoint = initializeCheckpointRepository(tmpRoot);
+    writeSourceReviewArtifacts(tmpRoot, 'source-run', 3, checkpoint.patch);
+    writeSourceReviewArtifacts(tmpRoot, 'conflicting-source', 3, checkpoint.patch, {
+      directive: '{"goal":"conflicting bytes"}\n',
+    });
+    const args = {
+      checkpoint_sha: checkpoint.sha,
+      source_run_id: 'source-run',
+      source_iter: 3,
+      scope: ['correctness'],
+      idempotency_key: 'audit-retry',
+    };
+    const plannerReply = ['```autoloop', JSON.stringify({ tool: 'request_review', args }), '```'].join('\n');
+    const { dispatcher, calls, ledgerDir } = makeDispatcher(
+      { secureLedger },
+      { sendOutputs: [plannerReply, plannerReply] },
+    );
+    const internal = dispatcher as unknown as {
+      reviewRequests: Map<string, unknown>;
+      reviewRequestIdentityHistory: Map<string, string>;
+    };
+    const unrelatedIdentityHash = reviewIdentityHash('unrelated-accepted-identity');
+    internal.reviewRequestIdentityHistory.set(unrelatedIdentityHash, 'f'.repeat(64));
+    internal.reviewRequests.set(unrelatedIdentityHash, { digest: 'f'.repeat(64), settled: true });
+
+    await expect(dispatcher.deliver(Msg.chat(0, { text: 'prepare review' }))).rejects.toMatchObject({
+      code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+    });
+    const importedBeforeRetry = new Map(
+      ['directive.json', 'eval_output.json', 'coder_summary.txt', 'diff.patch'].map((name) => [
+        name,
+        fs.readFileSync(path.join(ledgerDir, 'iter', '0', name)),
+      ]),
+    );
+    expect(requestReviewDecisions(ledgerDir)).toEqual([]);
+    expect(internal.reviewRequests.has(reviewIdentityHash(args.idempotency_key))).toBe(false);
+    expect(internal.reviewRequestIdentityHistory.has(reviewIdentityHash(args.idempotency_key))).toBe(false);
+    expect(internal.reviewRequests.has(unrelatedIdentityHash)).toBe(true);
+    expect(internal.reviewRequestIdentityHistory.get(unrelatedIdentityHash)).toBe('f'.repeat(64));
+
+    await expect(
+      dispatcher.requestReview(
+        {
+          ...args,
+          source_run_id: 'conflicting-source',
+          idempotency_key: 'conflicting-import',
+        },
+        0,
+      ),
+    ).rejects.toThrow(/artifact.*different|different.*artifact|immutable|already exists/i);
+    for (const [name, content] of importedBeforeRetry) {
+      expect(fs.readFileSync(path.join(ledgerDir, 'iter', '0', name))).toEqual(content);
+    }
+
+    const retry = await dispatcher.deliver(Msg.chat(0, { text: 'retry review preparation' }));
+
+    expect(retry).toHaveLength(1);
+    expect(validateMessage(retry[0])).toMatchObject({
+      type: 'review_request',
+      payload: expect.objectContaining({ idempotency_key: args.idempotency_key }),
+    });
+    expect(requestReviewDecisions(ledgerDir)).toHaveLength(1);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(2);
+    for (const [name, content] of importedBeforeRetry) {
+      expect(fs.readFileSync(path.join(ledgerDir, 'iter', '0', name))).toEqual(content);
+    }
+  });
+
+  it.each([
+    ['padded scope member', { scope: [' security'] }],
+    ['too many scope members', { scope: Array.from({ length: 129 }, () => 'security') }],
+    ['oversized UTF-8 scope member', { scope: ['é'.repeat(4_097)] }],
+    ['oversized UTF-8 idempotency key', { idempotency_key: 'é'.repeat(4_097) }],
+  ])('rejects direct requestReview with %s before ledger, session, or send effects', async (_label, override) => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+
+    await expect(
+      dispatcher.requestReview(
+        {
+          checkpoint_sha: 'a'.repeat(40),
+          source_run_id: 'source-run',
+          source_iter: 7,
+          scope: ['security'],
+          idempotency_key: 'direct-validation',
+          ...override,
+        },
+        0,
+      ),
+    ).rejects.toThrow(/scope|idempotency_key/i);
+
+    expect(fs.existsSync(path.join(ledgerDir, 'iter'))).toBe(false);
+    expect(requestReviewDecisions(ledgerDir)).toEqual([]);
+    expect(calls.startSession).not.toHaveBeenCalled();
+    expect(calls.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('rejects hostile scope accessors before ledger, session, or send effects', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: reviewerReply });
+    let getterCalls = 0;
+    const scope: string[] = [];
+    Object.defineProperty(scope, '0', {
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        throw new Error('scope getter must not run');
+      },
+    });
+    scope.length = 1;
+    const requestReview = (
+      dispatcher as unknown as {
+        requestReview(input: Record<string, unknown>, targetIter: number): Promise<Record<string, unknown>>;
+      }
+    ).requestReview.bind(dispatcher);
+
+    await expect(
+      requestReview(
+        {
+          checkpoint_sha: 'a'.repeat(40),
+          source_run_id: 'source-run',
+          source_iter: 7,
+          scope,
+          idempotency_key: 'hostile-scope',
+        },
+        0,
+      ),
+    ).rejects.toThrow(/scope.*array|scope.*own|scope.*data/i);
+
+    expect(getterCalls).toBe(0);
+    expect(calls.startSession).not.toHaveBeenCalled();
+    expect(calls.sendMessage).not.toHaveBeenCalled();
+    expect(fs.readdirSync(ledgerDir).sort()).not.toContain('iter');
+  });
+
+  it('canonicalizes checkpoint review_request payloads and rejects partial or hostile variants', () => {
+    const checkpoint = 'A'.repeat(40);
+    const valid = validateMessage(
+      Msg.reviewRequest(0, {
+        iter: 0,
+        ledger_path: '/trusted/run',
+        prior_metrics: [],
+        checkpoint_sha: checkpoint,
+        source_run_id: 'source-run',
+        source_iter: 3,
+        scope: ['security'],
+        idempotency_key: 'review-source-run-7',
+      } as never),
+    );
+    expect(valid.payload).toMatchObject({ checkpoint_sha: checkpoint.toLowerCase(), scope: ['security'] });
+    expect(Object.isFrozen((valid.payload as { scope: string[] }).scope)).toBe(true);
+
+    expect(() =>
+      validateMessage(
+        Msg.reviewRequest(7, {
+          iter: 7,
+          ledger_path: '/trusted/run',
+          prior_metrics: [],
+          checkpoint_sha: checkpoint,
+        } as never),
+      ),
+    ).toThrow(/source_run_id.*own data/i);
+
+    let getterCalls = 0;
+    const hostileScope: string[] = [];
+    Object.defineProperty(hostileScope, '0', {
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        return 'security';
+      },
+    });
+    hostileScope.length = 1;
+    expect(() =>
+      validateMessage(
+        Msg.reviewRequest(7, {
+          iter: 7,
+          ledger_path: '/trusted/run',
+          prior_metrics: [],
+          checkpoint_sha: checkpoint,
+          source_run_id: 'source-run',
+          source_iter: 7,
+          scope: hostileScope,
+          idempotency_key: 'hostile-message',
+        } as never),
+      ),
+    ).toThrow(/scope.*array|scope.*own|scope.*data/i);
+    expect(getterCalls).toBe(0);
+
+    const inherited = Object.create({ inherited: 'must not cross the message boundary' }) as Record<string, unknown>;
+    Object.assign(inherited, {
+      iter: 7,
+      ledger_path: '/trusted/run',
+      prior_metrics: [],
+      checkpoint_sha: checkpoint,
+      source_run_id: 'source-run',
+      source_iter: 7,
+      scope: ['security'],
+      idempotency_key: 'hostile-prototype',
+    });
+    expect(() => validateMessage(Msg.reviewRequest(7, inherited as never))).toThrow(/prototype|inherited/i);
+
+    const inheritedScope = ['security'];
+    Object.setPrototypeOf(inheritedScope, Object.create(Array.prototype));
+    expect(() =>
+      validateMessage(
+        Msg.reviewRequest(7, {
+          iter: 7,
+          ledger_path: '/trusted/run',
+          prior_metrics: [],
+          checkpoint_sha: checkpoint,
+          source_run_id: 'source-run',
+          source_iter: 7,
+          scope: inheritedScope,
+          idempotency_key: 'hostile-scope-prototype',
+        } as never),
+      ),
+    ).toThrow(/scope.*prototype|scope.*inherited/i);
   });
 });
 
@@ -3381,6 +6267,15 @@ describe('ClaudeAgentDispatcher — canonical immutable delivery payloads', () =
           ledger_path: 1,
           prior_metrics: [],
         } as unknown as Parameters<typeof Msg.reviewRequest>[1]),
+    ],
+    [
+      'review_request ledger_path UTF-8 bound',
+      () =>
+        Msg.reviewRequest(0, {
+          iter: 0,
+          ledger_path: 'é'.repeat(4_097),
+          prior_metrics: [],
+        }),
     ],
     [
       'review_request metric',

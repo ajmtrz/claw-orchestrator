@@ -25,6 +25,8 @@ export const SECURE_AUTOLOOP_ITERATION_ARTIFACTS = [
 export type SecureAutoloopIterationArtifact = (typeof SECURE_AUTOLOOP_ITERATION_ARTIFACTS)[number];
 export type SecureAutoloopReviewerPersistentFile = 'reviewer_memory.md' | 'reviewer_log.jsonl';
 
+const REVIEW_EVIDENCE_LIMIT_BYTES = 4 * 1024 * 1024;
+
 export interface SecureReviewerControlFiles {
   plan?: Buffer;
   goal?: Buffer;
@@ -97,8 +99,19 @@ export interface SecureAutoloopLedgerOptions {
     unlinkNestedTemporary?: (temporaryPath: string) => void;
     afterNestedTemporaryUnlink?: (event: SecureLedgerNestedPublishEvent) => void;
     afterNestedChildLstat?: (event: { filePath: string; label: string }) => void;
+    beforeNestedChildContentRead?: (event: { filePath: string; label: string; fd: number; size: number }) => void;
+    beforeNestedChildDescriptorRead?: (event: {
+      filePath: string;
+      label: string;
+      fd: number;
+      phase: 'content' | 'growth-probe';
+      bufferLength: number;
+      offset: number;
+      length: number;
+    }) => void;
     afterReviewerSandboxEntryRead?: (event: SecureReviewerSandboxReadEvent) => void;
     beforeReviewerSandboxResidueRemoval?: (event: SecureReviewerSandboxResidueRemovalEvent) => void;
+    closeFlatFileDescriptor?: (fd: number) => void;
     closeDescriptor?: (fd: number) => void;
   };
 }
@@ -184,13 +197,13 @@ interface AtomicChildWriteResult {
 }
 
 type ReviewerSandboxEntrySnapshot =
-  | { kind: 'file'; content: Buffer; stat: fs.Stats }
+  | { kind: 'file'; content: Buffer; stat: fs.Stats; maxBytes?: number }
   | { kind: 'directory'; entries: ReviewerSandboxSnapshot; stat: fs.Stats };
 
 type ReviewerSandboxSnapshot = Map<string, ReviewerSandboxEntrySnapshot>;
 
 type ReviewerSandboxResidueSnapshot =
-  | { kind: 'file'; content: Buffer; stat: fs.Stats }
+  | { kind: 'file'; content: Buffer; stat: fs.Stats; maxBytes?: number }
   | { kind: 'symlink'; linkTarget: string; stat: fs.Stats }
   | { kind: 'directory'; entries: ReviewerSandboxResidueMap; stat: fs.Stats }
   | { kind: 'special'; stat: fs.Stats };
@@ -198,7 +211,7 @@ type ReviewerSandboxResidueSnapshot =
 type ReviewerSandboxResidueMap = Map<string, ReviewerSandboxResidueSnapshot>;
 
 type ReviewerSandboxEntryExpectation =
-  | { kind: 'file'; content: Buffer; stat?: fs.Stats }
+  | { kind: 'file'; content: Buffer; stat?: fs.Stats; maxBytes?: number }
   | { kind: 'directory'; entries: ReviewerSandboxExpectation; stat?: fs.Stats };
 
 type ReviewerSandboxExpectation = ReadonlyMap<string, ReviewerSandboxEntryExpectation>;
@@ -273,6 +286,23 @@ function validateIterationArtifact(name: SecureAutoloopIterationArtifact): void 
   validatePathComponent(name, 'Autoloop iteration artifact');
 }
 
+function reviewerEvidenceLimit(name: string, requested?: number): number | undefined {
+  if (requested !== undefined && (!Number.isSafeInteger(requested) || requested < 0)) {
+    throw new Error('Autoloop iteration artifact byte limit must be a nonnegative safe integer');
+  }
+  const mandatory =
+    name === 'directive.json' || name === 'eval_output.json' || name === 'coder_summary.txt' || name === 'diff.patch'
+      ? REVIEW_EVIDENCE_LIMIT_BYTES
+      : undefined;
+  if (mandatory === undefined) return requested;
+  return requested === undefined ? mandatory : Math.min(mandatory, requested);
+}
+
+function reviewerSandboxEvidenceLimit(relativePath: string): number | undefined {
+  const match = /^iter-(?:0|[1-9]\d*)\/([^/]+)$/.exec(relativePath);
+  return match ? reviewerEvidenceLimit(match[1]) : undefined;
+}
+
 function normalizedFlags(flags?: SecureLedgerPlatformFlags): Required<SecureLedgerPlatformFlags> {
   return {
     noFollow: flags?.noFollow ?? fs.constants.O_NOFOLLOW ?? 0,
@@ -305,6 +335,7 @@ export class SecureAutoloopLedger {
     private readonly platform: NodeJS.Platform | undefined,
     private readonly logger: { warn?: (message: string) => void },
     private readonly testHooks: NonNullable<SecureAutoloopLedgerOptions['testHooks']>,
+    private readonly readOnly: boolean,
   ) {
     this.directory = runDirectory.path;
   }
@@ -332,6 +363,43 @@ export class SecureAutoloopLedger {
         options.platform,
         options.logger ?? {},
         options.testHooks ?? {},
+        false,
+      );
+      ledger.validateExistingFlatFiles(options.validateExistingFlatFiles);
+      return ledger;
+    } finally {
+      if (run) fs.closeSync(run.fd);
+      fs.closeSync(tasks.fd);
+    }
+  }
+
+  /**
+   * Pin an existing foreign run as a strictly read-only capability. Unlike
+   * `open`, this path never creates or hardens directories/files: importing
+   * evidence must not repair or chmod another run's ledger.
+   */
+  static openReadOnly(
+    workspace: string,
+    runId: string,
+    options: Omit<SecureAutoloopLedgerOptions, 'create'> = {},
+  ): SecureAutoloopLedger {
+    validateRunId(runId);
+    const flags = normalizedFlags(options.platformFlags);
+    const tasksDir = path.join(workspace, 'tasks');
+    const runDir = path.join(tasksDir, runId);
+    const tasks = this.openDirectory(tasksDir, 'Autoloop ledger tasks parent', false, flags, false);
+    let run: { pinned: PinnedDirectory; fd: number; created: boolean } | undefined;
+    try {
+      run = this.openDirectory(runDir, 'Autoloop ledger run directory', false, flags, false);
+      this.assertOpenDirectory(tasks.pinned, tasks.fd);
+      const ledger = new SecureAutoloopLedger(
+        { ...tasks.pinned, stat: fs.fstatSync(tasks.fd) },
+        { ...run.pinned, stat: fs.fstatSync(run.fd) },
+        flags,
+        options.platform,
+        options.logger ?? {},
+        options.testHooks ?? {},
+        true,
       );
       ledger.validateExistingFlatFiles(options.validateExistingFlatFiles);
       return ledger;
@@ -355,6 +423,7 @@ export class SecureAutoloopLedger {
         options.platform,
         options.logger ?? {},
         options.testHooks ?? {},
+        false,
       );
       ledger.validateExistingFlatFiles(options.validateExistingFlatFiles);
       return ledger;
@@ -430,6 +499,10 @@ export class SecureAutoloopLedger {
     this.assertPinnedDirectory(this.runDirectory);
   }
 
+  private assertMutable(operation: string): void {
+    if (this.readOnly) throw new Error(`Cannot ${operation} through a read-only Autoloop ledger capability`);
+  }
+
   private openPinnedChildDirectory(
     parent: PinnedDirectory,
     name: string,
@@ -444,6 +517,7 @@ export class SecureAutoloopLedger {
     const created = !observed;
     if (!observed) {
       if (!create) throw missingPath(target);
+      this.assertMutable(`create ${label}`);
       fs.mkdirSync(target, { mode: PRIVATE_DIRECTORY_MODE });
       observed = fs.lstatSync(target);
     }
@@ -456,7 +530,7 @@ export class SecureAutoloopLedger {
       if (!opened.isDirectory() || !sameIdentity(observed, opened)) {
         throw new Error(`${label} identity changed while it was being secured: '${target}'`);
       }
-      SecureAutoloopLedger.hardenDirectory(fd, created);
+      if (!this.readOnly) SecureAutoloopLedger.hardenDirectory(fd, created);
       const pinned = { path: target, stat: fs.fstatSync(fd), label };
       if (created) this.syncPinnedDirectory(parent, `${label} creation`);
       return pinned;
@@ -495,6 +569,7 @@ export class SecureAutoloopLedger {
     name: string,
     relativePath: string,
     expected: RegularChildSnapshot,
+    maxBytes?: number,
   ): RegularChildSnapshot {
     const target = path.join(parent.path, name);
     let fd: number | undefined;
@@ -533,7 +608,7 @@ export class SecureAutoloopLedger {
       }
 
       try {
-        verified = this.openRegularChildSnapshot(parent, name, 'Autoloop nested artifact');
+        verified = this.openRegularChildSnapshot(parent, name, 'Autoloop nested artifact', 1, maxBytes);
         if (!verified) {
           throw new Error(`Autoloop nested artifact was removed after its durability barrier: '${relativePath}'`);
         }
@@ -637,7 +712,11 @@ export class SecureAutoloopLedger {
     name: string,
     label: string,
     expectedLinkCount = 1,
+    maxBytes?: number,
   ): RegularChildSnapshot | undefined {
+    if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes < 0)) {
+      throw new Error(`${label} byte limit must be a nonnegative safe integer`);
+    }
     validatePathComponent(name, label);
     this.assertIdentity();
     this.assertPinnedDirectory(parent);
@@ -658,7 +737,14 @@ export class SecureAutoloopLedger {
         rejectNestedFile(target, label, opened);
       }
       this.assertPinnedDirectory(parent);
-      const content = fs.readFileSync(fd);
+      if (maxBytes !== undefined && opened.size > maxBytes) {
+        throw new Error(`${label} '${name}' exceeds the ${maxBytes}-byte limit`);
+      }
+      this.testHooks.beforeNestedChildContentRead?.({ filePath: target, label, fd, size: opened.size });
+      const content =
+        maxBytes === undefined
+          ? fs.readFileSync(fd)
+          : this.readBoundedRegularChildContent(fd, target, name, label, opened.size, maxBytes);
       const afterOpen = fs.fstatSync(fd);
       const current = lstatIfPresent(target);
       if (current?.isFile() && !sameIdentity(afterOpen, current)) {
@@ -683,8 +769,61 @@ export class SecureAutoloopLedger {
     }
   }
 
-  private openRegularChild(parent: PinnedDirectory, name: string, label: string): Buffer | undefined {
-    return this.openRegularChildSnapshot(parent, name, label)?.content;
+  private readBoundedRegularChildContent(
+    fd: number,
+    filePath: string,
+    name: string,
+    label: string,
+    openedSize: number,
+    maxBytes: number,
+  ): Buffer {
+    const content = Buffer.alloc(openedSize);
+    let offset = 0;
+    while (offset < openedSize) {
+      const length = openedSize - offset;
+      this.testHooks.beforeNestedChildDescriptorRead?.({
+        filePath,
+        label,
+        fd,
+        phase: 'content',
+        bufferLength: content.length,
+        offset,
+        length,
+      });
+      const bytesRead = fs.readSync(fd, content, offset, length, null);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+
+    const growthProbe = Buffer.alloc(1);
+    this.testHooks.beforeNestedChildDescriptorRead?.({
+      filePath,
+      label,
+      fd,
+      phase: 'growth-probe',
+      bufferLength: growthProbe.length,
+      offset: 0,
+      length: 1,
+    });
+    if (fs.readSync(fd, growthProbe, 0, 1, null) !== 0) {
+      const boundary = openedSize === maxBytes ? `the ${maxBytes}-byte limit` : `its ${openedSize}-byte opened size`;
+      throw new Error(`${label} '${name}' grew beyond ${boundary} while it was being read`);
+    }
+    if (offset !== openedSize) {
+      throw new Error(
+        `${label} '${name}' became shorter than its ${openedSize}-byte opened size while it was being read`,
+      );
+    }
+    return content;
+  }
+
+  private openRegularChild(
+    parent: PinnedDirectory,
+    name: string,
+    label: string,
+    maxBytes?: number,
+  ): Buffer | undefined {
+    return this.openRegularChildSnapshot(parent, name, label, 1, maxBytes)?.content;
   }
 
   private isInternalNestedTemporaryName(name: string, entry: string): boolean {
@@ -736,8 +875,9 @@ export class SecureAutoloopLedger {
     expectedIdentity: fs.Stats,
     expectedBytes: Buffer,
     expectedLinkCount: number,
+    maxBytes?: number,
   ): RegularChildSnapshot {
-    const snapshot = this.openRegularChildSnapshot(parent, name, label, expectedLinkCount);
+    const snapshot = this.openRegularChildSnapshot(parent, name, label, expectedLinkCount, maxBytes);
     if (!snapshot) throw new Error(`${label} was removed before it could be verified`);
     if (!sameIdentity(expectedIdentity, snapshot.stat)) {
       throw new Error(`${label} identity changed before it could be verified`);
@@ -755,6 +895,7 @@ export class SecureAutoloopLedger {
     relativePath: string,
     expectedIdentity: fs.Stats,
     expectedBytes: Buffer,
+    maxBytes?: number,
   ): RegularChildSnapshot {
     const targetSnapshot = this.openExpectedNestedAlias(
       parent,
@@ -763,6 +904,7 @@ export class SecureAutoloopLedger {
       expectedIdentity,
       expectedBytes,
       2,
+      maxBytes,
     );
     const temporarySnapshot = this.openExpectedNestedAlias(
       parent,
@@ -771,6 +913,7 @@ export class SecureAutoloopLedger {
       expectedIdentity,
       expectedBytes,
       2,
+      maxBytes,
     );
     if (!sameIdentity(targetSnapshot.stat, temporarySnapshot.stat)) {
       throw new Error(`Autoloop published aliases do not share one identity: '${relativePath}'`);
@@ -783,6 +926,7 @@ export class SecureAutoloopLedger {
     name: string,
     bytes: Buffer,
     relativePath: string,
+    maxBytes?: number,
   ): AtomicChildWriteResult | undefined {
     const target = path.join(parent.path, name);
     const observed = lstatIfPresent(target);
@@ -792,11 +936,14 @@ export class SecureAutoloopLedger {
     }
 
     if (observed.nlink === 1) {
-      const existing = this.openRegularChildSnapshot(parent, name, 'Autoloop nested artifact');
+      const existing = this.openRegularChildSnapshot(parent, name, 'Autoloop nested artifact', 1, maxBytes);
       if (!existing?.content.equals(bytes)) {
         throw new Error(`Refusing to overwrite conflicting immutable Autoloop artifact '${target}'`);
       }
-      return { outcome: 'unchanged', snapshot: this.syncCommittedNestedArtifact(parent, name, relativePath, existing) };
+      return {
+        outcome: 'unchanged',
+        snapshot: this.syncCommittedNestedArtifact(parent, name, relativePath, existing, maxBytes),
+      };
     }
 
     if (observed.nlink !== 2) rejectNestedFile(target, 'Autoloop nested artifact', observed);
@@ -812,8 +959,20 @@ export class SecureAutoloopLedger {
     if (!aliasObserved?.isFile() || aliasObserved.nlink !== 2 || !sameIdentity(observed, aliasObserved)) {
       rejectNestedFile(target, 'Autoloop nested artifact', observed);
     }
-    const targetSnapshot = this.openRegularChildSnapshot(parent, name, 'Autoloop published nested artifact', 2);
-    const aliasSnapshot = this.openRegularChildSnapshot(parent, aliasName, 'Autoloop published temporary alias', 2);
+    const targetSnapshot = this.openRegularChildSnapshot(
+      parent,
+      name,
+      'Autoloop published nested artifact',
+      2,
+      maxBytes,
+    );
+    const aliasSnapshot = this.openRegularChildSnapshot(
+      parent,
+      aliasName,
+      'Autoloop published temporary alias',
+      2,
+      maxBytes,
+    );
     if (
       !targetSnapshot ||
       !aliasSnapshot ||
@@ -833,13 +992,19 @@ export class SecureAutoloopLedger {
         filePath: target,
         temporaryPath: aliasPath,
       });
-      const reconciled = this.openRegularChildSnapshot(parent, name, 'Autoloop reconciled nested artifact');
+      const reconciled = this.openRegularChildSnapshot(
+        parent,
+        name,
+        'Autoloop reconciled nested artifact',
+        1,
+        maxBytes,
+      );
       if (!reconciled || !sameIdentity(targetSnapshot.stat, reconciled.stat) || !reconciled.content.equals(bytes)) {
         throw new Error(`Autoloop published temporary alias reconciliation was incomplete: '${relativePath}'`);
       }
       return {
         outcome: 'unchanged',
-        snapshot: this.syncCommittedNestedArtifact(parent, name, relativePath, reconciled),
+        snapshot: this.syncCommittedNestedArtifact(parent, name, relativePath, reconciled, maxBytes),
       };
     } catch (error) {
       throw this.committedNestedArtifactError(relativePath, error);
@@ -852,11 +1017,15 @@ export class SecureAutoloopLedger {
     content: string | Buffer,
     relativePath: string,
     operation: SecureLedgerNestedMutationEvent['operation'],
+    maxBytes?: number,
   ): AtomicChildWriteResult {
     validatePathComponent(name, 'Autoloop nested artifact');
     const target = path.join(parent.path, name);
     const bytes = Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf8');
-    const existing = this.reconcileExistingAtomicChild(parent, name, bytes, relativePath);
+    if (maxBytes !== undefined && bytes.length > maxBytes) {
+      throw new Error(`Autoloop nested artifact '${name}' exceeds the ${maxBytes}-byte limit`);
+    }
+    const existing = this.reconcileExistingAtomicChild(parent, name, bytes, relativePath, maxBytes);
     if (existing) {
       return existing;
     }
@@ -914,6 +1083,7 @@ export class SecureAutoloopLedger {
         temporaryIdentity,
         bytes,
         1,
+        maxBytes,
       );
       try {
         (this.testHooks.publishNestedTemporary ?? fs.linkSync)(temporary, target);
@@ -927,7 +1097,7 @@ export class SecureAutoloopLedger {
           );
         }
         temporaryCreated = false;
-        const raced = this.reconcileExistingAtomicChild(parent, name, bytes, relativePath);
+        const raced = this.reconcileExistingAtomicChild(parent, name, bytes, relativePath, maxBytes);
         if (!raced) {
           throw new Error(`Autoloop nested artifact disappeared after exclusive publish conflict: '${relativePath}'`);
         }
@@ -935,14 +1105,14 @@ export class SecureAutoloopLedger {
       }
       published = true;
       this.testHooks.afterNestedPublish?.(publishEvent);
-      this.verifyPublishedNestedAliases(parent, name, temporaryName, relativePath, temporaryIdentity, bytes);
+      this.verifyPublishedNestedAliases(parent, name, temporaryName, relativePath, temporaryIdentity, bytes, maxBytes);
       const cleanup = this.unlinkOwnedNestedTemporary(temporary, temporaryIdentity);
       if (cleanup !== 'removed') {
         throw new Error(`Autoloop published temporary alias could not be safely removed: '${relativePath}'`);
       }
       temporaryCreated = false;
       this.testHooks.afterNestedTemporaryUnlink?.(publishEvent);
-      const committed = this.openRegularChildSnapshot(parent, name, 'Autoloop nested artifact');
+      const committed = this.openRegularChildSnapshot(parent, name, 'Autoloop nested artifact', 1, maxBytes);
       if (
         !committed ||
         !temporaryIdentity ||
@@ -953,7 +1123,7 @@ export class SecureAutoloopLedger {
       }
       return {
         outcome: 'created',
-        snapshot: this.syncCommittedNestedArtifact(parent, name, relativePath, committed),
+        snapshot: this.syncCommittedNestedArtifact(parent, name, relativePath, committed, maxBytes),
       };
     } catch (error) {
       if (published) throw this.committedNestedArtifactError(relativePath, error);
@@ -1004,7 +1174,7 @@ export class SecureAutoloopLedger {
     }
   }
 
-  readIterationArtifact(iter: number, name: SecureAutoloopIterationArtifact): Buffer | undefined {
+  readIterationArtifact(iter: number, name: SecureAutoloopIterationArtifact, maxBytes?: number): Buffer | undefined {
     validateIteration(iter);
     validateIterationArtifact(name);
     let directory: PinnedDirectory;
@@ -1014,7 +1184,12 @@ export class SecureAutoloopLedger {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
       throw error;
     }
-    return this.openRegularChild(directory, name, `Autoloop iteration ${iter} artifact`);
+    return this.openRegularChild(
+      directory,
+      name,
+      `Autoloop iteration ${iter} artifact`,
+      reviewerEvidenceLimit(name, maxBytes),
+    );
   }
 
   private snapshotReviewerSource(
@@ -1034,6 +1209,8 @@ export class SecureAutoloopLedger {
       directory,
       name,
       `Reviewer authoritative source iter/${iter}/${name}`,
+      1,
+      reviewerEvidenceLimit(name),
     );
     if (!snapshot) return undefined;
     return { directory, name, relativePath: `iter/${iter}/${name}`, snapshot };
@@ -1045,6 +1222,8 @@ export class SecureAutoloopLedger {
         source.directory,
         source.name,
         `Reviewer authoritative source ${source.relativePath}`,
+        1,
+        reviewerEvidenceLimit(source.name),
       );
       if (!observed) throw new Error(`Reviewer authoritative source was removed: '${source.relativePath}'`);
       if (!sameIdentity(observed.stat, source.snapshot.stat)) {
@@ -1063,8 +1242,16 @@ export class SecureAutoloopLedger {
   ): 'created' | 'unchanged' {
     validateIteration(iter);
     validateIterationArtifact(name);
+    this.assertMutable(`write iter/${iter}/${name}`);
     const directory = this.getIterationDirectory(iter, true);
-    return this.writeAtomicChild(directory, name, content, `iter/${iter}/${name}`, 'artifact-commit').outcome;
+    return this.writeAtomicChild(
+      directory,
+      name,
+      content,
+      `iter/${iter}/${name}`,
+      'artifact-commit',
+      reviewerEvidenceLimit(name),
+    ).outcome;
   }
 
   private getReviewerSandbox(create: boolean): PinnedDirectory {
@@ -1083,6 +1270,7 @@ export class SecureAutoloopLedger {
   }
 
   ensureReviewerSandbox(): string {
+    this.assertMutable('create or validate the Reviewer sandbox');
     const sandbox = this.getReviewerSandbox(true);
     this.assertReviewerSandboxBoundary(sandbox);
     return sandbox.path;
@@ -1145,6 +1333,7 @@ export class SecureAutoloopLedger {
     parent: PinnedDirectory,
     name: string,
     label: string,
+    relativePath = name,
   ): ReviewerSandboxResidueSnapshot {
     validatePathComponent(name, 'Reviewer sandbox residue');
     const target = path.join(parent.path, name);
@@ -1154,11 +1343,12 @@ export class SecureAutoloopLedger {
       throw new Error(`${label} crossed a filesystem boundary at '${target}'`);
     }
     if (observed.isFile()) {
-      const file = this.openRegularChildSnapshot(parent, name, `${label} regular file`, observed.nlink);
+      const maxBytes = reviewerSandboxEvidenceLimit(relativePath);
+      const file = this.openRegularChildSnapshot(parent, name, `${label} regular file`, observed.nlink, maxBytes);
       if (!file || !sameIdentity(observed, file.stat)) {
         throw new Error(`${label} regular file identity changed unexpectedly: '${target}'`);
       }
-      return { kind: 'file', content: Buffer.from(file.content), stat: file.stat };
+      return { kind: 'file', content: Buffer.from(file.content), stat: file.stat, maxBytes };
     }
     if (observed.isSymbolicLink()) {
       const linkTarget = fs.readlinkSync(target);
@@ -1177,7 +1367,10 @@ export class SecureAutoloopLedger {
       }
       const entries: ReviewerSandboxResidueMap = new Map();
       for (const entry of this.readReviewerSandboxEntries(child)) {
-        entries.set(entry, this.snapshotReviewerSandboxResidue(child, entry, `${label}/${entry}`));
+        entries.set(
+          entry,
+          this.snapshotReviewerSandboxResidue(child, entry, `${label}/${entry}`, `${relativePath}/${entry}`),
+        );
       }
       this.assertPinnedDirectory(child);
       this.assertPinnedDirectory(parent);
@@ -1196,7 +1389,13 @@ export class SecureAutoloopLedger {
     const target = path.join(parent.path, name);
     this.assertReviewerSandboxResidueNode(parent, name, expected, label);
     if (expected.kind === 'file') {
-      const file = this.openRegularChildSnapshot(parent, name, `${label} regular file`, expected.stat.nlink);
+      const file = this.openRegularChildSnapshot(
+        parent,
+        name,
+        `${label} regular file`,
+        expected.stat.nlink,
+        expected.maxBytes,
+      );
       if (!file || !sameIdentity(file.stat, expected.stat)) {
         throw new Error(`${label} regular file identity changed unexpectedly: '${target}'`);
       }
@@ -1374,7 +1573,13 @@ export class SecureAutoloopLedger {
       const expectedEntry = expected.get(entry)!;
       const target = path.join(directory.path, entry);
       if (expectedEntry.kind === 'file') {
-        const file = this.openRegularChildSnapshot(directory, entry, `${label} expected regular file`);
+        const file = this.openRegularChildSnapshot(
+          directory,
+          entry,
+          `${label} expected regular file`,
+          1,
+          expectedEntry.maxBytes,
+        );
         if (!file) throw new Error(`${label} expected regular file was removed: '${target}'`);
         if (!sameIdentity(file.stat, expectedEntry.stat)) {
           throw new Error(`${label} regular file identity changed unexpectedly: '${target}'`);
@@ -1415,7 +1620,13 @@ export class SecureAutoloopLedger {
       const target = path.join(directory.path, entry);
       const relativePath = relativeDirectory ? `${relativeDirectory}/${entry}` : entry;
       if (expectedEntry.kind === 'file') {
-        const file = this.openRegularChildSnapshot(directory, entry, `${label} expected regular file`);
+        const file = this.openRegularChildSnapshot(
+          directory,
+          entry,
+          `${label} expected regular file`,
+          1,
+          expectedEntry.maxBytes,
+        );
         if (!file) throw new Error(`${label} expected regular file was removed: '${target}'`);
         if (expectedEntry.stat && !sameIdentity(file.stat, expectedEntry.stat)) {
           throw new Error(`${label} regular file identity changed unexpectedly: '${target}'`);
@@ -1424,7 +1635,12 @@ export class SecureAutoloopLedger {
           throw new Error(`${label} regular file contents changed unexpectedly: '${target}'`);
         }
         this.testHooks.afterReviewerSandboxEntryRead?.({ relativePath, filePath: target, kind: 'file' });
-        snapshot.set(entry, { kind: 'file', content: Buffer.from(file.content), stat: file.stat });
+        snapshot.set(entry, {
+          kind: 'file',
+          content: Buffer.from(file.content),
+          stat: file.stat,
+          maxBytes: expectedEntry.maxBytes,
+        });
         continue;
       }
       const child = this.openPinnedChildDirectory(directory, entry, `${label} expected directory`, false);
@@ -1474,7 +1690,7 @@ export class SecureAutoloopLedger {
         if (content === undefined) {
           throw new Error(`Reviewer staged iteration ${iter} has no authoritative iter/${iter}/${artifact}`);
         }
-        expectedArtifacts.set(artifact, { kind: 'file', content });
+        expectedArtifacts.set(artifact, { kind: 'file', content, maxBytes: reviewerEvidenceLimit(artifact) });
       }
       this.validateAndSnapshotReviewerSandbox(staged, expectedArtifacts, `Reviewer staged iteration ${iter}`);
       stagedIterationSeen = true;
@@ -1484,6 +1700,7 @@ export class SecureAutoloopLedger {
 
   stageReviewerSandbox(iter: number, controls: SecureReviewerControlFiles = {}): SecureReviewerStageResult {
     validateIteration(iter);
+    this.assertMutable(`stage Reviewer sandbox for iteration ${iter}`);
     const artifacts = new Map<SecureAutoloopIterationArtifact, ReviewerSourceSnapshot>();
     for (const name of ['directive.json', 'eval_output.json', 'coder_summary.txt', 'diff.patch'] as const) {
       const source = this.snapshotReviewerSource(iter, name);
@@ -1529,8 +1746,9 @@ export class SecureAutoloopLedger {
         source.snapshot.content,
         `reviewer_sandbox/iter-${iter}/${name}`,
         'sandbox-stage',
+        reviewerEvidenceLimit(name),
       );
-      expectedArtifacts.set(name, { kind: 'file', ...staged.snapshot });
+      expectedArtifacts.set(name, { kind: 'file', ...staged.snapshot, maxBytes: reviewerEvidenceLimit(name) });
     }
     const expectedSandboxEntries: ReviewerSandboxSnapshot = new Map(persistentEntries);
     expectedSandboxEntries.set(`iter-${iter}`, {
@@ -1591,6 +1809,7 @@ export class SecureAutoloopLedger {
   openFlatFile(name: SecureAutoloopFlatFile, mode: 'read' | 'append', create = false): SecureAutoloopFileHandle {
     if (!SECURE_AUTOLOOP_FLAT_FILES.includes(name)) throw new Error(`Unsupported Autoloop ledger file '${name}'`);
     if (mode === 'read' && create) throw new Error(`Cannot combine read mode with create for '${name}'`);
+    if (mode === 'append' || create) this.assertMutable(`open ${name} for append`);
     this.assertIdentity();
     const filePath = path.join(this.directory, name);
     const observed = lstatIfPresent(filePath);
@@ -1622,7 +1841,7 @@ export class SecureAutoloopLedger {
       };
       const current = opened.mode & 0o777;
       const secure = observed ? current & PRIVATE_FILE_MODE : PRIVATE_FILE_MODE;
-      if (current !== secure) {
+      if (!this.readOnly && current !== secure) {
         this.beforeFileMutation(handle, 'chmod');
         fs.fchmodSync(fd, secure);
         handle.stat = fs.fstatSync(fd);
@@ -1676,6 +1895,7 @@ export class SecureAutoloopLedger {
   }
 
   prepareFlatFileAppend(name: SecureAutoloopFlatFile, content: string): SecureAutoloopPreparedAppend {
+    this.assertMutable(`prepare append to ${name}`);
     const handle = this.openFlatFile(name, 'append', true);
     let committed = false;
     let fileSynced = false;
@@ -1763,27 +1983,54 @@ export class SecureAutoloopLedger {
   }
 
   appendFlatFile(name: SecureAutoloopFlatFile, content: string, durable = false): void {
+    this.assertMutable(`append to ${name}`);
     const handle = this.openFlatFile(name, 'append', true);
+    let committed = false;
+    let primaryFailure: unknown;
     try {
-      this.beforeFileMutation(handle, 'append');
-      const expected = Buffer.byteLength(content);
-      const written = fs.writeSync(handle.fd, content, null, 'utf8');
-      if (written !== expected) throw new Error(`Could not append the complete ${name} record`);
-      if (durable) {
-        try {
+      try {
+        this.beforeFileMutation(handle, 'append');
+        const expected = Buffer.byteLength(content);
+        const written = fs.writeSync(handle.fd, content, null, 'utf8');
+        if (written !== expected) throw new Error(`Could not append the complete ${name} record`);
+        committed = true;
+        if (durable) {
           this.beforeFileMutation(handle, 'flush');
           fs.fsyncSync(handle.fd);
-        } catch (error) {
-          throw new SecureAutoloopLedgerCommitError(
-            'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
-            `Autoloop ledger row was committed to ${name}, but its file durability barrier failed: ${errorMessage(error)}`,
-            { cause: error },
-          );
         }
+      } catch (error) {
+        primaryFailure =
+          committed && durable && !(error instanceof SecureAutoloopLedgerCommitError)
+            ? new SecureAutoloopLedgerCommitError(
+                'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+                `Autoloop ledger row was committed to ${name}, but its file durability barrier failed: ${errorMessage(error)}`,
+                { cause: error },
+              )
+            : error;
       }
     } finally {
-      fs.closeSync(handle.fd);
+      try {
+        (this.testHooks.closeFlatFileDescriptor ?? fs.closeSync)(handle.fd);
+      } catch (error) {
+        if (primaryFailure) {
+          if (primaryFailure instanceof SecureAutoloopLedgerCommitError) {
+            primaryFailure.secondaryErrors.push(error instanceof Error ? error : new Error(String(error)));
+          }
+          this.logger.warn?.(
+            `[autoloop] ledger descriptor close failed after the primary error: ${errorMessage(error)}`,
+          );
+        } else if (committed) {
+          primaryFailure = new SecureAutoloopLedgerCommitError(
+            'AUTOLOOP_LEDGER_DESCRIPTOR_CLOSE_INCOMPLETE',
+            `Autoloop ledger row was committed to ${name}, but its descriptor close failed: ${errorMessage(error)}`,
+            { cause: error, operation: 'secure_ledger_append' },
+          );
+        } else {
+          primaryFailure = error;
+        }
+      }
     }
+    if (primaryFailure) throw primaryFailure;
     if (durable) {
       try {
         this.syncDirectory(name);
@@ -1798,6 +2045,7 @@ export class SecureAutoloopLedger {
   }
 
   flushFlatFile(name: SecureAutoloopFlatFile): void {
+    this.assertMutable(`flush ${name}`);
     const handle = this.openFlatFile(name, 'append');
     try {
       try {
@@ -1825,6 +2073,7 @@ export class SecureAutoloopLedger {
   }
 
   syncDirectory(name?: SecureAutoloopFlatFile): void {
+    this.assertMutable(`sync ${name ?? 'ledger directory'}`);
     this.assertIdentity();
     const event: SecureLedgerMutationEvent = {
       ...(name ? { name } : {}),
