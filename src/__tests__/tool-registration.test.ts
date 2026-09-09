@@ -4,11 +4,14 @@ import * as os from 'node:os';
 import plugin from '../index.js';
 import { SessionManager, toPublicAutoloopFailure } from '../session-manager.js';
 import { AutoloopOperationError } from '../autoloop/dispatcher.js';
+import { Msg } from '../autoloop/messages.js';
+import { AutoloopRunner } from '../autoloop/runner.js';
 import { SecureAutoloopLedgerCommitError } from '../autoloop/secure-ledger.js';
 import { ENGINE_TYPES } from '../types.js';
 import { __rejectCustomEngineOverHttpForTest as rejectCustomEngineOverHttp } from '../embedded-server.js';
 import type { PluginConfig, PermissionMode, EffortLevel } from '../types.js';
 import type { AutoloopState, PublicAutoloopFailure, PublicAutoloopFailureCode } from '../index.js';
+import type { AgentDispatcher } from '../autoloop/types.js';
 
 const COMMITTED_LEDGER_CODES = [
   'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
@@ -1151,6 +1154,1307 @@ describe('openclaw.plugin.json parity', () => {
       expect(rejectCustomEngineOverHttp(asHostToolList)).toBeNull();
     } finally {
       registration.services[0]?.stop();
+    }
+  });
+});
+
+describe('Task 4B public reviewer-only registration', () => {
+  it('keeps typed failures structured through autoloop_request_review', async () => {
+    const registration = collectRegistration();
+    const call = vi
+      .spyOn(SessionManager.prototype as never, 'autoloopRequestReview' as never)
+      .mockRejectedValueOnce(new AutoloopOperationError('AUTOLOOP_ENGINE_FAILURE', 'typed Task 4B failure') as never);
+    try {
+      const tool = registration.tools.find((candidate) => candidate.name === 'autoloop_request_review')!;
+      const result = (await tool.execute('typed-task4b', {
+        run_id: 'run',
+        checkpoint_sha: 'a'.repeat(40),
+        source_run_id: 'source-run',
+        source_iter: 7,
+        scope: ['security'],
+        idempotency_key: 'review-7',
+      })) as { details: unknown };
+      expect(result.details).toEqual({
+        ok: false,
+        error: { code: 'AUTOLOOP_ENGINE_FAILURE', message: 'typed Task 4B failure', retryable: true },
+      });
+    } finally {
+      registration.services[0]?.stop();
+      call.mockRestore();
+    }
+  });
+
+  it.each([
+    ['AUTOLOOP_RUN_PAUSED', "Autoloop run 'run' is paused; resume it before requesting review"],
+    ['AUTOLOOP_RUN_TERMINAL', "Autoloop run 'run' is terminal and cannot accept a review request"],
+  ] as const)('keeps request_review state failure %s structured at the MCP boundary', async (code, message) => {
+    const registration = collectRegistration();
+    const failure = Object.assign(new Error(message), { name: 'AutoloopChatStateError', code, retryable: false });
+    const call = vi
+      .spyOn(SessionManager.prototype as never, 'autoloopRequestReview' as never)
+      .mockRejectedValueOnce(failure as never);
+    try {
+      const tool = registration.tools.find((candidate) => candidate.name === 'autoloop_request_review')!;
+      const result = (await tool.execute('typed-task4b-state', {
+        run_id: 'run',
+        checkpoint_sha: 'a'.repeat(40),
+        source_run_id: 'source-run',
+        source_iter: 7,
+        scope: ['security'],
+        idempotency_key: 'review-state',
+      })) as { details: unknown };
+      expect(result.details).toEqual({ ok: false, error: { code, message, retryable: false } });
+    } finally {
+      registration.services[0]?.stop();
+      call.mockRestore();
+    }
+  });
+  const NEW_TOOLS = ['autoloop_request_review'] as const;
+  const INTERNAL_ONLY_TOOLS = ['autoloop_spawn_coder', 'autoloop_spawn_reviewer'] as const;
+
+  it('registers each public Task 4B tool exactly once with the manifest in exact parity', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join } = await import('node:path');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const manifest = JSON.parse(readFileSync(join(here, '../../openclaw.plugin.json'), 'utf8')) as {
+      contracts: { tools: string[] };
+    };
+    const registered = collectRegistration().tools.map((tool) => tool.name);
+
+    for (const name of NEW_TOOLS) {
+      expect(registered.filter((candidate) => candidate === name)).toHaveLength(1);
+      expect(manifest.contracts.tools.filter((candidate) => candidate === name)).toHaveLength(1);
+    }
+    for (const name of INTERNAL_ONLY_TOOLS) {
+      expect(registered).not.toContain(name);
+      expect(manifest.contracts.tools).not.toContain(name);
+    }
+    expect([...manifest.contracts.tools].sort()).toEqual([...registered].sort());
+  });
+
+  it('publishes the checkpoint-bound request_review schema without a Coder field', () => {
+    const registration = collectRegistration();
+    try {
+      const tool = registration.tools.find((candidate) => candidate.name === 'autoloop_request_review');
+      expect(tool).toBeDefined();
+      expect(tool!.parameters).toEqual({
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          run_id: { type: 'string', minLength: 1, maxLength: 512 },
+          checkpoint_sha: { type: 'string', pattern: '^[0-9a-fA-F]{40}$' },
+          source_run_id: {
+            type: 'string',
+            minLength: 1,
+            maxLength: 8192,
+            pattern: '^[A-Za-z0-9][A-Za-z0-9._-]*$',
+          },
+          source_iter: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+          scope: {
+            type: 'array',
+            minItems: 1,
+            maxItems: 128,
+            items: { type: 'string', minLength: 1, maxLength: 8192 },
+          },
+          idempotency_key: { type: 'string', minLength: 1, maxLength: 8192 },
+        },
+        required: ['run_id', 'checkpoint_sha', 'source_run_id', 'source_iter', 'scope', 'idempotency_key'],
+      });
+      expect(JSON.stringify(tool!.parameters)).not.toMatch(/coder/i);
+    } finally {
+      registration.services[0]?.stop();
+    }
+  });
+
+  it('keeps independent role-spawn primitives out of the public MCP registry', () => {
+    const registration = collectRegistration();
+    try {
+      for (const name of INTERNAL_ONLY_TOOLS) {
+        expect(registration.tools.find((candidate) => candidate.name === name)).toBeUndefined();
+      }
+    } finally {
+      registration.services[0]?.stop();
+    }
+  });
+
+  it.each([
+    ['coder', 'autoloopSpawnCoder', { coder_engine: 'custom' }],
+    ['reviewer', 'autoloopSpawnReviewer', { reviewer_engine: 'custom' }],
+  ] as const)('rejects custom %s spawn before live-run effects', async (_role, method, args) => {
+    const manager = new SessionManager({});
+    const live = vi.spyOn(manager as never, '_liveAutoloop' as never);
+    await expect((manager[method] as (runId: string, input: unknown) => Promise<unknown>)('run', args)).rejects.toThrow(
+      /not supported/,
+    );
+    expect(live).not.toHaveBeenCalled();
+    await manager.shutdown();
+  });
+
+  it.each([
+    ['coder', 'autoloopSpawnCoder', {}],
+    ['reviewer', 'autoloopSpawnReviewer', {}],
+  ] as const)('fences %s spawn while the run is being deleted', async (_role, method, args) => {
+    const manager = new SessionManager({});
+    ((manager as unknown as Record<string, unknown>)['_autoloopReviewDeleting'] as Set<string>).add('run');
+    const live = vi.spyOn(manager as never, '_liveAutoloop' as never);
+    await expect((manager[method] as (runId: string, input: unknown) => Promise<unknown>)('run', args)).rejects.toThrow(
+      "Autoloop run 'run' is being deleted",
+    );
+    expect(live).not.toHaveBeenCalled();
+    await manager.shutdown();
+  });
+
+  it('serializes an in-flight spawn against delete without reporting failure after its effect succeeds', async () => {
+    const manager = new SessionManager({});
+    let releaseSpawn!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      releaseSpawn = resolve;
+    });
+    const spawnCoder = vi.fn(async () => {
+      await blocked;
+      return { role: 'coder', generation: 2 };
+    });
+    vi.spyOn(manager as never, '_liveAutoloop' as never).mockReturnValue({ dispatcher: { spawnCoder } } as never);
+    const registry = vi.spyOn(manager as never, '_withAgentRegistryLock' as never);
+    const spawn = manager.autoloopSpawnCoder('run');
+    await vi.waitFor(() => expect(spawnCoder).toHaveBeenCalledOnce());
+    registry.mockClear();
+    const deletion = manager.autoloopDelete('run');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(registry).not.toHaveBeenCalled();
+    releaseSpawn();
+    await expect(spawn).resolves.toEqual({ role: 'coder', generation: 2 });
+    await expect(deletion).resolves.toBe(false);
+    await manager.shutdown();
+  });
+
+  it('persists then queues one Reviewer-only request at the live iteration without a Coder effect', async () => {
+    const manager = new SessionManager({});
+    const send = vi.fn(async (_message: unknown) => undefined);
+    const requestReview = vi.fn(async () => ({
+      status: 'prepared' as const,
+      target: 'reviewer' as const,
+      idempotency_key: 'review-7',
+      payload: {
+        iter: 9,
+        ledger_path: '/ledger',
+        prior_metrics: [],
+        checkpoint_sha: 'a'.repeat(40),
+        source_run_id: 'source-run',
+        source_iter: 7,
+        scope: ['security'],
+        idempotency_key: 'review-7',
+      },
+    }));
+    const spawnCoder = vi.fn();
+    const acceptReviewRequest = vi.fn();
+    const releaseReviewRequest = vi.fn();
+    vi.spyOn(manager as never, '_liveAutoloop' as never).mockReturnValue({
+      runner: { state: { iter: 9 }, send },
+      dispatcher: {
+        requestReview,
+        spawnCoder,
+        acceptReviewRequest,
+        releaseReviewRequest,
+      },
+    } as never);
+
+    try {
+      const result = await manager.autoloopRequestReview('run', {
+        checkpoint_sha: 'A'.repeat(40),
+        source_run_id: 'source-run',
+        source_iter: 7,
+        scope: ['security'],
+        idempotency_key: 'review-7',
+      });
+      expect(requestReview).toHaveBeenCalledWith(
+        {
+          checkpoint_sha: 'a'.repeat(40),
+          source_run_id: 'source-run',
+          source_iter: 7,
+          scope: ['security'],
+          idempotency_key: 'review-7',
+        },
+        9,
+      );
+      expect(send).toHaveBeenCalledOnce();
+      expect(acceptReviewRequest).toHaveBeenCalledWith('review-7');
+      expect(requestReview.mock.invocationCallOrder[0]).toBeLessThan(send.mock.invocationCallOrder[0]);
+      expect(send.mock.invocationCallOrder[0]).toBeLessThan(acceptReviewRequest.mock.invocationCallOrder[0]);
+      expect(releaseReviewRequest).not.toHaveBeenCalled();
+      expect(send.mock.calls[0][0]).toMatchObject({
+        type: 'review_request',
+        iter: 9,
+        to: 'reviewer',
+        payload: {
+          iter: 9,
+          checkpoint_sha: 'a'.repeat(40),
+          source_run_id: 'source-run',
+          source_iter: 7,
+          idempotency_key: 'review-7',
+        },
+      });
+      expect(spawnCoder).not.toHaveBeenCalled();
+      expect(result).toEqual({ status: 'prepared', target: 'reviewer', idempotency_key: 'review-7' });
+    } finally {
+      await manager.shutdown();
+    }
+  });
+
+  it('rejects internal spawn accessors before live-run lookup or role effects', async () => {
+    const manager = new SessionManager({});
+    const live = vi.spyOn(manager as never, '_liveAutoloop' as never);
+    const args = Object.create(null) as Record<string, unknown>;
+    Object.defineProperty(args, 'coder_engine', { enumerable: true, get: () => 'codex' });
+    try {
+      await expect(manager.autoloopSpawnCoder('run', args as never)).rejects.toThrow(/own data property/i);
+      expect(live).not.toHaveBeenCalled();
+    } finally {
+      await manager.shutdown();
+    }
+  });
+
+  it('validates request_review before probing live-run state', async () => {
+    const manager = new SessionManager({});
+    const live = vi.spyOn(manager as never, '_liveAutoloop' as never);
+    try {
+      await expect(manager.autoloopRequestReview('missing', { checkpoint_sha: 'bad' } as never)).rejects.toThrow(
+        /request_review/i,
+      );
+      expect(live).not.toHaveBeenCalled();
+      expect(
+        (
+          (manager as unknown as Record<string, unknown>)['_autoloopReviewTransactions'] as Map<string, Promise<void>>
+        ).has('missing'),
+      ).toBe(false);
+    } finally {
+      await manager.shutdown();
+    }
+  });
+
+  it('does not enqueue or accept a duplicate Reviewer-only request', async () => {
+    const manager = new SessionManager({});
+    const send = vi.fn();
+    const acceptReviewRequest = vi.fn();
+    const releaseReviewRequest = vi.fn();
+    vi.spyOn(manager as never, '_liveAutoloop' as never).mockReturnValue({
+      runner: { state: { iter: 9 }, send },
+      dispatcher: {
+        requestReview: vi.fn(async () => ({
+          status: 'duplicate',
+          target: 'reviewer',
+          idempotency_key: 'review-7',
+        })),
+        acceptReviewRequest,
+        releaseReviewRequest,
+      },
+    } as never);
+    try {
+      await expect(
+        manager.autoloopRequestReview('run', {
+          checkpoint_sha: 'a'.repeat(40),
+          source_run_id: 'source-run',
+          source_iter: 7,
+          scope: ['security'],
+          idempotency_key: 'review-7',
+        }),
+      ).resolves.toEqual({ status: 'duplicate', target: 'reviewer', idempotency_key: 'review-7' });
+      expect(send).not.toHaveBeenCalled();
+      expect(acceptReviewRequest).not.toHaveBeenCalled();
+      expect(releaseReviewRequest).not.toHaveBeenCalled();
+    } finally {
+      await manager.shutdown();
+    }
+  });
+
+  it('retries a released review with its persisted iteration after the live iteration advances', async () => {
+    const manager = new SessionManager({});
+    const state = { iter: 9 };
+    const payload = {
+      iter: 9,
+      ledger_path: '/ledger',
+      prior_metrics: [],
+      checkpoint_sha: 'a'.repeat(40),
+      source_run_id: 'source-run',
+      source_iter: 7,
+      scope: ['security'],
+      idempotency_key: 'review-7',
+    };
+    const requestReview = vi.fn(async (_request: unknown, targetIter: number) => ({
+      status: 'prepared' as const,
+      target: 'reviewer' as const,
+      idempotency_key: 'review-7',
+      payload: { ...payload, iter: targetIter },
+    }));
+    const releaseReviewRequest = vi.fn();
+    const acceptReviewRequest = vi.fn();
+    const send = vi.fn().mockRejectedValueOnce(new Error('queue unavailable')).mockResolvedValueOnce(undefined);
+    vi.spyOn(manager as never, '_liveAutoloop' as never).mockReturnValue({
+      runner: { state, send },
+      dispatcher: { requestReview, releaseReviewRequest, acceptReviewRequest },
+    } as never);
+    const input = {
+      checkpoint_sha: 'a'.repeat(40),
+      source_run_id: 'source-run',
+      source_iter: 7,
+      scope: ['security'],
+      idempotency_key: 'review-7',
+    };
+    try {
+      await expect(manager.autoloopRequestReview('run', input)).rejects.toThrow('queue unavailable');
+      state.iter = 10;
+      await manager.autoloopRequestReview('run', input);
+      expect(requestReview.mock.calls.map((call) => call[1])).toEqual([9, 9]);
+      expect(acceptReviewRequest).toHaveBeenCalledWith('review-7');
+    } finally {
+      await manager.shutdown();
+    }
+  });
+
+  it('clears failed-delivery rearm state when the run is deleted', async () => {
+    const manager = new SessionManager({});
+    const payload = {
+      iter: 9,
+      ledger_path: '/ledger',
+      prior_metrics: [],
+      checkpoint_sha: 'a'.repeat(40),
+      source_run_id: 'source-run',
+      source_iter: 7,
+      scope: ['security'],
+      idempotency_key: 'review-7',
+    };
+    vi.spyOn(manager as never, '_liveAutoloop' as never).mockReturnValue({
+      runner: { state: { iter: 9 }, send: vi.fn().mockRejectedValue(new Error('queue unavailable')) },
+      dispatcher: {
+        requestReview: vi.fn(async () => ({
+          status: 'prepared',
+          target: 'reviewer',
+          idempotency_key: 'review-7',
+          payload,
+        })),
+        releaseReviewRequest: vi.fn(),
+        acceptReviewRequest: vi.fn(),
+      },
+    } as never);
+    try {
+      await expect(
+        manager.autoloopRequestReview('run', {
+          checkpoint_sha: 'a'.repeat(40),
+          source_run_id: 'source-run',
+          source_iter: 7,
+          scope: ['security'],
+          idempotency_key: 'review-7',
+        }),
+      ).rejects.toThrow('queue unavailable');
+      expect(
+        (
+          (manager as unknown as Record<string, unknown>)['_autoloopReleasedReviewIterations'] as Map<
+            string,
+            Map<string, number>
+          >
+        ).get('run')?.size,
+      ).toBe(1);
+      await manager.autoloopDelete('run');
+      expect(
+        (
+          (manager as unknown as Record<string, unknown>)['_autoloopReleasedReviewIterations'] as Map<
+            string,
+            Map<string, number>
+          >
+        ).has('run'),
+      ).toBe(false);
+    } finally {
+      await manager.shutdown();
+    }
+  });
+
+  it('strips the MCP routing run_id before validating and dispatching request_review', async () => {
+    const registration = collectRegistration();
+    const requestReview = vi
+      .spyOn(SessionManager.prototype as never, 'autoloopRequestReview' as never)
+      .mockResolvedValue({ status: 'prepared', target: 'reviewer', idempotency_key: 'review-7' } as never);
+    try {
+      const tool = registration.tools.find((candidate) => candidate.name === 'autoloop_request_review')!;
+      await tool.execute('review-only', {
+        run_id: 'run',
+        checkpoint_sha: 'A'.repeat(40),
+        source_run_id: 'source-run',
+        source_iter: 7,
+        scope: ['security'],
+        idempotency_key: 'review-7',
+      });
+      expect(requestReview).toHaveBeenCalledWith('run', {
+        checkpoint_sha: 'A'.repeat(40),
+        source_run_id: 'source-run',
+        source_iter: 7,
+        scope: ['security'],
+        idempotency_key: 'review-7',
+      });
+    } finally {
+      registration.services[0]?.stop();
+      requestReview.mockRestore();
+    }
+  });
+
+  it('rejects an accessor MCP run_id before request_review dispatch', async () => {
+    const registration = collectRegistration();
+    const requestReview = vi.spyOn(SessionManager.prototype as never, 'autoloopRequestReview' as never);
+    const args = Object.create(null) as Record<string, unknown>;
+    Object.defineProperty(args, 'run_id', {
+      enumerable: true,
+      get: () => {
+        throw new Error('run_id accessor executed');
+      },
+    });
+    Object.assign(args, {
+      checkpoint_sha: 'a'.repeat(40),
+      source_run_id: 'source-run',
+      source_iter: 7,
+      scope: ['security'],
+      idempotency_key: 'review-7',
+    });
+    try {
+      const tool = registration.tools.find((candidate) => candidate.name === 'autoloop_request_review')!;
+      await expect(tool.execute('review-only', args)).rejects.toThrow(/run_id.*own data property/i);
+      expect(requestReview).not.toHaveBeenCalled();
+    } finally {
+      registration.services[0]?.stop();
+      requestReview.mockRestore();
+    }
+  });
+
+  it('rejects accessor MCP request_review fields even when Object.prototype.value is polluted', async () => {
+    const registration = collectRegistration();
+    const requestReview = vi.spyOn(SessionManager.prototype as never, 'autoloopRequestReview' as never);
+    const args = Object.create(null) as Record<string, unknown>;
+    Object.defineProperty(args, 'run_id', { enumerable: true, value: 'run' });
+    Object.defineProperty(args, 'checkpoint_sha', {
+      enumerable: true,
+      get: () => {
+        throw new Error('checkpoint accessor executed');
+      },
+    });
+    Object.assign(args, {
+      source_run_id: 'source-run',
+      source_iter: 7,
+      scope: ['security'],
+      idempotency_key: 'review-7',
+    });
+    Object.defineProperty(Object.prototype, 'value', { configurable: true, value: 'a'.repeat(40) });
+    let caught: unknown;
+    try {
+      const tool = registration.tools.find((candidate) => candidate.name === 'autoloop_request_review')!;
+      try {
+        await tool.execute('review-only', args);
+      } catch (error) {
+        caught = error;
+      }
+    } finally {
+      delete (Object.prototype as Record<string, unknown>).value;
+      registration.services[0]?.stop();
+      requestReview.mockRestore();
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toMatch(/invalid property descriptor|own data property/i);
+    expect(requestReview).not.toHaveBeenCalled();
+  });
+
+  it('re-arms a durably prepared review when queue delivery fails', async () => {
+    const manager = new SessionManager({});
+    const payload = {
+      iter: 9,
+      ledger_path: '/ledger',
+      prior_metrics: [],
+      checkpoint_sha: 'a'.repeat(40),
+      source_run_id: 'source-run',
+      source_iter: 7,
+      scope: ['security'],
+      idempotency_key: 'review-7',
+    };
+    const requestReview = vi.fn(async () => ({
+      status: 'prepared' as const,
+      target: 'reviewer' as const,
+      idempotency_key: 'review-7',
+      payload,
+    }));
+    const releaseReviewRequest = vi.fn();
+    const acceptReviewRequest = vi.fn();
+    const send = vi.fn(async () => {
+      throw new Error('queue unavailable');
+    });
+    vi.spyOn(manager as never, '_liveAutoloop' as never).mockReturnValue({
+      runner: { state: { iter: 9 }, send },
+      dispatcher: { requestReview, releaseReviewRequest, acceptReviewRequest },
+    } as never);
+    try {
+      await expect(
+        manager.autoloopRequestReview('run', {
+          checkpoint_sha: 'a'.repeat(40),
+          source_run_id: 'source-run',
+          source_iter: 7,
+          scope: ['security'],
+          idempotency_key: 'review-7',
+        }),
+      ).rejects.toThrow('queue unavailable');
+      expect(releaseReviewRequest).toHaveBeenCalledWith('review-7', payload);
+      expect(acceptReviewRequest).not.toHaveBeenCalled();
+    } finally {
+      await manager.shutdown();
+    }
+  });
+
+  it('does not release or rearm a Reviewer identity after a committed ledger failure', async () => {
+    const manager = new SessionManager({});
+    const payload = {
+      iter: 9,
+      ledger_path: '/ledger',
+      prior_metrics: [],
+      checkpoint_sha: 'a'.repeat(40),
+      source_run_id: 'source-run',
+      source_iter: 7,
+      scope: ['security'],
+      idempotency_key: 'committed-review',
+    };
+    const failure = new SecureAutoloopLedgerCommitError(
+      'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+      'Reviewer bytes are already committed',
+      { cause: new Error('simulated fsync interruption'), effectsApplied: true },
+    );
+    const releaseReviewRequest = vi.fn();
+    vi.spyOn(manager as never, '_liveAutoloop' as never).mockReturnValue({
+      runner: { state: { iter: 9, status: 'running' }, send: vi.fn().mockRejectedValue(failure) },
+      dispatcher: {
+        requestReview: vi.fn().mockResolvedValue({
+          status: 'prepared',
+          target: 'reviewer',
+          idempotency_key: 'committed-review',
+          payload,
+        }),
+        releaseReviewRequest,
+        acceptReviewRequest: vi.fn(),
+      },
+    } as never);
+    await expect(
+      manager.autoloopRequestReview('run', {
+        checkpoint_sha: payload.checkpoint_sha,
+        source_run_id: payload.source_run_id,
+        source_iter: payload.source_iter,
+        scope: payload.scope,
+        idempotency_key: payload.idempotency_key,
+      }),
+    ).rejects.toBe(failure);
+    expect(releaseReviewRequest).not.toHaveBeenCalled();
+    expect(
+      (
+        (manager as unknown as Record<string, unknown>)['_autoloopReleasedReviewIterations'] as Map<string, unknown>
+      ).has('run'),
+    ).toBe(false);
+    await manager.shutdown();
+  });
+
+  it('caps released Reviewer identities at 64 while allowing an existing identity retry', async () => {
+    const manager = new SessionManager({});
+    const released = new Map(Array.from({ length: 64 }, (_, index) => [`review-${index}`, 9]));
+    (
+      (manager as unknown as Record<string, unknown>)['_autoloopReleasedReviewIterations'] as Map<
+        string,
+        Map<string, number>
+      >
+    ).set('run', released);
+    const live = vi.spyOn(manager as never, '_liveAutoloop' as never).mockReturnValue({
+      runner: { state: { iter: 10, status: 'running' }, send: vi.fn() },
+      dispatcher: { requestReview: vi.fn() },
+    } as never);
+    const base = {
+      checkpoint_sha: 'a'.repeat(40),
+      source_run_id: 'source-run',
+      source_iter: 7,
+      scope: ['security'],
+    };
+    await expect(manager.autoloopRequestReview('run', { ...base, idempotency_key: 'new-review' })).rejects.toThrow(
+      'request_review retry capacity is exhausted',
+    );
+    expect(live).toHaveBeenCalledWith('run', 'requesting review');
+    live.mockClear();
+    live.mockReturnValue({
+      runner: { state: { iter: 10, status: 'running' }, send: vi.fn().mockResolvedValue(undefined) },
+      dispatcher: {
+        requestReview: vi.fn().mockResolvedValue({
+          status: 'duplicate',
+          target: 'reviewer',
+          idempotency_key: 'review-0',
+        }),
+      },
+    } as never);
+    await expect(manager.autoloopRequestReview('run', { ...base, idempotency_key: 'review-0' })).resolves.toMatchObject(
+      {
+        status: 'duplicate',
+      },
+    );
+    await manager.shutdown();
+  });
+
+  it.each(['terminated', 'crashed'] as const)(
+    'releases a prepared review when the run becomes %s before queue delivery',
+    async (terminalStatus) => {
+      const manager = new SessionManager({});
+      const state = { iter: 9, status: 'running' };
+      const payload = {
+        iter: 9,
+        ledger_path: '/ledger',
+        prior_metrics: [],
+        checkpoint_sha: 'a'.repeat(40),
+        source_run_id: 'source-run',
+        source_iter: 7,
+        scope: ['security'],
+        idempotency_key: 'review-7',
+      };
+      const releaseReviewRequest = vi.fn();
+      const acceptReviewRequest = vi.fn();
+      const send = vi.fn();
+      vi.spyOn(manager as never, '_liveAutoloop' as never).mockReturnValue({
+        runner: { state, send },
+        dispatcher: {
+          requestReview: vi.fn(async () => {
+            state.status = terminalStatus;
+            return { status: 'prepared', target: 'reviewer', idempotency_key: 'review-7', payload };
+          }),
+          releaseReviewRequest,
+          acceptReviewRequest,
+        },
+      } as never);
+      await expect(
+        manager.autoloopRequestReview('run', {
+          checkpoint_sha: 'a'.repeat(40),
+          source_run_id: 'source-run',
+          source_iter: 7,
+          scope: ['security'],
+          idempotency_key: 'review-7',
+        }),
+      ).rejects.toThrow(/terminal/i);
+      expect(send).not.toHaveBeenCalled();
+      expect(releaseReviewRequest).toHaveBeenCalledWith('review-7', payload);
+      expect(acceptReviewRequest).not.toHaveBeenCalled();
+      await manager.shutdown();
+    },
+  );
+
+  it('accepts exactly once when queue delivery resolves before the run becomes terminal', async () => {
+    const manager = new SessionManager({});
+    const state = { iter: 9, status: 'running' };
+    const payload = {
+      iter: 9,
+      ledger_path: '/ledger',
+      prior_metrics: [],
+      checkpoint_sha: 'a'.repeat(40),
+      source_run_id: 'source-run',
+      source_iter: 7,
+      scope: ['security'],
+      idempotency_key: 'review-7',
+    };
+    const releaseReviewRequest = vi.fn();
+    const acceptReviewRequest = vi.fn();
+    const send = vi.fn(async () => {
+      state.status = 'terminated';
+    });
+    vi.spyOn(manager as never, '_liveAutoloop' as never).mockReturnValue({
+      runner: { state, send },
+      dispatcher: {
+        requestReview: vi.fn().mockResolvedValue({
+          status: 'prepared',
+          target: 'reviewer',
+          idempotency_key: 'review-7',
+          payload,
+        }),
+        releaseReviewRequest,
+        acceptReviewRequest,
+      },
+    } as never);
+    await expect(
+      manager.autoloopRequestReview('run', {
+        checkpoint_sha: 'a'.repeat(40),
+        source_run_id: 'source-run',
+        source_iter: 7,
+        scope: ['security'],
+        idempotency_key: 'review-7',
+      }),
+    ).resolves.toMatchObject({ status: 'prepared' });
+    expect(releaseReviewRequest).not.toHaveBeenCalled();
+    expect(acceptReviewRequest).toHaveBeenCalledWith('review-7');
+    await manager.shutdown();
+  });
+
+  it('rejects a queued Reviewer handoff that termination discards before delivery', async () => {
+    let releaseActiveDelivery!: () => void;
+    const activeDelivery = new Promise<void>((resolve) => {
+      releaseActiveDelivery = resolve;
+    });
+    const delivered: string[] = [];
+    const dispatcher: AgentDispatcher = {
+      async deliver(message) {
+        delivered.push(message.type);
+        if (message.type === 'chat') await activeDelivery;
+        return [];
+      },
+    };
+    const runner = new AutoloopRunner({
+      run_id: 'terminal-discard',
+      workspace: '/tmp/terminal-discard',
+      ledger_dir: '/tmp/terminal-discard/ledger',
+      dispatcher,
+      notifyUser: async () => undefined,
+      stallCheckIntervalMs: 24 * 60 * 60 * 1000,
+    });
+    const inFlight = runner.send(Msg.chat(0, { text: 'block the queue' }));
+    await vi.waitFor(() => expect(delivered).toEqual(['chat']));
+    const review = runner.send(
+      Msg.reviewRequest(0, {
+        iter: 0,
+        ledger_path: '/ledger',
+        prior_metrics: [],
+        checkpoint_sha: 'a'.repeat(40),
+        source_run_id: 'source-run',
+        source_iter: 7,
+        scope: ['security'],
+        idempotency_key: 'review-7',
+      }),
+    );
+    const reviewOutcome = expect(review).rejects.toThrow(/not delivered.*terminal/i);
+
+    await runner.send(Msg.terminate(0, { reason: 'operator-stop' }));
+    expect(delivered).toEqual(['chat']);
+    releaseActiveDelivery();
+    await expect(inFlight).resolves.toBeUndefined();
+    await reviewOutcome;
+    runner.stop();
+  });
+
+  it('rejects rather than acknowledges a Reviewer handoff that reaches a paused runner', async () => {
+    const delivered: string[] = [];
+    const dispatcher: AgentDispatcher = {
+      async deliver(message) {
+        delivered.push(message.type);
+        return [];
+      },
+    };
+    const runner = new AutoloopRunner({
+      run_id: 'paused-terminal-discard',
+      workspace: '/tmp/paused-terminal-discard',
+      ledger_dir: '/tmp/paused-terminal-discard/ledger',
+      dispatcher,
+      notifyUser: async () => undefined,
+    });
+    await runner.send(Msg.pause(0, { reason: 'operator-pause' }));
+    const review = runner.send(
+      Msg.reviewRequest(0, {
+        iter: 0,
+        ledger_path: '/ledger',
+        prior_metrics: [],
+        checkpoint_sha: 'a'.repeat(40),
+        source_run_id: 'source-run',
+        source_iter: 0,
+        scope: ['security'],
+        idempotency_key: 'paused-public-review',
+      }),
+    );
+    await expect(review).rejects.toThrow(/not delivered.*paused/i);
+    await runner.send(Msg.terminate(0, { reason: 'operator-stop' }));
+    expect(delivered).toEqual([]);
+    runner.stop();
+  });
+
+  it('parks and resumes the legacy internal review_request synthesized from iter_artifacts', async () => {
+    const delivered: string[] = [];
+    const dispatcher: AgentDispatcher = {
+      async deliver(message) {
+        delivered.push(message.type);
+        return [];
+      },
+    };
+    const runner = new AutoloopRunner({
+      run_id: 'paused-internal-review',
+      workspace: '/tmp/paused-internal-review',
+      ledger_dir: '/tmp/paused-internal-review/ledger',
+      dispatcher,
+      notifyUser: async () => undefined,
+    });
+    await runner.send(Msg.pause(0, { reason: 'operator-pause' }));
+    const internalReview = runner.send(
+      Msg.iterArtifacts(0, { diff: 'patch', eval_output: { passed: true }, files_changed: ['a.ts'] }),
+    );
+    await expect(Promise.race([internalReview.then(() => 'settled'), Promise.resolve('pending')])).resolves.toBe(
+      'pending',
+    );
+    expect(delivered).toEqual([]);
+    await runner.send(Msg.resume(0));
+    await internalReview;
+    expect(delivered).toEqual(['review_request']);
+    runner.stop();
+  });
+
+  it('does not double-close sender accounting when the legacy pause buffer evicts an old message', async () => {
+    const runner = new AutoloopRunner({
+      run_id: 'paused-buffer-accounting',
+      workspace: '/tmp/paused-buffer-accounting',
+      ledger_dir: '/tmp/paused-buffer-accounting/ledger',
+      dispatcher: {
+        async deliver() {
+          return [];
+        },
+      },
+      notifyUser: async () => undefined,
+    });
+    runner.on('error', () => undefined);
+    await runner.send(Msg.pause(0, { reason: 'operator-pause' }));
+    const oldest = Msg.chat(0, { text: 'oldest parked message' });
+    const sibling = Msg.chat(0, { text: 'sibling parked message' });
+    const sender = {
+      id: oldest.msg_id,
+      pending: 2,
+      settled: false,
+      rootDelivered: false,
+      promise: Promise.resolve(),
+      resolve: vi.fn(),
+      reject: vi.fn(),
+    };
+    const internals = runner as unknown as {
+      pausedBuffer: ReturnType<typeof Msg.chat>[];
+      messageSenders: Map<ReturnType<typeof Msg.chat>, typeof sender>;
+    };
+    internals.pausedBuffer.push(
+      oldest,
+      sibling,
+      ...Array.from({ length: 998 }, (_, i) => Msg.chat(0, { text: `parked-${i}` })),
+    );
+    internals.messageSenders.set(oldest, sender);
+    internals.messageSenders.set(sibling, sender);
+
+    await runner.send(Msg.chat(0, { text: 'overflow trigger' }));
+
+    expect(sender).toMatchObject({ pending: 2, settled: false });
+    expect(sender).not.toHaveProperty('failure');
+    expect(sender.reject).not.toHaveBeenCalled();
+    runner.stop();
+  });
+
+  it('keeps a delivered public root successful when termination discards a queued descendant', async () => {
+    const delivered: string[] = [];
+    const holder: { runner?: AutoloopRunner } = {};
+    const dispatcher: AgentDispatcher = {
+      async deliver(message) {
+        delivered.push(message.type);
+        if (message.type === 'review_request') {
+          return [Msg.chat(0, { text: 'first descendant' }), Msg.chat(0, { text: 'discarded descendant' })];
+        }
+        if (message.type === 'chat') {
+          await holder.runner!.send(Msg.terminate(0, { reason: 'terminal-after-root' }));
+        }
+        return [];
+      },
+    };
+    const runner = new AutoloopRunner({
+      run_id: 'descendant-terminal-discard',
+      workspace: '/tmp/descendant-terminal-discard',
+      ledger_dir: '/tmp/descendant-terminal-discard/ledger',
+      dispatcher,
+      notifyUser: async () => undefined,
+    });
+    holder.runner = runner;
+    await expect(
+      runner.send(
+        Msg.reviewRequest(0, {
+          iter: 0,
+          ledger_path: '/ledger',
+          prior_metrics: [],
+          checkpoint_sha: 'a'.repeat(40),
+          source_run_id: 'source-run',
+          source_iter: 0,
+          scope: ['security'],
+          idempotency_key: 'delivered-root',
+        }),
+      ),
+    ).resolves.toBeUndefined();
+    expect(delivered).toEqual(['review_request', 'chat']);
+    runner.stop();
+  });
+
+  it('rejects a paused run before persisting a Reviewer-only request', async () => {
+    const manager = new SessionManager({});
+    const requestReview = vi.fn();
+    vi.spyOn(manager as never, '_liveAutoloop' as never).mockReturnValue({
+      runner: { state: { iter: 9, status: 'paused' }, send: vi.fn() },
+      dispatcher: { requestReview },
+    } as never);
+    await expect(
+      manager.autoloopRequestReview('run', {
+        checkpoint_sha: 'a'.repeat(40),
+        source_run_id: 'source-run',
+        source_iter: 7,
+        scope: ['security'],
+        idempotency_key: 'review-7',
+      }),
+    ).rejects.toThrow(/paused/i);
+    expect(requestReview).not.toHaveBeenCalled();
+    await manager.shutdown();
+  });
+
+  it.each(['terminated', 'crashed'] as const)(
+    'rejects an already-%s run with a typed terminal failure before persistence',
+    async (status) => {
+      const manager = new SessionManager({});
+      const requestReview = vi.fn();
+      vi.spyOn(manager as never, '_liveAutoloop' as never).mockReturnValue({
+        runner: { state: { iter: 9, status }, send: vi.fn() },
+        dispatcher: { requestReview },
+      } as never);
+      const failure = manager.autoloopRequestReview('run', {
+        checkpoint_sha: 'a'.repeat(40),
+        source_run_id: 'source-run',
+        source_iter: 7,
+        scope: ['security'],
+        idempotency_key: 'terminal-before-prepare',
+      });
+      await expect(failure).rejects.toMatchObject({
+        name: 'AutoloopChatStateError',
+        code: 'AUTOLOOP_RUN_TERMINAL',
+      });
+      expect(requestReview).not.toHaveBeenCalled();
+      await manager.shutdown();
+    },
+  );
+
+  it.each([
+    [
+      "Autoloop message 'review-raw' was not delivered because the run became terminal",
+      'AUTOLOOP_RUN_TERMINAL',
+      'Autoloop run became terminal before Reviewer-only queue delivery',
+    ],
+    [
+      "Autoloop message 'review-raw' was not delivered because the run is paused",
+      'AUTOLOOP_RUN_PAUSED',
+      "Autoloop run 'run' became paused before Reviewer-only queue delivery",
+    ],
+  ] as const)('remaps raw runner non-delivery to typed public failure %s', async (raw, code, message) => {
+    const manager = new SessionManager({});
+    const payload = {
+      iter: 9,
+      ledger_path: '/ledger',
+      prior_metrics: [],
+      checkpoint_sha: 'a'.repeat(40),
+      source_run_id: 'source-run',
+      source_iter: 7,
+      scope: ['security'],
+      idempotency_key: 'raw-remap',
+    };
+    const releaseReviewRequest = vi.fn();
+    vi.spyOn(manager as never, '_liveAutoloop' as never).mockReturnValue({
+      runner: { state: { iter: 9, status: 'running' }, send: vi.fn().mockRejectedValue(new Error(raw)) },
+      dispatcher: {
+        requestReview: vi.fn().mockResolvedValue({
+          status: 'prepared',
+          target: 'reviewer',
+          idempotency_key: 'raw-remap',
+          payload,
+        }),
+        releaseReviewRequest,
+        acceptReviewRequest: vi.fn(),
+      },
+    } as never);
+    const failure = manager.autoloopRequestReview('run', {
+      checkpoint_sha: payload.checkpoint_sha,
+      source_run_id: payload.source_run_id,
+      source_iter: payload.source_iter,
+      scope: payload.scope,
+      idempotency_key: payload.idempotency_key,
+    });
+    await expect(failure).rejects.toMatchObject({ name: 'AutoloopChatStateError', code, message });
+    expect(releaseReviewRequest).toHaveBeenCalledWith('raw-remap', payload);
+    await manager.shutdown();
+  });
+
+  it('releases a prepared request if the run pauses during persistence before queue delivery', async () => {
+    const manager = new SessionManager({});
+    const state = { iter: 9, status: 'running' };
+    const payload = {
+      iter: 9,
+      ledger_path: '/ledger',
+      prior_metrics: [],
+      checkpoint_sha: 'a'.repeat(40),
+      source_run_id: 'source-run',
+      source_iter: 7,
+      scope: ['security'],
+      idempotency_key: 'review-7',
+    };
+    const send = vi.fn();
+    const releaseReviewRequest = vi.fn();
+    const acceptReviewRequest = vi.fn();
+    vi.spyOn(manager as never, '_liveAutoloop' as never).mockReturnValue({
+      runner: { state, send },
+      dispatcher: {
+        requestReview: vi.fn(async () => {
+          state.status = 'paused';
+          return { status: 'prepared', target: 'reviewer', idempotency_key: 'review-7', payload };
+        }),
+        releaseReviewRequest,
+        acceptReviewRequest,
+      },
+    } as never);
+    await expect(
+      manager.autoloopRequestReview('run', {
+        checkpoint_sha: 'a'.repeat(40),
+        source_run_id: 'source-run',
+        source_iter: 7,
+        scope: ['security'],
+        idempotency_key: 'review-7',
+      }),
+    ).rejects.toThrow("Autoloop run 'run' became paused before Reviewer-only queue delivery");
+    expect(send).not.toHaveBeenCalled();
+    expect(releaseReviewRequest).toHaveBeenCalledWith('review-7', payload);
+    expect(acceptReviewRequest).not.toHaveBeenCalled();
+    await manager.shutdown();
+  });
+
+  it('serializes stop behind an in-flight public mutation', async () => {
+    const manager = new SessionManager({});
+    let release!: () => void;
+    const predecessor = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    ((manager as unknown as Record<string, unknown>)['_autoloopReviewTransactions'] as Map<string, Promise<void>>).set(
+      'run',
+      predecessor,
+    );
+    const send = vi.fn().mockResolvedValue(undefined);
+    vi.spyOn(
+      (manager as unknown as { kernel: { handle: (...args: unknown[]) => unknown } }).kernel,
+      'handle',
+    ).mockReturnValue({
+      runner: { state: { iter: 9 }, send },
+    });
+    const stop = manager.autoloopStop('run');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(send).not.toHaveBeenCalled();
+    release();
+    await expect(stop).resolves.toBe(true);
+    expect(send).toHaveBeenCalledOnce();
+    await manager.shutdown();
+  });
+
+  it('does not report stop failure when delete begins after terminate delivery starts', async () => {
+    const manager = new SessionManager({});
+    let releaseStop!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    });
+    const send = vi.fn(async () => await blocked);
+    vi.spyOn(
+      (manager as unknown as { kernel: { handle: (...args: unknown[]) => unknown } }).kernel,
+      'handle',
+    ).mockReturnValue({
+      runner: { state: { iter: 9 }, send, stop: vi.fn() },
+      dispatcher: { shutdown: vi.fn().mockResolvedValue(undefined) },
+    });
+    const registry = vi.spyOn(manager as never, '_withAgentRegistryLock' as never);
+    const stop = manager.autoloopStop('run');
+    await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
+    registry.mockClear();
+    const deletion = manager.autoloopDelete('run');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(registry).not.toHaveBeenCalled();
+    releaseStop();
+    await expect(stop).resolves.toBe(true);
+    await deletion;
+    await manager.shutdown();
+  });
+
+  it('does not release and redeliver after queue delivery succeeds but acceptance throws', async () => {
+    const manager = new SessionManager({});
+    const payload = {
+      iter: 9,
+      ledger_path: '/ledger',
+      prior_metrics: [],
+      checkpoint_sha: 'a'.repeat(40),
+      source_run_id: 'source-run',
+      source_iter: 7,
+      scope: ['security'],
+      idempotency_key: 'review-7',
+    };
+    const releaseReviewRequest = vi.fn();
+    vi.spyOn(manager as never, '_liveAutoloop' as never).mockReturnValue({
+      runner: { state: { iter: 9, status: 'running' }, send: vi.fn().mockResolvedValue(undefined) },
+      dispatcher: {
+        requestReview: vi.fn().mockResolvedValue({
+          status: 'prepared',
+          target: 'reviewer',
+          idempotency_key: 'review-7',
+          payload,
+        }),
+        releaseReviewRequest,
+        acceptReviewRequest: vi.fn(() => {
+          throw new Error('accept unavailable');
+        }),
+      },
+    } as never);
+    await expect(
+      manager.autoloopRequestReview('run', {
+        checkpoint_sha: 'a'.repeat(40),
+        source_run_id: 'source-run',
+        source_iter: 7,
+        scope: ['security'],
+        idempotency_key: 'review-7',
+      }),
+    ).rejects.toThrow('accept unavailable');
+    expect(releaseReviewRequest).not.toHaveBeenCalled();
+    await manager.shutdown();
+  });
+
+  it('serializes public review preparation and delivery per run', async () => {
+    const manager = new SessionManager({});
+    let releaseFirst!: () => void;
+    const firstBlocked = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const requestReview = vi
+      .fn()
+      .mockImplementationOnce(async (request: { idempotency_key: string }) => {
+        await firstBlocked;
+        return {
+          status: 'duplicate' as const,
+          target: 'reviewer' as const,
+          idempotency_key: request.idempotency_key,
+        };
+      })
+      .mockImplementationOnce(async (request: { idempotency_key: string }) => ({
+        status: 'duplicate' as const,
+        target: 'reviewer' as const,
+        idempotency_key: request.idempotency_key,
+      }));
+    vi.spyOn(manager as never, '_liveAutoloop' as never).mockReturnValue({
+      runner: { state: { iter: 9 }, send: vi.fn() },
+      dispatcher: { requestReview },
+    } as never);
+    const first = manager.autoloopRequestReview('run', {
+      checkpoint_sha: 'a'.repeat(40),
+      source_run_id: 'source-run',
+      source_iter: 7,
+      scope: ['security'],
+      idempotency_key: 'review-7a',
+    });
+    const second = manager.autoloopRequestReview('run', {
+      checkpoint_sha: 'b'.repeat(40),
+      source_run_id: 'source-run',
+      source_iter: 8,
+      scope: ['logic'],
+      idempotency_key: 'review-7b',
+    });
+    try {
+      await vi.waitFor(() => expect(requestReview).toHaveBeenCalledTimes(1));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(requestReview).toHaveBeenCalledTimes(1);
+    } finally {
+      releaseFirst();
+      await Promise.all([first, second]);
+      await manager.shutdown();
+    }
+    expect(requestReview).toHaveBeenCalledTimes(2);
+  });
+
+  it('rechecks the delete fence after waiting for an earlier review transaction', async () => {
+    const manager = new SessionManager({});
+    let releaseFirst!: () => void;
+    const firstBlocked = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const requestReview = vi.fn().mockImplementationOnce(async () => {
+      await firstBlocked;
+      return { status: 'duplicate', target: 'reviewer', idempotency_key: 'review-7a' };
+    });
+    vi.spyOn(manager as never, '_liveAutoloop' as never).mockReturnValue({
+      runner: { state: { iter: 9 }, send: vi.fn() },
+      dispatcher: { requestReview },
+    } as never);
+    const base = {
+      checkpoint_sha: 'a'.repeat(40),
+      source_run_id: 'source-run',
+      source_iter: 7,
+      scope: ['security'],
+    };
+    const first = manager.autoloopRequestReview('run', { ...base, idempotency_key: 'review-7a' });
+    const second = manager.autoloopRequestReview('run', { ...base, idempotency_key: 'review-7b' });
+    await vi.waitFor(() => expect(requestReview).toHaveBeenCalledTimes(1));
+    ((manager as unknown as Record<string, unknown>)['_autoloopReviewDeleting'] as Set<string>).add('run');
+    releaseFirst();
+    await expect(first).resolves.toMatchObject({ status: 'duplicate' });
+    await expect(second).rejects.toThrow("Autoloop run 'run' is being deleted");
+    expect(requestReview).toHaveBeenCalledTimes(1);
+    await manager.shutdown();
+  });
+
+  it('always releases the delete fence when teardown throws', async () => {
+    const manager = new SessionManager({});
+    const registryLock = vi.spyOn(manager as never, '_withAgentRegistryLock' as never).mockImplementation(() => {
+      throw new Error('registry unavailable');
+    });
+    await expect(manager.autoloopDelete('run')).rejects.toThrow('registry unavailable');
+    expect(((manager as unknown as Record<string, unknown>)['_autoloopReviewDeleting'] as Set<string>).has('run')).toBe(
+      false,
+    );
+    registryLock.mockRestore();
+    await manager.shutdown();
+  });
+
+  it('keeps the delete fence while any overlapping delete remains in flight', async () => {
+    const manager = new SessionManager({});
+    let releaseSecond!: () => void;
+    const secondBlocked = new Promise<void>((resolve) => {
+      releaseSecond = resolve;
+    });
+    const shutdown = vi
+      .fn()
+      .mockResolvedValueOnce(undefined)
+      .mockImplementationOnce(async () => await secondBlocked);
+    vi.spyOn(
+      (manager as unknown as { kernel: { handle: (...args: unknown[]) => unknown } }).kernel,
+      'handle',
+    ).mockReturnValue({ dispatcher: { shutdown }, runner: { stop: vi.fn() } });
+    const first = manager.autoloopDelete('run');
+    const second = manager.autoloopDelete('run');
+    await expect(first).resolves.toBe(true);
+    expect(((manager as unknown as Record<string, unknown>)['_autoloopReviewDeleting'] as Set<string>).has('run')).toBe(
+      true,
+    );
+    await expect(manager.autoloopSpawnCoder('run')).rejects.toThrow(/being deleted/);
+    releaseSecond();
+    await second;
+    expect(((manager as unknown as Record<string, unknown>)['_autoloopReviewDeleting'] as Set<string>).has('run')).toBe(
+      false,
+    );
+    await manager.shutdown();
+  });
+
+  it('rejects inherited request_review input before persistence or queue effects', async () => {
+    const manager = new SessionManager({});
+    const requestReview = vi.fn();
+    const send = vi.fn();
+    vi.spyOn(manager as never, '_liveAutoloop' as never).mockReturnValue({
+      runner: { state: { iter: 9 }, send },
+      dispatcher: { requestReview },
+    } as never);
+    const inherited = Object.create({ source_iter: 7 }) as Record<string, unknown>;
+    Object.assign(inherited, {
+      checkpoint_sha: 'a'.repeat(40),
+      source_run_id: 'source-run',
+      scope: ['security'],
+      idempotency_key: 'review-7',
+    });
+
+    try {
+      await expect(manager.autoloopRequestReview('run', inherited as never)).rejects.toThrow(/inherited data/i);
+      expect(requestReview).not.toHaveBeenCalled();
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      await manager.shutdown();
     }
   });
 });

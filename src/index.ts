@@ -50,7 +50,14 @@ export {
   canonicalizeMessage as autoloopCanonicalize,
   validateMessage as autoloopValidate,
 } from './autoloop/messages.js';
-export type { AutoloopEnvelope, AnyAutoloopMessage, AutoloopMessageType, AutoloopRole } from './autoloop/messages.js';
+export type {
+  AutoloopEnvelope,
+  AnyAutoloopMessage,
+  AutoloopMessageType,
+  AutoloopRole,
+  CheckpointReviewRequestPayload,
+  RequestReviewArgs,
+} from './autoloop/messages.js';
 export type {
   AgentDispatcher,
   AutoloopAgentRole,
@@ -185,6 +192,20 @@ const CUSTOM_ENGINE_SCHEMA = {
     sanitizePatterns: { type: 'array', maxItems: 100, items: { type: 'string' } },
   },
   required: ['name', 'bin', 'args'],
+} as const;
+
+const REQUEST_REVIEW_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    run_id: { type: 'string', minLength: 1, maxLength: 512 },
+    checkpoint_sha: { type: 'string', pattern: '^[0-9a-fA-F]{40}$' },
+    source_run_id: { type: 'string', minLength: 1, maxLength: 8192, pattern: '^[A-Za-z0-9][A-Za-z0-9._-]*$' },
+    source_iter: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    scope: { type: 'array', minItems: 1, maxItems: 128, items: { type: 'string', minLength: 1, maxLength: 8192 } },
+    idempotency_key: { type: 'string', minLength: 1, maxLength: 8192 },
+  },
+  required: ['run_id', 'checkpoint_sha', 'source_run_id', 'source_iter', 'scope', 'idempotency_key'],
 } as const;
 
 /**
@@ -2096,6 +2117,43 @@ const plugin = {
         }
         if (result.ok === true) return { ok: true };
         throw new Error('Autoloop reset returned a malformed structured reset result');
+      },
+    });
+
+    registerTool({
+      name: 'autoloop_request_review',
+      description:
+        'Persist and enqueue one idempotent Reviewer-only request bound to an existing checkpoint and source iteration.',
+      parameters: REQUEST_REVIEW_SCHEMA,
+      execute: async (_id, args) => {
+        const descriptors = Object.getOwnPropertyDescriptors(args);
+        if (!descriptors.run_id || !Object.hasOwn(descriptors.run_id, 'value')) {
+          throw new Error('request_review run_id must be an own data property');
+        }
+        const runId = descriptors.run_id.value;
+        if (typeof runId !== 'string' || runId.length < 1 || runId.length > 512) {
+          throw new Error('request_review run_id must be a non-empty string of at most 512 characters');
+        }
+        const request = Object.create(null) as Record<string, unknown>;
+        for (const key of ['checkpoint_sha', 'source_run_id', 'source_iter', 'scope', 'idempotency_key']) {
+          const descriptor = descriptors[key];
+          if (!descriptor) continue;
+          if (!Object.hasOwn(descriptor, 'value')) {
+            throw new Error(`request_review ${key} must be an own data property`);
+          }
+          Object.defineProperty(request, key, {
+            enumerable: true,
+            value: descriptor.value,
+          });
+        }
+        try {
+          const result = await getManager().autoloopRequestReview(runId as string, request as never);
+          return autoloopPublicToolResult({ ok: true, ...result });
+        } catch (error) {
+          const failure = toPublicAutoloopFailure(error);
+          if (failure) return autoloopPublicToolResult({ ok: false, error: failure });
+          throw error;
+        }
       },
     });
 

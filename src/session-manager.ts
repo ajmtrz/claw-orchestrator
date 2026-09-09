@@ -41,6 +41,7 @@ function getPluginVersion(): string {
 const PERSIST_DIR = path.join(os.homedir(), '.openclaw');
 const PERSIST_FILE = path.join(PERSIST_DIR, 'claude-sessions.json');
 const PERSIST_LOCK_FILE = `${PERSIST_FILE}.lock`;
+const MAX_RELEASED_REVIEW_IDENTITIES_PER_RUN = 64;
 // PERSIST_DISK_TTL_MS imported from ./constants.js
 
 interface PersistedSession {
@@ -405,10 +406,12 @@ import {
 } from './autoloop/types.js';
 import {
   Msg as AutoloopMsg,
+  canonicalizeRequestReviewArgs,
   type AutoloopMessageType,
   type AutoloopOperationErrorCode,
   type PushChannel,
   type PushLevel,
+  type RequestReviewArgs,
   type SendTimeoutPayload,
 } from './autoloop/messages.js';
 import { appendPushLog, notifyUserFallbackChain } from './autoloop/notify.js';
@@ -3939,6 +3942,10 @@ export class SessionManager implements AgentRuntimeProbe {
    * own a run at a time.
    */
   private _autoloopChatTransactions = new Map<string, Promise<void>>();
+  private _autoloopReviewTransactions = new Map<string, Promise<void>>();
+  private _autoloopReleasedReviewIterations = new Map<string, Map<string, number>>();
+  private _autoloopReviewDeleting = new Set<string>();
+  private _autoloopReviewDeleteCounts = new Map<string, number>();
   /** Logical Planner chat identity and any causally observed Dispatcher audit. */
   private _autoloopFailureBindings = new WeakMap<object, Readonly<AutoloopChatFailureBinding>>();
   /** Successfully published logical bindings, including projections that later roll out of state. */
@@ -4883,7 +4890,10 @@ export class SessionManager implements AgentRuntimeProbe {
    * Chatting with a Planner needs the live dispatcher; a run that finished or
    * belongs to another process has a readable record and no one to talk to.
    */
-  private _liveAutoloop(runId: string): AutoloopHandle & {
+  private _liveAutoloop(
+    runId: string,
+    activity = 'chatting',
+  ): AutoloopHandle & {
     runner: AutoloopRunner;
     dispatcher: ClaudeAgentDispatcher;
   } {
@@ -4895,7 +4905,7 @@ export class SessionManager implements AgentRuntimeProbe {
     const record = loadRun(runId);
     if (!record || record.workflow !== 'autoloop') throw new Error(`Autoloop run '${runId}' not found`);
     throw new Error(
-      `Autoloop run '${runId}' is ${record.state} and not running in this process — resume it before chatting`,
+      `Autoloop run '${runId}' is ${record.state} and not running in this process — resume it before ${activity}`,
     );
   }
 
@@ -5000,14 +5010,249 @@ export class SessionManager implements AgentRuntimeProbe {
     return await ctx.dispatcher.resetAgent(agent, opts);
   }
 
+  /** Serialize internal single-role recovery primitives with reviewer-only transitions. */
+  private async _withAutoloopRoleMutation<T>(runId: string, operation: () => Promise<T>): Promise<T> {
+    if (this._autoloopReviewDeleting.has(runId)) throw new Error(`Autoloop run '${runId}' is being deleted`);
+    const predecessor = this._autoloopReviewTransactions.get(runId) ?? Promise.resolve();
+    let release!: () => void;
+    const transaction = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = predecessor.then(() => transaction);
+    this._autoloopReviewTransactions.set(runId, tail);
+    await predecessor;
+    try {
+      if (this._autoloopReviewDeleting.has(runId)) throw new Error(`Autoloop run '${runId}' is being deleted`);
+      const result = await operation();
+      return result;
+    } finally {
+      release();
+      if (this._autoloopReviewTransactions.get(runId) === tail) this._autoloopReviewTransactions.delete(runId);
+    }
+  }
+
+  async autoloopSpawnCoder(
+    runId: string,
+    args: { coder_engine?: EngineType; coder_model?: string } = {},
+  ): Promise<PhysicalAgentGeneration> {
+    if (
+      typeof args !== 'object' ||
+      args === null ||
+      (Object.getPrototypeOf(args) !== Object.prototype && Object.getPrototypeOf(args) !== null)
+    ) {
+      throw new Error('autoloop_spawn_coder arguments must not contain inherited data');
+    }
+    if (
+      Reflect.ownKeys(args).some(
+        (key) => typeof key !== 'string' || (key !== 'coder_engine' && key !== 'coder_model' && key !== 'run_id'),
+      )
+    ) {
+      throw new Error('autoloop_spawn_coder arguments contain an unknown field');
+    }
+    const own = Object.create(null) as { coder_engine?: EngineType; coder_model?: string };
+    const engineDescriptor = Object.getOwnPropertyDescriptor(args, 'coder_engine');
+    const modelDescriptor = Object.getOwnPropertyDescriptor(args, 'coder_model');
+    if (engineDescriptor && !Object.hasOwn(engineDescriptor, 'value'))
+      throw new Error('autoloop_spawn_coder coder_engine must be an own data property');
+    if (modelDescriptor && !Object.hasOwn(modelDescriptor, 'value'))
+      throw new Error('autoloop_spawn_coder coder_model must be an own data property');
+    const engine = engineDescriptor?.value;
+    const model = modelDescriptor?.value;
+    if (
+      engine !== undefined &&
+      (typeof engine !== 'string' || engine === 'custom' || !ENGINE_TYPES.includes(engine as EngineType))
+    )
+      throw new Error(`Coder engine '${String(engine)}' is not supported`);
+    if (model !== undefined && (typeof model !== 'string' || model.length === 0 || model.length > 512))
+      throw new Error('autoloop_spawn_coder coder_model must be a non-empty string of at most 512 characters');
+    if (engine !== undefined) own.coder_engine = engine as EngineType;
+    if (model !== undefined) own.coder_model = model;
+    return await this._withAutoloopRoleMutation(runId, async () => {
+      const ctx = this._liveAutoloop(runId);
+      return await ctx.dispatcher.spawnCoder(own);
+    });
+  }
+
+  /** Internal Task 4 boundary: start exactly one Reviewer generation for a live run. */
+  async autoloopSpawnReviewer(
+    runId: string,
+    args: { reviewer_engine?: EngineType; reviewer_model?: string } = {},
+  ): Promise<PhysicalAgentGeneration> {
+    if (
+      typeof args !== 'object' ||
+      args === null ||
+      (Object.getPrototypeOf(args) !== Object.prototype && Object.getPrototypeOf(args) !== null)
+    ) {
+      throw new Error('autoloop_spawn_reviewer arguments must not contain inherited data');
+    }
+    if (
+      Reflect.ownKeys(args).some(
+        (key) => typeof key !== 'string' || (key !== 'reviewer_engine' && key !== 'reviewer_model' && key !== 'run_id'),
+      )
+    ) {
+      throw new Error('autoloop_spawn_reviewer arguments contain an unknown field');
+    }
+    const own = Object.create(null) as { reviewer_engine?: EngineType; reviewer_model?: string };
+    const engineDescriptor = Object.getOwnPropertyDescriptor(args, 'reviewer_engine');
+    const modelDescriptor = Object.getOwnPropertyDescriptor(args, 'reviewer_model');
+    if (engineDescriptor && !Object.hasOwn(engineDescriptor, 'value'))
+      throw new Error('autoloop_spawn_reviewer reviewer_engine must be an own data property');
+    if (modelDescriptor && !Object.hasOwn(modelDescriptor, 'value'))
+      throw new Error('autoloop_spawn_reviewer reviewer_model must be an own data property');
+    const engine = engineDescriptor?.value;
+    const model = modelDescriptor?.value;
+    if (
+      engine !== undefined &&
+      (typeof engine !== 'string' || engine === 'custom' || !ENGINE_TYPES.includes(engine as EngineType))
+    )
+      throw new Error(`Reviewer engine '${String(engine)}' is not supported`);
+    if (model !== undefined && (typeof model !== 'string' || model.length === 0 || model.length > 512))
+      throw new Error('autoloop_spawn_reviewer reviewer_model must be a non-empty string of at most 512 characters');
+    if (engine !== undefined) own.reviewer_engine = engine as EngineType;
+    if (model !== undefined) own.reviewer_model = model;
+    return await this._withAutoloopRoleMutation(runId, async () => {
+      const ctx = this._liveAutoloop(runId);
+      return await ctx.dispatcher.spawnReviewer(own);
+    });
+  }
+
+  /**
+   * Persist and enqueue one checkpoint-bound Reviewer-only request.
+   * Preparation is durable before Runner acceptance; duplicates enqueue nothing.
+   */
+  async autoloopRequestReview(
+    runId: string,
+    input: RequestReviewArgs,
+  ): Promise<{
+    status: 'prepared' | 'duplicate';
+    target: 'reviewer';
+    idempotency_key: string;
+  }> {
+    const request = canonicalizeRequestReviewArgs(input);
+    if (this._autoloopReviewDeleting.has(runId)) {
+      throw new Error(`Autoloop run '${runId}' is being deleted`);
+    }
+    const predecessor = this._autoloopReviewTransactions.get(runId) ?? Promise.resolve();
+    let release!: () => void;
+    const transaction = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = predecessor.then(() => transaction);
+    this._autoloopReviewTransactions.set(runId, tail);
+    await predecessor;
+    try {
+      if (this._autoloopReviewDeleting.has(runId)) {
+        throw new Error(`Autoloop run '${runId}' is being deleted`);
+      }
+      return await this._autoloopRequestReviewTransaction(runId, request);
+    } finally {
+      release();
+      if (this._autoloopReviewTransactions.get(runId) === tail) {
+        this._autoloopReviewTransactions.delete(runId);
+      }
+    }
+  }
+
+  private async _autoloopRequestReviewTransaction(
+    runId: string,
+    input: RequestReviewArgs,
+  ): Promise<{
+    status: 'prepared' | 'duplicate';
+    target: 'reviewer';
+    idempotency_key: string;
+  }> {
+    const request = canonicalizeRequestReviewArgs(input);
+    const ctx = this._liveAutoloop(runId, 'requesting review');
+    if (ctx.runner.state.status === 'paused') {
+      throw new AutoloopChatStateError(
+        'AUTOLOOP_RUN_PAUSED',
+        `Autoloop run '${runId}' is paused; resume it before requesting review`,
+        false,
+        undefined,
+        ctx.runner.state.status_reason,
+      );
+    }
+    if (ctx.runner.state.status === 'terminated' || ctx.runner.state.status === 'crashed') {
+      throw new AutoloopChatStateError(
+        'AUTOLOOP_RUN_TERMINAL',
+        `Autoloop run '${runId}' is terminal and cannot accept a review request`,
+        false,
+        undefined,
+        ctx.runner.state.status_reason,
+      );
+    }
+    const releasedIterations = this._autoloopReleasedReviewIterations.get(runId);
+    if (
+      !releasedIterations?.has(request.idempotency_key) &&
+      (releasedIterations?.size ?? 0) >= MAX_RELEASED_REVIEW_IDENTITIES_PER_RUN
+    ) {
+      throw new Error('request_review retry capacity is exhausted for this Autoloop run');
+    }
+    const targetIter = releasedIterations?.get(request.idempotency_key) ?? ctx.runner.state.iter;
+    const prepared = await ctx.dispatcher.requestReview(request, targetIter);
+    if (prepared.status === 'prepared') {
+      try {
+        const statusBeforeSend = ctx.runner.state.status as string;
+        if (statusBeforeSend === 'paused') {
+          throw new AutoloopChatStateError(
+            'AUTOLOOP_RUN_PAUSED',
+            `Autoloop run '${runId}' became paused before Reviewer-only queue delivery`,
+            false,
+          );
+        }
+        if (statusBeforeSend === 'terminated' || statusBeforeSend === 'crashed') {
+          throw new AutoloopChatStateError(
+            'AUTOLOOP_RUN_TERMINAL',
+            'Autoloop run became terminal before Reviewer-only queue delivery',
+            false,
+          );
+        }
+        await ctx.runner.send(AutoloopMsg.reviewRequest(targetIter, prepared.payload));
+      } catch (error) {
+        if (isCommittedSecureLedgerError(error)) throw error;
+        ctx.dispatcher['releaseReviewRequest'](prepared.idempotency_key, prepared.payload);
+        const byIdentity = releasedIterations ?? new Map<string, number>();
+        byIdentity.set(prepared.idempotency_key, prepared.payload.iter);
+        this._autoloopReleasedReviewIterations.set(runId, byIdentity);
+        if (error instanceof Error && /was not delivered because the run became terminal$/.test(error.message)) {
+          throw new AutoloopChatStateError(
+            'AUTOLOOP_RUN_TERMINAL',
+            'Autoloop run became terminal before Reviewer-only queue delivery',
+            false,
+          );
+        }
+        if (error instanceof Error && /was not delivered because the run is paused$/.test(error.message)) {
+          throw new AutoloopChatStateError(
+            'AUTOLOOP_RUN_PAUSED',
+            `Autoloop run '${runId}' became paused before Reviewer-only queue delivery`,
+            false,
+          );
+        }
+        throw error;
+      }
+      ctx.dispatcher['acceptReviewRequest'](prepared.idempotency_key);
+      releasedIterations?.delete(request.idempotency_key);
+    } else {
+      releasedIterations?.delete(request.idempotency_key);
+    }
+    if (releasedIterations?.size === 0) this._autoloopReleasedReviewIterations.delete(runId);
+    return publicData({
+      status: prepared.status,
+      target: 'reviewer' as const,
+      idempotency_key: prepared.idempotency_key,
+    });
+  }
+
   async autoloopStop(runId: string, reason = 'user-stop'): Promise<boolean> {
-    const ctx = this.kernel.handle<AutoloopHandle & { runner: AutoloopRunner }>(runId, LEGACY_NODE);
-    if (!ctx) return false;
-    // Soft stop: a terminate envelope, so the three persistent agents shut down
-    // and the persisted sessions survive for a later resume. The node's exit
-    // watcher sees the status change and lets the run finish on its own.
-    await ctx.runner.send(AutoloopMsg.terminate(ctx.runner.state.iter, { reason }));
-    return true;
+    return await this._withAutoloopRoleMutation(runId, async () => {
+      const ctx = this.kernel.handle<AutoloopHandle & { runner: AutoloopRunner }>(runId, LEGACY_NODE);
+      if (!ctx) return false;
+      // Soft stop: a terminate envelope, so the three persistent agents shut down
+      // and the persisted sessions survive for a later resume. The node's exit
+      // watcher sees the status change and lets the run finish on its own.
+      await ctx.runner.send(AutoloopMsg.terminate(ctx.runner.state.iter, { reason }));
+      return true;
+    });
   }
 
   /**
@@ -5291,58 +5536,74 @@ export class SessionManager implements AgentRuntimeProbe {
     if ([...this._autoloopStarting.values()].includes(runId)) {
       throw new Error(`Autoloop with id '${runId}' is still starting`);
     }
-    const ctx = this.kernel.handle<AutoloopHandle & { runner: AutoloopRunner; dispatcher: ClaudeAgentDispatcher }>(
-      runId,
-      LEGACY_NODE,
-    );
-    let touched = false;
-    if (ctx) {
-      // Delete = "really gone". Call dispatcher.shutdown directly with
-      // purge:true so persistedSessions entries are removed too —
-      // otherwise the Claude Planner conversation lingers on disk and the
-      // run could be /resume'd back to life. Bypassing runner.send is
-      // intentional: the runner's terminate path is meant to be the
-      // soft-pause we use for autoloopStop / autoloopResume, which keeps
-      // persisted state intact.
-      try {
-        await ctx.dispatcher.shutdown('user-delete', { purge: true });
-      } catch (err) {
-        this.logger.warn?.(`[autoloop/${runId}] dispatcher shutdown during delete failed: ${(err as Error).message}`);
+    const deleteCount = (this._autoloopReviewDeleteCounts.get(runId) ?? 0) + 1;
+    this._autoloopReviewDeleteCounts.set(runId, deleteCount);
+    this._autoloopReviewDeleting.add(runId);
+    try {
+      await (this._autoloopReviewTransactions.get(runId) ?? Promise.resolve());
+      this._autoloopReleasedReviewIterations.delete(runId);
+      this._autoloopReviewTransactions.delete(runId);
+      const ctx = this.kernel.handle<AutoloopHandle & { runner: AutoloopRunner; dispatcher: ClaudeAgentDispatcher }>(
+        runId,
+        LEGACY_NODE,
+      );
+      let touched = false;
+      if (ctx) {
+        // Delete = "really gone". Call dispatcher.shutdown directly with
+        // purge:true so persistedSessions entries are removed too —
+        // otherwise the Claude Planner conversation lingers on disk and the
+        // run could be /resume'd back to life. Bypassing runner.send is
+        // intentional: the runner's terminate path is meant to be the
+        // soft-pause we use for autoloopStop / autoloopResume, which keeps
+        // persisted state intact.
+        try {
+          await ctx.dispatcher.shutdown('user-delete', { purge: true });
+        } catch (err) {
+          this.logger.warn?.(`[autoloop/${runId}] dispatcher shutdown during delete failed: ${(err as Error).message}`);
+        }
+        try {
+          ctx.runner.stop();
+        } catch {
+          /* runner may already be stopped */
+        }
+        this.kernel.cancel(runId);
+        touched = true;
+      } else {
+        // Disk-only run: ensure any leftover persistedSessions entry for the
+        // Planner is cleaned up so it isn't resumed by accident later.
+        try {
+          await this.stopSession(`autoloop-${runId}-planner`);
+        } catch {
+          /* session not in memory — fine */
+        }
+        this.persistedSessions.delete(`autoloop-${runId}-planner`);
+        this.persistedSessions.delete(`autoloop-${runId}-coder`);
+        this.persistedSessions.delete(`autoloop-${runId}-reviewer`);
+        const names = [`autoloop-${runId}-planner`, `autoloop-${runId}-coder`, `autoloop-${runId}-reviewer`];
+        this._withAgentRegistryLock((authoritative) => {
+          const updatedSessions = new Map(authoritative);
+          for (const name of names) updatedSessions.delete(name);
+          return { value: true, updatedSessions };
+        });
       }
-      try {
-        ctx.runner.stop();
-      } catch {
-        /* runner may already be stopped */
+      // No registry to scrub: the run record IS the registry, and removing it is
+      // the delete. The ledger directory under tasks/<runId>/ is deliberately left
+      // alone — postmortem artifacts (chat history, push log, plan.md) outlive the
+      // run, exactly as before.
+      if (loadRun(runId)) {
+        this.kernel.delete(runId);
+        touched = true;
       }
-      this.kernel.cancel(runId);
-      touched = true;
-    } else {
-      // Disk-only run: ensure any leftover persistedSessions entry for the
-      // Planner is cleaned up so it isn't resumed by accident later.
-      try {
-        await this.stopSession(`autoloop-${runId}-planner`);
-      } catch {
-        /* session not in memory — fine */
+      return touched;
+    } finally {
+      const remaining = (this._autoloopReviewDeleteCounts.get(runId) ?? 1) - 1;
+      if (remaining > 0) {
+        this._autoloopReviewDeleteCounts.set(runId, remaining);
+      } else {
+        this._autoloopReviewDeleteCounts.delete(runId);
+        this._autoloopReviewDeleting.delete(runId);
       }
-      this.persistedSessions.delete(`autoloop-${runId}-planner`);
-      this.persistedSessions.delete(`autoloop-${runId}-coder`);
-      this.persistedSessions.delete(`autoloop-${runId}-reviewer`);
-      const names = [`autoloop-${runId}-planner`, `autoloop-${runId}-coder`, `autoloop-${runId}-reviewer`];
-      this._withAgentRegistryLock((authoritative) => {
-        const updatedSessions = new Map(authoritative);
-        for (const name of names) updatedSessions.delete(name);
-        return { value: true, updatedSessions };
-      });
     }
-    // No registry to scrub: the run record IS the registry, and removing it is
-    // the delete. The ledger directory under tasks/<runId>/ is deliberately left
-    // alone — postmortem artifacts (chat history, push log, plan.md) outlive the
-    // run, exactly as before.
-    if (loadRun(runId)) {
-      this.kernel.delete(runId);
-      touched = true;
-    }
-    return touched;
   }
 
   /** Used by embedded-server to attach SSE listeners. Live runs only. */

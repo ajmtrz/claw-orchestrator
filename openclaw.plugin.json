@@ -164,6 +164,7 @@
       "autoloop_status",
       "autoloop_list",
       "autoloop_reset_agent",
+      "autoloop_request_review",
       "autoloop_stop",
       "session_send_to",
       "session_inbox",

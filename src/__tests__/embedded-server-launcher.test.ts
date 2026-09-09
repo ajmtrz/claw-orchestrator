@@ -4164,6 +4164,292 @@ describe('POST /autoloop/:id/chat', () => {
   });
 });
 
+describe('POST /autoloop/:id/request_review', () => {
+  let manager: SessionManager;
+  let server: EmbeddedServer;
+  let port: number;
+  let token: string;
+
+  beforeAll(async () => {
+    manager = new SessionManager({});
+    const ephemeral = await freePort();
+    server = new EmbeddedServer(manager, ephemeral);
+    port = await server.start();
+    token = fs.readFileSync(path.join(os.homedir(), '.openclaw', 'server-token'), 'utf-8').trim();
+  });
+  afterAll(async () => {
+    await server.stop();
+    await manager.shutdown();
+  });
+
+  it('passes one canonical checkpoint-bound request to SessionManager and never names Coder', async () => {
+    const requestReview = vi
+      .spyOn(manager as never, 'autoloopRequestReview' as never)
+      .mockResolvedValue({ status: 'prepared', target: 'reviewer', idempotency_key: 'review-7' } as never);
+    const body = {
+      run_id: 'run',
+      checkpoint_sha: 'A'.repeat(40),
+      source_run_id: 'source-run',
+      source_iter: 7,
+      scope: ['security'],
+      idempotency_key: 'review-7',
+    };
+
+    const response = await fetch(`http://127.0.0.1:${port}/autoloop/run/request_review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      ok: true,
+      status: 'prepared',
+      target: 'reviewer',
+      idempotency_key: 'review-7',
+    });
+    expect(requestReview).toHaveBeenCalledWith('run', {
+      checkpoint_sha: 'a'.repeat(40),
+      source_run_id: 'source-run',
+      source_iter: 7,
+      scope: ['security'],
+      idempotency_key: 'review-7',
+    });
+    expect(JSON.stringify(requestReview.mock.calls)).not.toMatch(/coder/i);
+    requestReview.mockRestore();
+  });
+
+  it.each([
+    ['mismatched route run id', { run_id: 'other-run' }, /must match the route run id/],
+    ['unknown field', { unexpected: true }, /unsupported field/],
+  ])('rejects %s before a request_review SessionManager effect', async (_label, extra, message) => {
+    const requestReview = vi.spyOn(manager as never, 'autoloopRequestReview' as never);
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/autoloop/run/request_review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          checkpoint_sha: 'a'.repeat(40),
+          source_run_id: 'source-run',
+          source_iter: 7,
+          scope: ['security'],
+          idempotency_key: 'review-7',
+          ...extra,
+        }),
+      });
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toMatchObject({ ok: false, error: expect.stringMatching(message) });
+      expect(requestReview).not.toHaveBeenCalled();
+    } finally {
+      requestReview.mockRestore();
+    }
+  });
+
+  it.each([
+    ['short checkpoint', { checkpoint_sha: 'abc' }],
+    ['negative iteration', { source_iter: -1 }],
+    ['empty scope', { scope: [] }],
+    ['empty identity', { idempotency_key: '' }],
+  ])('rejects %s before a SessionManager effect', async (_label, override) => {
+    const requestReview = vi.spyOn(manager as never, 'autoloopRequestReview' as never);
+    const response = await fetch(`http://127.0.0.1:${port}/autoloop/run/request_review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        checkpoint_sha: 'a'.repeat(40),
+        source_run_id: 'source-run',
+        source_iter: 7,
+        scope: ['security'],
+        idempotency_key: 'review-7',
+        ...override,
+      }),
+    });
+    expect(response.status).toBe(400);
+    expect(requestReview).not.toHaveBeenCalled();
+    requestReview.mockRestore();
+  });
+
+  it('returns 404 for a missing live run', async () => {
+    const requestReview = vi
+      .spyOn(manager as never, 'autoloopRequestReview' as never)
+      .mockRejectedValue(new Error("Autoloop run 'missing' not found") as never);
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/autoloop/missing/request_review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          checkpoint_sha: 'a'.repeat(40),
+          source_run_id: 'source-run',
+          source_iter: 7,
+          scope: ['security'],
+          idempotency_key: 'review-7',
+        }),
+      });
+      expect(response.status).toBe(404);
+    } finally {
+      requestReview.mockRestore();
+    }
+  });
+
+  it.each([
+    'Cannot change Reviewer engine or model after its session has started',
+    'Cannot start Reviewer after the Autoloop run became terminal',
+    `Reviewer-only checkpoint ${'a'.repeat(40)} does not match workspace HEAD ${'b'.repeat(40)}`,
+    "Reviewer-only request requires source run 'source-run' iter 7/diff.patch",
+    'Reviewer-only checkpoint could not verify workspace HEAD (code=1): bad repository',
+    'Reviewer-only checkpoint patch could not be read (code=1): missing object',
+    'Autoloop terminated while preparing the Reviewer-only request',
+    'Autoloop run became terminal before Reviewer-only queue delivery',
+    'Cannot request review after the Autoloop run became terminal',
+    'request_review retry capacity is exhausted for this Autoloop run',
+  ])('maps reachable request_review client error to 400: %s', async (message) => {
+    const requestReview = vi
+      .spyOn(manager as never, 'autoloopRequestReview' as never)
+      .mockRejectedValueOnce(new Error(message) as never);
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/autoloop/run/request_review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          checkpoint_sha: 'a'.repeat(40),
+          source_run_id: 'source-run',
+          source_iter: 7,
+          scope: ['security'],
+          idempotency_key: 'review-7',
+        }),
+      });
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toEqual({ ok: false, error: message });
+    } finally {
+      requestReview.mockRestore();
+    }
+  });
+
+  it.each([
+    ['AUTOLOOP_RUN_PAUSED', "Autoloop run 'run' is paused; resume it before requesting review", 409],
+    ['AUTOLOOP_RUN_TERMINAL', 'Autoloop run became terminal before Reviewer-only queue delivery', 400],
+    ['AUTOLOOP_RUN_TERMINAL', "Autoloop run 'run' is terminal and cannot accept a review request", 400],
+  ] as const)('preserves typed request_review failure %s over HTTP', async (code, message, status) => {
+    const failure = Object.assign(new Error(message), { name: 'AutoloopChatStateError', code, retryable: false });
+    const requestReview = vi
+      .spyOn(manager as never, 'autoloopRequestReview' as never)
+      .mockRejectedValueOnce(failure as never);
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/autoloop/run/request_review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          checkpoint_sha: 'a'.repeat(40),
+          source_run_id: 'source-run',
+          source_iter: 7,
+          scope: ['security'],
+          idempotency_key: 'typed-http',
+        }),
+      });
+      expect(response.status).toBe(status);
+      await expect(response.json()).resolves.toEqual({
+        ok: false,
+        error: { code, message, retryable: false },
+      });
+    } finally {
+      requestReview.mockRestore();
+    }
+  });
+
+  it.each([
+    `Autoloop run 'run' is being deleted`,
+    `Autoloop run 'run' is paused and not running in this process`,
+    `Autoloop run 'run' is paused; resume it before requesting review`,
+    `Autoloop run 'run' became paused before Reviewer-only queue delivery`,
+  ])('maps reachable request_review conflict to 409: %s', async (message) => {
+    const requestReview = vi
+      .spyOn(manager as never, 'autoloopRequestReview' as never)
+      .mockRejectedValueOnce(new Error(message) as never);
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/autoloop/run/request_review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          checkpoint_sha: 'a'.repeat(40),
+          source_run_id: 'source-run',
+          source_iter: 7,
+          scope: ['security'],
+          idempotency_key: 'review-7',
+        }),
+      });
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toEqual({ ok: false, error: message });
+    } finally {
+      requestReview.mockRestore();
+    }
+  });
+
+  it('rejects GET with 405 before a SessionManager effect', async () => {
+    const requestReview = vi.spyOn(manager as never, 'autoloopRequestReview' as never);
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/autoloop/run/request_review`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      expect(response.status).toBe(405);
+      expect(response.headers.get('allow')).toBe('POST');
+      expect(requestReview).not.toHaveBeenCalled();
+    } finally {
+      requestReview.mockRestore();
+    }
+  });
+
+  it('rejects a null JSON body before a SessionManager effect', async () => {
+    const requestReview = vi.spyOn(manager as never, 'autoloopRequestReview' as never);
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/autoloop/run/request_review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: 'null',
+      });
+      expect(response.status).toBe(400);
+      expect(requestReview).not.toHaveBeenCalled();
+    } finally {
+      requestReview.mockRestore();
+    }
+  });
+});
+
+describe.each([
+  ['spawn_coder', 'autoloopSpawnCoder'],
+  ['spawn_reviewer', 'autoloopSpawnReviewer'],
+] as const)('internal-only Autoloop primitive %s', (route, method) => {
+  let manager: SessionManager;
+  let server: EmbeddedServer;
+  let port: number;
+  let token: string;
+
+  beforeAll(async () => {
+    manager = new SessionManager({});
+    server = new EmbeddedServer(manager, await freePort());
+    port = await server.start();
+    token = fs.readFileSync(path.join(os.homedir(), '.openclaw', 'server-token'), 'utf-8').trim();
+  });
+  afterAll(async () => {
+    await server.stop();
+    await manager.shutdown();
+  });
+
+  it('has no public HTTP route and causes no role effect', async () => {
+    const selected = vi.spyOn(manager as never, method as never);
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/autoloop/run/${route}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: '{}',
+      });
+      expect(response.status).toBe(404);
+      expect(selected).not.toHaveBeenCalled();
+    } finally {
+      selected.mockRestore();
+    }
+  });
+});
+
 describe('POST /autoloop/:id/delete', () => {
   let manager: SessionManager;
   let server: EmbeddedServer;

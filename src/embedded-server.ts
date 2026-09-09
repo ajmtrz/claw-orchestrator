@@ -12,10 +12,11 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
-import { SessionManager } from './session-manager.js';
+import { SessionManager, toPublicAutoloopFailure } from './session-manager.js';
 import { sanitizeCwd, validateRegex } from './validation.js';
 import { resolveSecretRefs } from './kernel/secrets.js';
 import { validateAutoloopTimeoutConfig } from './autoloop/types.js';
+import { canonicalizeRequestReviewArgs } from './autoloop/messages.js';
 import type { EffortLevel, EngineType } from './types.js';
 import { handleChatCompletion } from './openai-compat.js';
 import { getModelList } from './models.js';
@@ -48,9 +49,14 @@ function safeOwnErrorMessage(error: unknown): string {
 }
 
 function autoloopErrorStatus(error: unknown): number {
-  const message = error instanceof Error ? error.message : String(error);
+  const message = safeOwnErrorMessage(error);
+  if (/^Autoloop run '.+' not found$/.test(message)) return 404;
   if (/^Autoloop run '.+' not found in registry$/.test(message)) return 404;
   if (/^Autoloop with id '.+' (?:already exists|is being deleted|is still starting)$/.test(message)) return 409;
+  if (/^Autoloop run '.+' is being deleted$/.test(message)) return 409;
+  if (/^Autoloop run '.+' is paused; resume it before requesting review$/.test(message)) return 409;
+  if (/^Autoloop run '.+' became paused before Reviewer-only queue delivery$/.test(message)) return 409;
+  if (/^Autoloop run '.+' is .+ and not running in this process/.test(message)) return 409;
   if (/^Autoloop session name '.+' is already in use$/.test(message)) return 409;
   if (/^(?:Planner|Coder|Reviewer) engine '.+' is not supported$/.test(message)) return 400;
   // Any custom-engine config complaint is caller error, not a server fault.
@@ -62,6 +68,24 @@ function autoloopErrorStatus(error: unknown): number {
   if (/^(?:sendTimeoutMs|activityLeaseMs|autoloopHardTimeoutMs|pendingDispatchId)\b/.test(message)) return 400;
   if (/^(?:allow_decrease|activity_lease_ms|autoloop_hard_timeout_ms) is not supported\b/.test(message)) return 400;
   if (/^pending dispatch\b/.test(message)) return 400;
+  if (/^(?:request_review|Invalid request_review)\b/i.test(message)) return 400;
+  if (/^autoloop_spawn_(?:coder|reviewer) run_id\b/.test(message)) return 400;
+  if (/^Cannot request review after the Autoloop run became terminal$/.test(message)) return 400;
+  if (/^Autoloop run '.+' is terminal and cannot accept a review request$/.test(message)) return 400;
+  if (
+    /^Cannot (?:change (?:Coder|Reviewer) engine or model after its session has started|start (?:Coder|Reviewer) after the Autoloop run became terminal)$/.test(
+      message,
+    )
+  )
+    return 400;
+  if (/^Reviewer-only checkpoint .+ does not match workspace HEAD .+$/.test(message)) return 400;
+  if (/^Reviewer-only request requires source run '.+' iter \d+\/.+$/.test(message)) return 400;
+  if (/^Reviewer-only checkpoint (?:could not verify workspace HEAD|patch could not be read)\b/.test(message))
+    return 400;
+  if (/^Autoloop terminated while preparing the Reviewer-only request$/.test(message)) return 400;
+  if (/^Autoloop run became terminal before Reviewer-only queue delivery$/.test(message)) return 400;
+  if (/^Autoloop terminated while starting (?:Coder|Reviewer)$/.test(message)) return 400;
+  if (/^autoloop_spawn_(?:coder|reviewer)\b/.test(message)) return 400;
   if (/^Autoloop run '.+' (?:has no pending dispatch|is not awaiting a recoverable send timeout)/.test(message)) {
     return 400;
   }
@@ -541,10 +565,10 @@ export class EmbeddedServer {
           res.end(JSON.stringify({ ok: false, error: 'Invalid JSON' }));
           return;
         }
-        this.route(path, parsed, url.searchParams, res, req.headers);
+        this.route(path, parsed, url.searchParams, res, req.headers, req.method);
       });
     } else {
-      this.route(path, {}, url.searchParams, res, req.headers);
+      this.route(path, {}, url.searchParams, res, req.headers, req.method);
     }
   }
 
@@ -554,6 +578,7 @@ export class EmbeddedServer {
     query: URLSearchParams,
     res: http.ServerResponse,
     headers: http.IncomingHttpHeaders = {},
+    method = 'GET',
   ): Promise<void> {
     try {
       const json = (status: number, data: unknown) => {
@@ -1323,6 +1348,66 @@ export class EmbeddedServer {
           });
         res.writeHead(202, { 'Content-Type': 'application/json' });
         res.end(stringifyAutoloopPublicJson({ ok: true, queued: true }));
+        return;
+      }
+
+      const v2RequestReviewMatch = path.match(/^\/autoloop\/([^/]+)\/request_review$/);
+      if (v2RequestReviewMatch) {
+        if (method !== 'POST') {
+          res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'POST' });
+          res.end(stringifyAutoloopPublicJson({ ok: false, error: 'Method not allowed' }));
+          return;
+        }
+        if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(stringifyAutoloopPublicJson({ ok: false, error: 'Request_review payload is invalid' }));
+          return;
+        }
+        try {
+          const descriptors = Object.getOwnPropertyDescriptors(body);
+          const allowedKeys = new Set([
+            'run_id',
+            'checkpoint_sha',
+            'source_run_id',
+            'source_iter',
+            'scope',
+            'idempotency_key',
+          ]);
+          for (const key of Reflect.ownKeys(body)) {
+            if (typeof key !== 'string' || !allowedKeys.has(key)) {
+              throw new Error(`request_review contains unsupported field '${String(key)}'`);
+            }
+          }
+          if (descriptors.run_id && !Object.hasOwn(descriptors.run_id, 'value')) {
+            throw new Error('request_review run_id must be an own data property');
+          }
+          if (descriptors.run_id?.value !== undefined && descriptors.run_id.value !== v2RequestReviewMatch[1]) {
+            throw new Error('request_review run_id must match the route run id');
+          }
+          const requestBody = Object.create(null) as Record<string, unknown>;
+          for (const key of ['checkpoint_sha', 'source_run_id', 'source_iter', 'scope', 'idempotency_key']) {
+            const descriptor = descriptors[key];
+            if (!descriptor) continue;
+            if (!Object.hasOwn(descriptor, 'value')) {
+              throw new Error(`request_review ${key} must be an own data property`);
+            }
+            Object.defineProperty(requestBody, key, { enumerable: true, value: descriptor.value });
+          }
+          const request = canonicalizeRequestReviewArgs(requestBody);
+          const result = await this.manager.autoloopRequestReview(v2RequestReviewMatch[1], request);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(stringifyAutoloopPublicJson({ ok: true, ...result }));
+        } catch (error) {
+          const status = autoloopErrorStatus(error);
+          const publicFailure = toPublicAutoloopFailure(error);
+          res.writeHead(status, { 'Content-Type': 'application/json' });
+          res.end(
+            stringifyAutoloopPublicJson({
+              ok: false,
+              error: publicFailure ?? safeOwnErrorMessage(error),
+            }),
+          );
+        }
         return;
       }
 

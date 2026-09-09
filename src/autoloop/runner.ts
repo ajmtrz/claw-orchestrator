@@ -48,6 +48,7 @@ interface SenderContext {
   pending: number;
   settled: boolean;
   failure?: unknown;
+  rootDelivered: boolean;
   readonly promise: Promise<void>;
   readonly resolve: () => void;
   readonly reject: (error: unknown) => void;
@@ -370,7 +371,14 @@ export class AutoloopRunner extends EventEmitter {
     this.state.status_reason = reason;
     this.state.pending_dispatch = null;
     for (const queued of this.queue.splice(0)) {
-      this.completeSenderMessage(this.messageSenders.get(queued));
+      const sender = this.messageSenders.get(queued);
+      if (!sender?.rootDelivered) {
+        this.failSender(
+          sender,
+          new Error(`Autoloop message '${queued.msg_id}' was not delivered because the run became terminal`),
+        );
+      }
+      this.completeSenderMessage(sender);
     }
     this.pausedBuffer.length = 0;
     this.stop();
@@ -424,6 +432,7 @@ export class AutoloopRunner extends EventEmitter {
       id: message.msg_id,
       pending: 0,
       settled: false,
+      rootDelivered: false,
       promise,
       resolve,
       reject,
@@ -655,6 +664,9 @@ export class AutoloopRunner extends EventEmitter {
     // Pause: park agent-bound messages until resume. Runner-bound (resume /
     // terminate) and user-bound (push) flow through above and are unaffected.
     if (this.state.status === 'paused') {
+      if (env.type === 'review_request' && Object.hasOwn(env.payload, 'checkpoint_sha')) {
+        throw new Error(`Autoloop message '${env.msg_id}' was not delivered because the run is paused`);
+      }
       // Bound the buffer: a long pause + continuous policy pushes would
       // otherwise grow it without limit and OOM the process.
       if (this.pausedBuffer.length >= MAX_PAUSED_BUFFER) {
@@ -665,6 +677,7 @@ export class AutoloopRunner extends EventEmitter {
       return;
     }
     const replies = await this.config.dispatcher.deliver(env);
+    if (sender && env.msg_id === sender.id) sender.rootDelivered = true;
     if (this.terminationStarted || ['terminated', 'crashed'].includes(this.state.status)) return;
     // Validate and snapshot the complete logical reply batch before recording
     // progress or enqueueing any member. Otherwise a valid early push/terminate
