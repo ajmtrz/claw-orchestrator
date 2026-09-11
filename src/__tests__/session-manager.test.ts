@@ -1365,6 +1365,43 @@ describe('SessionManager', () => {
       });
     });
 
+    it('reports adopted registry-lock cleanup failure as terminal and non-retryable', () => {
+      // This catches the registry adapter collapsing an entered lock cleanup
+      // failure into ordinary retryable lock contention.
+      const sessionName = 'autoloop-registry-cleanup-failed-planner';
+      const lockPath = `${SESSION_REGISTRY_FILE}.lock`;
+      const reclaimPath = `${lockPath}.reclaim`;
+      fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+      fs.writeFileSync(reclaimPath, JSON.stringify({ pid: 999_999_999 }), { mode: 0o600 });
+      fs.utimesSync(reclaimPath, new Date(Date.now() - 120_000), new Date(Date.now() - 120_000));
+      const originalRmSync = fs.rmSync;
+      const releaseFailure = new Error(
+        'injected adopted registry-lock reclaim release failure',
+      ) as NodeJS.ErrnoException;
+      releaseFailure.code = 'EBUSY';
+      const rmSpy = vi.spyOn(fs, 'rmSync').mockImplementation(((target: fs.PathLike, options?: fs.RmDirOptions) => {
+        if (String(target).startsWith(`${reclaimPath}.adopt-`)) throw releaseFailure;
+        return originalRmSync(target, options);
+      }) as typeof fs.rmSync);
+
+      try {
+        expect(() => mgr.reserveAgentGeneration(managerGeneration(sessionName), '/tmp')).toThrow(
+          expect.objectContaining({
+            code: 'AUTOLOOP_AGENT_REGISTRY_LOCK_CLEANUP_FAILED',
+            retryable: false,
+          }),
+        );
+      } finally {
+        rmSpy.mockRestore();
+        fs.rmSync(lockPath, { force: true });
+        fs.rmSync(reclaimPath, { force: true });
+      }
+
+      expect((mgr as unknown as { persistedSessions: Map<string, unknown> }).persistedSessions.has(sessionName)).toBe(
+        false,
+      );
+    });
+
     it('distinguishes registry lock and persistence failures from ownership rejection', async () => {
       const sessionName = 'autoloop-probe-persist-failure-planner';
       const first = managerGeneration(sessionName);

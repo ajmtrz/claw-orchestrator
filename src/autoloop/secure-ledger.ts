@@ -2044,13 +2044,16 @@ export class SecureAutoloopLedger {
     }
   }
 
-  flushFlatFile(name: SecureAutoloopFlatFile): void {
+  flushFlatFile(name: SecureAutoloopFlatFile): fs.Stats {
     this.assertMutable(`flush ${name}`);
     const handle = this.openFlatFile(name, 'append');
+    let flushed: fs.Stats | undefined;
     try {
       try {
         this.beforeFileMutation(handle, 'flush');
         fs.fsyncSync(handle.fd);
+        flushed = fs.fstatSync(handle.fd);
+        this.assertFileHandle(handle);
       } catch (error) {
         throw new SecureAutoloopLedgerCommitError(
           'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
@@ -2061,6 +2064,7 @@ export class SecureAutoloopLedger {
     } finally {
       fs.closeSync(handle.fd);
     }
+    if (!flushed) throw new Error(`Autoloop ledger flush did not retain descriptor identity for '${name}'`);
     try {
       this.syncDirectory(name);
     } catch (error) {
@@ -2070,6 +2074,7 @@ export class SecureAutoloopLedger {
         { cause: error },
       );
     }
+    return flushed;
   }
 
   syncDirectory(name?: SecureAutoloopFlatFile): void {

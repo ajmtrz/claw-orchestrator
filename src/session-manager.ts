@@ -159,6 +159,7 @@ function mergeRegistryView(
 export type AutoloopAgentRegistryErrorCode =
   | 'AUTOLOOP_AGENT_REGISTRY_CORRUPT'
   | 'AUTOLOOP_AGENT_REGISTRY_READ_FAILED'
+  | 'AUTOLOOP_AGENT_REGISTRY_LOCK_CLEANUP_FAILED'
   | 'AUTOLOOP_AGENT_REGISTRY_LOCK_CONTENDED'
   | 'AUTOLOOP_AGENT_REGISTRY_PERSIST_FAILED';
 
@@ -170,7 +171,8 @@ export class AutoloopAgentRegistryError extends Error {
     super(message, options);
     this.name = 'AutoloopAgentRegistryError';
     this.code = code;
-    this.retryable = code !== 'AUTOLOOP_AGENT_REGISTRY_CORRUPT';
+    this.retryable =
+      code !== 'AUTOLOOP_AGENT_REGISTRY_CORRUPT' && code !== 'AUTOLOOP_AGENT_REGISTRY_LOCK_CLEANUP_FAILED';
   }
 }
 
@@ -303,7 +305,7 @@ function makeDebounced(fn: () => void, ms: number): DebouncedCallback {
 import { type Logger, createConsoleLogger } from './logger.js';
 import { CircuitBreaker } from './circuit-breaker.js';
 import { detectRepoLang } from './kernel/repo.js';
-import { withFileLock } from './kernel/file-lock.js';
+import { isFileLockReleaseError, withFileLock } from './kernel/file-lock.js';
 import { RunKernel, runDir as kernelRunDir } from './kernel/engine.js';
 import { registerDefaultExecutors } from './kernel/nodes/index.js';
 import { autoloopStateFromRecord, makeAutoloopExecutor, type AutoloopHandle } from './kernel/nodes/autoloop.js';
@@ -1325,9 +1327,29 @@ export class SessionManager implements AgentRuntimeProbe {
       );
     } catch (err) {
       if (err instanceof AutoloopAgentRegistryError) return { ok: false, error: err };
+      if (isFileLockReleaseError(err)) {
+        return {
+          ok: false,
+          error: new AutoloopAgentRegistryError(
+            'AUTOLOOP_AGENT_REGISTRY_LOCK_CLEANUP_FAILED',
+            `The session registry write may have committed, but its lock could not be safely released: ${err.message}`,
+            { cause: err },
+          ),
+        };
+      }
       throw err;
     }
     if (!locked.ok) {
+      if (locked.reason === 'cleanup_failed') {
+        return {
+          ok: false,
+          error: new AutoloopAgentRegistryError(
+            'AUTOLOOP_AGENT_REGISTRY_LOCK_CLEANUP_FAILED',
+            `Could not safely clean up the shared session registry lock: ${locked.error}`,
+            { cause: locked.cause },
+          ),
+        };
+      }
       return {
         ok: false,
         error: new AutoloopAgentRegistryError(

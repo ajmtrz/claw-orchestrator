@@ -133,6 +133,64 @@ export interface RecoveryDeliveryEvidence {
   acknowledged: boolean;
 }
 
+export type DeliveryKind = 'coder_directive' | 'review_request';
+export type DeliveryTargetRole = Extract<AutoloopAgentRole, 'coder' | 'reviewer'>;
+
+export interface DeliveryIntent {
+  schema_version: 1;
+  delivery_id: string;
+  idempotency_key: string;
+  kind: DeliveryKind;
+  target_role: DeliveryTargetRole;
+  target_generation: number;
+  payload: unknown;
+  payload_sha256: string;
+  created_at: string;
+}
+
+export interface PrepareDeliveryInput {
+  idempotency_key: string;
+  kind: DeliveryKind;
+  target_role: DeliveryTargetRole;
+  target_generation: number;
+  payload: unknown;
+}
+
+export type AutoloopDeliveryOutboxErrorCode =
+  | 'AUTOLOOP_DELIVERY_INPUT_INVALID'
+  | 'AUTOLOOP_DELIVERY_LEDGER_INVALID'
+  | 'AUTOLOOP_DELIVERY_IDEMPOTENCY_CONFLICT'
+  | 'AUTOLOOP_DELIVERY_OUTBOX_LOCK_CONTENDED'
+  | 'AUTOLOOP_DELIVERY_OUTBOX_LOCK_CLEANUP_FAILED'
+  | 'AUTOLOOP_DELIVERY_COMMITTED_OBSERVATION_FAILED';
+
+const AUTOLOOP_DELIVERY_OUTBOX_RETRYABILITY = {
+  AUTOLOOP_DELIVERY_INPUT_INVALID: false,
+  AUTOLOOP_DELIVERY_LEDGER_INVALID: false,
+  AUTOLOOP_DELIVERY_IDEMPOTENCY_CONFLICT: false,
+  AUTOLOOP_DELIVERY_OUTBOX_LOCK_CONTENDED: true,
+  AUTOLOOP_DELIVERY_OUTBOX_LOCK_CLEANUP_FAILED: false,
+  AUTOLOOP_DELIVERY_COMMITTED_OBSERVATION_FAILED: false,
+} as const satisfies Record<AutoloopDeliveryOutboxErrorCode, boolean>;
+
+/** Stable failure contract for durable delivery preparation and recovery lookup. */
+export class AutoloopDeliveryOutboxError extends Error {
+  readonly retryable: boolean;
+  declare readonly committed?: true;
+  readonly secondaryErrors: Error[] = [];
+
+  constructor(
+    readonly code: AutoloopDeliveryOutboxErrorCode,
+    message: string,
+    options?: ErrorOptions & { committed?: true },
+  ) {
+    super(message, options);
+    this.name = 'AutoloopDeliveryOutboxError';
+    this.retryable = AUTOLOOP_DELIVERY_OUTBOX_RETRYABILITY[code];
+    if (options?.committed) this.committed = true;
+  }
+}
+
 export interface RecoveryAgentEvidence {
   generation: PhysicalAgentGeneration;
   /** Runtime observation for this exact generation and owner tuple. */

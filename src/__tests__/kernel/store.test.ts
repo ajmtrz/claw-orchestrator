@@ -4,8 +4,9 @@
  * what actually lands on disk.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import {
@@ -23,6 +24,7 @@ import {
   replayRun,
   runDir,
 } from '../../kernel/store.js';
+import { RunKernel } from '../../kernel/engine.js';
 import type { KernelEvent, RunRecord, WorkflowSpec } from '../../kernel/types.js';
 
 /**
@@ -114,6 +116,148 @@ describe('atomicWriteJson', () => {
 });
 
 describe('run directory', () => {
+  it('clears the lease heartbeat on terminal cleanup failure before releasing the run once', async () => {
+    // This catches the interval surviving a terminal release failure and
+    // renewing the lease again after the run has already stood down.
+    vi.useFakeTimers();
+    const runId = 'heartbeat-cleanup-failed';
+    const lockPath = path.join(runDir(runId), 'lease.lock');
+    const releaseFailure = new Error('injected heartbeat lock release failure') as NodeJS.ErrnoException;
+    releaseFailure.code = 'EBUSY';
+    let failRelease = false;
+    let rmSpy: ReturnType<typeof vi.spyOn> | undefined;
+    let releaseNode: (() => void) | undefined;
+    const kernel = new RunKernel();
+    kernel.setExecutor('agent', async () => {
+      await new Promise<void>((resolve) => {
+        releaseNode = resolve;
+      });
+      return { ok: true };
+    });
+    const kernelInternal = kernel as unknown as {
+      _scheduleRelease: (guard: unknown, reason?: string, attempt?: number) => void;
+    };
+    const scheduleSpy = vi.spyOn(kernelInternal, '_scheduleRelease').mockImplementation(() => undefined);
+
+    try {
+      await kernel.start(
+        { name: 'heartbeat cleanup failure', nodes: [{ id: 'a', kind: 'agent', prompt: 'a' }] },
+        { runId },
+      );
+      const originalRmSync = fs.rmSync;
+      rmSpy = vi.spyOn(fs, 'rmSync').mockImplementation(((target: fs.PathLike, options?: fs.RmDirOptions) => {
+        if (failRelease && target === lockPath) throw releaseFailure;
+        return originalRmSync(target, options);
+      }) as typeof fs.rmSync);
+      syncBuiltinESMExports();
+      failRelease = true;
+      await vi.advanceTimersByTimeAsync(31_000);
+      const afterFailure = JSON.parse(fs.readFileSync(path.join(runDir(runId), 'lease.json'), 'utf8')).renewedAt;
+      const rmCallsAfterFailure = rmSpy.mock.calls.filter(([target]) => target === lockPath).length;
+
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+
+      expect(JSON.parse(fs.readFileSync(path.join(runDir(runId), 'lease.json'), 'utf8')).renewedAt).toBe(afterFailure);
+      expect(rmSpy.mock.calls.filter(([target]) => target === lockPath)).toHaveLength(rmCallsAfterFailure);
+      expect(scheduleSpy).toHaveBeenCalledTimes(1);
+      expect(releaseNode).toBeTypeOf('function');
+      releaseNode!();
+      await vi.advanceTimersByTimeAsync(0);
+      await kernel.wait(runId);
+    } finally {
+      releaseNode?.();
+      scheduleSpy.mockRestore();
+      rmSpy?.mockRestore();
+      syncBuiltinESMExports();
+      vi.useRealTimers();
+      fs.rmSync(runDir(runId), { recursive: true, force: true });
+    }
+  });
+
+  it('stalls without retrying when a kernel transaction receives cleanup_failed', async () => {
+    // This catches RunTxn rejecting the terminal cleanup_failed CommitOutcome
+    // even though it must take the same stalled/stop path as other failed
+    // non-superseded commits.
+    const runId = 'kernel-cleanup-failed';
+    const lockPath = path.join(runDir(runId), 'lease.lock');
+    const reclaimPath = `${lockPath}.reclaim`;
+    const attempts: string[] = [];
+    const kernel = new RunKernel();
+    kernel.setExecutor('agent', async (node) => {
+      attempts.push(node.id);
+      fs.writeFileSync(reclaimPath, JSON.stringify({ pid: 999_999_999 }), { mode: 0o600 });
+      fs.utimesSync(reclaimPath, new Date(Date.now() - 120_000), new Date(Date.now() - 120_000));
+      return { ok: true };
+    });
+    const originalRmSync = fs.rmSync;
+    const releaseFailure = new Error(
+      'injected adopted transaction-lock reclaim release failure',
+    ) as NodeJS.ErrnoException;
+    releaseFailure.code = 'EBUSY';
+    const rmSpy = vi.spyOn(fs, 'rmSync').mockImplementation(((target: fs.PathLike, options?: fs.RmDirOptions) => {
+      if (String(target).startsWith(`${reclaimPath}.adopt-`)) throw releaseFailure;
+      return originalRmSync(target, options);
+    }) as typeof fs.rmSync);
+    syncBuiltinESMExports();
+
+    let done: RunRecord | undefined;
+    try {
+      const started = await kernel.start(
+        {
+          name: 'cleanup-failed-stop',
+          nodes: [{ id: 'a', kind: 'agent', prompt: 'a', retry: { max: 3, backoffMs: 1 } }],
+        },
+        { runId },
+      );
+      done = await kernel.wait(started.runId);
+    } finally {
+      rmSpy.mockRestore();
+      syncBuiltinESMExports();
+      fs.rmSync(lockPath, { force: true });
+      fs.rmSync(reclaimPath, { force: true });
+    }
+
+    expect(attempts).toEqual(['a']);
+    expect(done).toMatchObject({
+      state: 'running',
+      nodes: { a: { state: 'running', attempts: 1 } },
+    });
+  });
+
+  it('returns terminal cleanup_failed when an adopted run-lock reclaim cannot be released', () => {
+    // This catches commit collapsing a terminal lock-cleanup failure into a
+    // retryable blocked outcome after it has not entered the transaction.
+    const guard = createAndAcquire('cleanup-failed', spec, 'test-owner');
+    const lockPath = path.join(runDir('cleanup-failed'), 'lease.lock');
+    const reclaimPath = `${lockPath}.reclaim`;
+    fs.writeFileSync(reclaimPath, JSON.stringify({ pid: 999_999_999 }), { mode: 0o600 });
+    fs.utimesSync(reclaimPath, new Date(Date.now() - 120_000), new Date(Date.now() - 120_000));
+    const originalRmSync = fs.rmSync;
+    const releaseFailure = new Error('injected adopted run-lock reclaim release failure') as NodeJS.ErrnoException;
+    releaseFailure.code = 'EBUSY';
+    const rmSpy = vi.spyOn(fs, 'rmSync').mockImplementation(((target: fs.PathLike, options?: fs.RmDirOptions) => {
+      if (String(target).startsWith(`${reclaimPath}.adopt-`)) throw releaseFailure;
+      return originalRmSync(target, options);
+    }) as typeof fs.rmSync);
+    syncBuiltinESMExports();
+
+    let result: ReturnType<typeof commit>;
+    try {
+      result = commit(guard, { record: baseRecord('cleanup-failed') });
+    } finally {
+      rmSpy.mockRestore();
+      syncBuiltinESMExports();
+      fs.rmSync(lockPath, { force: true });
+      fs.rmSync(reclaimPath, { force: true });
+    }
+
+    expect(result!).toMatchObject({
+      outcome: 'cleanup_failed',
+      reason: expect.stringContaining('Could not safely release owned lock'),
+    });
+    expect(fs.existsSync(path.join(runDir('cleanup-failed'), 'run.json'))).toBe(false);
+  });
+
   it('writes the spec once and keeps it separate from the mutable checkpoint', () => {
     createRunDir('r1', spec);
     expect(loadSpec('r1')).toEqual(spec);

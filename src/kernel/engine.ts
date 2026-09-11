@@ -209,8 +209,8 @@ class RunTxn {
     private readonly logger: Logger,
     /** Notified with the events of each accepted commit, for the in-process stream. */
     private readonly onEvents: (events: KernelEvent[]) => void,
-    /** Called once, when this owner stops writing, with which of the two it was. */
-    private readonly onStop: (outcome: 'superseded' | 'blocked', reason: string) => void,
+    /** Called once, when this owner stops writing, with its terminal commit outcome. */
+    private readonly onStop: (outcome: Exclude<CommitOutcome, 'committed'>, reason: string) => void,
   ) {
     this._record = record;
   }
@@ -252,6 +252,11 @@ class RunTxn {
     if (result.outcome !== 'committed') return this._stop(result.outcome, result.reason);
     this.onEvents(events);
     return true;
+  }
+
+  /** A heartbeat observed terminal lock cleanup after its callback completed. */
+  failLeaseCleanup(reason: string): void {
+    this._stop('cleanup_failed', reason);
   }
 
   private _stop(outcome: Exclude<CommitOutcome, 'committed'>, reason?: string): boolean {
@@ -467,7 +472,7 @@ export class RunKernel extends EventEmitter {
         // claim we can no longer use, and leaving that behind is what wedges a
         // run permanently — a live local pid is never judged stale, so nobody
         // else could ever take it.
-        if (outcome === 'blocked') this._scheduleRelease(guard, reason);
+        if (outcome === 'blocked' || outcome === 'cleanup_failed') this._scheduleRelease(guard, reason);
       },
     );
     return { txn, signal };
@@ -753,7 +758,16 @@ export class RunKernel extends EventEmitter {
       handles: new Map(),
       done: Promise.resolve(txn.record),
     };
-    handle.heartbeat = setInterval(() => renewLease(txn.guard), LEASE_HEARTBEAT_MS);
+    handle.heartbeat = setInterval(() => {
+      if (renewLease(txn.guard) === 'cleanup_failed') {
+        // This terminal result arrived after renewLease's callback. Stop this
+        // interval before refusal handling can release or otherwise settle the
+        // run; another tick must never renew a terminally stopped owner.
+        if (handle.heartbeat) clearInterval(handle.heartbeat);
+        handle.heartbeat = undefined;
+        txn.failLeaseCleanup('could not safely release the run lock after lease renewal');
+      }
+    }, LEASE_HEARTBEAT_MS);
     if (typeof handle.heartbeat.unref === 'function') handle.heartbeat.unref();
     // Registered before the run starts: a workflow with no nodes finishes
     // synchronously up to its first await, and the `finally` below would
@@ -761,10 +775,8 @@ export class RunKernel extends EventEmitter {
     this.live.set(runId, handle);
     handle.done = this._run(handle).finally(() => {
       if (handle.heartbeat) clearInterval(handle.heartbeat);
-      // A run that stopped because it could not write still holds its claim.
-      // `_scheduleRelease` was already started by the stop callback; this covers
-      // the case where the run ended for another reason while stalled.
-      if (txn.stalled) this._scheduleRelease(txn.guard);
+      // The refusal callback owns release scheduling. Repeating it here can
+      // race a terminal cleanup failure and manufacture a duplicate finalizer.
       // Identity-checked: a run id can be reused, and deleting by key alone
       // meant a finishing run evicted the handle of the run that had just
       // replaced it.

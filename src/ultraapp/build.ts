@@ -27,7 +27,7 @@ import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
-import { withFileLock } from '../kernel/file-lock.js';
+import { isFileLockReleaseError, withFileLock } from '../kernel/file-lock.js';
 import type { BuildEvent } from './build-events.js';
 
 export type Worker = (runId: string, emit: (e: BuildEvent) => void) => Promise<void>;
@@ -81,7 +81,44 @@ export interface QueueOwner {
  * again. Collapsing them into a boolean is what let a queue dispatch a build
  * while the state file on disk already named a different owner.
  */
-type PersistOutcome = 'committed' | 'superseded' | 'blocked' | 'ephemeral';
+type PersistOutcome = 'committed' | 'superseded' | 'blocked' | 'cleanup_failed' | 'ephemeral';
+
+interface PersistResult {
+  outcome: PersistOutcome;
+  /** Whether the locked callback ran before an unreleasable lock was observed. */
+  callbackEntered?: boolean;
+  cause?: Error;
+}
+
+type QueueLockResult<T> =
+  | { kind: 'completed'; value: T }
+  | { kind: 'contended' }
+  | { kind: 'cleanup_failed'; callbackEntered: boolean; cause: Error };
+
+/**
+ * An enqueue reached a terminal lock-cleanup failure.
+ *
+ * `committed` is true only after the exact queued row was read back from the
+ * durable state file. Callers must not retry a committed logical build.
+ */
+export class UltraappEnqueueCleanupError extends Error {
+  readonly code = 'ULTRAAPP_ENQUEUE_LOCK_CLEANUP_FAILED';
+  readonly retryable = false;
+
+  constructor(
+    readonly committed: boolean,
+    readonly identity: { runId: string; ownerId: string },
+    cause: Error,
+  ) {
+    super(
+      committed
+        ? `Cannot confirm enqueue completion: '${identity.runId}' is durably queued, but lock cleanup failed.`
+        : `Cannot confirm enqueue completion: lock cleanup failed after queue persistence became terminally uncertain.`,
+      { cause },
+    );
+    this.name = 'UltraappEnqueueCleanupError';
+  }
+}
 
 /** How long an owner may go without a heartbeat before the queue is up for grabs. */
 const OWNER_TTL_MS = 60_000;
@@ -124,7 +161,9 @@ export class UltraappBuildQueue {
     if (this.statePath && !this.notOwner) {
       // Independent of any build finishing: a worker that runs for ten minutes
       // makes no state writes, and must not look abandoned for it.
-      this.heartbeat = setInterval(() => this.persist(), HEARTBEAT_MS);
+      this.heartbeat = setInterval(() => {
+        if (this.persist().outcome === 'cleanup_failed') this.standDownForCleanupFailure();
+      }, HEARTBEAT_MS);
       if (typeof this.heartbeat.unref === 'function') this.heartbeat.unref();
     }
     if (this.notOwner) opts.onNotOwner?.(this.notOwner);
@@ -192,19 +231,23 @@ export class UltraappBuildQueue {
    */
   private restore(): string[] {
     if (!this.statePath) return [];
-    let entered = false;
-    const ids = this.withLock(() => {
-      entered = true;
-      return this.claimLocked();
-    }, []);
-    if (!entered && !this.notOwner) {
+    const result = this.withLock(() => this.claimLocked());
+    if (result.kind === 'completed') return result.value;
+    if (result.kind === 'cleanup_failed' && result.callbackEntered) {
+      // claimLocked wrote our owner and restored rows before the release
+      // failed. Never start a heartbeat or worker from that ambiguous state;
+      // the durable row is for a successor to recover after this owner dies.
+      this.standDownForCleanupFailure();
+      return [];
+    }
+    if (!this.notOwner) {
       // We never got inside the critical section — someone else is claiming
       // right now, or the lock file is unusable. Either way we have not taken
       // the queue, and acting as though we had is how both processes end up
       // running the same builds.
       this.notOwner = { ownerId: 'unknown', pid: -1, renewedAt: new Date().toISOString() };
     }
-    return ids ?? [];
+    return [];
   }
 
   /**
@@ -213,10 +256,30 @@ export class UltraappBuildQueue {
    * Shared with the run store, and for the same reason: a lock that is merely
    * busy must not be reported the same way as a claim that has moved on.
    */
-  private withLock<T>(fn: () => T, onContended: T): T | undefined {
-    if (!this.statePath) return undefined;
-    const result = withFileLock(`${this.statePath}.lock`, fn, { staleMs: OWNER_TTL_MS, createParent: true });
-    return result.ok ? result.value : onContended;
+  private withLock<T>(fn: () => T): QueueLockResult<T> {
+    if (!this.statePath) return { kind: 'contended' };
+    let callbackEntered = false;
+    let result: ReturnType<typeof withFileLock<T>>;
+    try {
+      result = withFileLock(
+        `${this.statePath}.lock`,
+        () => {
+          callbackEntered = true;
+          return fn();
+        },
+        { staleMs: OWNER_TTL_MS, createParent: true },
+      );
+    } catch (error) {
+      if (isFileLockReleaseError(error)) {
+        return { kind: 'cleanup_failed', callbackEntered, cause: error };
+      }
+      throw error;
+    }
+    if (result.ok) return { kind: 'completed', value: result.value };
+    if (result.reason === 'cleanup_failed') {
+      return { kind: 'cleanup_failed', callbackEntered: false, cause: result.cause };
+    }
+    return { kind: 'contended' };
   }
 
   /** The critical section of `restore`: inspect the owner and take it, or step aside. */
@@ -255,10 +318,15 @@ export class UltraappBuildQueue {
    * itself back in as owner on its next persist, clobbering the new owner's
    * pending list and running its builds a second time.
    */
-  private persist(): PersistOutcome {
-    if (!this.statePath) return 'ephemeral';
-    if (this.notOwner) return 'superseded';
-    return this.withLock(() => this.writeStateLocked(), 'blocked' as PersistOutcome) ?? 'blocked';
+  private persist(): PersistResult {
+    if (!this.statePath) return { outcome: 'ephemeral' };
+    if (this.notOwner) return { outcome: 'superseded' };
+    const result = this.withLock(() => this.writeStateLocked());
+    if (result.kind === 'completed') return { outcome: result.value };
+    if (result.kind === 'cleanup_failed') {
+      return { outcome: 'cleanup_failed', callbackEntered: result.callbackEntered, cause: result.cause };
+    }
+    return { outcome: 'blocked' };
   }
 
   /** Caller must hold the lock. Steps aside — permanently — if the claim moved on. */
@@ -291,6 +359,31 @@ export class UltraappBuildQueue {
     this.stop();
     this.pending.length = 0;
     if (this.currentRunId === null) this.markIdle();
+  }
+
+  /** A post-callback release failure leaves durable ownership unknowable. */
+  private standDownForCleanupFailure(): void {
+    this.standDown({ ownerId: 'lock-cleanup-failed', pid: -1, renewedAt: new Date().toISOString() });
+  }
+
+  /** Prove the enqueue callback wrote exactly this queue owner's pending row. */
+  private hasQueuedDurableRow(runId: string): boolean {
+    if (!this.statePath) return false;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(this.statePath, 'utf8')) as PersistedQueue;
+      return (
+        parsed.owner?.ownerId === this.ownerId &&
+        // The callback may have appended this row behind a worker that remains
+        // active.  Its exact current row must be retained, not guessed away.
+        parsed.current === this.currentRunId &&
+        Array.isArray(parsed.pending) &&
+        // A duplicate id is not proof of this callback's single append; leave
+        // that ambiguous terminal outcome non-committed for the caller.
+        parsed.pending.filter((pendingRunId) => pendingRunId === runId).length === 1
+      );
+    } catch {
+      return false;
+    }
   }
 
   private writeStateUnchecked(): void {
@@ -334,12 +427,21 @@ export class UltraappBuildQueue {
     // the earlier version returned a bare `false` here and carried on, and ran a
     // build whose queue state on disk already belonged to another process.
     const persisted = this.persist();
-    if (persisted === 'superseded') this.assertOwner('enqueue');
-    if (persisted === 'blocked') {
+    if (persisted.outcome === 'superseded') this.assertOwner('enqueue');
+    if (persisted.outcome === 'blocked') {
       this.pending.pop();
       throw new Error(
         `Cannot enqueue: the build queue state file is locked by another process, so this build cannot be ` +
           `recorded. Retry in a moment.`,
+      );
+    }
+    if (persisted.outcome === 'cleanup_failed') {
+      const committed = persisted.callbackEntered === true && this.hasQueuedDurableRow(runId);
+      this.standDownForCleanupFailure();
+      throw new UltraappEnqueueCleanupError(
+        committed,
+        { runId, ownerId: this.ownerId },
+        persisted.cause ?? new Error('queue lock cleanup failed without a retained cause'),
       );
     }
     this.markBusy();
@@ -354,7 +456,12 @@ export class UltraappBuildQueue {
     const idx = this.pending.findIndex((p) => p.runId === runId);
     if (idx >= 0) {
       this.pending.splice(idx, 1);
-      this.persist();
+      const persisted = this.persist();
+      if (persisted.outcome !== 'committed' && persisted.outcome !== 'ephemeral') {
+        if (persisted.outcome === 'blocked') this.pending.splice(idx, 0, { runId });
+        if (persisted.outcome === 'cleanup_failed') this.standDownForCleanupFailure();
+        return;
+      }
       this.emit({ type: 'build-cancelled', runId });
       if (this.pending.length === 0 && this.currentRunId === null) this.markIdle();
     }
@@ -398,16 +505,29 @@ export class UltraappBuildQueue {
     // how a superseded queue ran a build whose state on disk already named
     // another owner.
     const persisted = this.persist();
-    if (persisted === 'superseded') {
+    if (persisted.outcome === 'superseded') {
       this.currentRunId = null;
       this.markIdle();
       return;
     }
-    if (persisted === 'blocked') {
+    if (persisted.outcome === 'blocked') {
       // Transient: put the build back at the front and try again shortly.
       this.currentRunId = null;
       this.pending.unshift(next);
       this._retryDispatch(next.runId);
+      return;
+    }
+    if (persisted.outcome === 'cleanup_failed') {
+      this.currentRunId = null;
+      this.standDownForCleanupFailure();
+      this.emit({
+        type: 'build-failed',
+        runId: next.runId,
+        phase: 'orchestrator',
+        reason:
+          'the build queue lock cleanup failed; queue ownership is terminally unknown and the build was not started',
+      });
+      this.markIdle();
       return;
     }
     this.dispatchRetries.delete(next.runId);
@@ -422,8 +542,13 @@ export class UltraappBuildQueue {
       });
     } finally {
       this.currentRunId = null;
-      this.persist();
-      void this.tryDispatch();
+      const persisted = this.persist();
+      if (persisted.outcome === 'cleanup_failed') this.standDownForCleanupFailure();
+      if (persisted.outcome === 'committed' || persisted.outcome === 'ephemeral') void this.tryDispatch();
+      // A stand-down made while the worker was active could not settle idle at
+      // that time.  This terminal persist is superseded because that stand-down
+      // already owns the transition, so settle without dispatching its rows.
+      if (persisted.outcome === 'superseded') this.markIdle();
     }
   }
 
