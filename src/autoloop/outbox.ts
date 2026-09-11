@@ -9,7 +9,12 @@ import {
   type SecureAutoloopLedger,
   type SecureAutoloopPreparedAppend,
 } from './secure-ledger.js';
-import { AutoloopDeliveryOutboxError, type DeliveryIntent, type PrepareDeliveryInput } from './types.js';
+import {
+  AutoloopDeliveryOutboxError,
+  type DeliveryAcknowledgement,
+  type DeliveryIntent,
+  type PrepareDeliveryInput,
+} from './types.js';
 
 export { AutoloopDeliveryOutboxError } from './types.js';
 
@@ -36,8 +41,15 @@ interface DecisionLedgerIndex {
   readonly ctimeMs: number;
   readonly rowCount: number;
   readonly tail: Buffer;
+  readonly deliveryRows: DeliveryLedgerRow[];
   readonly intentsByIdempotencyKey: Map<string, DeliveryIntent[]>;
+  readonly intentsByDeliveryId: Map<string, DeliveryIntent[]>;
+  readonly acknowledgementsByDeliveryId: Map<string, DeliveryAcknowledgement[]>;
 }
+
+type DeliveryLedgerRow =
+  | { readonly kind: 'intent'; readonly rowNumber: number; readonly intent: DeliveryIntent }
+  | { readonly kind: 'acknowledgement'; readonly rowNumber: number; readonly acknowledgement: DeliveryAcknowledgement };
 
 type DecisionLedgerRead =
   | { readonly kind: 'missing' }
@@ -62,6 +74,10 @@ export interface PrepareDeliveryOptions {
   now?: () => Date;
 }
 
+export interface AcknowledgeDeliveryOptions {
+  now?: () => Date;
+}
+
 function invalidInput(message: string, options?: ErrorOptions): never {
   throw new AutoloopDeliveryOutboxError('AUTOLOOP_DELIVERY_INPUT_INVALID', message, options);
 }
@@ -72,6 +88,10 @@ function invalidLedger(message: string, options?: ErrorOptions): never {
 
 function idempotencyConflict(message: string, options?: ErrorOptions): never {
   throw new AutoloopDeliveryOutboxError('AUTOLOOP_DELIVERY_IDEMPOTENCY_CONFLICT', message, options);
+}
+
+function acknowledgementConflict(message: string, options?: ErrorOptions): never {
+  throw new AutoloopDeliveryOutboxError('AUTOLOOP_DELIVERY_ACKNOWLEDGEMENT_CONFLICT', message, options);
 }
 
 function canonicalLedgerDirectory(ledger: SecureAutoloopLedger): string {
@@ -132,6 +152,25 @@ function validateIdempotencyKey(value: unknown): asserts value is string {
   }
 }
 
+function validateDeliveryId(value: unknown): asserts value is string {
+  if (
+    typeof value !== 'string' ||
+    !value.trim() ||
+    value.trim() !== value ||
+    Buffer.byteLength(value, 'utf8') > MAX_DELIVERY_IDEMPOTENCY_KEY_BYTES
+  ) {
+    invalidInput(
+      `Delivery delivery_id must be a non-empty unpadded string within ${MAX_DELIVERY_IDEMPOTENCY_KEY_BYTES} UTF-8 bytes`,
+    );
+  }
+}
+
+function validatePayloadSha256(value: unknown): asserts value is string {
+  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value)) {
+    invalidInput('Delivery payload_sha256 must be a lowercase SHA-256 digest');
+  }
+}
+
 function validateTargetGeneration(value: unknown): asserts value is number {
   if (!Number.isSafeInteger(value) || (value as number) < 0) {
     invalidInput('Delivery target_generation must be a nonnegative safe integer');
@@ -153,6 +192,23 @@ function deliveryCreatedAt(now: () => Date): string {
     return invalidInput('Delivery created_at must be a canonical ISO timestamp');
   }
   return createdAt;
+}
+
+function deliveryAcknowledgedAt(now: () => Date): string {
+  let acknowledgedAt: unknown;
+  try {
+    acknowledgedAt = now().toISOString();
+  } catch (error) {
+    return invalidInput('Delivery acknowledged_at must be a canonical ISO timestamp', { cause: error });
+  }
+  if (
+    typeof acknowledgedAt !== 'string' ||
+    Number.isNaN(Date.parse(acknowledgedAt)) ||
+    new Date(acknowledgedAt).toISOString() !== acknowledgedAt
+  ) {
+    return invalidInput('Delivery acknowledged_at must be a canonical ISO timestamp');
+  }
+  return acknowledgedAt;
 }
 
 function validateDeliveryKindAndRole(kind: unknown, targetRole: unknown): void {
@@ -274,6 +330,14 @@ function serializeDeliveryIntent(intent: DeliveryIntent, canonicalPayload: strin
   );
 }
 
+function serializeDeliveryAcknowledgement(acknowledgement: DeliveryAcknowledgement): string {
+  return (
+    `{"schema_version":1,"delivery_id":${JSON.stringify(acknowledgement.delivery_id)}` +
+    `,"payload_sha256":${JSON.stringify(acknowledgement.payload_sha256)}` +
+    `,"acknowledged_at":${JSON.stringify(acknowledgement.acknowledged_at)}}`
+  );
+}
+
 function sameDeliveryIntent(left: DeliveryIntent, right: DeliveryIntent): boolean {
   return (
     left.schema_version === right.schema_version &&
@@ -336,6 +400,31 @@ function isReservedDeliveryAcknowledgement(value: Record<string, unknown>): bool
     typeof value.acknowledged_at === 'string' &&
     !Number.isNaN(Date.parse(value.acknowledged_at))
   );
+}
+
+function isCanonicalTimestamp(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    !Number.isNaN(Date.parse(value)) &&
+    (() => {
+      try {
+        return new Date(value).toISOString() === value;
+      } catch {
+        return false;
+      }
+    })()
+  );
+}
+
+function parseDeliveryAcknowledgement(value: unknown, rowNumber: number): DeliveryAcknowledgement | undefined {
+  if (!isRecord(value)) return undefined;
+  if (isReservedDeliveryAcknowledgement(value) && isCanonicalTimestamp(value.acknowledged_at)) {
+    return value as unknown as DeliveryAcknowledgement;
+  }
+  if (Object.hasOwn(value, 'acknowledged_at')) {
+    invalidLedger(`decisions.jsonl record ${rowNumber} is not a valid delivery acknowledgement`);
+  }
+  return undefined;
 }
 
 function isDeliveryShaped(value: Record<string, unknown>): boolean {
@@ -495,28 +584,47 @@ function readBoundedDecisionLedger(
   }
 }
 
-function parseDecisionLedgerRows(contents: string, rowOffset: number): { intents: DeliveryIntent[]; rowCount: number } {
-  if (contents === '') return { intents: [], rowCount: 0 };
+function parseDecisionLedgerRows(
+  contents: string,
+  rowOffset: number,
+): {
+  intents: DeliveryIntent[];
+  acknowledgements: DeliveryAcknowledgement[];
+  deliveryRows: DeliveryLedgerRow[];
+  rowCount: number;
+} {
+  if (contents === '') return { intents: [], acknowledgements: [], deliveryRows: [], rowCount: 0 };
   if (!contents.endsWith('\n')) invalidLedger('decisions.jsonl has an incomplete final record');
 
   const lines = contents.slice(0, -1).split('\n');
-  const intents = lines
-    .map((line, index) => {
-      const rowNumber = rowOffset + index + 1;
-      const normalized = line.endsWith('\r') ? line.slice(0, -1) : line;
-      if (!normalized || Buffer.byteLength(normalized, 'utf8') > MAX_DECISION_LEDGER_ROW_BYTES) {
-        invalidLedger(`decisions.jsonl record ${rowNumber} is empty or exceeds its byte limit`);
-      }
-      let row: unknown;
-      try {
-        row = JSON.parse(normalized) as unknown;
-      } catch (error) {
-        return invalidLedger(`decisions.jsonl record ${rowNumber} is malformed`, { cause: error });
-      }
-      return parseDeliveryIntent(row, rowNumber);
-    })
-    .filter((intent): intent is DeliveryIntent => intent !== undefined);
-  return { intents, rowCount: lines.length };
+  const intents: DeliveryIntent[] = [];
+  const acknowledgements: DeliveryAcknowledgement[] = [];
+  const deliveryRows: DeliveryLedgerRow[] = [];
+  lines.forEach((line, index) => {
+    const rowNumber = rowOffset + index + 1;
+    const normalized = line.endsWith('\r') ? line.slice(0, -1) : line;
+    if (!normalized || Buffer.byteLength(normalized, 'utf8') > MAX_DECISION_LEDGER_ROW_BYTES) {
+      invalidLedger(`decisions.jsonl record ${rowNumber} is empty or exceeds its byte limit`);
+    }
+    let row: unknown;
+    try {
+      row = JSON.parse(normalized) as unknown;
+    } catch (error) {
+      return invalidLedger(`decisions.jsonl record ${rowNumber} is malformed`, { cause: error });
+    }
+    const acknowledgement = parseDeliveryAcknowledgement(row, rowNumber);
+    if (acknowledgement !== undefined) {
+      acknowledgements.push(acknowledgement);
+      deliveryRows.push({ kind: 'acknowledgement', rowNumber, acknowledgement });
+      return;
+    }
+    const intent = parseDeliveryIntent(row, rowNumber);
+    if (intent !== undefined) {
+      intents.push(intent);
+      deliveryRows.push({ kind: 'intent', rowNumber, intent });
+    }
+  });
+  return { intents, acknowledgements, deliveryRows, rowCount: lines.length };
 }
 
 function addIndexedIntents(index: Map<string, DeliveryIntent[]>, intents: readonly DeliveryIntent[]): void {
@@ -524,6 +632,59 @@ function addIndexedIntents(index: Map<string, DeliveryIntent[]>, intents: readon
     const matching = index.get(intent.idempotency_key);
     if (matching === undefined) index.set(intent.idempotency_key, [intent]);
     else matching.push(intent);
+  }
+}
+
+function addIndexedIntentsByDeliveryId(index: Map<string, DeliveryIntent[]>, intents: readonly DeliveryIntent[]): void {
+  for (const intent of intents) {
+    const matching = index.get(intent.delivery_id);
+    if (matching === undefined) index.set(intent.delivery_id, [intent]);
+    else matching.push(intent);
+  }
+}
+
+function addIndexedAcknowledgements(
+  index: Map<string, DeliveryAcknowledgement[]>,
+  acknowledgements: readonly DeliveryAcknowledgement[],
+): void {
+  for (const acknowledgement of acknowledgements) {
+    const matching = index.get(acknowledgement.delivery_id);
+    if (matching === undefined) index.set(acknowledgement.delivery_id, [acknowledgement]);
+    else matching.push(acknowledgement);
+  }
+}
+
+function validateDeliveryGraph(deliveryRows: readonly DeliveryLedgerRow[]): void {
+  const intentsByDeliveryId = new Map<string, DeliveryLedgerRow & { readonly kind: 'intent' }>();
+  const intentsByIdempotencyKey = new Map<string, DeliveryLedgerRow & { readonly kind: 'intent' }>();
+  const acknowledgementsByDeliveryId = new Map<string, DeliveryLedgerRow & { readonly kind: 'acknowledgement' }>();
+
+  for (const row of deliveryRows) {
+    if (row.kind === 'intent') {
+      if (intentsByDeliveryId.has(row.intent.delivery_id)) {
+        idempotencyConflict(`decisions.jsonl record ${row.rowNumber} duplicates a persisted delivery_id`);
+      }
+      if (intentsByIdempotencyKey.has(row.intent.idempotency_key)) {
+        idempotencyConflict(`decisions.jsonl record ${row.rowNumber} duplicates a persisted idempotency_key`);
+      }
+      intentsByDeliveryId.set(row.intent.delivery_id, row);
+      intentsByIdempotencyKey.set(row.intent.idempotency_key, row);
+      continue;
+    }
+
+    const intent = intentsByDeliveryId.get(row.acknowledgement.delivery_id);
+    if (intent === undefined) {
+      invalidLedger(`decisions.jsonl record ${row.rowNumber} acknowledges no earlier delivery intent`);
+    }
+    if (intent.intent.payload_sha256 !== row.acknowledgement.payload_sha256) {
+      invalidLedger(
+        `decisions.jsonl record ${row.rowNumber} acknowledgement digest does not match its earlier delivery intent`,
+      );
+    }
+    if (acknowledgementsByDeliveryId.has(row.acknowledgement.delivery_id)) {
+      invalidLedger(`decisions.jsonl record ${row.rowNumber} duplicates a persisted delivery acknowledgement`);
+    }
+    acknowledgementsByDeliveryId.set(row.acknowledgement.delivery_id, row);
   }
 }
 
@@ -537,8 +698,15 @@ function readDeliveryIntentIndex(ledger: SecureAutoloopLedger): DecisionLedgerIn
   if (read.kind === 'unchanged') return read.index;
 
   const parsed = parseDecisionLedgerRows(read.contents, read.rowOffset);
+  const deliveryRows = [...(read.previous?.deliveryRows ?? []), ...parsed.deliveryRows];
+  validateDeliveryGraph(deliveryRows);
   const intentsByIdempotencyKey = read.previous?.intentsByIdempotencyKey ?? new Map<string, DeliveryIntent[]>();
+  const intentsByDeliveryId = read.previous?.intentsByDeliveryId ?? new Map<string, DeliveryIntent[]>();
+  const acknowledgementsByDeliveryId =
+    read.previous?.acknowledgementsByDeliveryId ?? new Map<string, DeliveryAcknowledgement[]>();
   addIndexedIntents(intentsByIdempotencyKey, parsed.intents);
+  addIndexedIntentsByDeliveryId(intentsByDeliveryId, parsed.intents);
+  addIndexedAcknowledgements(acknowledgementsByDeliveryId, parsed.acknowledgements);
   const index: DecisionLedgerIndex = {
     dev: read.dev,
     ino: read.ino,
@@ -547,7 +715,10 @@ function readDeliveryIntentIndex(ledger: SecureAutoloopLedger): DecisionLedgerIn
     ctimeMs: read.ctimeMs,
     rowCount: read.rowOffset + parsed.rowCount,
     tail: read.tail,
+    deliveryRows,
     intentsByIdempotencyKey,
+    intentsByDeliveryId,
+    acknowledgementsByDeliveryId,
   };
   decisionLedgerIndexes.set(ledger, index);
   return index;
@@ -555,6 +726,10 @@ function readDeliveryIntentIndex(ledger: SecureAutoloopLedger): DecisionLedgerIn
 
 function cloneDeliveryIntent(intent: DeliveryIntent): DeliveryIntent {
   return { ...intent, payload: structuredClone(intent.payload) };
+}
+
+function cloneDeliveryAcknowledgement(acknowledgement: DeliveryAcknowledgement): DeliveryAcknowledgement {
+  return { ...acknowledgement };
 }
 
 function findDeliveryIntent(
@@ -572,6 +747,77 @@ function findDeliveryIntent(
     dev: index?.dev,
     ino: index?.ino,
   };
+}
+
+function findDeliveryById(
+  ledger: SecureAutoloopLedger,
+  deliveryId: string,
+): {
+  intent: DeliveryIntent | undefined;
+  acknowledgement: DeliveryAcknowledgement | undefined;
+  intentCount: number;
+  acknowledgementCount: number;
+  fileBytes: number;
+  dev: number | undefined;
+  ino: number | undefined;
+} {
+  const index = readDeliveryIntentIndex(ledger);
+  const intents = index?.intentsByDeliveryId.get(deliveryId) ?? [];
+  const acknowledgements = index?.acknowledgementsByDeliveryId.get(deliveryId) ?? [];
+  if (intents.length > 1) idempotencyConflict(`Delivery id '${deliveryId}' has duplicate persisted intents`);
+  if (acknowledgements.length > 1) {
+    invalidLedger(`Delivery id '${deliveryId}' has ambiguous persisted acknowledgements`);
+  }
+  const intent = intents[0];
+  const acknowledgement = acknowledgements[0];
+  if (
+    intent !== undefined &&
+    acknowledgement !== undefined &&
+    acknowledgement.payload_sha256 !== intent.payload_sha256
+  ) {
+    invalidLedger(`Delivery acknowledgement for '${deliveryId}' does not match its persisted intent digest`);
+  }
+  return {
+    intent: intent === undefined ? undefined : cloneDeliveryIntent(intent),
+    acknowledgement: acknowledgement === undefined ? undefined : cloneDeliveryAcknowledgement(acknowledgement),
+    intentCount: intents.length,
+    acknowledgementCount: acknowledgements.length,
+    fileBytes: index?.fileBytes ?? 0,
+    dev: index?.dev,
+    ino: index?.ino,
+  };
+}
+
+function observeDurableDeliveryAcknowledgement(
+  ledger: SecureAutoloopLedger,
+  deliveryId: string,
+  payloadSha256: string,
+  acknowledgedAt: string,
+  barrierDev: number,
+  barrierIno: number,
+): DeliveryAcknowledgement {
+  // Acknowledgement success is published only from a full, post-barrier ledger
+  // observation, never from the index read before that barrier.
+  decisionLedgerIndexes.delete(ledger);
+  const observed = findDeliveryById(ledger, deliveryId);
+  if (
+    observed.intentCount !== 1 ||
+    !observed.intent ||
+    observed.intent.delivery_id !== deliveryId ||
+    observed.intent.payload_sha256 !== payloadSha256 ||
+    observed.acknowledgementCount !== 1 ||
+    !observed.acknowledgement ||
+    observed.acknowledgement.delivery_id !== deliveryId ||
+    observed.acknowledgement.payload_sha256 !== payloadSha256 ||
+    observed.acknowledgement.acknowledged_at !== acknowledgedAt ||
+    observed.dev !== barrierDev ||
+    observed.ino !== barrierIno
+  ) {
+    invalidLedger(
+      'Delivery acknowledgement was not freshly observed with its exact persisted intent and one matching row',
+    );
+  }
+  return observed.acknowledgement;
 }
 
 function committedObservationFailure(message: string, cause: unknown): AutoloopDeliveryOutboxError {
@@ -646,7 +892,11 @@ function observeAppendedDeliveryIntent(
   }
 
   const intentsByIdempotencyKey = cached?.intentsByIdempotencyKey ?? new Map<string, DeliveryIntent[]>();
+  const intentsByDeliveryId = cached?.intentsByDeliveryId ?? new Map<string, DeliveryIntent[]>();
+  const acknowledgementsByDeliveryId =
+    cached?.acknowledgementsByDeliveryId ?? new Map<string, DeliveryAcknowledgement[]>();
   addIndexedIntents(intentsByIdempotencyKey, [cloneDeliveryIntent(intent)]);
+  addIndexedIntentsByDeliveryId(intentsByDeliveryId, [cloneDeliveryIntent(intent)]);
   const tailSource = Buffer.concat([cached?.tail ?? Buffer.alloc(0), appended]);
   decisionLedgerIndexes.set(ledger, {
     dev: observed.dev,
@@ -656,9 +906,98 @@ function observeAppendedDeliveryIntent(
     ctimeMs: observed.ctimeMs,
     rowCount: (cached?.rowCount ?? 0) + 1,
     tail: Buffer.from(tailSource.subarray(Math.max(0, tailSource.length - DECISION_LEDGER_TAIL_VERIFICATION_BYTES))),
+    deliveryRows: [
+      ...(cached?.deliveryRows ?? []),
+      { kind: 'intent', rowNumber: (cached?.rowCount ?? 0) + 1, intent: cloneDeliveryIntent(intent) },
+    ],
     intentsByIdempotencyKey,
+    intentsByDeliveryId,
+    acknowledgementsByDeliveryId,
   });
   return cloneDeliveryIntent(intent);
+}
+
+function observeAppendedDeliveryAcknowledgement(
+  ledger: SecureAutoloopLedger,
+  prepared: SecureAutoloopPreparedAppend,
+  previousFileBytes: number,
+  serializedAcknowledgement: string,
+  acknowledgement: DeliveryAcknowledgement,
+): { acknowledgement: DeliveryAcknowledgement; barrierDev: number; barrierIno: number } {
+  const appended = Buffer.from(`${serializedAcknowledgement}\n`, 'utf8');
+  const cached = decisionLedgerIndexes.get(ledger);
+  if (cached === undefined) {
+    const pinnedLastLine = Buffer.from(prepared.readLastNonEmptyLine(), 'utf8');
+    if (!pinnedLastLine.equals(Buffer.from(serializedAcknowledgement, 'utf8'))) {
+      throw committedObservationFailure(
+        'Pinned decisions.jsonl append no longer contains the intended delivery acknowledgement row',
+        new Error('pinned row mismatch'),
+      );
+    }
+  }
+  const observePathnameRange = (): fs.Stats => {
+    const handle = ledger.openFlatFile('decisions.jsonl', 'read');
+    try {
+      const observed = fs.fstatSync(handle.fd);
+      if (
+        observed.size !== previousFileBytes + appended.length ||
+        (cached !== undefined && (cached.dev !== observed.dev || cached.ino !== observed.ino)) ||
+        (cached === undefined && previousFileBytes !== 0)
+      ) {
+        invalidLedger('Appended delivery acknowledgement could not be observed at its expected decision-ledger range');
+      }
+      const observedRange = readExactLedgerBytes(handle.fd, previousFileBytes, appended.length);
+      if (!observedRange.equals(appended)) {
+        invalidLedger('Appended delivery acknowledgement does not match its expected decision-ledger range');
+      }
+      assertStableLedgerSnapshot(observed, fs.fstatSync(handle.fd));
+      return observed;
+    } finally {
+      fs.closeSync(handle.fd);
+    }
+  };
+
+  const beforeDurabilityBarrier = observePathnameRange();
+  const flushed = ledger.flushFlatFile('decisions.jsonl');
+  const observed = observePathnameRange();
+  if (observed.dev !== beforeDurabilityBarrier.dev || observed.ino !== beforeDurabilityBarrier.ino) {
+    invalidLedger('decisions.jsonl identity changed across the appended delivery acknowledgement durability barrier');
+  }
+  if (observed.dev !== flushed.dev || observed.ino !== flushed.ino) {
+    invalidLedger('decisions.jsonl durability barrier did not cover its observed delivery acknowledgement descriptor');
+  }
+
+  const intentsByIdempotencyKey = cached?.intentsByIdempotencyKey ?? new Map<string, DeliveryIntent[]>();
+  const intentsByDeliveryId = cached?.intentsByDeliveryId ?? new Map<string, DeliveryIntent[]>();
+  const acknowledgementsByDeliveryId =
+    cached?.acknowledgementsByDeliveryId ?? new Map<string, DeliveryAcknowledgement[]>();
+  addIndexedAcknowledgements(acknowledgementsByDeliveryId, [cloneDeliveryAcknowledgement(acknowledgement)]);
+  const tailSource = Buffer.concat([cached?.tail ?? Buffer.alloc(0), appended]);
+  decisionLedgerIndexes.set(ledger, {
+    dev: observed.dev,
+    ino: observed.ino,
+    fileBytes: observed.size,
+    mtimeMs: observed.mtimeMs,
+    ctimeMs: observed.ctimeMs,
+    rowCount: (cached?.rowCount ?? 0) + 1,
+    tail: Buffer.from(tailSource.subarray(Math.max(0, tailSource.length - DECISION_LEDGER_TAIL_VERIFICATION_BYTES))),
+    deliveryRows: [
+      ...(cached?.deliveryRows ?? []),
+      {
+        kind: 'acknowledgement',
+        rowNumber: (cached?.rowCount ?? 0) + 1,
+        acknowledgement: cloneDeliveryAcknowledgement(acknowledgement),
+      },
+    ],
+    intentsByIdempotencyKey,
+    intentsByDeliveryId,
+    acknowledgementsByDeliveryId,
+  });
+  return {
+    acknowledgement: cloneDeliveryAcknowledgement(acknowledgement),
+    barrierDev: flushed.dev,
+    barrierIno: flushed.ino,
+  };
 }
 
 function closePreparedAppend(prepared: SecureAutoloopPreparedAppend, primaryError?: unknown): Error | undefined {
@@ -681,6 +1020,209 @@ export function lookupByIdempotencyKey(
 ): DeliveryIntent | undefined {
   validateIdempotencyKey(idempotencyKey);
   return findDeliveryIntent(ledger, idempotencyKey).intent;
+}
+
+/** Persist one receiver acknowledgement for the exact intent digest, or return its original durable record. */
+export function acknowledgeDelivery(
+  ledger: SecureAutoloopLedger,
+  deliveryId: string,
+  payloadSha256: string,
+  options: AcknowledgeDeliveryOptions = {},
+): DeliveryAcknowledgement {
+  validateDeliveryId(deliveryId);
+  validatePayloadSha256(payloadSha256);
+  let acknowledgedAt: string | undefined;
+  let acknowledgementClockFailure: unknown;
+  try {
+    const now = options.now;
+    acknowledgedAt = deliveryAcknowledgedAt(now ?? (() => new Date()));
+  } catch (error) {
+    acknowledgementClockFailure =
+      error instanceof AutoloopDeliveryOutboxError && error.code === 'AUTOLOOP_DELIVERY_INPUT_INVALID'
+        ? error
+        : new AutoloopDeliveryOutboxError(
+            'AUTOLOOP_DELIVERY_INPUT_INVALID',
+            'Delivery acknowledged_at must be a canonical ISO timestamp',
+            { cause: error },
+          );
+  }
+  ledger.assertIdentity();
+  let locked;
+  try {
+    locked = withFileLock(
+      path.join(ledger.directory, '.delivery-outbox.lock'),
+      () => {
+        ledger.assertIdentity();
+        const observationFailureKey = canonicalLedgerDirectory(ledger);
+        const halted = committedObservationFailures.get(observationFailureKey);
+        if (halted !== undefined) throw halted;
+        const existing = findDeliveryById(ledger, deliveryId);
+        if (existing.intent === undefined) {
+          acknowledgementConflict(`Delivery acknowledgement references unknown delivery '${deliveryId}'`);
+        }
+        if (existing.intent.payload_sha256 !== payloadSha256) {
+          acknowledgementConflict(`Delivery acknowledgement digest does not match '${deliveryId}'`);
+        }
+        if (existing.acknowledgement !== undefined) {
+          const flushed = ledger.flushFlatFile('decisions.jsonl');
+          if (
+            existing.dev === undefined ||
+            existing.ino === undefined ||
+            flushed.dev !== existing.dev ||
+            flushed.ino !== existing.ino
+          ) {
+            invalidLedger(
+              'Existing delivery acknowledgement durability barrier covered a different decisions.jsonl identity',
+            );
+          }
+          return observeDurableDeliveryAcknowledgement(
+            ledger,
+            deliveryId,
+            payloadSha256,
+            existing.acknowledgement.acknowledged_at,
+            flushed.dev,
+            flushed.ino,
+          );
+        }
+
+        if (acknowledgementClockFailure !== undefined || acknowledgedAt === undefined) {
+          throw acknowledgementClockFailure;
+        }
+
+        const acknowledgement: DeliveryAcknowledgement = {
+          schema_version: 1,
+          delivery_id: deliveryId,
+          payload_sha256: payloadSha256,
+          acknowledged_at: acknowledgedAt,
+        };
+        const serialized = serializeDeliveryAcknowledgement(acknowledgement);
+        if (Buffer.byteLength(serialized, 'utf8') > MAX_DECISION_LEDGER_ROW_BYTES) {
+          invalidInput(`Delivery acknowledgement row exceeds the ${MAX_DECISION_LEDGER_ROW_BYTES}-byte limit`);
+        }
+        if (existing.fileBytes + Buffer.byteLength(serialized, 'utf8') + 1 > MAX_DECISION_LEDGER_BYTES) {
+          invalidLedger(`Delivery acknowledgement would exceed the ${MAX_DECISION_LEDGER_BYTES}-byte ledger limit`);
+        }
+
+        const prepared = ledger.prepareFlatFileAppend('decisions.jsonl', `${serialized}\n`);
+        try {
+          prepared.commitDurable();
+          const barrier = observeAppendedDeliveryAcknowledgement(
+            ledger,
+            prepared,
+            existing.fileBytes,
+            serialized,
+            acknowledgement,
+          );
+          const closeFailure = closePreparedAppend(prepared);
+          if (closeFailure !== undefined) {
+            throw committedObservationFailure(
+              'Committed delivery acknowledgement could not close its pinned observation descriptor',
+              closeFailure,
+            );
+          }
+          return observeDurableDeliveryAcknowledgement(
+            ledger,
+            deliveryId,
+            payloadSha256,
+            acknowledgement.acknowledged_at,
+            barrier.barrierDev,
+            barrier.barrierIno,
+          );
+        } catch (error) {
+          closePreparedAppend(prepared, error);
+          if (!isCommittedSecureLedgerError(error)) {
+            if (!prepared.committed) throw error;
+            const failure =
+              error instanceof AutoloopDeliveryOutboxError && error.committed
+                ? error
+                : committedObservationFailure('Committed delivery acknowledgement could not be safely observed', error);
+            committedObservationFailures.set(observationFailureKey, failure);
+            throw failure;
+          }
+          try {
+            decisionLedgerIndexes.delete(ledger);
+            const reconciled = findDeliveryById(ledger, deliveryId);
+            if (
+              !reconciled.intent ||
+              reconciled.intent.payload_sha256 !== payloadSha256 ||
+              !reconciled.acknowledgement ||
+              reconciled.acknowledgement.payload_sha256 !== payloadSha256 ||
+              reconciled.acknowledgement.acknowledged_at !== acknowledgedAt
+            ) {
+              invalidLedger('Committed delivery acknowledgement could not be reconciled to its exact persisted row');
+            }
+            const flushed = ledger.flushFlatFile('decisions.jsonl');
+            const observed = observeDurableDeliveryAcknowledgement(
+              ledger,
+              deliveryId,
+              payloadSha256,
+              acknowledgedAt,
+              flushed.dev,
+              flushed.ino,
+            );
+            if (
+              reconciled.dev === undefined ||
+              reconciled.ino === undefined ||
+              flushed.dev !== reconciled.dev ||
+              flushed.ino !== reconciled.ino ||
+              observed.acknowledged_at !== acknowledgedAt
+            ) {
+              invalidLedger(
+                'Committed delivery acknowledgement recovery durability barrier did not cover its exact row',
+              );
+            }
+            return observed;
+          } catch (proofFailure) {
+            latchCommittedObservationFailure(
+              observationFailureKey,
+              'Committed delivery acknowledgement could not be observed at its exact durable decision-ledger row after recovery',
+              error,
+              proofFailure,
+            );
+          }
+        }
+      },
+      { waitMs: DELIVERY_OUTBOX_LOCK_WAIT_MS },
+    );
+  } catch (error) {
+    if (!isFileLockReleaseError(error)) throw error;
+    const observationFailureKey = canonicalLedgerDirectory(ledger);
+    try {
+      decisionLedgerIndexes.delete(ledger);
+      const persisted = findDeliveryById(ledger, deliveryId).acknowledgement;
+      if (!persisted || persisted.payload_sha256 !== payloadSha256) {
+        throw error;
+      }
+    } catch (reconciliationError) {
+      const failure = committedObservationFailure(
+        'Committed delivery acknowledgement could not be reconciled after its lock release failed',
+        reconciliationError,
+      );
+      committedObservationFailures.set(observationFailureKey, failure);
+      throw failure;
+    }
+    const failure = committedObservationFailure(
+      'Committed delivery acknowledgement could not safely release its outbox lock',
+      error,
+    );
+    committedObservationFailures.set(observationFailureKey, failure);
+    throw failure;
+  }
+
+  if (!locked.ok) {
+    if (locked.reason === 'cleanup_failed') {
+      throw new AutoloopDeliveryOutboxError(
+        'AUTOLOOP_DELIVERY_OUTBOX_LOCK_CLEANUP_FAILED',
+        `Autoloop delivery outbox lock cleanup failed after a published acquisition: ${locked.error}`,
+        { cause: locked.cause },
+      );
+    }
+    throw new AutoloopDeliveryOutboxError(
+      'AUTOLOOP_DELIVERY_OUTBOX_LOCK_CONTENDED',
+      `Autoloop delivery outbox is contended: ${locked.error}`,
+    );
+  }
+  return locked.value;
 }
 
 export function prepareDelivery(

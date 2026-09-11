@@ -148,6 +148,14 @@ export interface DeliveryIntent {
   created_at: string;
 }
 
+/** Durable proof that a receiver accepted one exact persisted delivery payload. */
+export interface DeliveryAcknowledgement {
+  schema_version: 1;
+  delivery_id: string;
+  payload_sha256: string;
+  acknowledged_at: string;
+}
+
 export interface PrepareDeliveryInput {
   idempotency_key: string;
   kind: DeliveryKind;
@@ -160,6 +168,7 @@ export type AutoloopDeliveryOutboxErrorCode =
   | 'AUTOLOOP_DELIVERY_INPUT_INVALID'
   | 'AUTOLOOP_DELIVERY_LEDGER_INVALID'
   | 'AUTOLOOP_DELIVERY_IDEMPOTENCY_CONFLICT'
+  | 'AUTOLOOP_DELIVERY_ACKNOWLEDGEMENT_CONFLICT'
   | 'AUTOLOOP_DELIVERY_OUTBOX_LOCK_CONTENDED'
   | 'AUTOLOOP_DELIVERY_OUTBOX_LOCK_CLEANUP_FAILED'
   | 'AUTOLOOP_DELIVERY_COMMITTED_OBSERVATION_FAILED';
@@ -168,6 +177,7 @@ const AUTOLOOP_DELIVERY_OUTBOX_RETRYABILITY = {
   AUTOLOOP_DELIVERY_INPUT_INVALID: false,
   AUTOLOOP_DELIVERY_LEDGER_INVALID: false,
   AUTOLOOP_DELIVERY_IDEMPOTENCY_CONFLICT: false,
+  AUTOLOOP_DELIVERY_ACKNOWLEDGEMENT_CONFLICT: false,
   AUTOLOOP_DELIVERY_OUTBOX_LOCK_CONTENDED: true,
   AUTOLOOP_DELIVERY_OUTBOX_LOCK_CLEANUP_FAILED: false,
   AUTOLOOP_DELIVERY_COMMITTED_OBSERVATION_FAILED: false,

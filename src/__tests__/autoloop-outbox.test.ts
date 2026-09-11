@@ -216,6 +216,44 @@ function spawnLookupWorker(workspace: string, runId: string, idempotencyKey: str
   });
 }
 
+function spawnAcknowledgementWorker(
+  workspace: string,
+  runId: string,
+  deliveryId: string,
+  payloadSha256: string,
+): ChildProcess {
+  const secureLedgerUrl = pathToFileURL(path.resolve('src/autoloop/secure-ledger.ts')).href;
+  const outboxUrl = pathToFileURL(path.resolve('src/autoloop/outbox.ts')).href;
+  const script = `
+    import { SecureAutoloopLedger } from ${JSON.stringify(secureLedgerUrl)};
+    import { acknowledgeDelivery } from ${JSON.stringify(outboxUrl)};
+    const ledger = SecureAutoloopLedger.open(${JSON.stringify(workspace)}, ${JSON.stringify(runId)});
+    process.send?.({ type: 'ready' });
+    process.once('message', (message) => {
+      if (message !== 'go') process.exit(2);
+      try {
+        const acknowledgement = acknowledgeDelivery(ledger, ${JSON.stringify(deliveryId)}, ${JSON.stringify(payloadSha256)});
+        process.send?.({ type: 'result', acknowledgement });
+        process.exit(0);
+      } catch (error) {
+        const failure = typeof error === 'object' && error !== null ? error : {};
+        process.send?.({
+          type: 'error',
+          message: error instanceof Error ? error.message : String(error),
+          code: failure.code,
+          committed: failure.committed,
+          retryable: failure.retryable,
+        });
+        process.exit(1);
+      }
+    });
+  `;
+  return spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', script], {
+    cwd: process.cwd(),
+    stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+  });
+}
+
 function spawnReclamationRaceWorker(lockPath: string, effectPath: string, role: string): ChildProcess {
   const fileLockUrl = pathToFileURL(path.resolve('src/kernel/file-lock.ts')).href;
   const script = `
@@ -267,6 +305,835 @@ afterEach(() => {
 });
 
 describe('Autoloop delivery outbox', () => {
+  it('persists the matching acknowledgement before returning it (break: acknowledgement API returns success without a durable row)', async () => {
+    // Production break caught: acknowledgeDelivery returns before its acknowledgement is durable in decisions.jsonl.
+    const outbox = (await import('../autoloop/outbox.js')) as typeof import('../autoloop/outbox.js') & {
+      acknowledgeDelivery: (
+        ledger: SecureAutoloopLedger,
+        deliveryId: string,
+        payloadSha256: string,
+        options?: { now?: () => Date },
+      ) => unknown;
+    };
+    const workspace = makeWorkspace();
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-ack-persist-before-success', { create: true });
+    const intent = outbox.prepareDelivery(ledger, {
+      idempotency_key: 'ack-persist-before-success',
+      kind: 'coder_directive',
+      target_role: 'coder',
+      target_generation: 1,
+      payload: { directive: 'durably acknowledge this exact delivery' },
+    });
+
+    const acknowledgement = outbox.acknowledgeDelivery(ledger, intent.delivery_id, intent.payload_sha256, {
+      now: () => new Date('2026-09-11T06:00:00.000Z'),
+    });
+
+    expect(acknowledgement).toEqual({
+      schema_version: 1,
+      delivery_id: intent.delivery_id,
+      payload_sha256: intent.payload_sha256,
+      acknowledged_at: '2026-09-11T06:00:00.000Z',
+    });
+    expect(fs.readFileSync(path.join(ledger.directory, 'decisions.jsonl'), 'utf8')).toContain(
+      `${JSON.stringify(acknowledgement)}\n`,
+    );
+  });
+
+  it('replays an identical acknowledgement without appending or changing its first timestamp (break: retry writes a second acknowledgement)', async () => {
+    // Production break caught: an acknowledgement retry appends another record or replaces the first timestamp.
+    const outbox = (await import('../autoloop/outbox.js')) as typeof import('../autoloop/outbox.js') & {
+      acknowledgeDelivery: (
+        ledger: SecureAutoloopLedger,
+        deliveryId: string,
+        payloadSha256: string,
+        options?: { now?: () => Date },
+      ) => unknown;
+    };
+    const workspace = makeWorkspace();
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-ack-idempotent-replay', { create: true });
+    const intent = outbox.prepareDelivery(ledger, {
+      idempotency_key: 'ack-idempotent-replay',
+      kind: 'review_request',
+      target_role: 'reviewer',
+      target_generation: 2,
+      payload: { scope: 'preserve the first acknowledgement' },
+    });
+    const first = outbox.acknowledgeDelivery(ledger, intent.delivery_id, intent.payload_sha256, {
+      now: () => new Date('2026-09-11T06:01:00.000Z'),
+    });
+    const beforeReplay = fs.readFileSync(path.join(ledger.directory, 'decisions.jsonl'), 'utf8');
+
+    const replay = outbox.acknowledgeDelivery(ledger, intent.delivery_id, intent.payload_sha256, {
+      now: () => new Date('2026-09-11T07:01:00.000Z'),
+    });
+
+    expect(replay).toEqual(first);
+    expect(fs.readFileSync(path.join(ledger.directory, 'decisions.jsonl'), 'utf8')).toEqual(beforeReplay);
+  });
+
+  it('replays an identical acknowledgement when its later clock throws or is invalid (break: replay validates a clock it does not need)', async () => {
+    // Production break caught: a durable acknowledgement retry must be a no-op
+    // even when a later caller clock cannot supply a new timestamp.
+    const { acknowledgeDelivery, prepareDelivery } = await import('../autoloop/outbox.js');
+    const workspace = makeWorkspace();
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-ack-idempotent-replay-clock-failure', { create: true });
+    const intent = prepareDelivery(ledger, {
+      idempotency_key: 'ack-idempotent-replay-clock-failure',
+      kind: 'review_request',
+      target_role: 'reviewer',
+      target_generation: 2,
+      payload: { scope: 'preserve the first acknowledgement without a second clock' },
+    });
+    const first = acknowledgeDelivery(ledger, intent.delivery_id, intent.payload_sha256, {
+      now: () => new Date('2026-09-11T06:01:00.000Z'),
+    });
+    const beforeReplay = fs.readFileSync(path.join(ledger.directory, 'decisions.jsonl'), 'utf8');
+
+    expect(
+      acknowledgeDelivery(ledger, intent.delivery_id, intent.payload_sha256, {
+        now: () => {
+          throw new Error('second acknowledgement clock must not be used for replay');
+        },
+      }),
+    ).toEqual(first);
+    expect(
+      acknowledgeDelivery(ledger, intent.delivery_id, intent.payload_sha256, {
+        now: () => new Date('not-a-real-acknowledgement-time'),
+      }),
+    ).toEqual(first);
+    expect(fs.readFileSync(path.join(ledger.directory, 'decisions.jsonl'), 'utf8')).toEqual(beforeReplay);
+  });
+
+  it('rejects a throwing or invalid acknowledgement clock before mutating an unacknowledged delivery', async () => {
+    const { acknowledgeDelivery, prepareDelivery } = await import('../autoloop/outbox.js');
+    const workspace = makeWorkspace();
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-ack-new-clock-failure', { create: true });
+    const intent = prepareDelivery(ledger, {
+      idempotency_key: 'ack-new-clock-failure',
+      kind: 'review_request',
+      target_role: 'reviewer',
+      target_generation: 2,
+      payload: { scope: 'validate a new acknowledgement clock before append' },
+    });
+    const before = fs.readFileSync(path.join(ledger.directory, 'decisions.jsonl'), 'utf8');
+
+    for (const now of [
+      () => {
+        throw new Error('acknowledgement clock failure');
+      },
+      () => new Date('not-a-real-acknowledgement-time'),
+    ]) {
+      expect(
+        captureFailure(() => acknowledgeDelivery(ledger, intent.delivery_id, intent.payload_sha256, { now })),
+      ).toMatchObject({
+        code: 'AUTOLOOP_DELIVERY_INPUT_INVALID',
+        retryable: false,
+      });
+      expect(fs.readFileSync(path.join(ledger.directory, 'decisions.jsonl'), 'utf8')).toEqual(before);
+    }
+  });
+
+  it('classifies hostile acknowledgement clock accessors without invalidating a durable replay (break: options.now getter errors escape the typed input boundary)', async () => {
+    // Production break caught: resolving options.now can execute a hostile getter or
+    // Proxy trap. A new acknowledgement must report typed invalid input, while an
+    // existing acknowledgement remains a durable no-op regardless of that later clock.
+    const { acknowledgeDelivery, prepareDelivery } = await import('../autoloop/outbox.js');
+    const workspace = makeWorkspace();
+    const replayLedger = SecureAutoloopLedger.open(workspace, 'run-ack-hostile-now-replay', { create: true });
+    const replayIntent = prepareDelivery(replayLedger, {
+      idempotency_key: 'ack-hostile-now-replay',
+      kind: 'review_request',
+      target_role: 'reviewer',
+      target_generation: 2,
+      payload: { scope: 'preserve a durable acknowledgement despite hostile clock property access' },
+    });
+    const first = acknowledgeDelivery(replayLedger, replayIntent.delivery_id, replayIntent.payload_sha256, {
+      now: () => new Date('2026-09-11T06:01:00.000Z'),
+    });
+    const replayPath = path.join(replayLedger.directory, 'decisions.jsonl');
+    const beforeReplay = fs.readFileSync(replayPath, 'utf8');
+
+    const newLedger = SecureAutoloopLedger.open(workspace, 'run-ack-hostile-now-new', { create: true });
+    const newIntent = prepareDelivery(newLedger, {
+      idempotency_key: 'ack-hostile-now-new',
+      kind: 'review_request',
+      target_role: 'reviewer',
+      target_generation: 2,
+      payload: { scope: 'reject hostile clock property access before acknowledgement append' },
+    });
+    const newPath = path.join(newLedger.directory, 'decisions.jsonl');
+    const beforeNewAcknowledgement = fs.readFileSync(newPath, 'utf8');
+
+    const hostileOptions = [
+      {
+        label: 'own getter',
+        create(failure: Error): { now?: () => Date } {
+          const options = {};
+          Object.defineProperty(options, 'now', {
+            enumerable: true,
+            get: () => {
+              throw failure;
+            },
+          });
+          return options;
+        },
+      },
+      {
+        label: 'inherited getter',
+        create(failure: Error): { now?: () => Date } {
+          return Object.create({
+            get now() {
+              throw failure;
+            },
+          }) as { now?: () => Date };
+        },
+      },
+      {
+        label: 'Proxy get trap',
+        create(failure: Error): { now?: () => Date } {
+          return new Proxy(
+            {},
+            {
+              get(_target, key) {
+                if (key === 'now') throw failure;
+                return undefined;
+              },
+            },
+          ) as { now?: () => Date };
+        },
+      },
+    ];
+
+    for (const hostile of hostileOptions) {
+      const replayFailure = new Error(`replay ${hostile.label} failure`);
+      expect(
+        acknowledgeDelivery(
+          replayLedger,
+          replayIntent.delivery_id,
+          replayIntent.payload_sha256,
+          hostile.create(replayFailure),
+        ),
+      ).toEqual(first);
+      expect(fs.readFileSync(replayPath, 'utf8')).toEqual(beforeReplay);
+
+      const newFailure = new Error(`new ${hostile.label} failure`);
+      const failure = captureFailure(() =>
+        acknowledgeDelivery(newLedger, newIntent.delivery_id, newIntent.payload_sha256, hostile.create(newFailure)),
+      );
+      expect(failure).toMatchObject({
+        code: 'AUTOLOOP_DELIVERY_INPUT_INVALID',
+        retryable: false,
+        cause: newFailure,
+      });
+      expect(fs.readFileSync(newPath, 'utf8')).toEqual(beforeNewAcknowledgement);
+    }
+  });
+
+  it('fails closed when the acknowledgement clock rewrites the matching intent before its first acknowledgement (break: caller-controlled acknowledgement time can leave stale intent proof)', async () => {
+    // Production break caught: acknowledgeDelivery reads an intent, then lets its
+    // caller-controlled clock replace that same-length intent before success.
+    const { acknowledgeDelivery, prepareDelivery } = await import('../autoloop/outbox.js');
+    const workspace = makeWorkspace();
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-ack-clock-prefix-rewrite', { create: true });
+    const intent = prepareDelivery(ledger, {
+      idempotency_key: 'ack-clock-prefix-rewrite',
+      kind: 'coder_directive',
+      target_role: 'coder',
+      target_generation: 1,
+      payload: { directive: 'reject stale acknowledgement proof' },
+    });
+    const ledgerPath = path.join(ledger.directory, 'decisions.jsonl');
+    const replacementId = `${intent.delivery_id[0] === 'a' ? 'b' : 'a'}${intent.delivery_id.slice(1)}`;
+    let rewritten = false;
+
+    const failure = captureFailure(() =>
+      acknowledgeDelivery(ledger, intent.delivery_id, intent.payload_sha256, {
+        now: () => {
+          const contents = fs.readFileSync(ledgerPath, 'utf8');
+          const replacement = contents.replace(intent.delivery_id, replacementId);
+          expect(Buffer.byteLength(replacement, 'utf8')).toBe(Buffer.byteLength(contents, 'utf8'));
+          fs.writeFileSync(ledgerPath, replacement, { mode: 0o600 });
+          rewritten = true;
+          return new Date('2026-09-11T08:00:00.000Z');
+        },
+      }),
+    );
+
+    expect(rewritten).toBe(true);
+    expect(failure).toMatchObject({ code: 'AUTOLOOP_DELIVERY_LEDGER_INVALID', retryable: false });
+    const cold = SecureAutoloopLedger.open(workspace, 'run-ack-clock-prefix-rewrite');
+    expect(captureFailure(() => acknowledgeDelivery(cold, intent.delivery_id, intent.payload_sha256))).toMatchObject({
+      code: 'AUTOLOOP_DELIVERY_ACKNOWLEDGEMENT_CONFLICT',
+      retryable: false,
+    });
+  });
+
+  it('fails closed when replay durability rewrites an intent outside the cached tail (break: replay returns acknowledgement without freshly proving its intent)', async () => {
+    // Production break caught: replay validates only its acknowledgement after
+    // durability, so an older same-length intent rewrite can return stale proof.
+    const { acknowledgeDelivery, prepareDelivery } = await import('../autoloop/outbox.js');
+    const workspace = makeWorkspace();
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-ack-replay-prefix-rewrite', { create: true });
+    const intent = prepareDelivery(ledger, {
+      idempotency_key: 'ack-replay-prefix-rewrite',
+      kind: 'coder_directive',
+      target_role: 'coder',
+      target_generation: 1,
+      payload: { directive: 'freshly prove intent on replay' },
+    });
+    acknowledgeDelivery(ledger, intent.delivery_id, intent.payload_sha256, {
+      now: () => new Date('2026-09-11T08:01:00.000Z'),
+    });
+    const ledgerPath = path.join(ledger.directory, 'decisions.jsonl');
+    ledger.appendFlatFile('decisions.jsonl', `${'{"kind":"legacy_seed","padding":"'}${'x'.repeat(8 * 1024)}"}\n`, true);
+    const replacementId = `${intent.delivery_id[0] === 'a' ? 'b' : 'a'}${intent.delivery_id.slice(1)}`;
+    const flush = ledger.flushFlatFile.bind(ledger);
+    let rewritten = false;
+    const flushSpy = vi.spyOn(ledger, 'flushFlatFile').mockImplementation((name) => {
+      const result = flush(name);
+      if (name === 'decisions.jsonl' && !rewritten) {
+        const contents = fs.readFileSync(ledgerPath, 'utf8');
+        const replacement = contents.replace(intent.delivery_id, replacementId);
+        expect(Buffer.byteLength(replacement, 'utf8')).toBe(Buffer.byteLength(contents, 'utf8'));
+        fs.writeFileSync(ledgerPath, replacement, { mode: 0o600 });
+        rewritten = true;
+      }
+      return result;
+    });
+
+    try {
+      const failure = captureFailure(() => acknowledgeDelivery(ledger, intent.delivery_id, intent.payload_sha256));
+      expect(rewritten).toBe(true);
+      expect(failure).toMatchObject({ code: 'AUTOLOOP_DELIVERY_LEDGER_INVALID', retryable: false });
+    } finally {
+      flushSpy.mockRestore();
+    }
+
+    const cold = SecureAutoloopLedger.open(workspace, 'run-ack-replay-prefix-rewrite');
+    expect(captureFailure(() => acknowledgeDelivery(cold, intent.delivery_id, intent.payload_sha256))).toMatchObject({
+      code: 'AUTOLOOP_DELIVERY_LEDGER_INVALID',
+      retryable: false,
+    });
+  });
+
+  it('fails closed when a fresh acknowledgement pathname is identically replaced after its barrier before final observation', async () => {
+    // Production break caught: the final acknowledgement observation can prove
+    // identical bytes from a new pathname inode that the barrier never flushed.
+    const { acknowledgeDelivery, prepareDelivery } = await import('../autoloop/outbox.js');
+    const workspace = makeWorkspace();
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-ack-fresh-post-barrier-inode-replacement', {
+      create: true,
+    });
+    const intent = prepareDelivery(ledger, {
+      idempotency_key: 'ack-fresh-post-barrier-inode-replacement',
+      kind: 'coder_directive',
+      target_role: 'coder',
+      target_generation: 1,
+      payload: { directive: 'bind final acknowledgement proof to its flushed inode' },
+    });
+    const ledgerPath = path.join(ledger.directory, 'decisions.jsonl');
+    const flush = ledger.flushFlatFile.bind(ledger);
+    const open = ledger.openFlatFile.bind(ledger);
+    let barrierComplete = false;
+    let readsAfterBarrier = 0;
+    let swapped = false;
+    const flushSpy = vi.spyOn(ledger, 'flushFlatFile').mockImplementation((name) => {
+      const flushed = flush(name);
+      if (name === 'decisions.jsonl') barrierComplete = true;
+      return flushed;
+    });
+    const openSpy = vi.spyOn(ledger, 'openFlatFile').mockImplementation((name, mode, create) => {
+      if (name === 'decisions.jsonl' && mode === 'read' && barrierComplete) {
+        readsAfterBarrier += 1;
+      }
+      if (name === 'decisions.jsonl' && mode === 'read' && readsAfterBarrier === 2 && !swapped) {
+        const replacementPath = path.join(ledger.directory, 'decisions.fresh-post-barrier-replacement.jsonl');
+        fs.writeFileSync(replacementPath, fs.readFileSync(ledgerPath), { mode: 0o600 });
+        fs.renameSync(replacementPath, ledgerPath);
+        swapped = true;
+      }
+      return open(name, mode, create);
+    });
+
+    try {
+      const first = captureFailure(() =>
+        acknowledgeDelivery(ledger, intent.delivery_id, intent.payload_sha256, {
+          now: () => new Date('2026-09-11T10:00:00.000Z'),
+        }),
+      );
+      const retry = captureFailure(() => acknowledgeDelivery(ledger, intent.delivery_id, intent.payload_sha256));
+
+      expect(first).toMatchObject({
+        code: 'AUTOLOOP_DELIVERY_COMMITTED_OBSERVATION_FAILED',
+        committed: true,
+        retryable: false,
+      });
+      expect(retry).toBe(first);
+    } finally {
+      openSpy.mockRestore();
+      flushSpy.mockRestore();
+    }
+
+    expect(swapped).toBe(true);
+  });
+
+  it('fails closed when an acknowledgement replay pathname is identically replaced after its barrier before final observation', async () => {
+    // Production break caught: replay can return an acknowledgement from a
+    // replacement inode after flushing the old pathname inode.
+    const { acknowledgeDelivery, prepareDelivery } = await import('../autoloop/outbox.js');
+    const workspace = makeWorkspace();
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-ack-replay-post-barrier-inode-replacement', {
+      create: true,
+    });
+    const intent = prepareDelivery(ledger, {
+      idempotency_key: 'ack-replay-post-barrier-inode-replacement',
+      kind: 'review_request',
+      target_role: 'reviewer',
+      target_generation: 1,
+      payload: { scope: 'bind replay proof to its flushed inode' },
+    });
+    acknowledgeDelivery(ledger, intent.delivery_id, intent.payload_sha256, {
+      now: () => new Date('2026-09-11T10:01:00.000Z'),
+    });
+    const ledgerPath = path.join(ledger.directory, 'decisions.jsonl');
+    const flush = ledger.flushFlatFile.bind(ledger);
+    const open = ledger.openFlatFile.bind(ledger);
+    let barrierComplete = false;
+    let swapped = false;
+    const flushSpy = vi.spyOn(ledger, 'flushFlatFile').mockImplementation((name) => {
+      const flushed = flush(name);
+      if (name === 'decisions.jsonl') barrierComplete = true;
+      return flushed;
+    });
+    const openSpy = vi.spyOn(ledger, 'openFlatFile').mockImplementation((name, mode, create) => {
+      if (name === 'decisions.jsonl' && mode === 'read' && barrierComplete && !swapped) {
+        const replacementPath = path.join(ledger.directory, 'decisions.replay-post-barrier-replacement.jsonl');
+        fs.writeFileSync(replacementPath, fs.readFileSync(ledgerPath), { mode: 0o600 });
+        fs.renameSync(replacementPath, ledgerPath);
+        swapped = true;
+      }
+      return open(name, mode, create);
+    });
+
+    try {
+      const failure = captureFailure(() => acknowledgeDelivery(ledger, intent.delivery_id, intent.payload_sha256));
+
+      expect(failure).toMatchObject({
+        code: 'AUTOLOOP_DELIVERY_LEDGER_INVALID',
+        retryable: false,
+      });
+      expect(failure).not.toHaveProperty('committed');
+    } finally {
+      openSpy.mockRestore();
+      flushSpy.mockRestore();
+    }
+
+    expect(swapped).toBe(true);
+  });
+
+  it('latches committed recovery failure when its final acknowledgement observation sees an identical replacement inode', async () => {
+    // Production break caught: committed recovery accepts identical replacement
+    // bytes after its recovery barrier, despite never flushing that inode.
+    const { acknowledgeDelivery, prepareDelivery } = await import('../autoloop/outbox.js');
+    const workspace = makeWorkspace();
+    const originalBarrier = new Error('original acknowledgement directory barrier');
+    let failCommitBarrier = false;
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-ack-recovery-post-barrier-inode-replacement', {
+      create: true,
+      testHooks: {
+        beforeDirectorySync: ({ name }) => {
+          if (name === 'decisions.jsonl' && failCommitBarrier) {
+            failCommitBarrier = false;
+            throw originalBarrier;
+          }
+        },
+      },
+    });
+    const intent = prepareDelivery(ledger, {
+      idempotency_key: 'ack-recovery-post-barrier-inode-replacement',
+      kind: 'coder_directive',
+      target_role: 'coder',
+      target_generation: 1,
+      payload: { directive: 'bind recovered proof to its flushed inode' },
+    });
+    const ledgerPath = path.join(ledger.directory, 'decisions.jsonl');
+    const flush = ledger.flushFlatFile.bind(ledger);
+    const open = ledger.openFlatFile.bind(ledger);
+    let barrierComplete = false;
+    let swapped = false;
+    const flushSpy = vi.spyOn(ledger, 'flushFlatFile').mockImplementation((name) => {
+      const flushed = flush(name);
+      if (name === 'decisions.jsonl') barrierComplete = true;
+      return flushed;
+    });
+    const openSpy = vi.spyOn(ledger, 'openFlatFile').mockImplementation((name, mode, create) => {
+      if (name === 'decisions.jsonl' && mode === 'read' && barrierComplete && !swapped) {
+        const replacementPath = path.join(ledger.directory, 'decisions.recovery-post-barrier-replacement.jsonl');
+        fs.writeFileSync(replacementPath, fs.readFileSync(ledgerPath), { mode: 0o600 });
+        fs.renameSync(replacementPath, ledgerPath);
+        swapped = true;
+      }
+      return open(name, mode, create);
+    });
+    failCommitBarrier = true;
+
+    try {
+      const first = captureFailure(() =>
+        acknowledgeDelivery(ledger, intent.delivery_id, intent.payload_sha256, {
+          now: () => new Date('2026-09-11T10:02:00.000Z'),
+        }),
+      );
+      const retry = captureFailure(() => acknowledgeDelivery(ledger, intent.delivery_id, intent.payload_sha256));
+
+      expect(first).toMatchObject({
+        code: 'AUTOLOOP_DELIVERY_COMMITTED_OBSERVATION_FAILED',
+        committed: true,
+        retryable: false,
+        cause: expect.objectContaining({
+          code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+          cause: originalBarrier,
+        }),
+      });
+      expect(first.secondaryErrors).toEqual(expect.arrayContaining([expect.any(Error)]));
+      expect(retry).toBe(first);
+    } finally {
+      openSpy.mockRestore();
+      flushSpy.mockRestore();
+    }
+
+    expect(swapped).toBe(true);
+  });
+
+  it('stops a mismatched acknowledgement before changing the ledger (break: digest mismatch is accepted)', async () => {
+    // Production break caught: acknowledgeDelivery accepts a digest different from the persisted delivery intent.
+    const outbox = (await import('../autoloop/outbox.js')) as typeof import('../autoloop/outbox.js') & {
+      acknowledgeDelivery: (ledger: SecureAutoloopLedger, deliveryId: string, payloadSha256: string) => unknown;
+    };
+    const workspace = makeWorkspace();
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-ack-digest-mismatch', { create: true });
+    const intent = outbox.prepareDelivery(ledger, {
+      idempotency_key: 'ack-digest-mismatch',
+      kind: 'coder_directive',
+      target_role: 'coder',
+      target_generation: 1,
+      payload: { directive: 'require exact digest' },
+    });
+    const before = fs.readFileSync(path.join(ledger.directory, 'decisions.jsonl'));
+
+    const failure = captureFailure(() => outbox.acknowledgeDelivery(ledger, intent.delivery_id, 'b'.repeat(64)));
+
+    expect(failure).toMatchObject({
+      code: 'AUTOLOOP_DELIVERY_ACKNOWLEDGEMENT_CONFLICT',
+      retryable: false,
+    });
+    expect(fs.readFileSync(path.join(ledger.directory, 'decisions.jsonl'))).toEqual(before);
+  });
+
+  it('stops an acknowledgement for an unknown delivery before changing the ledger (break: orphan acknowledgement is persisted)', async () => {
+    // Production break caught: acknowledgeDelivery creates durable evidence for a delivery that was never prepared.
+    const outbox = (await import('../autoloop/outbox.js')) as typeof import('../autoloop/outbox.js') & {
+      acknowledgeDelivery: (ledger: SecureAutoloopLedger, deliveryId: string, payloadSha256: string) => unknown;
+    };
+    const workspace = makeWorkspace();
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-ack-unknown-delivery', { create: true });
+
+    const failure = captureFailure(() => outbox.acknowledgeDelivery(ledger, 'unknown-delivery', 'a'.repeat(64)));
+
+    expect(failure).toMatchObject({
+      code: 'AUTOLOOP_DELIVERY_ACKNOWLEDGEMENT_CONFLICT',
+      retryable: false,
+    });
+    expect(fs.existsSync(path.join(ledger.directory, 'decisions.jsonl'))).toBe(false);
+  });
+
+  it('fails closed on ambiguous acknowledgement evidence (break: duplicate acknowledgement rows are silently accepted)', async () => {
+    // Production break caught: a duplicate acknowledgement in decisions.jsonl is treated as an idempotent replay.
+    const outbox = (await import('../autoloop/outbox.js')) as typeof import('../autoloop/outbox.js') & {
+      acknowledgeDelivery: (ledger: SecureAutoloopLedger, deliveryId: string, payloadSha256: string) => unknown;
+    };
+    const workspace = makeWorkspace();
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-ack-ambiguous-evidence', { create: true });
+    const intent = outbox.prepareDelivery(ledger, {
+      idempotency_key: 'ack-ambiguous-evidence',
+      kind: 'coder_directive',
+      target_role: 'coder',
+      target_generation: 1,
+      payload: { directive: 'reject ambiguous proof' },
+    });
+    const acknowledgement = {
+      schema_version: 1,
+      delivery_id: intent.delivery_id,
+      payload_sha256: intent.payload_sha256,
+      acknowledged_at: '2026-09-11T06:02:00.000Z',
+    };
+    ledger.appendFlatFile(
+      'decisions.jsonl',
+      `${JSON.stringify(acknowledgement)}\n${JSON.stringify(acknowledgement)}\n`,
+      true,
+    );
+    const before = fs.readFileSync(path.join(ledger.directory, 'decisions.jsonl'));
+
+    const failure = captureFailure(() => outbox.acknowledgeDelivery(ledger, intent.delivery_id, intent.payload_sha256));
+
+    expect(failure).toMatchObject({ code: 'AUTOLOOP_DELIVERY_LEDGER_INVALID', retryable: false });
+    expect(fs.readFileSync(path.join(ledger.directory, 'decisions.jsonl'))).toEqual(before);
+  });
+
+  it('rejects an acknowledgement that precedes its matching intent without mutating the durable ledger (break: row-order loss accepts causal inversion)', async () => {
+    // Production break caught: rebuilding lookup maps without row order accepts an
+    // acknowledgement as proof even when its intent is appended only afterwards.
+    const { lookupByIdempotencyKey, prepareDelivery } = await import('../autoloop/outbox.js');
+    const workspace = makeWorkspace();
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-ack-before-intent', { create: true });
+    const intent = prepareDelivery(ledger, {
+      idempotency_key: 'ack-before-intent',
+      kind: 'coder_directive',
+      target_role: 'coder',
+      target_generation: 1,
+      payload: { directive: 'require causal durable evidence' },
+    });
+    const acknowledgement = {
+      schema_version: 1,
+      delivery_id: intent.delivery_id,
+      payload_sha256: intent.payload_sha256,
+      acknowledged_at: '2026-09-11T06:03:00.000Z',
+    };
+    const ledgerPath = path.join(ledger.directory, 'decisions.jsonl');
+    fs.writeFileSync(ledgerPath, `${JSON.stringify(acknowledgement)}\n${JSON.stringify(intent)}\n`, { mode: 0o600 });
+    const before = fs.readFileSync(ledgerPath);
+
+    const coldLedger = SecureAutoloopLedger.open(workspace, 'run-ack-before-intent');
+    const failure = captureFailure(() => lookupByIdempotencyKey(coldLedger, intent.idempotency_key));
+
+    expect(failure).toMatchObject({ code: 'AUTOLOOP_DELIVERY_LEDGER_INVALID', retryable: false });
+    expect(fs.readFileSync(ledgerPath)).toEqual(before);
+  });
+
+  it('rejects an unrelated orphan acknowledgement anywhere in the durable ledger without mutation (break: lookup ignores invalid acknowledgement evidence for another delivery)', async () => {
+    // Production break caught: the requested intent is returned although another
+    // acknowledgement in the same durable graph has no causal intent.
+    const { lookupByIdempotencyKey, prepareDelivery } = await import('../autoloop/outbox.js');
+    const workspace = makeWorkspace();
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-global-orphan-acknowledgement', { create: true });
+    const intent = prepareDelivery(ledger, {
+      idempotency_key: 'global-orphan-acknowledgement',
+      kind: 'review_request',
+      target_role: 'reviewer',
+      target_generation: 1,
+      payload: { scope: 'validate every acknowledgement' },
+    });
+    const orphan = {
+      schema_version: 1,
+      delivery_id: 'unrelated-orphan-delivery',
+      payload_sha256: 'a'.repeat(64),
+      acknowledged_at: '2026-09-11T06:04:00.000Z',
+    };
+    const ledgerPath = path.join(ledger.directory, 'decisions.jsonl');
+    ledger.appendFlatFile('decisions.jsonl', `${JSON.stringify(orphan)}\n`, true);
+    const before = fs.readFileSync(ledgerPath);
+
+    const failure = captureFailure(() => lookupByIdempotencyKey(ledger, intent.idempotency_key));
+
+    expect(failure).toMatchObject({ code: 'AUTOLOOP_DELIVERY_LEDGER_INVALID', retryable: false });
+    expect(fs.readFileSync(ledgerPath)).toEqual(before);
+  });
+
+  it('rejects duplicate delivery IDs globally even when the requested idempotency key is otherwise unique (break: lookup validates only the queried map entry)', async () => {
+    // Production break caught: two distinct intent rows can claim one delivery ID
+    // while a lookup of an unrelated, unique idempotency key succeeds.
+    const { lookupByIdempotencyKey, prepareDelivery } = await import('../autoloop/outbox.js');
+    const workspace = makeWorkspace();
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-global-duplicate-delivery-id', { create: true });
+    const first = prepareDelivery(ledger, {
+      idempotency_key: 'first-delivery-id-claim',
+      kind: 'coder_directive',
+      target_role: 'coder',
+      target_generation: 1,
+      payload: { directive: 'first claim' },
+    });
+    const clean = prepareDelivery(ledger, {
+      idempotency_key: 'unrelated-unique-delivery-id-key',
+      kind: 'review_request',
+      target_role: 'reviewer',
+      target_generation: 1,
+      payload: { scope: 'must not hide graph corruption' },
+    });
+    const duplicateDeliveryId = { ...first, idempotency_key: 'second-delivery-id-claim' };
+    const ledgerPath = path.join(ledger.directory, 'decisions.jsonl');
+    ledger.appendFlatFile('decisions.jsonl', `${JSON.stringify(duplicateDeliveryId)}\n`, true);
+    const before = fs.readFileSync(ledgerPath);
+
+    const failure = captureFailure(() => lookupByIdempotencyKey(ledger, clean.idempotency_key));
+
+    expect(failure).toMatchObject({ code: 'AUTOLOOP_DELIVERY_IDEMPOTENCY_CONFLICT', retryable: false });
+    expect(fs.readFileSync(ledgerPath)).toEqual(before);
+  });
+
+  it('rejects duplicate idempotency keys globally even when the requested key is otherwise unique (break: lookup leaves unrelated duplicate intent claims unchecked)', async () => {
+    // Production break caught: two distinct intent rows can share an idempotency
+    // key without invalidating a lookup for another delivery.
+    const { lookupByIdempotencyKey, prepareDelivery } = await import('../autoloop/outbox.js');
+    const workspace = makeWorkspace();
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-global-duplicate-idempotency-key', { create: true });
+    const first = prepareDelivery(ledger, {
+      idempotency_key: 'duplicated-idempotency-key',
+      kind: 'coder_directive',
+      target_role: 'coder',
+      target_generation: 1,
+      payload: { directive: 'first idempotency claim' },
+    });
+    const clean = prepareDelivery(ledger, {
+      idempotency_key: 'unrelated-unique-idempotency-key',
+      kind: 'review_request',
+      target_role: 'reviewer',
+      target_generation: 1,
+      payload: { scope: 'must not hide duplicate key corruption' },
+    });
+    const duplicateKey = { ...first, delivery_id: 'different-delivery-for-same-idempotency-key' };
+    const ledgerPath = path.join(ledger.directory, 'decisions.jsonl');
+    ledger.appendFlatFile('decisions.jsonl', `${JSON.stringify(duplicateKey)}\n`, true);
+    const before = fs.readFileSync(ledgerPath);
+
+    const failure = captureFailure(() => lookupByIdempotencyKey(ledger, clean.idempotency_key));
+
+    expect(failure).toMatchObject({ code: 'AUTOLOOP_DELIVERY_IDEMPOTENCY_CONFLICT', retryable: false });
+    expect(fs.readFileSync(ledgerPath)).toEqual(before);
+  });
+
+  it('reconciles a committed acknowledgement after its first directory barrier fails (break: committed acknowledgement returns false success or appends twice)', async () => {
+    // Production break caught: a post-append durability ambiguity loses or duplicates a committed acknowledgement.
+    const outbox = (await import('../autoloop/outbox.js')) as typeof import('../autoloop/outbox.js') & {
+      acknowledgeDelivery: (ledger: SecureAutoloopLedger, deliveryId: string, payloadSha256: string) => unknown;
+    };
+    const workspace = makeWorkspace();
+    let failOnce = false;
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-ack-committed-reconciliation', {
+      create: true,
+      testHooks: {
+        beforeDirectorySync: ({ name }) => {
+          if (name === 'decisions.jsonl' && failOnce) {
+            failOnce = false;
+            throw new Error('injected acknowledgement directory barrier failure');
+          }
+        },
+      },
+    });
+    const intent = outbox.prepareDelivery(ledger, {
+      idempotency_key: 'ack-committed-reconciliation',
+      kind: 'coder_directive',
+      target_role: 'coder',
+      target_generation: 1,
+      payload: { directive: 'reconcile after commit' },
+    });
+    failOnce = true;
+
+    const acknowledgement = outbox.acknowledgeDelivery(ledger, intent.delivery_id, intent.payload_sha256);
+
+    const rows = fs
+      .readFileSync(path.join(ledger.directory, 'decisions.jsonl'), 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((row) => row.delivery_id === intent.delivery_id && Object.hasOwn(row, 'acknowledged_at'));
+    expect(rows).toEqual([acknowledgement]);
+  });
+
+  it('latches committed observation failure when recovery finds a same-length rewritten acknowledgement timestamp', async () => {
+    // Production break caught: recovery accepted a timestamp reread from disk
+    // rather than the timestamp serialized by this invocation.
+    const { acknowledgeDelivery, prepareDelivery } = await import('../autoloop/outbox.js');
+    const workspace = makeWorkspace();
+    const originalBarrier = new Error('original acknowledgement directory barrier');
+    const originalTime = '2026-09-11T08:00:00.000Z';
+    const replacementTime = '2026-09-11T09:00:00.000Z';
+    let failOnce = false;
+    let rewritten = false;
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-ack-committed-timestamp-rewrite', {
+      create: true,
+      testHooks: {
+        beforeDirectorySync: ({ name }) => {
+          if (name !== 'decisions.jsonl' || !failOnce) return;
+          failOnce = false;
+          const ledgerPath = path.join(ledger.directory, 'decisions.jsonl');
+          const contents = fs.readFileSync(ledgerPath, 'utf8');
+          const replacement = contents.replace(originalTime, replacementTime);
+          expect(Buffer.byteLength(replacement, 'utf8')).toBe(Buffer.byteLength(contents, 'utf8'));
+          fs.writeFileSync(ledgerPath, replacement, { mode: 0o600 });
+          rewritten = true;
+          throw originalBarrier;
+        },
+      },
+    });
+    const intent = prepareDelivery(ledger, {
+      idempotency_key: 'ack-committed-timestamp-rewrite',
+      kind: 'coder_directive',
+      target_role: 'coder',
+      target_generation: 1,
+      payload: { directive: 'reject rewritten committed acknowledgement timestamp' },
+    });
+    failOnce = true;
+
+    const first = captureFailure(() =>
+      acknowledgeDelivery(ledger, intent.delivery_id, intent.payload_sha256, { now: () => new Date(originalTime) }),
+    );
+    const retry = captureFailure(() =>
+      acknowledgeDelivery(ledger, intent.delivery_id, intent.payload_sha256, { now: () => new Date(originalTime) }),
+    );
+
+    expect(rewritten).toBe(true);
+    expect(first).toMatchObject({
+      code: 'AUTOLOOP_DELIVERY_COMMITTED_OBSERVATION_FAILED',
+      committed: true,
+      retryable: false,
+      cause: expect.objectContaining({
+        code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+        cause: originalBarrier,
+      }),
+    });
+    expect(first.secondaryErrors).toEqual(expect.arrayContaining([expect.any(Error)]));
+    expect(retry).toBe(first);
+  });
+
+  it('gives concurrent identical acknowledgements one durable record (break: parallel acknowledgement callers append duplicates)', async () => {
+    // Production break caught: separate processes both observe an unacknowledged intent and append duplicate acknowledgements.
+    const { prepareDelivery } = await import('../autoloop/outbox.js');
+    const workspace = makeWorkspace();
+    const runId = 'run-concurrent-identical-acknowledgements';
+    const ledger = SecureAutoloopLedger.open(workspace, runId, { create: true });
+    const intent = prepareDelivery(ledger, {
+      idempotency_key: 'concurrent-identical-acknowledgements',
+      kind: 'coder_directive',
+      target_role: 'coder',
+      target_generation: 1,
+      payload: { directive: 'only one acknowledgement may become durable' },
+    });
+    const first = spawnAcknowledgementWorker(workspace, runId, intent.delivery_id, intent.payload_sha256);
+    const second = spawnAcknowledgementWorker(workspace, runId, intent.delivery_id, intent.payload_sha256);
+    await Promise.all([nextWorkerMessage(first), nextWorkerMessage(second)]);
+    first.send('go');
+    second.send('go');
+    const results = await Promise.all([nextWorkerMessage(first), nextWorkerMessage(second)]);
+    const exitCodes = await Promise.all(
+      [first, second].map(async (worker) =>
+        worker.exitCode === null ? (await once(worker, 'exit'))[0] : worker.exitCode,
+      ),
+    );
+    const rows = fs
+      .readFileSync(path.join(ledger.directory, 'decisions.jsonl'), 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((row) => row.delivery_id === intent.delivery_id && Object.hasOwn(row, 'acknowledged_at'));
+
+    expect(exitCodes).toEqual([0, 0]);
+    expect(results).toEqual([
+      { type: 'result', acknowledgement: rows[0] },
+      { type: 'result', acknowledgement: rows[0] },
+    ]);
+    expect(rows).toHaveLength(1);
+  });
+
   it('makes a complete versioned intent durable before the caller can begin transport', async () => {
     const { prepareDelivery } = await import('../autoloop/outbox.js');
     const durabilityOrder: string[] = [];
@@ -2031,8 +2898,8 @@ describe('Autoloop delivery outbox', () => {
     expect(fs.readFileSync(ledgerPath)).toEqual(before);
   });
 
-  it('ignores unrelated legacy decisions and the reserved acknowledgement shape', async () => {
-    const { lookupByIdempotencyKey, prepareDelivery } = await import('../autoloop/outbox.js');
+  it('rejects an orphan reserved acknowledgement among otherwise compatible legacy decisions', async () => {
+    const { prepareDelivery } = await import('../autoloop/outbox.js');
     const workspace = makeWorkspace();
     const ledger = SecureAutoloopLedger.open(workspace, 'run-compatible-rows', { create: true });
     const compatibleRows = [
@@ -2052,16 +2919,21 @@ describe('Autoloop delivery outbox', () => {
     ];
     ledger.appendFlatFile('decisions.jsonl', `${compatibleRows.map((row) => JSON.stringify(row)).join('\n')}\n`, true);
 
-    const intent = prepareDelivery(ledger, {
-      idempotency_key: 'coder-after-compatible-rows',
-      kind: 'coder_directive',
-      target_role: 'coder',
-      target_generation: 1,
-      payload: { directive: 'continue' },
-    });
+    const ledgerPath = path.join(ledger.directory, 'decisions.jsonl');
+    const before = fs.readFileSync(ledgerPath);
 
-    expect(lookupByIdempotencyKey(ledger, 'legacy-review')).toBeUndefined();
-    expect(lookupByIdempotencyKey(ledger, 'coder-after-compatible-rows')).toEqual(intent);
+    const failure = captureFailure(() =>
+      prepareDelivery(ledger, {
+        idempotency_key: 'coder-after-compatible-rows',
+        kind: 'coder_directive',
+        target_role: 'coder',
+        target_generation: 1,
+        payload: { directive: 'continue' },
+      }),
+    );
+
+    expect(failure).toMatchObject({ code: 'AUTOLOOP_DELIVERY_LEDGER_INVALID', retryable: false });
+    expect(fs.readFileSync(ledgerPath)).toEqual(before);
   });
 
   it('rejects duplicate persisted idempotency keys instead of returning the first claim', async () => {
