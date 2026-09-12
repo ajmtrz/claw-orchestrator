@@ -1128,6 +1128,112 @@ describe('AutoloopRunner', () => {
     expect(iterDoneEvent).toEqual({ iter: 0, verdict: 'advance', metric: 0.9 });
   });
 
+  it('persists the canonical automatic Reviewer envelope before queueing it', async () => {
+    const persisted: AnyAutoloopMessage[] = [];
+    const dispatcher: AgentDispatcher = {
+      async deliver(env) {
+        if (env.type === 'review_request') {
+          // This assertion catches a regression where the queue accepts the
+          // Reviewer effect before its exact recovery envelope is durable.
+          expect(persisted).toEqual([env]);
+        }
+        return [];
+      },
+    };
+    const { runner } = makeRunner(dispatcher, [], {
+      persistReviewEnvelope: async (envelope: AnyAutoloopMessage) => {
+        persisted.push(envelope);
+      },
+    } as unknown as Partial<AutoloopConfig>);
+    await runner.start();
+
+    await runner.send(Msg.iterArtifacts(7, { diff: 'patch', eval_output: {}, files_changed: ['a.ts'] }));
+
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0]).toMatchObject({
+      iter: 7,
+      from: 'runner',
+      to: 'reviewer',
+      type: 'review_request',
+      payload: { iter: 7, ledger_path: '/tmp/test/ledger', prior_metrics: [] },
+    });
+    runner.stop();
+  });
+
+  it('rejects a Reviewer envelope when termination wins the persist-before-queue boundary', async () => {
+    let releasePersistence!: () => void;
+    const persistenceBlocked = new Promise<void>((resolve) => {
+      releasePersistence = resolve;
+    });
+    let persistenceStarted!: () => void;
+    const persistenceEntered = new Promise<void>((resolve) => {
+      persistenceStarted = resolve;
+    });
+    const dispatcher: AgentDispatcher = {
+      async deliver() {
+        return [];
+      },
+    };
+    const { runner } = makeRunner(dispatcher, [], {
+      persistReviewEnvelope: async () => {
+        persistenceStarted();
+        await persistenceBlocked;
+      },
+    } as unknown as Partial<AutoloopConfig>);
+    await runner.start();
+
+    const review = runner.send(
+      Msg.reviewRequest(0, {
+        iter: 0,
+        ledger_path: '/tmp/test/ledger',
+        prior_metrics: [],
+      }),
+    );
+    await persistenceEntered;
+    await runner.send(Msg.terminate(0, { reason: 'operator-stop' }));
+    releasePersistence();
+
+    await expect(review).rejects.toThrow(/not delivered.*terminal/i);
+    runner.stop();
+  });
+
+  it('rejects automatic Reviewer queueing when termination wins during envelope persistence', async () => {
+    let releasePersistence!: () => void;
+    const persistenceBlocked = new Promise<void>((resolve) => {
+      releasePersistence = resolve;
+    });
+    let persistenceStarted!: () => void;
+    const persistenceEntered = new Promise<void>((resolve) => {
+      persistenceStarted = resolve;
+    });
+    const delivered: AnyAutoloopMessage[] = [];
+    const { runner } = makeRunner(
+      {
+        async deliver(env) {
+          delivered.push(env);
+          return [];
+        },
+      },
+      [],
+      {
+        persistReviewEnvelope: async () => {
+          persistenceStarted();
+          await persistenceBlocked;
+        },
+      } as unknown as Partial<AutoloopConfig>,
+    );
+    await runner.start();
+
+    const artifacts = runner.send(Msg.iterArtifacts(0, { diff: 'patch', eval_output: {}, files_changed: ['a.ts'] }));
+    await persistenceEntered;
+    await runner.send(Msg.terminate(0, { reason: 'operator-stop' }));
+    releasePersistence();
+
+    await expect(artifacts).rejects.toThrow(/not delivered.*terminal/i);
+    expect(delivered).toEqual([]);
+    runner.stop();
+  });
+
   it('terminate halts further dispatch', async () => {
     const dispatcher: AgentDispatcher = {
       async deliver() {
@@ -1284,6 +1390,56 @@ describe('AutoloopRunner', () => {
     await runner.send(Msg.resume(0));
     expect(runner.state.status).toBe('running');
     expect(delivered).toEqual(['directive']);
+    runner.stop();
+  });
+
+  it('rejects a strict root-delivery send instead of parking it while paused', async () => {
+    const delivered: string[] = [];
+    const dispatcher: AgentDispatcher = {
+      async deliver(env) {
+        delivered.push(env.msg_id);
+        return [];
+      },
+    };
+    const { runner } = makeRunner(dispatcher);
+    await runner.start();
+    runner.markSubagentsSpawned();
+    await runner.send(Msg.pause(0, { reason: 'recovery-race' }));
+    const recovery = Msg.directive(0, {
+      goal: 'strict recovery root',
+      constraints: [],
+      success_criteria: [],
+      max_attempts: 1,
+    });
+
+    await expect(runner.send(recovery, { requireRootDelivery: true })).rejects.toThrow(/not delivered.*paused/i);
+    await runner.send(Msg.resume(0));
+
+    expect(delivered).toEqual([]);
+    runner.stop();
+  });
+
+  it('resolves a strict root-delivery send after the dispatcher accepts it', async () => {
+    const delivered: string[] = [];
+    const dispatcher: AgentDispatcher = {
+      async deliver(env) {
+        delivered.push(env.msg_id);
+        return [];
+      },
+    };
+    const { runner } = makeRunner(dispatcher);
+    await runner.start();
+    runner.markSubagentsSpawned();
+    const recovery = Msg.directive(0, {
+      goal: 'strict recovery root',
+      constraints: [],
+      success_criteria: [],
+      max_attempts: 1,
+    });
+
+    await expect(runner.send(recovery, { requireRootDelivery: true })).resolves.toBeUndefined();
+
+    expect(delivered).toEqual([recovery.msg_id]);
     runner.stop();
   });
 

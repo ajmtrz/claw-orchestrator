@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { assessRecovery, computeRecoveryToken } from '../autoloop/recovery.js';
+import {
+  assessRecovery,
+  computeRecoveryToken,
+  parseRecoveryReceipt,
+  recoveryActionDigest,
+} from '../autoloop/recovery.js';
 import type {
   AutoloopPhase,
   PhysicalAgentGeneration,
@@ -105,6 +110,54 @@ describe('assessRecovery', () => {
     expect(assessment.next_safe_action).toBe('none');
   });
 
+  it('makes a disk-only acknowledged Coder directive recoverable instead of claiming a live owner', () => {
+    const assessment = assessRecovery(
+      input({
+        iterations: [{ iter: 0, artifacts: ['directive'] }],
+        deliveries: [
+          {
+            delivery_id: 'delivery-coder-0',
+            iter: 0,
+            kind: 'coder_directive',
+            acknowledged: true,
+          },
+        ],
+        agents: [],
+      }),
+    );
+
+    expect(assessment.phase).toBe('PAUSED_RECOVERABLE');
+    expect(assessment.next_safe_action).toBe('dispatch_coder');
+    expect(assessment.evidence).toContain('recovery:coder:no_live_generation');
+  });
+
+  it('keeps a caller watchdog observation distinct from an absent Coder generation', () => {
+    const assessment = assessRecovery(
+      input({
+        legacy_state: {
+          status: 'paused',
+          iter: 0,
+          subagents_spawned: true,
+          status_reason: 'caller_watchdog_timeout',
+        },
+        iterations: [{ iter: 0, artifacts: ['directive'] }],
+        deliveries: [
+          {
+            delivery_id: 'delivery-coder-0',
+            iter: 0,
+            kind: 'coder_directive',
+            acknowledged: true,
+          },
+        ],
+        agents: [{ generation: generation('coder'), matching_runtime: 'live' }],
+      }),
+    );
+
+    expect(assessment.phase).toBe('CODER_RUNNING');
+    expect(assessment.next_safe_action).toBe('none');
+    expect(assessment.evidence).toContain('legacy:status_reason:caller_watchdog_timeout');
+  });
+
   it('reconstructs awaiting review from the complete Coder artifact set', () => {
     const assessment = assessRecovery(
       input({
@@ -154,6 +207,11 @@ describe('assessRecovery', () => {
   it('moves an advance verdict to the next Planner boundary', () => {
     const assessment = assessRecovery(
       input({
+        legacy_state: {
+          status: 'running',
+          iter: 4,
+          subagents_spawned: true,
+        },
         iterations: [
           {
             iter: 3,
@@ -167,6 +225,38 @@ describe('assessRecovery', () => {
     expect(assessment.phase).toBe('PLANNING');
     expect(assessment.evidence).toContain('iteration:3:verdict:advance');
     expect(assessment.next_safe_action).toBe('resume_planner');
+  });
+
+  it('replays a same-iteration durable verdict that the Runner has not consumed', () => {
+    const assessment = assessRecovery(
+      input({
+        legacy_state: {
+          status: 'running',
+          iter: 3,
+          subagents_spawned: true,
+        },
+        iterations: [
+          {
+            iter: 3,
+            artifacts: ['directive', 'coder_summary', 'eval_output', 'diff'],
+            verdict: 'hold',
+          },
+        ],
+        deliveries: [
+          {
+            delivery_id: 'delivery-reviewer-3',
+            iter: 3,
+            kind: 'review_request',
+            acknowledged: false,
+          },
+        ],
+      }),
+    );
+
+    expect(assessment.phase).toBe('AWAITING_REVIEW');
+    expect(assessment.next_safe_action).toBe('request_review');
+    expect(assessment.pending_delivery_ids).toEqual(['delivery-reviewer-3']);
+    expect(assessment.evidence).toContain('recovery:review:verdict_unconsumed');
   });
 
   it('blocks partial legacy Coder artifacts instead of guessing a phase', () => {
@@ -363,5 +453,57 @@ describe('assessRecovery', () => {
     expect(phase).toBe('AWAITING_REVIEW');
     expect(assessRecoveryFromPublicApi).toBe(assessRecovery);
     expect(computeRecoveryTokenFromPublicApi).toBe(computeRecoveryToken);
+  });
+});
+
+describe('parseRecoveryReceipt', () => {
+  it('rejects inherited, accessor, and unknown receipt fields', () => {
+    const actionSnapshot = { type: 'resume_planner', run_id: 'run-1', iter: 0, phase: 'PLANNING' } as const;
+    const receipt = {
+      schema_version: 1,
+      record_type: 'autoloop_recovery_receipt',
+      kind: 'autoloop_recovery_receipt',
+      run_id: 'run-1',
+      recovery_token: 'a'.repeat(64),
+      action_sha256: recoveryActionDigest(actionSnapshot),
+      action_snapshot: actionSnapshot,
+      claim_id: '12345678-1234-1234-1234-123456789abc',
+      phase: 'PLANNING',
+      next_safe_action: 'resume_planner',
+      status: 'prepared',
+      recorded_at: '2026-09-12T00:00:00.000Z',
+    } as const;
+    const inherited = Object.create(receipt);
+    const accessor = Object.defineProperty({ ...receipt }, 'run_id', {
+      enumerable: true,
+      get: () => 'run-1',
+    });
+
+    expect(parseRecoveryReceipt(inherited)).toBeUndefined();
+    expect(parseRecoveryReceipt(accessor)).toBeUndefined();
+    expect(parseRecoveryReceipt({ ...receipt, extra: true })).toBeUndefined();
+  });
+
+  it.each([
+    ['run_id', 'another-run'],
+    ['phase', 'AWAITING_CODER'],
+  ] as const)('rejects a %s mismatch between a resume_planner snapshot and its receipt', (field, value) => {
+    const actionSnapshot = { type: 'resume_planner', run_id: 'run-1', iter: 0, phase: 'PLANNING' } as const;
+    const receipt = {
+      schema_version: 1,
+      record_type: 'autoloop_recovery_receipt',
+      kind: 'autoloop_recovery_receipt',
+      run_id: 'run-1',
+      recovery_token: 'a'.repeat(64),
+      action_sha256: recoveryActionDigest(actionSnapshot),
+      action_snapshot: actionSnapshot,
+      claim_id: '12345678-1234-1234-1234-123456789abc',
+      phase: 'PLANNING',
+      next_safe_action: 'resume_planner',
+      status: 'prepared',
+      recorded_at: '2026-09-12T00:00:00.000Z',
+    } as const;
+
+    expect(parseRecoveryReceipt({ ...receipt, [field]: value })).toBeUndefined();
   });
 });

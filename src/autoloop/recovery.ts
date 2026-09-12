@@ -4,10 +4,15 @@ import type {
   AutoloopPhase,
   PhysicalAgentGeneration,
   RecoveryAgentEvidence,
+  RecoveryActionSnapshot,
   RecoveryAssessment,
   RecoveryInput,
   RecoveryIterationEvidence,
+  RecoveryReceipt,
+  RecoveryReviewEnvelope,
 } from './types.js';
+import { types as nodeTypes } from 'node:util';
+import { canonicalizeMessage, type AnyAutoloopMessage } from './messages.js';
 
 type NextSafeAction = RecoveryAssessment['next_safe_action'];
 type AssessmentWithoutToken = Omit<RecoveryAssessment, 'recovery_token'>;
@@ -29,6 +34,44 @@ function canonicalJson(value: unknown): string {
 
   if (serialized === undefined) throw new TypeError('Recovery token input is not JSON-serializable');
   return serialized;
+}
+
+/** Stable digest of the exact action envelope reconstructed from durable bytes. */
+export function recoveryActionDigest(action: unknown): string {
+  return createHash('sha256').update(canonicalJson(action), 'utf8').digest('hex');
+}
+
+/** Reconstruct Task-5's immutable routing identity for a recovered agent action. */
+export function recoveryActionDispatchId(
+  runId: string,
+  action: Extract<RecoveryActionSnapshot, { type: 'directive' | 'review_request' }>,
+): string {
+  const identity = [runId, action.msg_id, action.iter, action.from, action.to, action.type];
+  return `dispatch_${createHash('sha256').update(JSON.stringify(identity), 'utf8').digest('hex')}`;
+}
+
+/** Digest an exact Coder/Reviewer envelope using the transport field order. */
+export function recoveryLogicalMessageSha256(
+  envelope: Extract<AnyAutoloopMessage, { type: 'directive' | 'review_request' }>,
+): string {
+  const canonical = canonicalizeMessage(envelope) as Extract<
+    AnyAutoloopMessage,
+    { type: 'directive' | 'review_request' }
+  >;
+  return createHash('sha256')
+    .update(
+      JSON.stringify({
+        msg_id: canonical.msg_id,
+        iter: canonical.iter,
+        from: canonical.from,
+        to: canonical.to,
+        type: canonical.type,
+        ts: canonical.ts,
+        payload: canonical.payload,
+      }),
+      'utf8',
+    )
+    .digest('hex');
 }
 
 function sortEvidence(evidence: Iterable<string>): string[] {
@@ -138,7 +181,20 @@ function deriveLogicalPhase(
   const coderArtifactsComplete = coderArtifactCount === CODER_ARTIFACTS.length;
 
   if (iteration.verdict) {
-    return { phase: 'PLANNING', nextSafeAction: 'resume_planner' };
+    const checkpointIter = input.legacy_state?.iter;
+    if (checkpointIter !== undefined && checkpointIter > iteration.iter) {
+      return { phase: 'PLANNING', nextSafeAction: 'resume_planner' };
+    }
+    if (checkpointIter === iteration.iter && reviewDeliveries.length > 0) {
+      // The Reviewer persisted its canonical verdict before ACK and before the
+      // Runner advanced the durable iteration checkpoint. Replaying the exact
+      // review_request lets Task 5 reconcile the ACK and releases that same
+      // verdict to the Runner without another Reviewer effect.
+      evidence.push('recovery:review:verdict_unconsumed');
+      return { phase: 'AWAITING_REVIEW', nextSafeAction: 'request_review' };
+    }
+    evidence.push(`ambiguity:iteration:${iteration.iter}:verdict_checkpoint_mismatch`);
+    return { phase: 'BLOCKED', nextSafeAction: 'manual_resolution' };
   }
 
   if (reviewDeliveries.length > 0 && !coderArtifactsComplete) {
@@ -212,7 +268,14 @@ function buildAssessment(input: RecoveryInput): AssessmentWithoutToken {
       .filter(({ generation }) => generation.role === neededRole && generation.state !== 'released')
       .sort((left, right) => right.generation.generation - left.generation.generation)[0];
 
-    if (relevant?.blocksRecovery) {
+    if (!relevant && (logicalPhase === 'CODER_RUNNING' || logicalPhase === 'REVIEWER_RUNNING')) {
+      // An acknowledged durable delivery proves the logical dispatch, not a
+      // surviving physical owner. A cold process must never be projected as a
+      // running agent merely because its generation ledger is absent.
+      evidence.push(`recovery:${neededRole}:no_live_generation`);
+      phase = 'PAUSED_RECOVERABLE';
+      nextSafeAction = neededRole === 'coder' ? 'dispatch_coder' : 'request_review';
+    } else if (relevant?.blocksRecovery) {
       evidence.push(`ambiguity:agent:${neededRole}:${relevant.generation.generation}:ownership_unresolved`);
       phase = 'BLOCKED';
       nextSafeAction = 'manual_resolution';
@@ -232,6 +295,9 @@ function buildAssessment(input: RecoveryInput): AssessmentWithoutToken {
       ...new Set(input.deliveries.filter((delivery) => !delivery.acknowledged).map((delivery) => delivery.delivery_id)),
     ].sort(compareStrings),
     next_safe_action: nextSafeAction,
+    action_sha256:
+      input.action_sha256 ??
+      recoveryActionDigest({ kind: 'none', run_id: input.run_id, phase, next_safe_action: nextSafeAction }),
   };
 }
 
@@ -250,5 +316,200 @@ export function assessRecovery(input: RecoveryInput): RecoveryAssessment {
   return {
     ...assessment,
     recovery_token: tokenForAssessment(assessment),
+  };
+}
+
+/**
+ * Convert evidence that cannot safely reconstruct the selected recovery action
+ * into a deterministic inspection result.  Inspection remains read-only while
+ * apply has one stable, token-fenced manual-resolution outcome.
+ */
+export function blockRecoveryAssessment(assessment: RecoveryAssessment, evidence: string): RecoveryAssessment {
+  const blocked: AssessmentWithoutToken = {
+    ...assessment,
+    phase: 'BLOCKED',
+    evidence: sortEvidence([...assessment.evidence, evidence]),
+    next_safe_action: 'manual_resolution',
+  };
+  return { ...blocked, recovery_token: tokenForAssessment(blocked) };
+}
+
+/** Rebind a recovery decision after durable runtime evidence proves it is already satisfied. */
+export function rebindRecoveryAction(
+  assessment: RecoveryAssessment,
+  nextSafeAction: NextSafeAction,
+  actionSha256: string,
+  evidence: string,
+): RecoveryAssessment {
+  const rebound: AssessmentWithoutToken = {
+    ...assessment,
+    next_safe_action: nextSafeAction,
+    action_sha256: actionSha256,
+    evidence: sortEvidence([...assessment.evidence, evidence]),
+  };
+  return { ...rebound, recovery_token: tokenForAssessment(rebound) };
+}
+
+/** Parse only the versioned recovery receipt shape; other decision rows are ignored. */
+export function parseRecoveryReceipt(value: unknown): RecoveryReceipt | undefined {
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    Array.isArray(value) ||
+    nodeTypes.isProxy(value) ||
+    !hasExactOwnDataFields(value, [
+      'schema_version',
+      'record_type',
+      'kind',
+      'run_id',
+      'recovery_token',
+      'action_sha256',
+      'action_snapshot',
+      'claim_id',
+      'phase',
+      'next_safe_action',
+      'status',
+      'recorded_at',
+    ]) ||
+    (value as Partial<RecoveryReceipt>).schema_version !== 1 ||
+    (value as Partial<RecoveryReceipt>).record_type !== 'autoloop_recovery_receipt' ||
+    (value as Partial<RecoveryReceipt>).kind !== 'autoloop_recovery_receipt' ||
+    typeof (value as Partial<RecoveryReceipt>).run_id !== 'string' ||
+    !(value as Partial<RecoveryReceipt>).run_id?.trim() ||
+    (value as Partial<RecoveryReceipt>).run_id?.trim() !== (value as Partial<RecoveryReceipt>).run_id ||
+    typeof (value as Partial<RecoveryReceipt>).recovery_token !== 'string' ||
+    !/^[a-f0-9]{64}$/.test((value as Partial<RecoveryReceipt>).recovery_token ?? '') ||
+    typeof (value as Partial<RecoveryReceipt>).action_sha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test((value as Partial<RecoveryReceipt>).action_sha256 ?? '') ||
+    typeof (value as Partial<RecoveryReceipt>).claim_id !== 'string' ||
+    !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test((value as Partial<RecoveryReceipt>).claim_id ?? '') ||
+    !Object.values({
+      PLANNING: 'PLANNING',
+      AWAITING_CODER: 'AWAITING_CODER',
+      CODER_RUNNING: 'CODER_RUNNING',
+      AWAITING_REVIEW: 'AWAITING_REVIEW',
+      REVIEWER_RUNNING: 'REVIEWER_RUNNING',
+      PAUSED_RECOVERABLE: 'PAUSED_RECOVERABLE',
+      BLOCKED: 'BLOCKED',
+      COMPLETED: 'COMPLETED',
+    }).includes((value as Partial<RecoveryReceipt>).phase ?? '') ||
+    !['none', 'resume_planner', 'dispatch_coder', 'request_review', 'manual_resolution'].includes(
+      (value as Partial<RecoveryReceipt>).next_safe_action ?? '',
+    ) ||
+    ((value as Partial<RecoveryReceipt>).status !== 'prepared' &&
+      (value as Partial<RecoveryReceipt>).status !== 'applied') ||
+    typeof (value as Partial<RecoveryReceipt>).recorded_at !== 'string' ||
+    Number.isNaN(Date.parse((value as Partial<RecoveryReceipt>).recorded_at ?? ''))
+  ) {
+    return undefined;
+  }
+  const candidate = value as RecoveryReceipt;
+  const actionSnapshot = parseRecoveryActionSnapshot(candidate.action_snapshot);
+  if (
+    !actionSnapshot ||
+    recoveryActionDigest(actionSnapshot) !== candidate.action_sha256 ||
+    (actionSnapshot.iter !== undefined && actionSnapshot.iter < 0) ||
+    (candidate.next_safe_action === 'dispatch_coder' && actionSnapshot.type !== 'directive') ||
+    (candidate.next_safe_action === 'request_review' && actionSnapshot.type !== 'review_request') ||
+    (candidate.next_safe_action === 'resume_planner' && actionSnapshot.type !== 'resume_planner') ||
+    (candidate.next_safe_action === 'none' && actionSnapshot.type !== 'none') ||
+    ((actionSnapshot.type === 'none' || actionSnapshot.type === 'resume_planner') &&
+      (actionSnapshot.run_id !== candidate.run_id || actionSnapshot.phase !== candidate.phase)) ||
+    candidate.next_safe_action === 'manual_resolution'
+  ) {
+    return undefined;
+  }
+  return { ...candidate, action_snapshot: actionSnapshot };
+}
+
+function hasExactOwnDataFields(value: object, expected: readonly string[]): boolean {
+  if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return false;
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== expected.length || keys.some((key) => typeof key !== 'string' || !expected.includes(key))) {
+    return false;
+  }
+  return expected.every((key) => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return !!descriptor && descriptor.enumerable === true && Object.hasOwn(descriptor, 'value');
+  });
+}
+
+function parseRecoveryActionSnapshot(value: unknown): RecoveryActionSnapshot | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value) || nodeTypes.isProxy(value)) return undefined;
+  const type = (value as { type?: unknown }).type;
+  if (type === 'directive' || type === 'review_request') {
+    let canonical: AnyAutoloopMessage;
+    try {
+      canonical = canonicalizeMessage(value as AnyAutoloopMessage);
+    } catch {
+      return undefined;
+    }
+    if (canonical.type !== type || JSON.stringify(canonical) !== JSON.stringify(value)) return undefined;
+    return canonical;
+  }
+  if (
+    (type !== 'none' && type !== 'resume_planner') ||
+    !hasExactOwnDataFields(value, ['type', 'run_id', 'iter', 'phase']) ||
+    typeof (value as { run_id?: unknown }).run_id !== 'string' ||
+    !(value as { run_id: string }).run_id.trim() ||
+    !Number.isSafeInteger((value as { iter?: unknown }).iter) ||
+    (value as { iter: number }).iter < 0 ||
+    ![
+      'PLANNING',
+      'AWAITING_CODER',
+      'CODER_RUNNING',
+      'AWAITING_REVIEW',
+      'REVIEWER_RUNNING',
+      'PAUSED_RECOVERABLE',
+      'BLOCKED',
+      'COMPLETED',
+    ].includes(String((value as { phase?: unknown }).phase))
+  ) {
+    return undefined;
+  }
+  return { ...(value as Extract<RecoveryActionSnapshot, { type: 'none' | 'resume_planner' }>) };
+}
+
+/** Parse one strict, canonical, run-bound exact Reviewer recovery envelope. */
+export function parseRecoveryReviewEnvelope(value: unknown): RecoveryReviewEnvelope | undefined {
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    Array.isArray(value) ||
+    !hasExactOwnDataFields(value, ['schema_version', 'record_type', 'kind', 'run_id', 'envelope'])
+  ) {
+    return undefined;
+  }
+  const candidate = value as Partial<RecoveryReviewEnvelope>;
+  if (
+    candidate.schema_version !== 1 ||
+    candidate.record_type !== 'autoloop_recovery_review_envelope' ||
+    candidate.kind !== 'autoloop_recovery_review_envelope' ||
+    typeof candidate.run_id !== 'string' ||
+    !candidate.run_id.trim() ||
+    candidate.run_id.trim() !== candidate.run_id
+  ) {
+    return undefined;
+  }
+  let envelope: AnyAutoloopMessage;
+  try {
+    envelope = canonicalizeMessage(candidate.envelope as AnyAutoloopMessage);
+  } catch {
+    return undefined;
+  }
+  if (
+    envelope.type !== 'review_request' ||
+    envelope.from !== 'runner' ||
+    envelope.to !== 'reviewer' ||
+    JSON.stringify(envelope) !== JSON.stringify(candidate.envelope)
+  ) {
+    return undefined;
+  }
+  return {
+    schema_version: 1,
+    record_type: 'autoloop_recovery_review_envelope',
+    kind: 'autoloop_recovery_review_envelope',
+    run_id: candidate.run_id,
+    envelope,
   };
 }

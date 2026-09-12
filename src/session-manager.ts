@@ -42,6 +42,10 @@ const PERSIST_DIR = path.join(os.homedir(), '.openclaw');
 const PERSIST_FILE = path.join(PERSIST_DIR, 'claude-sessions.json');
 const PERSIST_LOCK_FILE = `${PERSIST_FILE}.lock`;
 const MAX_RELEASED_REVIEW_IDENTITIES_PER_RUN = 64;
+/** A recovery envelope is written before queue acceptance and may be replayed once by a crash retry. */
+const MAX_RECOVERY_REVIEW_ENVELOPE_DUPLICATES = 2;
+/** Bound untrusted decision-ledger indexing during cold recovery. */
+const MAX_RECOVERY_REVIEW_ENVELOPE_INDEX_ROWS = 128;
 // PERSIST_DISK_TTL_MS imported from ./constants.js
 
 interface PersistedSession {
@@ -394,18 +398,42 @@ import type {
   AgentRuntimeProbe,
   AutoloopChatStateCode,
   AutoloopState,
+  RecoveryAgentEvidence,
+  RecoveryActionSnapshot,
+  RecoveryAssessment,
+  RecoveryDeliveryEvidence,
+  RecoveryIterationEvidence,
+  RecoveryReceipt,
+  RecoveryReviewEnvelope,
+  RecoveryResult,
   PhysicalAgentGeneration,
   PublicAutoloopFailure,
   PublicAutoloopFailureCode,
   PushPolicy,
 } from './autoloop/types.js';
 import {
+  AutoloopRecoveryError,
   AutoloopAgentReleaseOwnerError,
   DEFAULT_PUSH_POLICY,
   DEFAULT_SEND_TIMEOUT_MS,
   isRecoverableAgentOwnerInstanceId,
   validateAutoloopTimeoutConfig,
 } from './autoloop/types.js';
+import {
+  assessRecovery,
+  blockRecoveryAssessment,
+  parseRecoveryReceipt,
+  parseRecoveryReviewEnvelope,
+  rebindRecoveryAction,
+  recoveryActionDispatchId,
+  recoveryActionDigest,
+  recoveryLogicalMessageSha256,
+} from './autoloop/recovery.js';
+import {
+  parseOutboxDecisionLedgerRow,
+  validateOutboxDecisionLedgerGraph,
+  type DeliveryLedgerRow,
+} from './autoloop/outbox.js';
 import {
   Msg as AutoloopMsg,
   canonicalizeRequestReviewArgs,
@@ -3965,6 +3993,8 @@ export class SessionManager implements AgentRuntimeProbe {
    */
   private _autoloopChatTransactions = new Map<string, Promise<void>>();
   private _autoloopReviewTransactions = new Map<string, Promise<void>>();
+  /** One in-process recovery transaction per logical run and token; durable receipts fence restarts. */
+  private _autoloopRecoveryTransactions = new Map<string, Promise<RecoveryResult>>();
   private _autoloopReleasedReviewIterations = new Map<string, Map<string, number>>();
   private _autoloopReviewDeleting = new Set<string>();
   private _autoloopReviewDeleteCounts = new Map<string, number>();
@@ -4417,6 +4447,9 @@ export class SessionManager implements AgentRuntimeProbe {
         );
       },
       dispatcher,
+      persistReviewEnvelope: async (envelope) => {
+        this._appendRecoveryReviewEnvelope(secureLedger, runId, envelope);
+      },
       sendTimeoutMs: opts.sendTimeoutMs,
       activityLeaseMs: opts.activityLeaseMs,
       autoloopHardTimeoutMs: opts.autoloopHardTimeoutMs,
@@ -5004,6 +5037,1180 @@ export class SessionManager implements AgentRuntimeProbe {
       );
     }
     return state;
+  }
+
+  private _recoveryReceiptRows(ledger: SecureAutoloopLedger, runId: string): RecoveryReceipt[] {
+    const rows: RecoveryReceipt[] = [];
+    const contents = ledger.readFlatFile('decisions.jsonl') ?? '';
+    for (const [index, line] of contents.split('\n').entries()) {
+      if (!line) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line) as unknown;
+      } catch {
+        throw new Error(`Autoloop recovery ledger contains malformed JSON at decisions row ${index + 1}`);
+      }
+      const isReceiptRow =
+        typeof parsed === 'object' &&
+        parsed !== null &&
+        (parsed as { record_type?: unknown }).record_type === 'autoloop_recovery_receipt';
+      const receipt = parseRecoveryReceipt(parsed);
+      if (isReceiptRow && !receipt) {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' has malformed recovery receipt at decisions row ${index + 1}`,
+        );
+      }
+      if (!receipt) continue;
+      if (receipt.run_id !== runId) {
+        throw new Error(`Autoloop recovery receipt at decisions row ${index + 1} belongs to another run`);
+      }
+      rows.push(receipt);
+    }
+    const byToken = new Map<string, Array<{ receipt: RecoveryReceipt; index: number }>>();
+    for (const [index, receipt] of rows.entries()) {
+      const matching = byToken.get(receipt.recovery_token) ?? [];
+      matching.push({ receipt, index });
+      byToken.set(receipt.recovery_token, matching);
+    }
+    for (const [token, matching] of byToken) {
+      const prepared = matching.filter(({ receipt }) => receipt.status === 'prepared');
+      const applied = matching.filter(({ receipt }) => receipt.status === 'applied');
+      if (
+        prepared.length !== 1 ||
+        applied.length > 1 ||
+        (applied.length === 1 && applied[0].index < prepared[0].index)
+      ) {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' has an invalid recovery receipt graph for token '${token}'`,
+        );
+      }
+      if (
+        applied[0] &&
+        (applied[0].receipt.action_sha256 !== prepared[0].receipt.action_sha256 ||
+          JSON.stringify(applied[0].receipt.action_snapshot) !== JSON.stringify(prepared[0].receipt.action_snapshot) ||
+          applied[0].receipt.claim_id !== prepared[0].receipt.claim_id ||
+          applied[0].receipt.phase !== prepared[0].receipt.phase ||
+          applied[0].receipt.next_safe_action !== prepared[0].receipt.next_safe_action)
+      ) {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' has conflicting recovery receipt evidence for token '${token}'`,
+        );
+      }
+    }
+    return rows;
+  }
+
+  private _appendRecoveryReceipt(
+    ledger: SecureAutoloopLedger,
+    receipt: RecoveryReceipt,
+    validatePrepared?: (prepared: RecoveryReceipt) => void,
+  ): { receipt: RecoveryReceipt; appended: boolean } {
+    const canonicalReceipt = parseRecoveryReceipt(receipt);
+    if (!canonicalReceipt) {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${receipt.run_id}' recovery receipt is malformed`,
+      );
+    }
+    receipt = canonicalReceipt;
+    const lock = withFileLock(
+      path.join(ledger.directory, '.autoloop-recovery.lock'),
+      () => {
+        // The caller's asynchronous inspection is necessarily outside this
+        // synchronous cross-process lock. Re-read the exact durable action
+        // while holding the lock before its prepared receipt can fence it.
+        // This deliberately cannot await: recovery-envelope persistence uses
+        // this same lock.
+        if (receipt.status === 'prepared') validatePrepared?.(receipt);
+        const rows = this._recoveryReceiptRows(ledger, receipt.run_id);
+        const matching = rows.filter((row) => row.recovery_token === receipt.recovery_token);
+        const existingPrepared = matching.filter((row) => row.status === 'prepared');
+        const existingApplied = matching.filter((row) => row.status === 'applied');
+        if (
+          existingPrepared.length > 1 ||
+          existingApplied.length > 1 ||
+          (existingApplied.length > 0 && existingPrepared.length === 0)
+        ) {
+          throw new AutoloopRecoveryError(
+            'AUTOLOOP_RECOVERY_INCOMPLETE',
+            `Autoloop run '${receipt.run_id}' has ambiguous recovery receipts for the supplied token`,
+          );
+        }
+        if (existingApplied[0]) return { receipt: existingApplied[0], appended: false };
+        if (receipt.status === 'prepared' && existingPrepared[0])
+          return { receipt: existingPrepared[0], appended: false };
+        if (receipt.status === 'prepared') {
+          const appliedTokens = new Set(
+            rows.filter((row) => row.status === 'applied').map((row) => row.recovery_token),
+          );
+          const unresolvedPrepared = rows.find(
+            (row) => row.status === 'prepared' && !appliedTokens.has(row.recovery_token),
+          );
+          if (unresolvedPrepared) {
+            throw new AutoloopRecoveryError(
+              'AUTOLOOP_RECOVERY_INCOMPLETE',
+              `Autoloop run '${receipt.run_id}' has an unresolved prepared recovery receipt`,
+            );
+          }
+        }
+        ledger.appendFlatFile('decisions.jsonl', `${JSON.stringify(receipt)}\n`, true);
+        const observed = this._recoveryReceiptRows(ledger, receipt.run_id).filter(
+          (row) => row.recovery_token === receipt.recovery_token,
+        );
+        const observedStatus = observed.filter((row) => row.status === receipt.status);
+        if (observedStatus.length !== 1) {
+          throw new AutoloopRecoveryError(
+            'AUTOLOOP_RECOVERY_INCOMPLETE',
+            `Autoloop run '${receipt.run_id}' recovery receipt was not durably observed`,
+          );
+        }
+        return { receipt: observedStatus[0], appended: true };
+      },
+      { waitMs: 500 },
+    );
+    if (!lock.ok) {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${receipt.run_id}' recovery receipt lock is ${lock.reason}`,
+      );
+    }
+    return lock.value;
+  }
+
+  /**
+   * Validate the exact action bytes that bind an inspected token immediately
+   * before a prepared receipt is durably appended. This is synchronous because
+   * it executes while `.autoloop-recovery.lock` is owned.
+   */
+  private _validatePreparedRecoveryAction(
+    ledger: SecureAutoloopLedger,
+    receipt: RecoveryReceipt,
+    recovered: {
+      assessment: RecoveryAssessment;
+      state: AutoloopState;
+      directive?: { iter: number; envelope: ReturnType<typeof AutoloopMsg.directive> };
+      review?: RecoveryReviewEnvelope;
+    },
+    expectedEvidenceDigest: string,
+  ): void {
+    const stale = (): never => {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_TOKEN_STALE',
+        `recovery_token is stale for Autoloop run '${receipt.run_id}'`,
+      );
+    };
+    if (
+      receipt.recovery_token !== recovered.assessment.recovery_token ||
+      receipt.action_sha256 !== recovered.assessment.action_sha256 ||
+      this._recoveryClaimEvidenceDigest(ledger, this._recoveryClaimCurrentState(receipt.run_id)) !==
+        expectedEvidenceDigest
+    ) {
+      return stale();
+    }
+
+    let exactAction: RecoveryActionSnapshot;
+    if (receipt.next_safe_action === 'request_review') {
+      if (!recovered.review) return stale();
+      const matches: RecoveryReviewEnvelope[] = [];
+      for (const line of (ledger.readFlatFile('decisions.jsonl') ?? '').split('\n')) {
+        if (!line) continue;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line) as unknown;
+        } catch {
+          return stale();
+        }
+        const review = parseRecoveryReviewEnvelope(parsed);
+        if (review?.run_id === receipt.run_id && review.envelope.msg_id === recovered.review.envelope.msg_id) {
+          matches.push(review);
+        }
+      }
+      if (matches.length !== 1) return stale();
+      exactAction = matches[0].envelope;
+    } else if (receipt.next_safe_action === 'dispatch_coder') {
+      if (!recovered.directive) return stale();
+      const bytes = ledger.readIterationArtifact(recovered.directive.iter, 'directive.json');
+      if (!bytes) return stale();
+      let candidate: Partial<{
+        iter: unknown;
+        message_id: unknown;
+        ts: unknown;
+        goal: unknown;
+        constraints: unknown;
+        success_criteria: unknown;
+        max_attempts: unknown;
+      }>;
+      try {
+        candidate = JSON.parse(bytes.toString('utf8')) as typeof candidate;
+      } catch {
+        return stale();
+      }
+      if (
+        candidate.iter !== recovered.directive.iter ||
+        typeof candidate.message_id !== 'string' ||
+        typeof candidate.ts !== 'string' ||
+        typeof candidate.goal !== 'string' ||
+        !Array.isArray(candidate.constraints) ||
+        !candidate.constraints.every((value) => typeof value === 'string') ||
+        !Array.isArray(candidate.success_criteria) ||
+        !candidate.success_criteria.every((value) => typeof value === 'string') ||
+        !Number.isSafeInteger(candidate.max_attempts)
+      ) {
+        return stale();
+      }
+      exactAction = {
+        msg_id: candidate.message_id,
+        iter: candidate.iter as number,
+        from: 'planner',
+        to: 'coder',
+        type: 'directive',
+        ts: candidate.ts,
+        payload: {
+          goal: candidate.goal,
+          constraints: candidate.constraints,
+          success_criteria: candidate.success_criteria,
+          max_attempts: candidate.max_attempts as number,
+        },
+      };
+    } else {
+      if (receipt.next_safe_action !== 'none' && receipt.next_safe_action !== 'resume_planner') return stale();
+      const currentState = this._recoveryClaimCurrentState(receipt.run_id);
+      if (currentState.iter !== recovered.state.iter) return stale();
+      // The remaining actions have no envelope bytes. Their exact action is
+      // reconstructed from the current live-or-durable boundary so a cold
+      // Planner can reach the disk-boot path without weakening the byte fence.
+      exactAction = {
+        type: receipt.next_safe_action,
+        run_id: receipt.run_id,
+        iter: currentState.iter,
+        phase: receipt.phase,
+      };
+    }
+    if (
+      recoveryActionDigest(exactAction) !== receipt.action_sha256 ||
+      JSON.stringify(exactAction) !== JSON.stringify(receipt.action_snapshot)
+    ) {
+      return stale();
+    }
+  }
+
+  private _recoveryActionSnapshot(recovered: {
+    assessment: RecoveryAssessment;
+    state: AutoloopState;
+    directive?: { iter: number; envelope: ReturnType<typeof AutoloopMsg.directive> };
+    review?: RecoveryReviewEnvelope;
+  }): RecoveryActionSnapshot {
+    if (recovered.assessment.next_safe_action === 'dispatch_coder' && recovered.directive) {
+      return structuredClone(recovered.directive.envelope);
+    }
+    if (recovered.assessment.next_safe_action === 'request_review' && recovered.review) {
+      return structuredClone(recovered.review.envelope);
+    }
+    if (
+      recovered.assessment.next_safe_action === 'none' ||
+      recovered.assessment.next_safe_action === 'resume_planner'
+    ) {
+      return {
+        type: recovered.assessment.next_safe_action,
+        run_id: recovered.assessment.run_id,
+        iter: recovered.state.iter,
+        phase: recovered.assessment.phase,
+      };
+    }
+    throw new AutoloopRecoveryError(
+      'AUTOLOOP_RECOVERY_INCOMPLETE',
+      `Autoloop run '${recovered.assessment.run_id}' lacks an exact recovery action snapshot`,
+    );
+  }
+
+  /** Byte-fence every durable input used to reconstruct a recovery assessment. */
+  private _recoveryClaimEvidenceDigest(ledger: SecureAutoloopLedger, state: AutoloopState): string {
+    const digest = createHash('sha256');
+    const add = (name: string, bytes: Buffer | string | undefined): void => {
+      digest.update(name, 'utf8');
+      digest.update('\0', 'utf8');
+      digest.update(bytes ?? '');
+      digest.update('\0', 'utf8');
+    };
+    add(
+      'state',
+      JSON.stringify({
+        status: state.status,
+        iter: state.iter,
+        subagents_spawned: state.subagents_spawned,
+        status_reason: state.status_reason,
+        pending_dispatch: state.pending_dispatch ?? null,
+      }),
+    );
+    add('decisions.jsonl', ledger.readFlatFile('decisions.jsonl'));
+    add('agent-generations.jsonl', ledger.readFlatFile('agent-generations.jsonl'));
+    for (let iter = 0; iter <= state.iter; iter += 1) {
+      for (const name of [
+        'directive.json',
+        'coder_summary.txt',
+        'eval_output.json',
+        'diff.patch',
+        'verdict.json',
+      ] as const) {
+        add(`iter/${iter}/${name}`, ledger.readIterationArtifact(iter, name));
+      }
+    }
+    return digest.digest('hex');
+  }
+
+  private _recoveryClaimCurrentState(runId: string): AutoloopState {
+    const live = this.kernel.handle<AutoloopHandle & { runner: AutoloopRunner }>(runId, LEGACY_NODE);
+    if (live) return live.runner.state;
+    const record = loadRun(runId);
+    const state = record?.workflow === 'autoloop' ? autoloopStateFromRecord(record) : undefined;
+    if (!state) throw new AutoloopRecoveryError('AUTOLOOP_RECOVERY_TOKEN_STALE', `Autoloop run '${runId}' changed`);
+    return state;
+  }
+
+  /**
+   * Persist one fully canonical Reviewer message at the SessionManager/ledger
+   * boundary. The Runner can only enqueue after this returns, which keeps the
+   * envelope identity independent of transient runner/dispatcher memory.
+   */
+  private _appendRecoveryReviewEnvelope(
+    ledger: SecureAutoloopLedger,
+    runId: string,
+    envelope: Extract<import('./autoloop/messages.js').AnyAutoloopMessage, { type: 'review_request' }>,
+  ): RecoveryReviewEnvelope {
+    const candidate: RecoveryReviewEnvelope = {
+      schema_version: 1,
+      record_type: 'autoloop_recovery_review_envelope',
+      kind: 'autoloop_recovery_review_envelope',
+      run_id: runId,
+      envelope,
+    };
+    const serialized = JSON.stringify(candidate);
+    const rows = (): RecoveryReviewEnvelope[] => {
+      const found: RecoveryReviewEnvelope[] = [];
+      for (const [index, line] of (ledger.readFlatFile('decisions.jsonl') ?? '').split('\n').entries()) {
+        if (!line) continue;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line) as unknown;
+        } catch {
+          throw new AutoloopRecoveryError(
+            'AUTOLOOP_RECOVERY_INCOMPLETE',
+            `Autoloop run '${runId}' has malformed decisions evidence at row ${index + 1}`,
+          );
+        }
+        const isEnvelopeRow =
+          typeof parsed === 'object' &&
+          parsed !== null &&
+          (parsed as { record_type?: unknown }).record_type === 'autoloop_recovery_review_envelope';
+        const row = parseRecoveryReviewEnvelope(parsed);
+        if (isEnvelopeRow && !row) {
+          throw new AutoloopRecoveryError(
+            'AUTOLOOP_RECOVERY_INCOMPLETE',
+            `Autoloop run '${runId}' has malformed Reviewer recovery envelope at row ${index + 1}`,
+          );
+        }
+        if (!row) continue;
+        if (row.run_id !== runId) {
+          throw new AutoloopRecoveryError(
+            'AUTOLOOP_RECOVERY_INCOMPLETE',
+            `Autoloop Reviewer recovery envelope at row ${index + 1} belongs to another run`,
+          );
+        }
+        found.push(row);
+      }
+      return found;
+    };
+    const lock = withFileLock(
+      path.join(ledger.directory, '.autoloop-recovery.lock'),
+      () => {
+        const matching = rows().filter((row) => row.envelope.msg_id === envelope.msg_id);
+        if (matching.length > 2 || matching.some((row) => JSON.stringify(row) !== serialized)) {
+          throw new AutoloopRecoveryError(
+            'AUTOLOOP_RECOVERY_INCOMPLETE',
+            `Autoloop run '${runId}' has conflicting Reviewer recovery envelopes for '${envelope.msg_id}'`,
+          );
+        }
+        if (matching.length > 0) return matching[0];
+        ledger.appendFlatFile('decisions.jsonl', `${serialized}\n`, true);
+        const observed = rows().filter((row) => row.envelope.msg_id === envelope.msg_id);
+        if (observed.length !== 1 || JSON.stringify(observed[0]) !== serialized) {
+          throw new AutoloopRecoveryError(
+            'AUTOLOOP_RECOVERY_INCOMPLETE',
+            `Autoloop run '${runId}' Reviewer recovery envelope was not durably observed`,
+          );
+        }
+        return observed[0];
+      },
+      { waitMs: 500 },
+    );
+    if (!lock.ok) {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${runId}' Reviewer recovery envelope lock is ${lock.reason}`,
+      );
+    }
+    return lock.value;
+  }
+
+  private async _recoveryInput(
+    runId: string,
+    options: { readOnly?: boolean } = {},
+  ): Promise<{
+    assessment: RecoveryAssessment;
+    ledger: SecureAutoloopLedger;
+    state: AutoloopState;
+    deliveries: RecoveryDeliveryEvidence[];
+    directive?: { iter: number; envelope: ReturnType<typeof AutoloopMsg.directive> };
+    review?: RecoveryReviewEnvelope;
+  }> {
+    const live = this.kernel.handle<AutoloopHandle & { runner: AutoloopRunner }>(runId, LEGACY_NODE);
+    const record = loadRun(runId);
+    if (!live && (!record || record.workflow !== 'autoloop')) throw new Error(`Autoloop run '${runId}' not found`);
+    const state = live?.runner.state ?? (record ? autoloopStateFromRecord(record) : undefined);
+    if (!state) throw new Error(`Autoloop run '${runId}' has no durable state checkpoint`);
+    const workspace = live?.runner.config.workspace ?? record!.cwd;
+    const ledgerOptions = {
+      validateExistingFlatFiles: ['decisions.jsonl', 'agent-generations.jsonl'] as const,
+      logger: this.logger,
+    };
+    const ledger = options.readOnly
+      ? SecureAutoloopLedger.openReadOnly(workspace, runId, ledgerOptions)
+      : SecureAutoloopLedger.open(workspace, runId, ledgerOptions);
+    // Validate the complete receipt relation during inspection as well as
+    // apply. A malformed or orphaned receipt is never safe to derive from.
+    this._recoveryReceiptRows(ledger, runId);
+
+    const iterations: RecoveryIterationEvidence[] = [];
+    let directive: { iter: number; envelope: ReturnType<typeof AutoloopMsg.directive> } | undefined;
+    let directiveEvidenceProblem: string | undefined;
+    const noteDirectiveEvidenceProblem = (reason: string): void => {
+      directiveEvidenceProblem ??= reason;
+    };
+    const dispatchIter = new Map<string, number>();
+    const directivesByDispatchIdentity = new Map<string, ReturnType<typeof AutoloopMsg.directive>>();
+    for (let iter = 0; iter <= state.iter; iter += 1) {
+      const names: Array<[string, RecoveryIterationEvidence['artifacts'][number]]> = [
+        ['directive.json', 'directive'],
+        ['coder_summary.txt', 'coder_summary'],
+        ['eval_output.json', 'eval_output'],
+        ['diff.patch', 'diff'],
+      ];
+      const artifacts: RecoveryIterationEvidence['artifacts'][number][] = [];
+      for (const [file, artifact] of names) {
+        if (
+          ledger.readIterationArtifact(
+            iter,
+            file as 'directive.json' | 'coder_summary.txt' | 'eval_output.json' | 'diff.patch',
+          )
+        ) {
+          artifacts.push(artifact);
+        }
+      }
+      let verdict: RecoveryIterationEvidence['verdict'];
+      const verdictBytes = ledger.readIterationArtifact(iter, 'verdict.json');
+      if (verdictBytes) {
+        let persistedVerdict: unknown;
+        try {
+          persistedVerdict = JSON.parse(verdictBytes.toString('utf8')) as unknown;
+        } catch {
+          throw new Error(`Autoloop run '${runId}' has malformed verdict evidence for iteration ${iter}`);
+        }
+        const decision =
+          typeof persistedVerdict === 'object' && persistedVerdict !== null
+            ? (persistedVerdict as { decision?: unknown }).decision
+            : undefined;
+        if (decision !== 'advance' && decision !== 'hold' && decision !== 'rollback') {
+          throw new Error(`Autoloop run '${runId}' has ambiguous verdict evidence for iteration ${iter}`);
+        }
+        verdict = decision;
+      }
+      if (artifacts.length > 0 || verdict) iterations.push({ iter, artifacts, ...(verdict ? { verdict } : {}) });
+
+      const directiveBytes = ledger.readIterationArtifact(iter, 'directive.json');
+      if (directiveBytes) {
+        let persisted: unknown;
+        try {
+          persisted = JSON.parse(directiveBytes.toString('utf8')) as unknown;
+        } catch {
+          noteDirectiveEvidenceProblem('malformed_exact_directive');
+          continue;
+        }
+        const candidate = persisted as Partial<{
+          iter: unknown;
+          message_id: unknown;
+          ts: unknown;
+          dispatch_id: unknown;
+          goal: unknown;
+          constraints: unknown;
+          success_criteria: unknown;
+          max_attempts: unknown;
+        }>;
+        if (
+          candidate.iter !== iter ||
+          typeof candidate.message_id !== 'string' ||
+          typeof candidate.ts !== 'string' ||
+          typeof candidate.dispatch_id !== 'string' ||
+          typeof candidate.goal !== 'string' ||
+          !Array.isArray(candidate.constraints) ||
+          !candidate.constraints.every((value) => typeof value === 'string') ||
+          !Array.isArray(candidate.success_criteria) ||
+          !candidate.success_criteria.every((value) => typeof value === 'string') ||
+          !Number.isSafeInteger(candidate.max_attempts)
+        ) {
+          noteDirectiveEvidenceProblem('malformed_exact_directive');
+          continue;
+        }
+        const exactDirective: { iter: number; envelope: ReturnType<typeof AutoloopMsg.directive> } = {
+          iter,
+          envelope: {
+            msg_id: candidate.message_id,
+            iter,
+            from: 'planner',
+            to: 'coder',
+            type: 'directive',
+            ts: candidate.ts,
+            payload: {
+              goal: candidate.goal,
+              constraints: candidate.constraints,
+              success_criteria: candidate.success_criteria,
+              max_attempts: candidate.max_attempts as number,
+            },
+          },
+        };
+        dispatchIter.set(candidate.dispatch_id, iter);
+        directivesByDispatchIdentity.set(candidate.dispatch_id, exactDirective.envelope);
+        directive = exactDirective;
+      }
+    }
+
+    const acknowledged = new Map<string, string>();
+    const reviewEnvelopes: RecoveryReviewEnvelope[] = [];
+    let reviewEvidenceProblem: string | undefined;
+    const noteReviewEvidenceProblem = (reason: string): void => {
+      reviewEvidenceProblem ??= reason;
+    };
+    const intents: Array<{
+      delivery_id: string;
+      idempotency_key: string;
+      kind: 'coder_directive' | 'review_request';
+      target_role: 'coder' | 'reviewer';
+      payload_sha256: string;
+      logical_message_sha256: string;
+    }> = [];
+    const deliveryRows: DeliveryLedgerRow[] = [];
+    for (const [index, line] of (ledger.readFlatFile('decisions.jsonl') ?? '').split('\n').entries()) {
+      if (!line) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line) as unknown;
+      } catch {
+        throw new Error(`Autoloop run '${runId}' has malformed decisions evidence at row ${index + 1}`);
+      }
+      // Recovery receipts share the append-only decision ledger but are not
+      // Task-5 outbox records. Classify them first so the outbox validator
+      // remains strict for every row it owns.
+      const isReceiptRow =
+        typeof parsed === 'object' &&
+        parsed !== null &&
+        (parsed as { record_type?: unknown }).record_type === 'autoloop_recovery_receipt';
+      const receipt = parseRecoveryReceipt(parsed);
+      if (isReceiptRow && !receipt) {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' has malformed recovery receipt at decisions row ${index + 1}`,
+        );
+      }
+      if (receipt) continue;
+      const isReviewEnvelopeRow =
+        typeof parsed === 'object' &&
+        parsed !== null &&
+        (parsed as { record_type?: unknown }).record_type === 'autoloop_recovery_review_envelope';
+      const reviewEnvelope = parseRecoveryReviewEnvelope(parsed);
+      if (isReviewEnvelopeRow && !reviewEnvelope) {
+        noteReviewEvidenceProblem('malformed_exact_envelope');
+        continue;
+      }
+      if (reviewEnvelope) {
+        if (reviewEnvelope.run_id !== runId) {
+          noteReviewEvidenceProblem('foreign_exact_envelope');
+          continue;
+        }
+        reviewEnvelopes.push(reviewEnvelope);
+        if (reviewEnvelopes.length > MAX_RECOVERY_REVIEW_ENVELOPE_INDEX_ROWS) {
+          noteReviewEvidenceProblem('envelope_index_cap_exceeded');
+        }
+        continue;
+      }
+      const row = parseOutboxDecisionLedgerRow(parsed, index + 1);
+      if (!row) continue;
+      deliveryRows.push(row);
+      if (row.kind === 'acknowledgement') {
+        const existing = acknowledged.get(row.acknowledgement.delivery_id);
+        if (existing !== undefined && existing !== row.acknowledgement.payload_sha256) {
+          throw new Error(`Autoloop run '${runId}' has conflicting acknowledgement provenance`);
+        }
+        acknowledged.set(row.acknowledgement.delivery_id, row.acknowledgement.payload_sha256);
+      }
+      if (row.kind === 'intent') {
+        const payload = row.intent.payload;
+        const payloadKeys =
+          typeof payload === 'object' && payload !== null && !Array.isArray(payload) ? Reflect.ownKeys(payload) : [];
+        const promptDescriptor =
+          typeof payload === 'object' && payload !== null && !Array.isArray(payload)
+            ? Object.getOwnPropertyDescriptor(payload, 'prompt')
+            : undefined;
+        const logicalDigestDescriptor =
+          typeof payload === 'object' && payload !== null && !Array.isArray(payload)
+            ? Object.getOwnPropertyDescriptor(payload, 'logical_message_sha256')
+            : undefined;
+        const logicalMessageDigest =
+          payloadKeys.length === 2 &&
+          payloadKeys.includes('prompt') &&
+          payloadKeys.includes('logical_message_sha256') &&
+          promptDescriptor?.enumerable === true &&
+          Object.hasOwn(promptDescriptor, 'value') &&
+          typeof promptDescriptor.value === 'string' &&
+          logicalDigestDescriptor?.enumerable === true &&
+          Object.hasOwn(logicalDigestDescriptor, 'value') &&
+          typeof logicalDigestDescriptor.value === 'string' &&
+          /^[a-f0-9]{64}$/.test(logicalDigestDescriptor.value)
+            ? logicalDigestDescriptor.value
+            : undefined;
+        if (!logicalMessageDigest) {
+          if (row.intent.kind === 'coder_directive') noteDirectiveEvidenceProblem('malformed_intent_payload');
+          else noteReviewEvidenceProblem('malformed_intent_payload');
+          continue;
+        }
+        intents.push({
+          delivery_id: row.intent.delivery_id,
+          idempotency_key: row.intent.idempotency_key,
+          kind: row.intent.kind,
+          target_role: row.intent.target_role,
+          payload_sha256: row.intent.payload_sha256,
+          logical_message_sha256: logicalMessageDigest,
+        });
+      }
+    }
+    // Do not derive a recovery action from a subset of delivery rows. The
+    // Task-5 graph is append ordered and an orphan/conflict makes every later
+    // recovery effect ambiguous.
+    validateOutboxDecisionLedgerGraph(deliveryRows);
+
+    const generations = new Map<string, PhysicalAgentGeneration>();
+    for (const [index, line] of (ledger.readFlatFile('agent-generations.jsonl') ?? '').split('\n').entries()) {
+      if (!line) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line) as { kind?: unknown; payload?: unknown };
+      } catch {
+        throw new Error(`Autoloop run '${runId}' has malformed generation evidence at row ${index + 1}`);
+      }
+      const entry = parsed as { kind?: unknown; payload?: unknown };
+      if (
+        entry.kind !== 'agent_generation_reserved' &&
+        entry.kind !== 'agent_generation_started' &&
+        entry.kind !== 'agent_generation_lease_renewed' &&
+        entry.kind !== 'agent_generation_orphaned' &&
+        entry.kind !== 'agent_generation_released'
+      ) {
+        continue;
+      }
+      const generation = entry.payload as Partial<PhysicalAgentGeneration>;
+      if (
+        !generation ||
+        (generation.role !== 'planner' && generation.role !== 'coder' && generation.role !== 'reviewer') ||
+        !Number.isSafeInteger(generation.generation) ||
+        typeof generation.session_name !== 'string' ||
+        typeof generation.owner_instance_id !== 'string' ||
+        typeof generation.created_at !== 'string' ||
+        typeof generation.last_activity_at !== 'string' ||
+        typeof generation.lease_expires_at !== 'string' ||
+        (generation.state !== 'live' &&
+          generation.state !== 'stale' &&
+          generation.state !== 'orphaned' &&
+          generation.state !== 'released')
+      ) {
+        throw new Error(`Autoloop run '${runId}' has ambiguous generation evidence at row ${index + 1}`);
+      }
+      const key = generation.role;
+      const current = generations.get(key);
+      if (!current || (generation.generation as number) >= current.generation)
+        generations.set(key, generation as PhysicalAgentGeneration);
+    }
+    const agents: RecoveryAgentEvidence[] = [];
+    for (const generation of generations.values()) {
+      agents.push({
+        generation: { ...generation },
+        matching_runtime: await this.inspect(generation.session_name, generation.session_id),
+      });
+    }
+    const reviewForCurrentIteration = reviewEnvelopes.filter((row) => row.envelope.iter === state.iter);
+    const reviewIdentities = new Map<string, RecoveryReviewEnvelope[]>();
+    for (const row of reviewForCurrentIteration) {
+      const matching = reviewIdentities.get(row.envelope.msg_id) ?? [];
+      matching.push(row);
+      reviewIdentities.set(row.envelope.msg_id, matching);
+    }
+    if (
+      reviewIdentities.size > 1 ||
+      [...reviewIdentities.values()].some(
+        (rows) =>
+          rows.length > MAX_RECOVERY_REVIEW_ENVELOPE_DUPLICATES ||
+          rows.some((row) => JSON.stringify(row) !== JSON.stringify(rows[0])),
+      )
+    ) {
+      noteReviewEvidenceProblem('conflicting_current_identity');
+    }
+    const review = reviewIdentities.values().next().value?.[0] as RecoveryReviewEnvelope | undefined;
+    const reviewsByDispatchIdentity = new Map<string, RecoveryReviewEnvelope>();
+    for (const row of reviewEnvelopes) {
+      const dispatchIdentity = `dispatch_${createHash('sha256')
+        .update(
+          JSON.stringify([
+            runId,
+            row.envelope.msg_id,
+            row.envelope.iter,
+            row.envelope.from,
+            row.envelope.to,
+            row.envelope.type,
+          ]),
+          'utf8',
+        )
+        .digest('hex')}`;
+      const existing = reviewsByDispatchIdentity.get(dispatchIdentity);
+      if (existing && JSON.stringify(existing) !== JSON.stringify(row)) {
+        noteReviewEvidenceProblem('conflicting_dispatch_identity');
+        continue;
+      }
+      reviewsByDispatchIdentity.set(dispatchIdentity, row);
+    }
+    const deliveries: RecoveryDeliveryEvidence[] = [];
+    for (const intent of intents) {
+      const acknowledgement = acknowledged.get(intent.delivery_id);
+      if (acknowledgement !== undefined && acknowledgement !== intent.payload_sha256) {
+        if (intent.kind === 'coder_directive') noteDirectiveEvidenceProblem('conflicting_acknowledgement');
+        else noteReviewEvidenceProblem('conflicting_acknowledgement');
+        continue;
+      }
+      if (intent.kind === 'coder_directive') {
+        const iter = dispatchIter.get(intent.idempotency_key);
+        const envelope = directivesByDispatchIdentity.get(intent.idempotency_key);
+        if (intent.target_role !== 'coder' || iter === undefined || !envelope) {
+          noteDirectiveEvidenceProblem('missing_exact_directive');
+          continue;
+        }
+        if (recoveryLogicalMessageSha256(envelope) !== intent.logical_message_sha256) {
+          noteDirectiveEvidenceProblem('intent_digest_mismatch');
+          continue;
+        }
+        deliveries.push({
+          delivery_id: intent.delivery_id,
+          idempotency_key: intent.idempotency_key,
+          iter,
+          kind: intent.kind,
+          acknowledged: acknowledgement !== undefined,
+        });
+        continue;
+      }
+      const envelope = reviewsByDispatchIdentity.get(intent.idempotency_key);
+      if (
+        intent.target_role !== 'reviewer' ||
+        !envelope ||
+        envelope.envelope.from !== 'runner' ||
+        envelope.envelope.to !== 'reviewer' ||
+        envelope.envelope.type !== 'review_request'
+      ) {
+        noteReviewEvidenceProblem('missing_exact_envelope');
+        continue;
+      }
+      if (recoveryLogicalMessageSha256(envelope.envelope) !== intent.logical_message_sha256) {
+        noteReviewEvidenceProblem('intent_digest_mismatch');
+        continue;
+      }
+      deliveries.push({
+        delivery_id: intent.delivery_id,
+        idempotency_key: intent.idempotency_key,
+        iter: envelope.envelope.iter,
+        kind: intent.kind,
+        acknowledged: acknowledgement !== undefined,
+      });
+    }
+    let assessment = assessRecovery({
+      run_id: runId,
+      observed_at: new Date().toISOString(),
+      legacy_state: state,
+      iterations,
+      deliveries,
+      agents,
+      completed: state.status === 'terminated' && state.status_reason === 'completed',
+    });
+    const actionEvidenceProblem =
+      assessment.next_safe_action === 'dispatch_coder'
+        ? (directiveEvidenceProblem ??
+          (!directive || directive.iter !== state.iter ? 'missing_exact_directive' : undefined))
+        : assessment.next_safe_action === 'request_review'
+          ? (reviewEvidenceProblem ??
+            (!review || review.envelope.iter !== state.iter ? 'missing_exact_envelope' : undefined))
+          : undefined;
+    if (actionEvidenceProblem) {
+      const role = assessment.next_safe_action === 'dispatch_coder' ? 'coder' : 'review';
+      assessment = blockRecoveryAssessment(assessment, `ambiguity:recovery:${role}:${actionEvidenceProblem}`);
+    } else {
+      const exactAction =
+        assessment.next_safe_action === 'dispatch_coder'
+          ? directive!.envelope
+          : assessment.next_safe_action === 'request_review'
+            ? review!.envelope
+            : {
+                type: assessment.next_safe_action,
+                run_id: runId,
+                iter: state.iter,
+                phase: assessment.phase,
+              };
+      assessment = assessRecovery({
+        run_id: runId,
+        observed_at: new Date().toISOString(),
+        legacy_state: state,
+        iterations,
+        deliveries,
+        agents,
+        completed: state.status === 'terminated' && state.status_reason === 'completed',
+        action_sha256: recoveryActionDigest(exactAction),
+      });
+      if (
+        assessment.next_safe_action === 'resume_planner' &&
+        (live?.runner.state.status === 'planning' || live?.runner.state.status === 'running')
+      ) {
+        assessment = rebindRecoveryAction(
+          assessment,
+          'none',
+          recoveryActionDigest({ type: 'none', run_id: runId, iter: state.iter, phase: assessment.phase }),
+          'recovery:planner:already_satisfied',
+        );
+      } else if (
+        (assessment.next_safe_action === 'dispatch_coder' || assessment.next_safe_action === 'request_review') &&
+        live &&
+        (live.runner.state.status === 'paused' ||
+          live.runner.state.status === 'terminated' ||
+          live.runner.state.status === 'crashed')
+      ) {
+        assessment = blockRecoveryAssessment(assessment, `ambiguity:recovery:runner:${live.runner.state.status}`);
+      }
+    }
+    return {
+      assessment,
+      ledger,
+      state,
+      deliveries,
+      directive,
+      review,
+    };
+  }
+
+  /** Internal token-fenced inspection/apply core. Public MCP/HTTP wiring is deliberately deferred. */
+  async autoloopRecover(
+    runId: string,
+    options: { apply?: boolean; recovery_token?: string } = {},
+  ): Promise<RecoveryResult> {
+    if (!options.apply) {
+      const { assessment } = await this._recoveryInput(runId, { readOnly: true });
+      return { assessment };
+    }
+    if (!options.recovery_token) {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_TOKEN_REQUIRED',
+        'recovery_token is required when apply is true',
+      );
+    }
+    const transactionKey = `${runId}\u0000${options.recovery_token}`;
+    const existing = this._autoloopRecoveryTransactions.get(transactionKey);
+    if (existing) return await existing;
+    const operation = this._autoloopRecoverApply(runId, options.recovery_token);
+    this._autoloopRecoveryTransactions.set(transactionKey, operation);
+    try {
+      return await operation;
+    } finally {
+      if (this._autoloopRecoveryTransactions.get(transactionKey) === operation) {
+        this._autoloopRecoveryTransactions.delete(transactionKey);
+      }
+    }
+  }
+
+  private async _autoloopRecoverApply(runId: string, token: string): Promise<RecoveryResult> {
+    const inspected = await this._recoveryInput(runId, { readOnly: true });
+    const inspectedReceipts = this._recoveryReceiptRows(inspected.ledger, runId).filter(
+      (row) => row.recovery_token === token,
+    );
+    const inspectedApplied = inspectedReceipts.find((row) => row.status === 'applied');
+    if (inspectedApplied) {
+      // A durable applied pair is the authority for exact replay even when its
+      // effect advanced the live state and therefore changed the current token.
+      return { assessment: inspected.assessment, receipt: inspectedApplied };
+    }
+    if (token !== inspected.assessment.recovery_token) {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_TOKEN_STALE',
+        `recovery_token is stale for Autoloop run '${runId}'`,
+      );
+    }
+    // Applying may harden mutable ledger state, but only after the current
+    // token and exact action digest have been reconstructed through the
+    // read-only boundary. Re-open and compare once more immediately before
+    // claiming the durable effect.
+    const recovered = await this._recoveryInput(runId);
+    const { assessment, ledger } = recovered;
+    if (token !== assessment.recovery_token) {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_TOKEN_STALE',
+        `recovery_token is stale for Autoloop run '${runId}'`,
+      );
+    }
+    const allReceipts = this._recoveryReceiptRows(ledger, runId);
+    const existingReceipts = allReceipts.filter((row) => row.recovery_token === token);
+    if (existingReceipts.some((row) => row.status === 'applied')) {
+      const applied = existingReceipts.filter((row) => row.status === 'applied');
+      if (applied.length !== 1 || existingReceipts.filter((row) => row.status === 'prepared').length !== 1) {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' has ambiguous applied recovery receipts`,
+        );
+      }
+      return { assessment, receipt: applied[0] };
+    }
+    const appliedTokens = new Set(
+      allReceipts.filter((row) => row.status === 'applied').map((row) => row.recovery_token),
+    );
+    const unresolvedPrepared = allReceipts.find(
+      (row) => row.status === 'prepared' && !appliedTokens.has(row.recovery_token),
+    );
+    if (unresolvedPrepared) {
+      // Any prior durable claim may already have executed its external effect.
+      // A changed assessment/token cannot make that unknown outcome safe to
+      // supersede, so fail closed until the original claim is resolved.
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${runId}' has an unresolved prepared recovery receipt`,
+      );
+    }
+    if (existingReceipts.length > 0) {
+      // A process can die after fencing this token but before (or during) the
+      // external effect. Replaying it would turn an unknown outcome into a
+      // duplicate effect, so preserve the evidence and require resolution.
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${runId}' has an unresolved prepared recovery receipt`,
+      );
+    }
+    if (assessment.next_safe_action === 'manual_resolution') {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_MANUAL_RESOLUTION_REQUIRED',
+        `Autoloop run '${runId}' has ambiguous recovery evidence`,
+      );
+    }
+    const claimState = structuredClone(recovered.state);
+    const claimEvidenceDigest = this._recoveryClaimEvidenceDigest(ledger, claimState);
+    const actionSnapshot = this._recoveryActionSnapshot({ ...recovered, state: claimState });
+    if (recoveryActionDigest(actionSnapshot) !== assessment.action_sha256) {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_TOKEN_STALE',
+        `recovery_token is stale for Autoloop run '${runId}'`,
+      );
+    }
+    const preparedClaim = this._appendRecoveryReceipt(
+      ledger,
+      {
+        schema_version: 1,
+        record_type: 'autoloop_recovery_receipt',
+        kind: 'autoloop_recovery_receipt',
+        run_id: runId,
+        recovery_token: token,
+        action_sha256: assessment.action_sha256,
+        action_snapshot: actionSnapshot,
+        claim_id: randomUUID(),
+        phase: assessment.phase,
+        next_safe_action: assessment.next_safe_action,
+        status: 'prepared',
+        recorded_at: new Date().toISOString(),
+      },
+      (preparedReceipt) =>
+        this._validatePreparedRecoveryAction(
+          ledger,
+          preparedReceipt,
+          { ...recovered, state: claimState },
+          claimEvidenceDigest,
+        ),
+    );
+    const prepared = preparedClaim.receipt;
+    if (!preparedClaim.appended) {
+      // Another process owns an unresolved durable claim. The effect outcome
+      // cannot be inferred, so this caller must not replay it.
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${runId}' recovery effect is claimed by another process`,
+      );
+    }
+    if (prepared.status !== 'prepared') {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${runId}' recovery receipt is invalid`,
+      );
+    }
+    const prior = this._recoveryReceiptRows(ledger, runId).filter((row) => row.recovery_token === token);
+    if (prior.length !== 1 || prior[0].status !== 'prepared') {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${runId}' recovery effect is unresolved`,
+      );
+    }
+
+    const live = this.getAutoloop(runId);
+    let plannerTransitionProven = false;
+    if (assessment.next_safe_action === 'resume_planner') {
+      if (live) {
+        if (live.runner.state.status === 'paused' && !live.runner.state.pending_dispatch) {
+          await live.runner.send(AutoloopMsg.resume(live.runner.state.iter));
+          const postResumeStatus = live.runner.state.status as AutoloopState['status'];
+          plannerTransitionProven =
+            (postResumeStatus === 'planning' || postResumeStatus === 'running') && !live.runner.state.pending_dispatch;
+        }
+      } else {
+        const record = loadRun(runId);
+        const config = (
+          record?.spec.nodes.find((node) => node.id === LEGACY_NODE) as { config?: Record<string, unknown> } | undefined
+        )?.config;
+        if (!record || record.workflow !== 'autoloop' || !config) {
+          throw new AutoloopRecoveryError(
+            'AUTOLOOP_RECOVERY_INCOMPLETE',
+            `Autoloop run '${runId}' cannot resume from disk`,
+          );
+        }
+        await this._resumeAutoloopRun(runId, { ...config, _secureLedger: ledger } as Parameters<
+          SessionManager['_bootAutoloop']
+        >[0]);
+        const resumed = this.getAutoloop(runId);
+        plannerTransitionProven =
+          !!resumed &&
+          (resumed.runner.state.status === 'planning' || resumed.runner.state.status === 'running') &&
+          !resumed.runner.state.pending_dispatch;
+      }
+    } else if (assessment.next_safe_action === 'dispatch_coder') {
+      let handle = live ?? this.getAutoloop(runId);
+      if (!handle) {
+        const record = loadRun(runId);
+        const config = (
+          record?.spec.nodes.find((node) => node.id === LEGACY_NODE) as { config?: Record<string, unknown> } | undefined
+        )?.config;
+        if (!record || record.workflow !== 'autoloop' || !config) {
+          throw new AutoloopRecoveryError(
+            'AUTOLOOP_RECOVERY_INCOMPLETE',
+            `Autoloop run '${runId}' cannot resume from disk`,
+          );
+        }
+        await this._resumeAutoloopRun(runId, { ...config, _secureLedger: ledger } as Parameters<
+          SessionManager['_bootAutoloop']
+        >[0]);
+        handle = this.getAutoloop(runId);
+      }
+      if (!handle || prepared.action_snapshot.type !== 'directive') {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' lacks an exact Coder delivery to recover`,
+        );
+      }
+      try {
+        await handle.runner.send(prepared.action_snapshot, { requireRootDelivery: true });
+      } catch {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' Coder recovery did not reach the agent dispatcher`,
+        );
+      }
+    } else if (assessment.next_safe_action === 'request_review') {
+      let handle = live ?? this.getAutoloop(runId);
+      if (!handle) {
+        const record = loadRun(runId);
+        const config = (
+          record?.spec.nodes.find((node) => node.id === LEGACY_NODE) as { config?: Record<string, unknown> } | undefined
+        )?.config;
+        if (!record || record.workflow !== 'autoloop' || !config) {
+          throw new AutoloopRecoveryError(
+            'AUTOLOOP_RECOVERY_INCOMPLETE',
+            `Autoloop run '${runId}' cannot resume Reviewer recovery from disk`,
+          );
+        }
+        await this._resumeAutoloopRun(runId, { ...config, _secureLedger: ledger } as Parameters<
+          SessionManager['_bootAutoloop']
+        >[0]);
+        handle = this.getAutoloop(runId);
+      }
+      if (!handle || prepared.action_snapshot.type !== 'review_request') {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' lacks an exact durable Reviewer request to recover`,
+        );
+      }
+      try {
+        await handle.runner.send(prepared.action_snapshot, { requireRootDelivery: true });
+      } catch {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' Reviewer recovery did not reach the agent dispatcher`,
+        );
+      }
+    }
+    if (assessment.next_safe_action === 'resume_planner') {
+      const resumed = this.getAutoloop(runId);
+      if (
+        !plannerTransitionProven ||
+        !resumed ||
+        (resumed.runner.state.status !== 'planning' && resumed.runner.state.status !== 'running') ||
+        resumed.runner.state.pending_dispatch
+      ) {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' Planner recovery has no proven live postcondition`,
+        );
+      }
+    } else if (assessment.next_safe_action === 'dispatch_coder' || assessment.next_safe_action === 'request_review') {
+      const observed = await this._recoveryInput(runId, { readOnly: true });
+      const kind = assessment.next_safe_action === 'dispatch_coder' ? 'coder_directive' : 'review_request';
+      const actionSnapshot = prepared.action_snapshot;
+      if (actionSnapshot.type !== 'directive' && actionSnapshot.type !== 'review_request') {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' recovery action has no agent delivery identity`,
+        );
+      }
+      const acknowledged = observed.deliveries.some(
+        (delivery) =>
+          delivery.kind === kind &&
+          delivery.iter === actionSnapshot.iter &&
+          delivery.idempotency_key === recoveryActionDispatchId(runId, actionSnapshot) &&
+          delivery.acknowledged,
+      );
+      if (!acknowledged) {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' ${kind} recovery has no durable acknowledgement`,
+        );
+      }
+    }
+    const appliedClaim = this._appendRecoveryReceipt(ledger, {
+      ...prepared,
+      status: 'applied',
+      recorded_at: new Date().toISOString(),
+    });
+    const receipt = appliedClaim.receipt;
+    if (receipt.status !== 'applied') {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${runId}' recovery effect remains unresolved`,
+      );
+    }
+    return { assessment, receipt };
   }
 
   autoloopList(): AutoloopState[] {

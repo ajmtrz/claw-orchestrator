@@ -49,6 +49,7 @@ interface SenderContext {
   settled: boolean;
   failure?: unknown;
   rootDelivered: boolean;
+  requireRootDelivery: boolean;
   readonly promise: Promise<void>;
   readonly resolve: () => void;
   readonly reject: (error: unknown) => void;
@@ -411,8 +412,17 @@ export class AutoloopRunner extends EventEmitter {
   }
 
   /** Enqueue a message and drain the queue. Resolves when the queue is idle. */
-  async send(env: AnyAutoloopMessage): Promise<void> {
+  async send(env: AnyAutoloopMessage, options: { requireRootDelivery?: boolean } = {}): Promise<void> {
     const message = canonicalizeMessage(env);
+    if (message.type === 'review_request') {
+      if (this.terminationStarted || ['terminated', 'crashed'].includes(this.state.status)) {
+        throw new Error(`Autoloop message '${message.msg_id}' was not delivered because the run became terminal`);
+      }
+      await this.config.persistReviewEnvelope?.(message);
+      if (this.terminationStarted || ['terminated', 'crashed'].includes(this.state.status)) {
+        throw new Error(`Autoloop message '${message.msg_id}' was not delivered because the run became terminal`);
+      }
+    }
     this.recordActivity('queue_message_accepted');
     if (this.drainPromise && message.to === 'runner' && message.type === 'terminate') {
       // Termination is the one pre-emptive control: queueing it behind a stuck
@@ -433,6 +443,7 @@ export class AutoloopRunner extends EventEmitter {
       pending: 0,
       settled: false,
       rootDelivered: false,
+      requireRootDelivery: options.requireRootDelivery === true,
       promise,
       resolve,
       reject,
@@ -448,6 +459,9 @@ export class AutoloopRunner extends EventEmitter {
     while (!sender.settled) await this.drain();
     const settled = await outcome;
     if (!settled.ok) throw settled.error;
+    if (sender.requireRootDelivery && !sender.rootDelivered) {
+      throw new Error(`Autoloop message '${message.msg_id}' was not delivered to the agent dispatcher`);
+    }
   }
 
   private enqueueMessage(env: AnyAutoloopMessage, sender?: SenderContext, front = false): void {
@@ -643,7 +657,12 @@ export class AutoloopRunner extends EventEmitter {
     // 'terminated' is the final state — once reached, no message of any kind is
     // processed (see events contract above). The terminate message itself still
     // runs because status only flips to 'terminated' while handling it.
-    if (this.state.status === 'terminated' || this.state.status === 'crashed') return;
+    if (this.state.status === 'terminated' || this.state.status === 'crashed') {
+      if (sender?.requireRootDelivery && env.msg_id === sender.id) {
+        throw new Error(`Autoloop message '${env.msg_id}' was not delivered because the run became terminal`);
+      }
+      return;
+    }
     this.emit('message', env);
 
     // Runner is the target for a small set of messages — handle them inline.
@@ -664,6 +683,9 @@ export class AutoloopRunner extends EventEmitter {
     // Pause: park agent-bound messages until resume. Runner-bound (resume /
     // terminate) and user-bound (push) flow through above and are unaffected.
     if (this.state.status === 'paused') {
+      if (sender?.requireRootDelivery && env.msg_id === sender.id) {
+        throw new Error(`Autoloop message '${env.msg_id}' was not delivered because the run is paused`);
+      }
       if (env.type === 'review_request' && Object.hasOwn(env.payload, 'checkpoint_sha')) {
         throw new Error(`Autoloop message '${env.msg_id}' was not delivered because the run is paused`);
       }
@@ -703,7 +725,14 @@ export class AutoloopRunner extends EventEmitter {
             ledger_path: this.config.ledger_dir,
             prior_metrics: this.state.metric_history.slice(-10),
           }),
-        );
+        ) as Extract<AnyAutoloopMessage, { type: 'review_request' }>;
+        if (this.terminationStarted || ['terminated', 'crashed'].includes(this.state.status)) {
+          throw new Error(`Autoloop message '${req.msg_id}' was not delivered because the run became terminal`);
+        }
+        await this.config.persistReviewEnvelope?.(req);
+        if (this.terminationStarted || ['terminated', 'crashed'].includes(this.state.status)) {
+          throw new Error(`Autoloop message '${req.msg_id}' was not delivered because the run became terminal`);
+        }
         this.enqueueMessage(req, sender);
         return;
       }

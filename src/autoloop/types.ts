@@ -115,7 +115,71 @@ export interface RecoveryAssessment {
   agents: PhysicalAgentGeneration[];
   pending_delivery_ids: string[];
   next_safe_action: 'none' | 'resume_planner' | 'dispatch_coder' | 'request_review' | 'manual_resolution';
+  /** SHA-256 of the exact action reconstructed from durable evidence. */
+  action_sha256: string;
   recovery_token: string;
+}
+
+/** Exact immutable action bytes fenced by a prepared recovery receipt. */
+export type RecoveryActionSnapshot =
+  | Extract<AnyAutoloopMessage, { type: 'directive' | 'review_request' }>
+  | {
+      type: 'none' | 'resume_planner';
+      run_id: string;
+      iter: number;
+      phase: AutoloopPhase;
+    };
+
+/**
+ * Append-only record for one token-fenced recovery attempt. A prepared receipt
+ * fences the effect; an applied receipt is the only successful result.
+ */
+export interface RecoveryReceipt {
+  schema_version: 1;
+  record_type: 'autoloop_recovery_receipt';
+  /** Non-delivery decision kind keeps Task-5's strict outbox parser read-compatible. */
+  kind: 'autoloop_recovery_receipt';
+  run_id: string;
+  recovery_token: string;
+  action_sha256: string;
+  action_snapshot: RecoveryActionSnapshot;
+  /** Unique durable owner of the prepared recovery effect. */
+  claim_id: string;
+  phase: AutoloopPhase;
+  next_safe_action: RecoveryAssessment['next_safe_action'];
+  status: 'prepared' | 'applied';
+  recorded_at: string;
+}
+
+/** Versioned exact Reviewer transport envelope retained for disk-only recovery. */
+export interface RecoveryReviewEnvelope {
+  schema_version: 1;
+  record_type: 'autoloop_recovery_review_envelope';
+  /** Non-delivery decision kind keeps Task-5's strict outbox parser read-compatible. */
+  kind: 'autoloop_recovery_review_envelope';
+  run_id: string;
+  envelope: Extract<AnyAutoloopMessage, { type: 'review_request' }>;
+}
+
+export interface RecoveryResult {
+  assessment: RecoveryAssessment;
+  receipt?: RecoveryReceipt;
+}
+
+export class AutoloopRecoveryError extends Error {
+  readonly retryable = false;
+
+  constructor(
+    readonly code:
+      | 'AUTOLOOP_RECOVERY_TOKEN_REQUIRED'
+      | 'AUTOLOOP_RECOVERY_TOKEN_STALE'
+      | 'AUTOLOOP_RECOVERY_MANUAL_RESOLUTION_REQUIRED'
+      | 'AUTOLOOP_RECOVERY_INCOMPLETE',
+    message: string,
+  ) {
+    super(message);
+    this.name = 'AutoloopRecoveryError';
+  }
 }
 
 export type RecoveryArtifactName = 'directive' | 'coder_summary' | 'eval_output' | 'diff';
@@ -128,6 +192,8 @@ export interface RecoveryIterationEvidence {
 
 export interface RecoveryDeliveryEvidence {
   delivery_id: string;
+  /** Task-5 routing identity that owns this durable delivery id. */
+  idempotency_key?: string;
   iter: number;
   kind: 'coder_directive' | 'review_request';
   acknowledged: boolean;
@@ -249,6 +315,8 @@ export interface RecoveryInput {
   iterations: readonly RecoveryIterationEvidence[];
   deliveries: readonly RecoveryDeliveryEvidence[];
   agents: readonly RecoveryAgentEvidence[];
+  /** Exact directive/review action bytes, canonicalized before token derivation. */
+  action_sha256?: string;
   /** Explicit durable terminal evidence; legacy `terminated` alone is not completion. */
   completed?: boolean;
 }
@@ -444,6 +512,12 @@ export interface AutoloopConfig extends AutoloopTimeoutConfig {
   notifyUser: (level: PushLevel, summary: string, detail: string | undefined, channel: PushChannel) => Promise<void>;
   /** Agent transport layer (mockable). */
   dispatcher: AgentDispatcher;
+  /**
+   * SessionManager-owned durable boundary for an exact Reviewer envelope.
+   * The Runner awaits this before its first queue admission or reviewer send,
+   * so recovery never has to reconstruct a message identity from mutable state.
+   */
+  persistReviewEnvelope?: (envelope: Extract<AnyAutoloopMessage, { type: 'review_request' }>) => Promise<void>;
   /**
    * Phase-error circuit threshold. After this many consecutive `phase_error`
    * messages the runner auto-terminates with reason `phase_error_circuit`

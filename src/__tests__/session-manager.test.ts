@@ -8,6 +8,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -21,9 +22,10 @@ import type {
   CostBreakdown,
   EffortLevel,
 } from '../types.js';
-import type { AgentReservationReleaseOptions, PhysicalAgentGeneration } from '../autoloop/types.js';
-import type { PhaseErrorPayload } from '../autoloop/messages.js';
+import type { AgentReservationReleaseOptions, PhysicalAgentGeneration, RecoveryReceipt } from '../autoloop/types.js';
+import type { AnyAutoloopMessage, PhaseErrorPayload } from '../autoloop/messages.js';
 import type { PlannerToolCall } from '../autoloop/planner-tools.js';
+import { recoveryActionDigest } from '../autoloop/recovery.js';
 
 // ─── Mock ISession ──────────────────────────────────────────────────────────
 
@@ -333,6 +335,7 @@ vi.mock('node:fs', async () => {
 const { SessionManager } = await import('../session-manager.js');
 const { Msg: AutoloopMsg } = await import('../autoloop/messages.js');
 const { AutoloopOperationError } = await import('../autoloop/dispatcher.js');
+const { acknowledgeDelivery, prepareDelivery } = await import('../autoloop/outbox.js');
 const { applyValidatedPlannerToolCalls, validatePlannerToolCalls } = await import('../autoloop/planner-tools.js');
 
 const SESSION_REGISTRY_FILE = path.join(os.homedir(), '.openclaw', 'claude-sessions.json');
@@ -377,6 +380,29 @@ function successfulRoleReplyFromDeliveryPrompt(
       ? { tool: 'iter_complete', args: { summary, eval_output: {}, files_changed: [], ...provenance } }
       : { tool: 'review_complete', args: { decision: 'hold', metric: null, audit_notes: summary, ...provenance } };
   return [summary, '```autoloop', JSON.stringify(completion), '```'].join('\n');
+}
+
+function recoveryDispatchId(runId: string, envelope: Record<string, unknown>): string {
+  return `dispatch_${createHash('sha256')
+    .update(JSON.stringify([runId, envelope.msg_id, envelope.iter, envelope.from, envelope.to, envelope.type]), 'utf8')
+    .digest('hex')}`;
+}
+
+function recoveryLogicalMessageSha256(envelope: Record<string, unknown>): string {
+  return createHash('sha256')
+    .update(
+      JSON.stringify({
+        msg_id: envelope.msg_id,
+        iter: envelope.iter,
+        from: envelope.from,
+        to: envelope.to,
+        type: envelope.type,
+        ts: envelope.ts,
+        payload: envelope.payload,
+      }),
+      'utf8',
+    )
+    .digest('hex');
 }
 
 function createManager(overrides?: Record<string, unknown>): InstanceType<typeof SessionManager> {
@@ -9364,6 +9390,1351 @@ describe('SessionManager', () => {
 
     it('councilReject throws for unknown council', async () => {
       await expect(mgr.councilReject('unknown', 'bad work')).rejects.toThrow("Council 'unknown' not found");
+    });
+  });
+
+  // ─── Durable recovery core ─────────────────────────────────────────────
+
+  describe('autoloop recovery core', () => {
+    const reconstructManager = async (runId: string): Promise<void> => {
+      // Model loss of the physical process while preserving the kernel record
+      // and every ledger byte used by disk-only recovery.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const oldKernel = (mgr as any).kernel;
+      oldKernel.cancel(runId);
+      await oldKernel.wait(runId);
+      await mgr.shutdown();
+      mgr = createManager();
+    };
+
+    const seedExactReviewArtifacts = (workspace: string, runId: string, iter: number): void => {
+      seedCompleteLegacyReviewArtifacts(workspace, runId, iter);
+      fs.writeFileSync(
+        path.join(workspace, 'tasks', runId, 'iter', String(iter), 'directive.json'),
+        `${JSON.stringify({
+          iter,
+          message_id: `directive-recovery-${iter}`,
+          ts: '2026-09-12T00:00:00.000Z',
+          dispatch_id: `dispatch-recovery-${iter}`,
+          goal: 'recover the exact Reviewer delivery',
+          constraints: [],
+          success_criteria: [],
+          max_attempts: 1,
+        })}\n`,
+      );
+    };
+
+    it('persists an exact public Reviewer envelope before its queue delivery', async () => {
+      const runId = 'recover-public-review-envelope';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      execFileSync('git', ['init', '-q'], { cwd: workspace });
+      execFileSync('git', ['config', 'user.email', 'autoloop-test@example.invalid'], { cwd: workspace });
+      execFileSync('git', ['config', 'user.name', 'Autoloop Test'], { cwd: workspace });
+      fs.writeFileSync(path.join(workspace, 'checkpoint.txt'), 'review checkpoint\n');
+      execFileSync('git', ['add', '--', 'checkpoint.txt'], { cwd: workspace });
+      execFileSync('git', ['commit', '-q', '-m', 'review checkpoint'], { cwd: workspace });
+      const checkpointSha = execFileSync('git', ['rev-parse', '--verify', 'HEAD'], {
+        cwd: workspace,
+        encoding: 'utf8',
+      }).trim();
+      const checkpointPatch = execFileSync(
+        'git',
+        ['show', '--format=', '--unified=3', '--no-renames', checkpointSha, '--'],
+        {
+          cwd: workspace,
+        },
+      );
+      await mgr.autoloopStart({ runId, workspace });
+      seedCompleteLegacyReviewArtifacts(workspace, runId, 0);
+      fs.writeFileSync(
+        path.join(workspace, 'tasks', runId, 'iter', '0', 'directive.json'),
+        `${JSON.stringify({
+          iter: 0,
+          message_id: 'directive-public-review-0',
+          ts: '2026-09-12T00:00:00.000Z',
+          dispatch_id: 'dispatch-public-review-0',
+          goal: 'verify recovered Reviewer provenance',
+          constraints: [],
+          success_criteria: [],
+          max_attempts: 1,
+        })}\n`,
+      );
+      fs.writeFileSync(path.join(workspace, 'tasks', runId, 'iter', '0', 'diff.patch'), checkpointPatch);
+      const handle = mgr.getAutoloop(runId)!;
+      await handle.dispatcher.spawnReviewer();
+      let persisted: unknown;
+      mockSessions[1].sendImplementation = async (message) => {
+        const rows = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { record_type?: string });
+        persisted = rows.find((row) => row.record_type === 'autoloop_recovery_review_envelope');
+        const text = successfulRoleReplyFromDeliveryPrompt('reviewer', message, 'public envelope persisted');
+        return { text, event: { type: 'result', result: text } };
+      };
+
+      await mgr.autoloopRequestReview(runId, {
+        checkpoint_sha: checkpointSha,
+        source_run_id: runId,
+        source_iter: 0,
+        scope: ['security'],
+        idempotency_key: 'public-review-envelope',
+      });
+
+      expect(persisted).toMatchObject({
+        schema_version: 1,
+        record_type: 'autoloop_recovery_review_envelope',
+        run_id: runId,
+        envelope: {
+          iter: 0,
+          from: 'runner',
+          to: 'reviewer',
+          type: 'review_request',
+          payload: {
+            iter: 0,
+            checkpoint_sha: checkpointSha,
+            source_run_id: runId,
+            source_iter: 0,
+            scope: ['security'],
+            idempotency_key: 'public-review-envelope',
+          },
+        },
+      });
+      expect(createdConfigs.map((config) => config.name).filter((name) => name.endsWith('-coder'))).toEqual([]);
+      expect(createdConfigs.map((config) => config.name).filter((name) => name.endsWith('-reviewer'))).toHaveLength(1);
+      await expect(mgr.autoloopRecover(runId)).resolves.toHaveProperty('assessment');
+    });
+
+    it('fails closed on a crash-window prepared receipt instead of replaying an unproven effect', async () => {
+      const runId = 'recover-prepared-receipt-window';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const inspection = await mgr.autoloopRecover(runId);
+      const recovered = await (mgr as any)._recoveryInput(runId);
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      fs.appendFileSync(
+        decisionPath,
+        `${JSON.stringify({
+          schema_version: 1,
+          record_type: 'autoloop_recovery_receipt',
+          kind: 'autoloop_recovery_receipt',
+          run_id: runId,
+          recovery_token: inspection.assessment.recovery_token,
+          action_sha256: inspection.assessment.action_sha256,
+          action_snapshot: (mgr as any)._recoveryActionSnapshot(recovered),
+          claim_id: '12345678-1234-1234-1234-123456789abc',
+          phase: inspection.assessment.phase,
+          next_safe_action: inspection.assessment.next_safe_action,
+          status: 'prepared',
+          recorded_at: '2026-09-12T00:00:00.000Z',
+        })}\n`,
+      );
+
+      await expect(
+        mgr.autoloopRecover(runId, { apply: true, recovery_token: inspection.assessment.recovery_token }),
+      ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_INCOMPLETE' });
+      expect(
+        fs
+          .readFileSync(decisionPath, 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as Record<string, unknown>)
+          .filter((row) => row.record_type === 'autoloop_recovery_receipt'),
+      ).toHaveLength(1);
+    });
+
+    it('rejects a cross-bound none receipt pair before graph acceptance or idempotent replay', async () => {
+      const runId = 'recover-cross-bound-none-receipt';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const inspection = await mgr.autoloopRecover(runId);
+      expect(inspection.assessment.next_safe_action).toBe('none');
+      const actionSnapshot = {
+        type: 'none' as const,
+        run_id: 'another-run',
+        iter: 0,
+        phase: 'PLANNING' as const,
+      };
+      const receipt = {
+        schema_version: 1,
+        record_type: 'autoloop_recovery_receipt',
+        kind: 'autoloop_recovery_receipt',
+        run_id: runId,
+        recovery_token: inspection.assessment.recovery_token,
+        action_sha256: recoveryActionDigest(actionSnapshot),
+        action_snapshot: actionSnapshot,
+        claim_id: '12345678-1234-1234-1234-123456789abc',
+        phase: 'PLANNING',
+        next_safe_action: 'none',
+        status: 'prepared',
+        recorded_at: '2026-09-12T00:00:00.000Z',
+      } as const;
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      fs.appendFileSync(
+        decisionPath,
+        `${JSON.stringify(receipt)}\n${JSON.stringify({ ...receipt, status: 'applied' })}\n`,
+      );
+
+      await expect(mgr.autoloopRecover(runId)).rejects.toMatchObject({
+        code: 'AUTOLOOP_RECOVERY_INCOMPLETE',
+        retryable: false,
+      });
+      await expect(
+        mgr.autoloopRecover(runId, {
+          apply: true,
+          recovery_token: inspection.assessment.recovery_token,
+        }),
+      ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_INCOMPLETE', retryable: false });
+    });
+
+    it('blocks an unproven Reviewer recovery before receipt, boot, or queue delivery', async () => {
+      // This fails if request_review is fenced before its exact durable
+      // envelope has been validated: the old path appended `prepared` and
+      // only then discovered that there was no Reviewer message to send.
+      const runId = 'recover-review-missing-envelope';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      seedCompleteLegacyReviewArtifacts(workspace, runId, 0);
+      fs.writeFileSync(
+        path.join(workspace, 'tasks', runId, 'iter', '0', 'directive.json'),
+        `${JSON.stringify({
+          iter: 0,
+          message_id: 'directive-missing-review-envelope',
+          ts: '2026-09-12T00:00:00.000Z',
+          dispatch_id: 'dispatch-missing-review-envelope',
+          goal: 'prove recovery input is validated before effects',
+          constraints: [],
+          success_criteria: [],
+          max_attempts: 1,
+        })}\n`,
+      );
+      const handle = mgr.getAutoloop(runId)!;
+      const queue = vi.spyOn(handle.runner, 'send');
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const before = fs.existsSync(decisionPath) ? fs.readFileSync(decisionPath, 'utf8') : '';
+      const beforeSessions = createdConfigs.length;
+
+      const inspection = await mgr.autoloopRecover(runId);
+
+      expect(inspection.assessment).toMatchObject({
+        phase: 'BLOCKED',
+        next_safe_action: 'manual_resolution',
+      });
+      expect(inspection.assessment.evidence).toContain('ambiguity:recovery:review:missing_exact_envelope');
+      await expect(
+        mgr.autoloopRecover(runId, { apply: true, recovery_token: inspection.assessment.recovery_token }),
+      ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_MANUAL_RESOLUTION_REQUIRED' });
+      expect(fs.existsSync(decisionPath) ? fs.readFileSync(decisionPath, 'utf8') : '').toBe(before);
+      expect(queue).not.toHaveBeenCalled();
+      expect(createdConfigs).toHaveLength(beforeSessions);
+    });
+
+    it('blocks malformed Coder provenance before its recovery receipt or queue delivery', async () => {
+      // A directive artifact alone requests Coder recovery.  Its bytes must be
+      // reconstructed into the exact message before the receipt fence exists.
+      const runId = 'recover-coder-malformed-directive';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const iterDirectory = path.join(workspace, 'tasks', runId, 'iter', '0');
+      fs.mkdirSync(iterDirectory, { recursive: true });
+      fs.writeFileSync(path.join(iterDirectory, 'directive.json'), '{not-json}\n');
+      const handle = mgr.getAutoloop(runId)!;
+      const queue = vi.spyOn(handle.runner, 'send');
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const before = fs.existsSync(decisionPath) ? fs.readFileSync(decisionPath, 'utf8') : '';
+
+      const inspection = await mgr.autoloopRecover(runId);
+
+      expect(inspection.assessment).toMatchObject({ phase: 'BLOCKED', next_safe_action: 'manual_resolution' });
+      expect(inspection.assessment.evidence).toContain('ambiguity:recovery:coder:malformed_exact_directive');
+      await expect(
+        mgr.autoloopRecover(runId, { apply: true, recovery_token: inspection.assessment.recovery_token }),
+      ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_MANUAL_RESOLUTION_REQUIRED' });
+      expect(fs.existsSync(decisionPath) ? fs.readFileSync(decisionPath, 'utf8') : '').toBe(before);
+      expect(queue).not.toHaveBeenCalled();
+    });
+
+    it.each(['coder', 'reviewer'] as const)(
+      'blocks a reconstructed %s action whose envelope does not match the durable intent digest',
+      async (role) => {
+        const runId = `recover-${role}-intent-digest-mismatch`;
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const ledger = handle.dispatcher.secureLedgerCapability;
+        const envelope =
+          role === 'coder'
+            ? AutoloopMsg.directive(0, {
+                goal: 'recover the intent-bound Coder directive',
+                constraints: [],
+                success_criteria: [],
+                max_attempts: 1,
+              })
+            : AutoloopMsg.reviewRequest(0, {
+                iter: 0,
+                ledger_path: handle.runner.state.ledger_dir,
+                prior_metrics: [],
+              });
+        const dispatchId = recoveryDispatchId(runId, envelope as unknown as Record<string, unknown>);
+        if (role === 'coder') {
+          const directiveEnvelope = envelope as Extract<AnyAutoloopMessage, { type: 'directive' }>;
+          const iterDirectory = path.join(workspace, 'tasks', runId, 'iter', '0');
+          fs.mkdirSync(iterDirectory, { recursive: true });
+          fs.writeFileSync(
+            path.join(iterDirectory, 'directive.json'),
+            `${JSON.stringify({
+              iter: 0,
+              message_id: directiveEnvelope.msg_id,
+              ts: directiveEnvelope.ts,
+              dispatch_id: dispatchId,
+              goal: directiveEnvelope.payload.goal,
+              constraints: directiveEnvelope.payload.constraints,
+              success_criteria: directiveEnvelope.payload.success_criteria,
+              max_attempts: directiveEnvelope.payload.max_attempts,
+            })}\n`,
+          );
+        } else {
+          seedExactReviewArtifacts(workspace, runId, 0);
+          await handle.runner.config.persistReviewEnvelope!(
+            envelope as Extract<AnyAutoloopMessage, { type: 'review_request' }>,
+          );
+        }
+        prepareDelivery(ledger, {
+          idempotency_key: dispatchId,
+          kind: role === 'coder' ? 'coder_directive' : 'review_request',
+          target_role: role,
+          target_generation: 1,
+          payload: {
+            prompt: `immutable ${role} delivery`,
+            logical_message_sha256: recoveryLogicalMessageSha256(envelope as unknown as Record<string, unknown>),
+          },
+        });
+
+        if (role === 'coder') {
+          const directivePath = path.join(workspace, 'tasks', runId, 'iter', '0', 'directive.json');
+          const changed = JSON.parse(fs.readFileSync(directivePath, 'utf8')) as { goal: string };
+          changed.goal = 'changed after the durable intent was committed';
+          fs.writeFileSync(directivePath, `${JSON.stringify(changed)}\n`);
+        } else {
+          const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+          const rows = fs
+            .readFileSync(decisionPath, 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as Record<string, unknown>);
+          const persisted = rows.find((row) => row.record_type === 'autoloop_recovery_review_envelope')!;
+          const changed = persisted.envelope as { payload: { prior_metrics: number[] } };
+          changed.payload.prior_metrics = [91];
+          fs.writeFileSync(decisionPath, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+        }
+
+        const inspection = await mgr.autoloopRecover(runId);
+
+        expect(inspection.assessment).toMatchObject({ phase: 'BLOCKED', next_safe_action: 'manual_resolution' });
+        expect(inspection.assessment.evidence).toContain(
+          `ambiguity:recovery:${role === 'coder' ? 'coder' : 'review'}:intent_digest_mismatch`,
+        );
+        const receiptRows = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .split('\n')
+          .filter((line) => line.includes('autoloop_recovery_receipt'));
+        expect(receiptRows).toEqual([]);
+      },
+    );
+
+    it('validates a cold Planner claim against durable state so disk boot can be reached', async () => {
+      const runId = 'recover-cold-planner-durable-state';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      fs.writeFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), '');
+      const fresh = createManager();
+      const recovered = await (fresh as any)._recoveryInput(runId);
+      expect(recovered.assessment).toMatchObject({ phase: 'PLANNING', next_safe_action: 'resume_planner' });
+      const receipt: RecoveryReceipt = {
+        schema_version: 1,
+        record_type: 'autoloop_recovery_receipt',
+        kind: 'autoloop_recovery_receipt',
+        run_id: runId,
+        recovery_token: recovered.assessment.recovery_token,
+        action_sha256: recovered.assessment.action_sha256,
+        action_snapshot: (fresh as any)._recoveryActionSnapshot(recovered),
+        claim_id: '12345678-1234-1234-1234-123456789abc',
+        phase: recovered.assessment.phase,
+        next_safe_action: 'resume_planner',
+        status: 'prepared',
+        recorded_at: '2026-09-12T00:00:00.000Z',
+      };
+      const evidenceDigest = (fresh as any)._recoveryClaimEvidenceDigest(
+        recovered.ledger,
+        (fresh as any)._recoveryClaimCurrentState(runId),
+      );
+
+      expect(() =>
+        (fresh as any)._validatePreparedRecoveryAction(
+          recovered.ledger,
+          receipt,
+          { ...recovered, state: structuredClone(recovered.state) },
+          evidenceDigest,
+        ),
+      ).not.toThrow();
+      const coldBootReached = new Error('cold Planner boot reached');
+      const resume = vi.spyOn(fresh as any, '_resumeAutoloopRun').mockRejectedValue(coldBootReached);
+      await expect(
+        fresh.autoloopRecover(runId, {
+          apply: true,
+          recovery_token: recovered.assessment.recovery_token,
+        }),
+      ).rejects.toBe(coldBootReached);
+      expect(resume).toHaveBeenCalledTimes(1);
+      const receipts = fs
+        .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((row) => row.record_type === 'autoloop_recovery_receipt');
+      expect(receipts).toEqual([
+        expect.objectContaining({
+          recovery_token: recovered.assessment.recovery_token,
+          next_safe_action: 'resume_planner',
+          status: 'prepared',
+        }),
+      ]);
+      await fresh.shutdown();
+    });
+
+    it('reconstructs and applies an exact Reviewer request from disk once across concurrent and repeated callers', async () => {
+      const runId = 'recover-review-disk-only';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      seedExactReviewArtifacts(workspace, runId, 0);
+      const original = mgr.getAutoloop(runId)!;
+      const envelope = AutoloopMsg.reviewRequest(0, {
+        iter: 0,
+        ledger_path: original.runner.state.ledger_dir,
+        prior_metrics: [],
+      });
+      await original.runner.config.persistReviewEnvelope!(envelope);
+      await reconstructManager(runId);
+
+      // Configure only the reconstructed manager. A single Reviewer completion
+      // must serve both concurrent apply callers and every later retry.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (mgr as any)._createSession = (_engine: string, config: SessionConfig): ISession => {
+        const mock = new MockSession();
+        if (config.name.endsWith('-reviewer')) {
+          mock.sendImplementation = async (message) => {
+            const text = successfulRoleReplyFromDeliveryPrompt('reviewer', message, 'disk-only recovery review');
+            return { text, event: { type: 'result', result: text } };
+          };
+        }
+        mockSessions.push(mock);
+        createdConfigs.push(config);
+        return mock;
+      };
+
+      const inspection = await mgr.autoloopRecover(runId);
+      expect(inspection.assessment).toMatchObject({
+        phase: 'AWAITING_REVIEW',
+        next_safe_action: 'request_review',
+      });
+      const repeatedInspection = await mgr.autoloopRecover(runId);
+      expect(repeatedInspection.assessment).toEqual(inspection.assessment);
+      const token = inspection.assessment.recovery_token;
+      const valid = mgr.autoloopRecover(runId, { apply: true, recovery_token: token });
+      const stale = mgr.autoloopRecover(runId, { apply: true, recovery_token: 'f'.repeat(64) });
+      const duplicate = mgr.autoloopRecover(runId, { apply: true, recovery_token: token });
+
+      await expect(stale).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_TOKEN_STALE' });
+      const [first, second] = await Promise.all([valid, duplicate]);
+      expect(first.receipt).toEqual(second.receipt);
+      expect(first.receipt).toMatchObject({ status: 'applied', recovery_token: token });
+      expect(mgr.getAutoloop(runId)!.runner.state.iter).toBe(1);
+
+      const reviewerConfigs = createdConfigs.filter((config) => config.name.endsWith('-reviewer'));
+      const reviewerSessions = mockSessions.filter((_session, index) =>
+        createdConfigs[index]?.name.endsWith('-reviewer'),
+      );
+      expect(reviewerConfigs).toHaveLength(1);
+      expect(reviewerSessions[0].sendCalls.filter((call) => call.options?.waitForComplete !== false)).toHaveLength(1);
+
+      const repeated = await mgr.autoloopRecover(runId, { apply: true, recovery_token: token });
+      expect(repeated.receipt).toEqual(first.receipt);
+      expect(createdConfigs.filter((config) => config.name.endsWith('-reviewer'))).toHaveLength(1);
+      const decisions = fs.readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8');
+      expect(decisions.match(/"record_type":"autoloop_recovery_receipt"/g)).toHaveLength(2);
+      expect(decisions.match(/"record_type":"autoloop_recovery_review_envelope"/g)).toHaveLength(1);
+    });
+
+    it('cold-recovers a persisted Reviewer verdict before its missing acknowledgement without another Reviewer', async () => {
+      const runId = 'recover-review-result-before-ack';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      seedExactReviewArtifacts(workspace, runId, 0);
+      const original = mgr.getAutoloop(runId)!;
+      const envelope = AutoloopMsg.reviewRequest(0, {
+        iter: 0,
+        ledger_path: original.runner.state.ledger_dir,
+        prior_metrics: [],
+      });
+      await original.runner.config.persistReviewEnvelope!(envelope);
+      await original.dispatcher.spawnReviewer();
+      const oldReviewerIndex = createdConfigs.findIndex((config) => config.name.endsWith('-reviewer'));
+      mockSessions[oldReviewerIndex].sendImplementation = async (message) => {
+        const text = successfulRoleReplyFromDeliveryPrompt('reviewer', message, 'persisted before acknowledgement');
+        return { text, event: { type: 'result', result: text } };
+      };
+      await expect(original.dispatcher.deliver(envelope)).resolves.toMatchObject([{ type: 'review_verdict' }]);
+
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const rows = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => ({ line, value: JSON.parse(line) as Record<string, unknown> }));
+      expect(rows.filter(({ value }) => typeof value.acknowledged_at === 'string')).toHaveLength(1);
+      fs.writeFileSync(
+        decisionPath,
+        `${rows
+          .filter(({ value }) => typeof value.acknowledged_at !== 'string')
+          .map(({ line }) => line)
+          .join('\n')}\n`,
+      );
+      expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter', '0', 'verdict.json'))).toBe(true);
+      await reconstructManager(runId);
+
+      const freshConfigStart = createdConfigs.length;
+      // Any fresh Reviewer startup is a duplicate physical effect. Planner
+      // reconstruction remains allowed so the recovered verdict can re-enter
+      // the Runner and advance its checkpoint.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (mgr as any)._createSession = (_engine: string, config: SessionConfig): ISession => {
+        if (config.name.endsWith('-reviewer')) throw new Error('duplicate Reviewer startup');
+        const mock = new MockSession();
+        mockSessions.push(mock);
+        createdConfigs.push(config);
+        return mock;
+      };
+
+      const inspection = await mgr.autoloopRecover(runId);
+      expect(inspection.assessment).toMatchObject({
+        phase: 'AWAITING_REVIEW',
+        next_safe_action: 'request_review',
+      });
+      expect(inspection.assessment.evidence).toContain('recovery:review:verdict_unconsumed');
+      const applied = await mgr.autoloopRecover(runId, {
+        apply: true,
+        recovery_token: inspection.assessment.recovery_token,
+      });
+
+      expect(applied.receipt).toMatchObject({ status: 'applied' });
+      expect(mgr.getAutoloop(runId)!.runner.state.iter).toBe(1);
+      expect(createdConfigs.slice(freshConfigStart).filter((config) => config.name.endsWith('-reviewer'))).toEqual([]);
+      const recoveredRows = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(recoveredRows.filter((row) => typeof row.acknowledged_at === 'string')).toHaveLength(1);
+      expect(recoveredRows.filter((row) => row.kind === 'review_request')).toHaveLength(1);
+    });
+
+    it('allows exactly one physical Reviewer recovery effect across independent manager instances', async () => {
+      const runId = 'recover-cross-manager-single-effect';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      seedExactReviewArtifacts(workspace, runId, 0);
+      const original = mgr.getAutoloop(runId)!;
+      const envelope = AutoloopMsg.reviewRequest(0, {
+        iter: 0,
+        ledger_path: original.runner.state.ledger_dir,
+        prior_metrics: [],
+      });
+      await original.runner.config.persistReviewEnvelope!(envelope);
+      const peer = createManager();
+      const installReviewer = (manager: InstanceType<typeof SessionManager>): void => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (manager as any)._createSession = (_engine: string, config: SessionConfig): ISession => {
+          const mock = new MockSession();
+          if (config.name.endsWith('-reviewer')) {
+            mock.sendImplementation = async (message) => {
+              const text = successfulRoleReplyFromDeliveryPrompt('reviewer', message, 'one claimant only');
+              return { text, event: { type: 'result', result: text } };
+            };
+          }
+          mockSessions.push(mock);
+          createdConfigs.push(config);
+          return mock;
+        };
+      };
+      installReviewer(mgr);
+      installReviewer(peer);
+      try {
+        const token = (await mgr.autoloopRecover(runId)).assessment.recovery_token;
+        let readers = 0;
+        let bothRead!: () => void;
+        const bothReadBarrier = new Promise<void>((resolve) => {
+          bothRead = resolve;
+        });
+        let releaseReaders!: () => void;
+        const releaseBarrier = new Promise<void>((resolve) => {
+          releaseReaders = resolve;
+        });
+        const holdAfterRead = (manager: InstanceType<typeof SessionManager>): void => {
+          // Both calls must pass their receipt precheck before either may claim
+          // durable ownership. This is the cross-process crash-window schedule.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const originalInput = (manager as any)._recoveryInput.bind(manager);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (manager as any)._recoveryInput = async (...args: unknown[]) => {
+            const recovered = await originalInput(...args);
+            readers += 1;
+            if (readers === 2) bothRead();
+            await releaseBarrier;
+            return recovered;
+          };
+        };
+        holdAfterRead(mgr);
+        holdAfterRead(peer);
+        const first = mgr.autoloopRecover(runId, { apply: true, recovery_token: token });
+        const second = peer.autoloopRecover(runId, { apply: true, recovery_token: token });
+        await bothReadBarrier;
+        releaseReaders();
+        const outcomes = await Promise.allSettled([first, second]);
+
+        expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1);
+        const rejected = outcomes.filter((outcome) => outcome.status === 'rejected');
+        expect(rejected).toHaveLength(1);
+        const rejectedReason = (rejected[0] as PromiseRejectedResult).reason as {
+          code?: unknown;
+          retryable?: unknown;
+        };
+        expect(['AUTOLOOP_RECOVERY_INCOMPLETE', 'AUTOLOOP_RECOVERY_TOKEN_STALE']).toContain(rejectedReason.code);
+        expect(rejectedReason.retryable).toBe(false);
+        expect(createdConfigs.filter((config) => config.name.endsWith('-reviewer'))).toHaveLength(1);
+        const receipts = fs
+          .readFileSync(decisionPath, 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as Record<string, unknown>)
+          .filter((row) => row.record_type === 'autoloop_recovery_receipt');
+        expect(receipts).toHaveLength(2);
+        const prepared = receipts.find((row) => row.status === 'prepared')!;
+        const applied = receipts.find((row) => row.status === 'applied')!;
+        expect(prepared).toMatchObject({ recovery_token: token, status: 'prepared' });
+        expect(applied).toMatchObject({
+          recovery_token: token,
+          action_sha256: prepared.action_sha256,
+          claim_id: prepared.claim_id,
+          phase: prepared.phase,
+          next_safe_action: prepared.next_safe_action,
+          status: 'applied',
+        });
+      } finally {
+        await peer.shutdown();
+      }
+    });
+
+    it('fences a changed recovery token inside the durable claim transaction across managers', async () => {
+      // This invokes the real locked claim boundary after the point where two
+      // processes could both have observed an empty receipt ledger.  The
+      // transaction itself must reject token B once token A owns an unresolved
+      // prepared claim; an unlocked caller-side precheck cannot provide that
+      // cross-process guarantee.
+      const runId = 'recover-cross-token-atomic-claim';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const recovered = await (mgr as any)._recoveryInput(runId);
+      const peer = createManager();
+      const firstToken = recovered.assessment.recovery_token as string;
+      const secondToken = firstToken === 'e'.repeat(64) ? 'f'.repeat(64) : 'e'.repeat(64);
+      const prepared = {
+        schema_version: 1 as const,
+        record_type: 'autoloop_recovery_receipt' as const,
+        kind: 'autoloop_recovery_receipt' as const,
+        run_id: runId,
+        recovery_token: firstToken,
+        action_sha256: recovered.assessment.action_sha256 as string,
+        action_snapshot: (mgr as any)._recoveryActionSnapshot(recovered),
+        claim_id: '11111111-1111-4111-8111-111111111111',
+        phase: recovered.assessment.phase,
+        next_safe_action: recovered.assessment.next_safe_action,
+        status: 'prepared' as const,
+        recorded_at: '2026-09-12T00:00:00.000Z',
+      };
+
+      try {
+        expect((mgr as any)._appendRecoveryReceipt(recovered.ledger, prepared)).toMatchObject({
+          appended: true,
+          receipt: { recovery_token: firstToken, status: 'prepared' },
+        });
+
+        expect(() =>
+          (peer as any)._appendRecoveryReceipt(recovered.ledger, {
+            ...prepared,
+            recovery_token: secondToken,
+            action_sha256: 'a'.repeat(64),
+            claim_id: '22222222-2222-4222-8222-222222222222',
+            recorded_at: '2026-09-12T00:00:01.000Z',
+          }),
+        ).toThrowError(
+          expect.objectContaining({
+            code: 'AUTOLOOP_RECOVERY_INCOMPLETE',
+            retryable: false,
+          }),
+        );
+
+        const receipts = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as Record<string, unknown>)
+          .filter((row) => row.record_type === 'autoloop_recovery_receipt');
+        expect(receipts).toEqual([expect.objectContaining({ recovery_token: firstToken, status: 'prepared' })]);
+      } finally {
+        await peer.shutdown();
+      }
+    });
+
+    it('invalidates an inspected recovery token when its exact durable review action changes', async () => {
+      const runId = 'recover-action-digest';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      seedExactReviewArtifacts(workspace, runId, 0);
+      const original = mgr.getAutoloop(runId)!;
+      await original.runner.config.persistReviewEnvelope!(
+        AutoloopMsg.reviewRequest(0, { iter: 0, ledger_path: original.runner.state.ledger_dir, prior_metrics: [] }),
+      );
+      const inspection = await mgr.autoloopRecover(runId);
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const rows = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      const envelope = rows.find((row) => row.record_type === 'autoloop_recovery_review_envelope')!;
+      (envelope.envelope as { payload: { prior_metrics: number[] } }).payload.prior_metrics = [73];
+      fs.writeFileSync(decisionPath, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+
+      await expect(
+        mgr.autoloopRecover(runId, { apply: true, recovery_token: inspection.assessment.recovery_token }),
+      ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_TOKEN_STALE' });
+    });
+
+    it('rejects an exact review action mutated after both token checks but before its locked prepared claim', async () => {
+      const runId = 'recover-action-mutated-at-claim';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      seedExactReviewArtifacts(workspace, runId, 0);
+      const handle = mgr.getAutoloop(runId)!;
+      await handle.runner.config.persistReviewEnvelope!(
+        AutoloopMsg.reviewRequest(0, { iter: 0, ledger_path: handle.runner.state.ledger_dir, prior_metrics: [] }),
+      );
+      const inspection = await mgr.autoloopRecover(runId);
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const appendReceipt = (mgr as any)._appendRecoveryReceipt.bind(mgr);
+      const append = vi.spyOn(mgr as any, '_appendRecoveryReceipt').mockImplementation((ledger, receipt, validate) => {
+        if ((receipt as RecoveryReceipt).status === 'prepared') {
+          const rows = fs
+            .readFileSync(decisionPath, 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as Record<string, unknown>);
+          const envelope = rows.find((row) => row.record_type === 'autoloop_recovery_review_envelope')!;
+          (envelope.envelope as { payload: { prior_metrics: number[] } }).payload.prior_metrics = [73];
+          fs.writeFileSync(decisionPath, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+        }
+        return appendReceipt(ledger, receipt, validate);
+      });
+      const send = vi.spyOn(handle.runner, 'send');
+
+      try {
+        await expect(
+          mgr.autoloopRecover(runId, { apply: true, recovery_token: inspection.assessment.recovery_token }),
+        ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_TOKEN_STALE', retryable: false });
+      } finally {
+        append.mockRestore();
+      }
+
+      const receipts = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((row) => row.record_type === 'autoloop_recovery_receipt');
+      expect(receipts).toEqual([]);
+      expect(send).not.toHaveBeenCalled();
+    });
+
+    it('executes the immutable claimed action when its source changes after locked validation', async () => {
+      const runId = 'recover-action-mutated-after-validation';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      seedExactReviewArtifacts(workspace, runId, 0);
+      const handle = mgr.getAutoloop(runId)!;
+      const originalEnvelope = AutoloopMsg.reviewRequest(0, {
+        iter: 0,
+        ledger_path: handle.runner.state.ledger_dir,
+        prior_metrics: [],
+      });
+      await handle.runner.config.persistReviewEnvelope!(originalEnvelope);
+      const inspection = await mgr.autoloopRecover(runId);
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const validatePrepared = (mgr as any)._validatePreparedRecoveryAction.bind(mgr);
+      const validate = vi
+        .spyOn(mgr as any, '_validatePreparedRecoveryAction')
+        .mockImplementation((ledger, receipt, recovered, digest) => {
+          validatePrepared(ledger, receipt, recovered, digest);
+          const rows = fs
+            .readFileSync(decisionPath, 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as Record<string, unknown>);
+          const envelope = rows.find((row) => row.record_type === 'autoloop_recovery_review_envelope')!;
+          (envelope.envelope as { payload: { prior_metrics: number[] } }).payload.prior_metrics = [73];
+          fs.writeFileSync(decisionPath, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+        });
+      const send = vi.spyOn(handle.runner, 'send').mockResolvedValue(undefined);
+
+      try {
+        await expect(
+          mgr.autoloopRecover(runId, { apply: true, recovery_token: inspection.assessment.recovery_token }),
+        ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_INCOMPLETE', retryable: false });
+      } finally {
+        validate.mockRestore();
+      }
+
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(send.mock.calls[0]?.[0]).toEqual(originalEnvelope);
+      const receipts = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((row) => row.record_type === 'autoloop_recovery_receipt');
+      expect(receipts).toEqual([
+        expect.objectContaining({
+          recovery_token: inspection.assessment.recovery_token,
+          action_sha256: inspection.assessment.action_sha256,
+          action_snapshot: originalEnvelope,
+          status: 'prepared',
+        }),
+      ]);
+    });
+
+    it('blocks a new recovery action while any earlier prepared claim remains unresolved', async () => {
+      const runId = 'recover-stale-prepared-claim';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      seedExactReviewArtifacts(workspace, runId, 0);
+      const handle = mgr.getAutoloop(runId)!;
+      await handle.runner.config.persistReviewEnvelope!(
+        AutoloopMsg.reviewRequest(0, { iter: 0, ledger_path: handle.runner.state.ledger_dir, prior_metrics: [] }),
+      );
+      const firstInspection = await mgr.autoloopRecover(runId);
+      const firstRecovered = await (mgr as any)._recoveryInput(runId);
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      fs.appendFileSync(
+        decisionPath,
+        `${JSON.stringify({
+          schema_version: 1,
+          record_type: 'autoloop_recovery_receipt',
+          kind: 'autoloop_recovery_receipt',
+          run_id: runId,
+          recovery_token: firstInspection.assessment.recovery_token,
+          action_sha256: firstInspection.assessment.action_sha256,
+          action_snapshot: (mgr as any)._recoveryActionSnapshot(firstRecovered),
+          claim_id: '12345678-1234-1234-1234-123456789abc',
+          phase: firstInspection.assessment.phase,
+          next_safe_action: firstInspection.assessment.next_safe_action,
+          status: 'prepared',
+          recorded_at: '2026-09-12T00:00:00.000Z',
+        })}\n`,
+      );
+      const rows = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      const envelope = rows.find((row) => row.record_type === 'autoloop_recovery_review_envelope')!;
+      (envelope.envelope as { payload: { prior_metrics: number[] } }).payload.prior_metrics = [73];
+      fs.writeFileSync(decisionPath, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+      const secondInspection = await mgr.autoloopRecover(runId);
+      expect(secondInspection.assessment.recovery_token).not.toBe(firstInspection.assessment.recovery_token);
+      const send = vi.spyOn(handle.runner, 'send').mockRejectedValue(new Error('new recovery effect executed'));
+
+      await expect(
+        mgr.autoloopRecover(runId, {
+          apply: true,
+          recovery_token: secondInspection.assessment.recovery_token,
+        }),
+      ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_INCOMPLETE', retryable: false });
+
+      expect(send).not.toHaveBeenCalled();
+      const receipts = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((row) => row.record_type === 'autoloop_recovery_receipt');
+      expect(receipts).toHaveLength(1);
+      expect(receipts[0]).toMatchObject({
+        recovery_token: firstInspection.assessment.recovery_token,
+        status: 'prepared',
+      });
+    });
+
+    it('fails closed before recovery effects when the complete outbox ledger graph has an orphan acknowledgement', async () => {
+      const runId = 'recover-outbox-graph';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      fs.appendFileSync(
+        decisionPath,
+        `${JSON.stringify({
+          schema_version: 1,
+          delivery_id: 'orphan-delivery',
+          payload_sha256: 'a'.repeat(64),
+          acknowledged_at: '2026-09-12T00:00:00.000Z',
+        })}\n`,
+      );
+
+      await expect(mgr.autoloopRecover(runId)).rejects.toThrow(/acknowledges no earlier delivery intent/i);
+    });
+
+    it('does not mutate ledger directory or decisions-file metadata during read-only inspection', async () => {
+      const runId = 'recover-read-only-metadata';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const tasksDirectory = path.join(workspace, 'tasks');
+      const runDirectory = path.join(tasksDirectory, runId);
+      const decisionPath = path.join(runDirectory, 'decisions.jsonl');
+      fs.writeFileSync(decisionPath, '');
+      fs.chmodSync(tasksDirectory, 0o777);
+      fs.chmodSync(runDirectory, 0o777);
+      fs.chmodSync(decisionPath, 0o644);
+      const snapshot = (entry: string): { mode: number; ctimeMs: number; mtimeMs: number; bytes?: Buffer } => {
+        const stat = fs.statSync(entry);
+        return {
+          mode: stat.mode,
+          ctimeMs: stat.ctimeMs,
+          mtimeMs: stat.mtimeMs,
+          ...(stat.isFile() ? { bytes: fs.readFileSync(entry) } : {}),
+        };
+      };
+      const before = [tasksDirectory, runDirectory, decisionPath].map((entry) => ({
+        entry,
+        snapshot: snapshot(entry),
+      }));
+
+      await mgr.autoloopRecover(runId);
+
+      for (const entry of before) {
+        expect(snapshot(entry.entry)).toEqual(entry.snapshot);
+      }
+    });
+
+    it('blocks a paused Reviewer recovery before preparing a receipt or parking the delivery', async () => {
+      // A paused Runner accepts legacy review requests into its in-memory
+      // buffer and resolves the sender without any Task-5 delivery intent or
+      // acknowledgement. Recovery must classify that state before claiming an
+      // effect, rather than mistaking the parked message for an applied action.
+      const runId = 'recover-paused-review-before-claim';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      seedExactReviewArtifacts(workspace, runId, 0);
+      const handle = mgr.getAutoloop(runId)!;
+      const envelope = AutoloopMsg.reviewRequest(0, {
+        iter: 0,
+        ledger_path: handle.runner.state.ledger_dir,
+        prior_metrics: [],
+      });
+      await handle.runner.config.persistReviewEnvelope!(envelope);
+      handle.runner.state.status = 'paused';
+      handle.runner.state.status_reason = 'operator-paused-before-recovery';
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const before = fs.readFileSync(decisionPath, 'utf8');
+      const send = vi.spyOn(handle.runner, 'send');
+
+      const inspection = await mgr.autoloopRecover(runId);
+
+      expect(inspection.assessment).toMatchObject({ phase: 'BLOCKED', next_safe_action: 'manual_resolution' });
+      expect(inspection.assessment.evidence).toContain('ambiguity:recovery:runner:paused');
+      await expect(
+        mgr.autoloopRecover(runId, {
+          apply: true,
+          recovery_token: inspection.assessment.recovery_token,
+        }),
+      ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_MANUAL_RESOLUTION_REQUIRED', retryable: false });
+      expect(send).not.toHaveBeenCalled();
+      expect(fs.readFileSync(decisionPath, 'utf8')).toBe(before);
+    });
+
+    it('does not mark a Reviewer recovery applied when it becomes parked after the prepared claim', async () => {
+      // This is the post-precondition race: inspection and token validation see
+      // a runnable state, but the Runner pauses immediately after the durable
+      // claim.  Its legacy queue contract resolves a parked send, so recovery
+      // must require Task-5 acknowledgement evidence before writing `applied`.
+      const runId = 'recover-review-paused-after-claim';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      seedExactReviewArtifacts(workspace, runId, 0);
+      const handle = mgr.getAutoloop(runId)!;
+      const envelope = AutoloopMsg.reviewRequest(0, {
+        iter: 0,
+        ledger_path: handle.runner.state.ledger_dir,
+        prior_metrics: [],
+      });
+      await handle.runner.config.persistReviewEnvelope!(envelope);
+      const inspection = await mgr.autoloopRecover(runId);
+      expect(inspection.assessment).toMatchObject({
+        phase: 'AWAITING_REVIEW',
+        next_safe_action: 'request_review',
+      });
+      const appendReceipt = (mgr as any)._appendRecoveryReceipt.bind(mgr);
+      const append = vi.spyOn(mgr as any, '_appendRecoveryReceipt').mockImplementation((ledger, receipt) => {
+        const typedReceipt = receipt as RecoveryReceipt;
+        const result = appendReceipt(ledger, typedReceipt);
+        if (typedReceipt.status === 'prepared') {
+          handle.runner.state.status = 'paused';
+          handle.runner.state.status_reason = 'paused-after-recovery-claim';
+        }
+        return result;
+      });
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+
+      try {
+        await expect(
+          mgr.autoloopRecover(runId, {
+            apply: true,
+            recovery_token: inspection.assessment.recovery_token,
+          }),
+        ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_INCOMPLETE', retryable: false });
+      } finally {
+        append.mockRestore();
+      }
+
+      const rows = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(rows.filter((row) => row.record_type === 'autoloop_recovery_receipt')).toEqual([
+        expect.objectContaining({
+          recovery_token: inspection.assessment.recovery_token,
+          status: 'prepared',
+        }),
+      ]);
+      expect(rows.filter((row) => typeof row.delivery_id === 'string' && typeof row.created_at === 'string')).toEqual(
+        [],
+      );
+      expect(rows.filter((row) => typeof row.acknowledged_at === 'string')).toEqual([]);
+      expect(createdConfigs.filter((config) => config.name.endsWith('-reviewer'))).toEqual([]);
+    });
+
+    it('does not mark a Coder recovery applied when it becomes parked after the prepared claim', async () => {
+      const runId = 'recover-coder-paused-after-claim';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const handle = mgr.getAutoloop(runId)!;
+      const envelope = AutoloopMsg.directive(0, {
+        goal: 'recover exact Coder delivery',
+        constraints: [],
+        success_criteria: [],
+        max_attempts: 1,
+      });
+      const dispatchId = recoveryDispatchId(runId, envelope as unknown as Record<string, unknown>);
+      const iterDirectory = path.join(workspace, 'tasks', runId, 'iter', '0');
+      fs.mkdirSync(iterDirectory, { recursive: true });
+      fs.writeFileSync(
+        path.join(iterDirectory, 'directive.json'),
+        `${JSON.stringify({
+          iter: 0,
+          message_id: envelope.msg_id,
+          ts: envelope.ts,
+          dispatch_id: dispatchId,
+          goal: envelope.payload.goal,
+          constraints: envelope.payload.constraints,
+          success_criteria: envelope.payload.success_criteria,
+          max_attempts: envelope.payload.max_attempts,
+        })}\n`,
+      );
+      const historicalIntent = prepareDelivery(handle.dispatcher.secureLedgerCapability, {
+        idempotency_key: dispatchId,
+        kind: 'coder_directive',
+        target_role: 'coder',
+        target_generation: 1,
+        payload: {
+          prompt: 'historical exact Coder delivery',
+          logical_message_sha256: recoveryLogicalMessageSha256(envelope as unknown as Record<string, unknown>),
+        },
+      });
+      acknowledgeDelivery(
+        handle.dispatcher.secureLedgerCapability,
+        historicalIntent.delivery_id,
+        historicalIntent.payload_sha256,
+      );
+      const inspection = await mgr.autoloopRecover(runId);
+      expect(inspection.assessment).toMatchObject({
+        phase: 'PAUSED_RECOVERABLE',
+        next_safe_action: 'dispatch_coder',
+      });
+      const appendReceipt = (mgr as any)._appendRecoveryReceipt.bind(mgr);
+      const append = vi.spyOn(mgr as any, '_appendRecoveryReceipt').mockImplementation((ledger, receipt) => {
+        const typedReceipt = receipt as RecoveryReceipt;
+        const result = appendReceipt(ledger, typedReceipt);
+        if (typedReceipt.status === 'prepared') {
+          handle.runner.state.status = 'paused';
+          handle.runner.state.status_reason = 'paused-after-recovery-claim';
+        }
+        return result;
+      });
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const deliver = vi.spyOn(handle.dispatcher, 'deliver');
+      const beforeDeliveryRows = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((row) => typeof row.delivery_id === 'string');
+
+      let outcome: PromiseSettledResult<Awaited<ReturnType<typeof mgr.autoloopRecover>>>;
+      try {
+        [outcome] = await Promise.allSettled([
+          mgr.autoloopRecover(runId, {
+            apply: true,
+            recovery_token: inspection.assessment.recovery_token,
+          }),
+        ]);
+      } finally {
+        append.mockRestore();
+      }
+
+      const rows = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      const receipts = rows.filter((row) => row.record_type === 'autoloop_recovery_receipt');
+      expect(deliver).not.toHaveBeenCalled();
+      expect(rows.filter((row) => typeof row.delivery_id === 'string')).toEqual(beforeDeliveryRows);
+      expect.soft(receipts).toEqual([
+        expect.objectContaining({
+          recovery_token: inspection.assessment.recovery_token,
+          status: 'prepared',
+        }),
+      ]);
+      expect(outcome!).toMatchObject({
+        status: 'rejected',
+        reason: { code: 'AUTOLOOP_RECOVERY_INCOMPLETE', retryable: false },
+      });
+      expect(createdConfigs.filter((config) => config.name.endsWith('-coder'))).toEqual([]);
+    });
+
+    it('does not treat a pre-existing same-iteration Coder acknowledgement as proof after terminal recovery', async () => {
+      const runId = 'recover-coder-terminal-preexisting-ack';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const handle = mgr.getAutoloop(runId)!;
+      const envelope = AutoloopMsg.directive(0, {
+        goal: 'recover only the exact Coder delivery',
+        constraints: [],
+        success_criteria: [],
+        max_attempts: 1,
+      });
+      const iterDirectory = path.join(workspace, 'tasks', runId, 'iter', '0');
+      fs.mkdirSync(iterDirectory, { recursive: true });
+      fs.writeFileSync(
+        path.join(iterDirectory, 'directive.json'),
+        `${JSON.stringify({
+          iter: 0,
+          message_id: envelope.msg_id,
+          ts: envelope.ts,
+          dispatch_id: recoveryDispatchId(runId, envelope as unknown as Record<string, unknown>),
+          goal: envelope.payload.goal,
+          constraints: envelope.payload.constraints,
+          success_criteria: envelope.payload.success_criteria,
+          max_attempts: envelope.payload.max_attempts,
+        })}\n`,
+      );
+      const historicalIntent = prepareDelivery(handle.dispatcher.secureLedgerCapability, {
+        idempotency_key: recoveryDispatchId(runId, envelope as unknown as Record<string, unknown>),
+        kind: 'coder_directive',
+        target_role: 'coder',
+        target_generation: 1,
+        payload: {
+          prompt: 'historical exact Coder delivery',
+          logical_message_sha256: recoveryLogicalMessageSha256(envelope as unknown as Record<string, unknown>),
+        },
+      });
+      acknowledgeDelivery(
+        handle.dispatcher.secureLedgerCapability,
+        historicalIntent.delivery_id,
+        historicalIntent.payload_sha256,
+      );
+      const inspection = await mgr.autoloopRecover(runId);
+      expect(inspection.assessment).toMatchObject({ next_safe_action: 'dispatch_coder' });
+      const deliver = vi.spyOn(handle.dispatcher, 'deliver');
+      const appendReceipt = (mgr as any)._appendRecoveryReceipt.bind(mgr);
+      const append = vi.spyOn(mgr as any, '_appendRecoveryReceipt').mockImplementation((ledger, receipt, validate) => {
+        const result = appendReceipt(ledger, receipt, validate);
+        if ((receipt as RecoveryReceipt).status === 'prepared') {
+          handle.runner.state.status = 'terminated';
+          handle.runner.state.status_reason = 'terminal-after-recovery-claim';
+        }
+        return result;
+      });
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+
+      let outcome: PromiseSettledResult<Awaited<ReturnType<typeof mgr.autoloopRecover>>>;
+      try {
+        [outcome] = await Promise.allSettled([
+          mgr.autoloopRecover(runId, {
+            apply: true,
+            recovery_token: inspection.assessment.recovery_token,
+          }),
+        ]);
+      } finally {
+        append.mockRestore();
+      }
+
+      expect(deliver).not.toHaveBeenCalled();
+      const receipts = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as { record_type?: string; status?: string })
+        .filter((row) => row.record_type === 'autoloop_recovery_receipt');
+      expect.soft(receipts.map((row) => row.status)).toEqual(['prepared']);
+      expect(outcome!).toMatchObject({
+        status: 'rejected',
+        reason: { code: 'AUTOLOOP_RECOVERY_INCOMPLETE', retryable: false },
+      });
+    });
+
+    it('classifies an already-live planning boundary before any recovery receipt is prepared', async () => {
+      const runId = 'recover-live-planning-already-satisfied';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const handle = mgr.getAutoloop(runId)!;
+      const before = structuredClone(handle.runner.state);
+      const send = vi.spyOn(handle.runner, 'send');
+
+      const inspection = await mgr.autoloopRecover(runId);
+
+      expect(inspection.assessment).toMatchObject({ phase: 'PLANNING', next_safe_action: 'none' });
+      const applied = await mgr.autoloopRecover(runId, {
+        apply: true,
+        recovery_token: inspection.assessment.recovery_token,
+      });
+      expect(applied.receipt?.next_safe_action).toBe('none');
+      expect(handle.runner.state).toEqual(before);
+      expect(send).not.toHaveBeenCalled();
+    });
+
+    it('rebinds a live running Planner boundary to none before any non-none receipt is claimed', async () => {
+      const runId = 'recover-live-running-planner-already-satisfied';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const handle = mgr.getAutoloop(runId)!;
+      const iterDirectory = path.join(workspace, 'tasks', runId, 'iter', '0');
+      fs.mkdirSync(iterDirectory, { recursive: true });
+      fs.writeFileSync(path.join(iterDirectory, 'verdict.json'), `${JSON.stringify({ decision: 'advance' })}\n`);
+      handle.runner.state.iter = 1;
+      handle.runner.state.status = 'running';
+      handle.runner.state.status_reason = null;
+      const send = vi.spyOn(handle.runner, 'send');
+
+      const inspection = await mgr.autoloopRecover(runId);
+
+      expect(inspection.assessment).toMatchObject({ phase: 'PLANNING', next_safe_action: 'none' });
+      const applied = await mgr.autoloopRecover(runId, {
+        apply: true,
+        recovery_token: inspection.assessment.recovery_token,
+      });
+      expect(applied.receipt).toMatchObject({ next_safe_action: 'none', status: 'applied' });
+      expect(send).not.toHaveBeenCalled();
+    });
+
+    it('records resume_planner as applied only after this invocation resumes a paused Planner', async () => {
+      const runId = 'recover-paused-planner-transition';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const handle = mgr.getAutoloop(runId)!;
+      const iterDirectory = path.join(workspace, 'tasks', runId, 'iter', '0');
+      fs.mkdirSync(iterDirectory, { recursive: true });
+      fs.writeFileSync(path.join(iterDirectory, 'verdict.json'), `${JSON.stringify({ decision: 'advance' })}\n`);
+      handle.runner.state.iter = 1;
+      handle.runner.state.status = 'paused';
+      handle.runner.state.status_reason = 'recoverable-planner-pause';
+      const send = vi.spyOn(handle.runner, 'send');
+
+      const inspection = await mgr.autoloopRecover(runId);
+      expect(inspection.assessment).toMatchObject({ phase: 'PLANNING', next_safe_action: 'resume_planner' });
+
+      const applied = await mgr.autoloopRecover(runId, {
+        apply: true,
+        recovery_token: inspection.assessment.recovery_token,
+      });
+
+      expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: 'resume', iter: 1 }));
+      expect(handle.runner.state.status).not.toBe('paused');
+      expect(applied.receipt).toMatchObject({ next_safe_action: 'resume_planner', status: 'applied' });
+    });
+
+    it('inspects read-only, fences apply by the current token, and shares one durable receipt', async () => {
+      const runId = 'recover-inspect-apply-core';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const handle = mgr.getAutoloop(runId)!;
+      const before = structuredClone(handle.runner.state);
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const beforeDecisions = fs.existsSync(decisionPath) ? fs.readFileSync(decisionPath, 'utf8') : '';
+
+      const inspection = await mgr.autoloopRecover(runId);
+
+      expect(inspection.receipt).toBeUndefined();
+      expect(handle.runner.state).toEqual(before);
+      expect(fs.existsSync(decisionPath) ? fs.readFileSync(decisionPath, 'utf8') : '').toBe(beforeDecisions);
+      await expect(mgr.autoloopRecover(runId, { apply: true })).rejects.toMatchObject({
+        code: 'AUTOLOOP_RECOVERY_TOKEN_REQUIRED',
+      });
+      await expect(mgr.autoloopRecover(runId, { apply: true, recovery_token: '0'.repeat(64) })).rejects.toMatchObject({
+        code: 'AUTOLOOP_RECOVERY_TOKEN_STALE',
+      });
+
+      const [first, second] = await Promise.all([
+        mgr.autoloopRecover(runId, { apply: true, recovery_token: inspection.assessment.recovery_token }),
+        mgr.autoloopRecover(runId, { apply: true, recovery_token: inspection.assessment.recovery_token }),
+      ]);
+
+      expect(first.receipt).toEqual(second.receipt);
+      expect(first.receipt).toMatchObject({
+        schema_version: 1,
+        record_type: 'autoloop_recovery_receipt',
+        status: 'applied',
+        recovery_token: inspection.assessment.recovery_token,
+      });
+      const receipts = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as { record_type?: string; status?: string })
+        .filter((row) => row.record_type === 'autoloop_recovery_receipt');
+      expect(receipts.map((row) => row.status)).toEqual(['prepared', 'applied']);
+
+      const repeated = await mgr.autoloopRecover(runId, {
+        apply: true,
+        recovery_token: inspection.assessment.recovery_token,
+      });
+      expect(repeated.receipt).toEqual(first.receipt);
+      expect(
+        fs
+          .readFileSync(decisionPath, 'utf8')
+          .split('\n')
+          .filter((line) => line.includes('autoloop_recovery_receipt')),
+      ).toHaveLength(2);
     });
   });
 
