@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
@@ -6919,6 +6919,83 @@ describe('SessionManager', () => {
         expect(fs.readFileSync(evidencePath, 'utf8')).toBe(original.evidence);
       });
 
+      it('keeps a stored timeout migration on the legacy resume path without recovery receipts', async () => {
+        const runId = 'resume-timeout-stored-migration-legacy-path';
+        const workspace = workspaceFor(runId);
+        await mgr.autoloopStart({ runId, workspace, sendTimeoutMs: 650_000 });
+        await terminateAndReconstructManager(runId);
+        await resumeWithOverride(runId, { sendTimeoutMs: 700_000 });
+
+        const auditPath = auditPathFor(workspace, runId);
+        await terminateAndReconstructManager(runId);
+        const auditBeforeResume = fs.readFileSync(auditPath, 'utf8');
+
+        await expect(mgr.autoloopResume(runId)).resolves.toMatchObject({ run_id: runId });
+        expect(fs.readFileSync(auditPath, 'utf8')).toBe(auditBeforeResume);
+      });
+
+      it.each((['migrated', 'pending', 'cancelled'] as const).map((state) => ({ state })))(
+        'coalesces concurrent receipt-free $state stored resumes into one successful boot',
+        async ({ state }) => {
+          // Mutation caught: allowing both callers into _resumeAutoloopRun
+          // creates competing readiness tags and can strand one caller.
+          const runId = `resume-concurrent-receipt-free-${state}`;
+          const workspace = workspaceFor(runId);
+          if (state === 'pending') {
+            await pauseForTimeout(runId, workspace, 650_000, `dispatch-${runId}`);
+            const checkpointPath = path.join(TEST_WF_DIR, runId, 'run.json');
+            const pendingCheckpoint = fs.readFileSync(checkpointPath, 'utf8');
+            await terminateAndReconstructManager(runId);
+            fs.writeFileSync(checkpointPath, pendingCheckpoint);
+          } else {
+            await mgr.autoloopStart({ runId, workspace, sendTimeoutMs: 650_000 });
+            await terminateAndReconstructManager(runId);
+            if (state === 'migrated') {
+              await resumeWithOverride(runId, { sendTimeoutMs: 700_000 });
+              await terminateAndReconstructManager(runId);
+            } else {
+              const checkpointPath = path.join(TEST_WF_DIR, runId, 'run.json');
+              const checkpoint = JSON.parse(fs.readFileSync(checkpointPath, 'utf8')) as { state: string };
+              checkpoint.state = 'cancelled';
+              fs.writeFileSync(checkpointPath, JSON.stringify(checkpoint));
+            }
+          }
+          const receiptRows = fs
+            .readFileSync(auditPathFor(workspace, runId), 'utf8')
+            .split('\n')
+            .filter((line) => line.includes('autoloop_recovery_receipt'));
+          expect(receiptRows).toEqual([]);
+
+          let enterBoot!: () => void;
+          const bootEntered = new Promise<void>((resolve) => {
+            enterBoot = resolve;
+          });
+          let releaseBoot!: () => void;
+          const bootBarrier = new Promise<void>((resolve) => {
+            releaseBoot = resolve;
+          });
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const resume = (mgr as any)._resumeAutoloopRun.bind(mgr);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const boot = vi.spyOn(mgr as any, '_resumeAutoloopRun').mockImplementation(async (...args: unknown[]) => {
+            enterBoot();
+            await bootBarrier;
+            return await resume(...args);
+          });
+
+          const first = mgr.autoloopResume(runId);
+          await bootEntered;
+          const second = mgr.autoloopResume(runId);
+          await new Promise<void>((resolve) => nativeSetImmediate(resolve));
+          releaseBoot();
+          const [firstState, secondState] = await Promise.all([first, second]);
+
+          expect(boot).toHaveBeenCalledTimes(1);
+          expect(firstState).toBe(secondState);
+          expect(firstState).toBe(mgr.getAutoloop(runId)!.runner.state);
+        },
+      );
+
       it.each([
         { barrier: 'file', target: 'decisions.jsonl' },
         { barrier: 'directory', target: '' },
@@ -9424,6 +9501,681 @@ describe('SessionManager', () => {
       );
     };
 
+    type StoredResumeCompatibilityState = 'pending' | 'migrated' | 'cancelled';
+
+    const startStoredResumeCompatibilityState = async (runId: string): Promise<string> => {
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace, sendTimeoutMs: 650_000 });
+      return workspace;
+    };
+
+    const layerStoredResumeCompatibilityState = async (
+      runId: string,
+      workspace: string,
+      state: StoredResumeCompatibilityState,
+    ): Promise<void> => {
+      if (state === 'pending') {
+        await mgr.getAutoloop(runId)!.runner.send(
+          AutoloopMsg.sendTimeout(0, {
+            status: 'awaiting_resume',
+            dispatch_id: `dispatch-${runId}`,
+            agent: 'planner',
+            message_id: `message-${runId}`,
+            message_type: 'chat',
+            iter: 0,
+            timeout_ms: 650_000,
+            error: 'Timed out after 650000ms',
+          }),
+        );
+      } else if (state === 'migrated') {
+        const timestamp = '2026-09-12T00:00:01.000Z';
+        fs.appendFileSync(
+          path.join(workspace, 'tasks', runId, 'decisions.jsonl'),
+          `${JSON.stringify({
+            ts: timestamp,
+            kind: 'timeout_migration',
+            actor: 'operator',
+            timestamp,
+            runId,
+            field: 'sendTimeoutMs',
+            oldValue: 650_000,
+            newValue: 700_000,
+            reason: 'stored_run_resume',
+          })}\n`,
+        );
+      }
+      const checkpointPath = path.join(TEST_WF_DIR, runId, 'run.json');
+      const checkpoint = JSON.parse(fs.readFileSync(checkpointPath, 'utf8')) as { state: string };
+      if (state === 'cancelled') checkpoint.state = 'cancelled';
+      await reconstructManager(runId);
+      fs.writeFileSync(checkpointPath, JSON.stringify(checkpoint));
+      fs.writeFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), '');
+    };
+
+    const appendRecoveryReceiptPair = async (
+      runId: string,
+      workspace: string,
+      status: 'prepared' | 'applied',
+    ): Promise<string> => {
+      const inspection = await mgr.autoloopRecover(runId);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const recovered = await (mgr as any)._recoveryInput(runId);
+      const receipt = {
+        schema_version: 1,
+        record_type: 'autoloop_recovery_receipt',
+        kind: 'autoloop_recovery_receipt',
+        run_id: runId,
+        recovery_token: inspection.assessment.recovery_token,
+        action_sha256: inspection.assessment.action_sha256,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        action_snapshot: (mgr as any)._recoveryActionSnapshot(recovered),
+        claim_id: '12345678-1234-1234-1234-123456789abc',
+        phase: inspection.assessment.phase,
+        next_safe_action: inspection.assessment.next_safe_action,
+        status: 'prepared',
+        recorded_at: '2026-09-12T00:00:00.000Z',
+      } as const;
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      fs.appendFileSync(
+        decisionPath,
+        `${JSON.stringify(receipt)}\n${status === 'applied' ? `${JSON.stringify({ ...receipt, status })}\n` : ''}`,
+      );
+      return decisionPath;
+    };
+
+    it('lets a cross-process prepared recovery claim win after the legacy receipt snapshot', async () => {
+      // Mutation caught: deciding from the first empty receipt read without
+      // sharing recovery's file lock lets this explicit migration boot after a
+      // different process has durably prepared the same recovery effect.
+      const runId = 'resume-recovery-claim-wins-after-empty-snapshot';
+      const workspace = await startStoredResumeCompatibilityState(runId);
+      await layerStoredResumeCompatibilityState(runId, workspace, 'migrated');
+      const inspection = await mgr.autoloopRecover(runId);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const recovered = await (mgr as any)._recoveryInput(runId);
+      expect(inspection.assessment.next_safe_action).toBe('resume_planner');
+      const receipt: RecoveryReceipt = {
+        schema_version: 1,
+        record_type: 'autoloop_recovery_receipt',
+        kind: 'autoloop_recovery_receipt',
+        run_id: runId,
+        recovery_token: inspection.assessment.recovery_token,
+        action_sha256: inspection.assessment.action_sha256,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        action_snapshot: (mgr as any)._recoveryActionSnapshot(recovered),
+        claim_id: '12345678-1234-1234-1234-123456789abc',
+        phase: inspection.assessment.phase,
+        next_safe_action: inspection.assessment.next_safe_action,
+        status: 'prepared',
+        recorded_at: '2026-09-12T00:00:00.000Z',
+      };
+      const ledgerDirectory = path.join(workspace, 'tasks', runId);
+      const decisionPath = path.join(ledgerDirectory, 'decisions.jsonl');
+      const recoveryLockPath = path.join(ledgerDirectory, '.autoloop-recovery.lock');
+      const snapshotBarrierPath = path.join(ledgerDirectory, 'legacy-receipt-snapshot-observed');
+      const decisionBefore = fs.readFileSync(decisionPath, 'utf8');
+      const timeoutMigrationsBefore = decisionBefore
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as { kind?: string })
+        .filter((row) => row.kind === 'timeout_migration');
+
+      const childScript = String.raw`
+        (async () => {
+          const fs = await import('node:fs');
+          const path = await import('node:path');
+          const { withFileLock } = await import('./src/kernel/file-lock.ts');
+          const [lockPath, decisionPath, barrierPath, receiptJson] = process.argv.slice(1);
+          const result = withFileLock(lockPath, () => {
+            process.stdout.write('LOCKED\n');
+            const deadline = Date.now() + 5000;
+            while (!fs.existsSync(barrierPath)) {
+              if (Date.now() >= deadline) throw new Error('legacy receipt snapshot barrier timed out');
+              Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+            }
+            const receiptFd = fs.openSync(decisionPath, 'a');
+            try {
+              fs.writeSync(receiptFd, receiptJson + '\n');
+              fs.fsyncSync(receiptFd);
+            } finally {
+              fs.closeSync(receiptFd);
+            }
+            const directoryFd = fs.openSync(path.dirname(decisionPath), 'r');
+            try {
+              fs.fsyncSync(directoryFd);
+            } finally {
+              fs.closeSync(directoryFd);
+            }
+          }, { waitMs: 5000 });
+          if (!result.ok) throw new Error(result.error);
+        })().catch((error) => {
+          process.stderr.write(String(error && error.stack ? error.stack : error));
+          process.exitCode = 1;
+        });
+      `;
+      const claimant = spawn(
+        process.execPath,
+        [
+          '--import',
+          'tsx',
+          '--eval',
+          childScript,
+          recoveryLockPath,
+          decisionPath,
+          snapshotBarrierPath,
+          JSON.stringify(receipt),
+        ],
+        { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      let childStdout = '';
+      let childStderr = '';
+      claimant.stdout.setEncoding('utf8');
+      claimant.stderr.setEncoding('utf8');
+      claimant.stdout.on('data', (chunk: string) => {
+        childStdout += chunk;
+      });
+      claimant.stderr.on('data', (chunk: string) => {
+        childStderr += chunk;
+      });
+      const claimantLocked = new Promise<void>((resolve, reject) => {
+        const inspect = (): void => {
+          if (childStdout.includes('LOCKED\n')) resolve();
+        };
+        claimant.stdout.on('data', inspect);
+        claimant.once('error', reject);
+        claimant.once('exit', (code) => {
+          if (!childStdout.includes('LOCKED\n')) {
+            reject(new Error(`receipt claimant exited ${String(code)} before locking: ${childStderr}`));
+          }
+        });
+      });
+      const claimantExit = new Promise<number | null>((resolve, reject) => {
+        claimant.once('error', reject);
+        claimant.once('exit', resolve);
+      });
+      await claimantLocked;
+
+      let emptySnapshotObserved = false;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const readReceipts = (mgr as any)._recoveryReceiptRows.bind(mgr);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      vi.spyOn(mgr as any, '_recoveryReceiptRows').mockImplementation((...args: unknown[]) => {
+        const rows = readReceipts(...args) as RecoveryReceipt[];
+        if (!emptySnapshotObserved && rows.length === 0) {
+          emptySnapshotObserved = true;
+          fs.writeFileSync(snapshotBarrierPath, 'observed\n');
+        }
+        return rows;
+      });
+      const legacyBoot = new Error('legacy boot crossed the recovery claim');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const boot = vi.spyOn(mgr as any, '_resumeAutoloopRun').mockImplementation(async (...args: unknown[]) => {
+        (args[2] as { commitTimeoutMigration?: () => void } | undefined)?.commitTimeoutMigration?.();
+        throw legacyBoot;
+      });
+      const sessionsBefore = createdConfigs.length;
+
+      const [outcome] = await Promise.allSettled([mgr.autoloopResume(runId, { sendTimeoutMs: 750_000 })]);
+      const childExitCode = await claimantExit;
+      const decisionAfter = fs.readFileSync(decisionPath, 'utf8');
+      const rowsAfter = decisionAfter
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as { kind?: string; record_type?: string; status?: string });
+
+      expect(childExitCode, childStderr).toBe(0);
+      expect(emptySnapshotObserved).toBe(true);
+      expect(outcome).toMatchObject({
+        status: 'rejected',
+        reason: { code: 'AUTOLOOP_RECOVERY_INCOMPLETE', retryable: false },
+      });
+      expect(boot).not.toHaveBeenCalled();
+      expect(createdConfigs).toHaveLength(sessionsBefore);
+      expect(rowsAfter.filter((row) => row.kind === 'timeout_migration')).toEqual(timeoutMigrationsBefore);
+      expect(rowsAfter.filter((row) => row.record_type === 'autoloop_recovery_receipt')).toMatchObject([
+        { status: 'prepared' },
+      ]);
+    });
+
+    it('lets the legacy durable lease win before a concurrent recovery receipt claim', async () => {
+      // Mutation caught: starting the legacy boot without ordering recovery's
+      // under-lock receipt validation against its durable lease lets the peer
+      // append a prepared claim and reach a competing physical recovery.
+      const runId = 'resume-legacy-lease-wins-before-recovery-claim';
+      const workspace = await startStoredResumeCompatibilityState(runId);
+      await layerStoredResumeCompatibilityState(runId, workspace, 'migrated');
+      const inspection = await mgr.autoloopRecover(runId);
+      expect(inspection.assessment.next_safe_action).toBe('resume_planner');
+      const peer = createManager();
+      const competingRecovery = new Error('competing recovery boot crossed the legacy lease');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const recoveryBoot = vi.spyOn(peer as any, '_resumeAutoloopRun').mockRejectedValue(competingRecovery);
+      const state = mgr.autoloopStatus(runId)!;
+      const runDirectory = path.join(TEST_WF_DIR, runId);
+      const incarnation = JSON.parse(fs.readFileSync(path.join(runDirectory, 'incarnation.json'), 'utf8')) as {
+        incarnationId: string;
+        nextFence: number;
+      };
+      const leasePath = path.join(runDirectory, 'lease.json');
+      let legacyBootEntered!: () => void;
+      const legacyBootBarrier = new Promise<void>((resolve) => {
+        legacyBootEntered = resolve;
+      });
+      let releaseLegacyBoot!: () => void;
+      const legacyBootRelease = new Promise<void>((resolve) => {
+        releaseLegacyBoot = resolve;
+      });
+      // `_resumeAutoloopRun` invokes kernel.resume before its first await. The
+      // test double keeps that durable synchronous boundary real and replaces
+      // only the slow boot body that follows it.
+      const legacyBoot = vi
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        .spyOn(mgr as any, '_resumeAutoloopRun')
+        .mockImplementation(async (_observedRunId: unknown, _config: unknown, options: unknown) => {
+          const now = new Date().toISOString();
+          fs.writeFileSync(
+            leasePath,
+            JSON.stringify({
+              runId,
+              incarnationId: incarnation.incarnationId,
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              ownerId: (mgr as any).kernel.ownerId,
+              acquisitionId: '87654321-4321-4321-4321-cba987654321',
+              fence: incarnation.nextFence + 1,
+              pid: process.pid,
+              host: os.hostname(),
+              acquiredAt: now,
+              renewedAt: now,
+            }),
+          );
+          legacyBootEntered();
+          await legacyBootRelease;
+          (options as { commitTimeoutMigration?: () => void } | undefined)?.commitTimeoutMigration?.();
+          return state;
+        });
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const decisionBefore = fs.readFileSync(decisionPath, 'utf8');
+      const sessionsBefore = createdConfigs.length;
+
+      const legacy = mgr.autoloopResume(runId, { sendTimeoutMs: 750_000 });
+      await legacyBootBarrier;
+      const [recoveryOutcome] = await Promise.allSettled([
+        peer.autoloopRecover(runId, {
+          apply: true,
+          recovery_token: inspection.assessment.recovery_token,
+        }),
+      ]);
+      releaseLegacyBoot();
+      const [legacyOutcome] = await Promise.allSettled([legacy]);
+      await peer.shutdown();
+      fs.rmSync(leasePath, { force: true });
+
+      const decisionAfter = fs.readFileSync(decisionPath, 'utf8');
+      const rowsBefore = decisionBefore
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as { kind?: string });
+      const rowsAfter = decisionAfter
+        .trim()
+        .split('\n')
+        .map(
+          (line) =>
+            JSON.parse(line) as {
+              kind?: string;
+              record_type?: string;
+              oldValue?: number;
+              newValue?: number;
+            },
+        );
+      expect(recoveryOutcome).toMatchObject({
+        status: 'rejected',
+        reason: { code: 'AUTOLOOP_RECOVERY_TOKEN_STALE', retryable: false },
+      });
+      expect(legacyOutcome).toMatchObject({ status: 'fulfilled', value: state });
+      expect(legacyBoot).toHaveBeenCalledTimes(1);
+      expect(recoveryBoot).not.toHaveBeenCalled();
+      expect(createdConfigs).toHaveLength(sessionsBefore);
+      expect(rowsAfter.filter((row) => row.record_type === 'autoloop_recovery_receipt')).toEqual([]);
+      expect(rowsAfter.filter((row) => row.kind === 'timeout_migration')).toEqual([
+        ...rowsBefore.filter((row) => row.kind === 'timeout_migration'),
+        expect.objectContaining({ oldValue: 700_000, newValue: 750_000 }),
+      ]);
+    });
+
+    it.each(
+      (['pending', 'migrated', 'cancelled'] as const).flatMap((state) =>
+        (['prepared', 'applied'] as const).map((receiptStatus) => ({ state, receiptStatus })),
+      ),
+    )(
+      'makes an $receiptStatus recovery receipt authoritative over a $state stored resume',
+      async ({ state, receiptStatus }) => {
+        // Mutation caught: allowing a timeout/pending/cancelled compatibility
+        // shortcut to outrank a receipt boots a duplicate Planner process.
+        const runId = `resume-receipt-authority-${state}-${receiptStatus}`;
+        const workspace = await startStoredResumeCompatibilityState(runId);
+        const decisionPath = await appendRecoveryReceiptPair(runId, workspace, receiptStatus);
+        await layerStoredResumeCompatibilityState(runId, workspace, state);
+        const decisionBefore = fs.readFileSync(decisionPath, 'utf8');
+        const sessionsBefore = createdConfigs.length;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const boot = vi.spyOn(mgr as any, '_resumeAutoloopRun');
+
+        const outcome = mgr.autoloopResume(runId);
+        if (receiptStatus === 'prepared') {
+          await expect(outcome).rejects.toMatchObject({
+            code: 'AUTOLOOP_RECOVERY_INCOMPLETE',
+            retryable: false,
+          });
+        } else {
+          await expect(outcome).resolves.toMatchObject({ run_id: runId });
+        }
+
+        expect(boot).not.toHaveBeenCalled();
+        expect(createdConfigs).toHaveLength(sessionsBefore);
+        expect(fs.readFileSync(decisionPath, 'utf8')).toBe(decisionBefore);
+      },
+    );
+
+    it.each(
+      (['pending', 'migrated', 'cancelled'] as const).flatMap((state) =>
+        (['prepared', 'applied'] as const).map((receiptStatus) => ({
+          state,
+          receiptStatus,
+          requestedSendTimeoutMs: state === 'migrated' ? 750_000 : 700_000,
+        })),
+      ),
+    )(
+      'makes an $receiptStatus recovery receipt authoritative over an explicit timeout increase on a $state stored resume',
+      async ({ state, receiptStatus, requestedSendTimeoutMs }) => {
+        // Mutation caught: gating receipt routing on the absence of a timeout
+        // increase lets the legacy migration path boot or dispatch twice.
+        const runId = `resume-receipt-timeout-authority-${state}-${receiptStatus}`;
+        const workspace = await startStoredResumeCompatibilityState(runId);
+        const decisionPath = await appendRecoveryReceiptPair(runId, workspace, receiptStatus);
+        await layerStoredResumeCompatibilityState(runId, workspace, state);
+        const decisionBefore = fs.readFileSync(decisionPath, 'utf8');
+        const rowsBefore = decisionBefore
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind?: string; record_type?: string });
+        const receiptRowsBefore = rowsBefore.filter((row) => row.record_type === 'autoloop_recovery_receipt');
+        const timeoutMigrationsBefore = rowsBefore.filter((row) => row.kind === 'timeout_migration');
+        const sessionsBefore = createdConfigs.length;
+        const sendsBefore = mockSessions.reduce((total, session) => total + session.sendCalls.length, 0);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const boot = vi.spyOn(mgr as any, '_resumeAutoloopRun');
+
+        const outcome = mgr.autoloopResume(runId, { sendTimeoutMs: requestedSendTimeoutMs });
+        if (receiptStatus === 'prepared') {
+          await expect(outcome).rejects.toMatchObject({
+            code: 'AUTOLOOP_RECOVERY_INCOMPLETE',
+            retryable: false,
+          });
+        } else {
+          await expect(outcome).resolves.toMatchObject({ run_id: runId });
+        }
+
+        const decisionAfter = fs.readFileSync(decisionPath, 'utf8');
+        const rowsAfter = decisionAfter
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind?: string; record_type?: string });
+        expect(boot).not.toHaveBeenCalled();
+        expect(createdConfigs).toHaveLength(sessionsBefore);
+        expect(mockSessions.reduce((total, session) => total + session.sendCalls.length, 0)).toBe(sendsBefore);
+        expect(rowsAfter.filter((row) => row.kind === 'timeout_migration')).toEqual(timeoutMigrationsBefore);
+        expect(rowsAfter.filter((row) => row.record_type === 'autoloop_recovery_receipt')).toEqual(receiptRowsBefore);
+        expect(decisionAfter).toBe(decisionBefore);
+      },
+    );
+
+    it('passes a migrated timeout only through the in-memory token-recovery boot', async () => {
+      // Mutation caught: rebuilding recovery boot config from the immutable
+      // spec alone silently restores the original timeout after migration.
+      const runId = 'resume-recovery-effective-timeout';
+      const workspace = await startStoredResumeCompatibilityState(runId);
+      const checkpointPath = path.join(TEST_WF_DIR, runId, 'run.json');
+      const checkpoint = fs.readFileSync(checkpointPath, 'utf8');
+      const specPath = path.join(TEST_WF_DIR, runId, 'spec.json');
+      const originalSpec = fs.readFileSync(specPath, 'utf8');
+      const timestamp = '2026-09-12T00:00:01.000Z';
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      fs.appendFileSync(
+        decisionPath,
+        `${JSON.stringify({
+          ts: timestamp,
+          kind: 'timeout_migration',
+          actor: 'operator',
+          timestamp,
+          runId,
+          field: 'sendTimeoutMs',
+          oldValue: 650_000,
+          newValue: 700_000,
+          reason: 'stored_run_resume',
+        })}\n`,
+      );
+      await reconstructManager(runId);
+      fs.writeFileSync(checkpointPath, checkpoint);
+      fs.writeFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), '');
+
+      const inspection = await mgr.autoloopRecover(runId);
+      const coldBootReached = new Error('migrated timeout recovery boot reached');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const boot = vi.spyOn(mgr as any, '_resumeAutoloopRun').mockRejectedValue(coldBootReached);
+      // Exercise the internal recovery boot used by stored no-option resume;
+      // caller options remain process-local and outside the durable receipt.
+      await expect(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (mgr as any)._autoloopRecover(
+          runId,
+          { apply: true, recovery_token: inspection.assessment.recovery_token },
+          { sendTimeoutMs: 700_000 },
+        ),
+      ).rejects.toBe(coldBootReached);
+      expect(boot).toHaveBeenCalledWith(runId, expect.objectContaining({ sendTimeoutMs: 700_000 }));
+
+      expect(fs.readFileSync(specPath, 'utf8')).toBe(originalSpec);
+      const receipts = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as { record_type?: string; action_snapshot?: Record<string, unknown> })
+        .filter((row) => row.record_type === 'autoloop_recovery_receipt');
+      expect(receipts).toHaveLength(1);
+      expect(receipts.every((row) => !Object.hasOwn(row.action_snapshot ?? {}, 'sendTimeoutMs'))).toBe(true);
+    });
+
+    it('routes a stored plain resume through the exact inspected recovery token', async () => {
+      // Mutation caught: restoring the legacy direct _resumeAutoloopRun path
+      // bypasses the durable inspect/apply fence and produces no recovery pair.
+      const runId = 'legacy-resume-recovery-token';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const checkpoint = path.join(TEST_WF_DIR, runId, 'run.json');
+      const beforeCrash = fs.readFileSync(checkpoint, 'utf8');
+      await reconstructManager(runId);
+      // Model a process loss after its last durable checkpoint: teardown must
+      // release local resources, while the stored state remains pre-loss.
+      fs.writeFileSync(checkpoint, beforeCrash);
+      fs.writeFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), '');
+      const inspection = await mgr.autoloopRecover(runId);
+
+      const coldBoot = new Error('cold boot reached through recovery');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const resume = vi.spyOn(mgr as any, '_resumeAutoloopRun').mockRejectedValue(coldBoot);
+      await expect(mgr.autoloopResume(runId)).rejects.toBe(coldBoot);
+      expect(resume).toHaveBeenCalledTimes(1);
+      const receipts = fs
+        .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as { record_type?: string; recovery_token?: string; status?: string })
+        .filter((row) => row.record_type === 'autoloop_recovery_receipt');
+      expect(receipts).toEqual([
+        expect.objectContaining({ status: 'prepared', recovery_token: inspection.assessment.recovery_token }),
+      ]);
+    });
+
+    it('fails closed on an unresolved recovery receipt instead of directly booting a stored run', async () => {
+      // Mutation caught: a fallback to the legacy boot path would start a new
+      // Planner despite a crash-window claim whose physical effect is unknown.
+      const runId = 'legacy-resume-unresolved-receipt';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const inspection = await mgr.autoloopRecover(runId);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const recovered = await (mgr as any)._recoveryInput(runId);
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      fs.appendFileSync(
+        decisionPath,
+        `${JSON.stringify({
+          schema_version: 1,
+          record_type: 'autoloop_recovery_receipt',
+          kind: 'autoloop_recovery_receipt',
+          run_id: runId,
+          recovery_token: inspection.assessment.recovery_token,
+          action_sha256: inspection.assessment.action_sha256,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          action_snapshot: (mgr as any)._recoveryActionSnapshot(recovered),
+          claim_id: '12345678-1234-1234-1234-123456789abc',
+          phase: inspection.assessment.phase,
+          next_safe_action: inspection.assessment.next_safe_action,
+          status: 'prepared',
+          recorded_at: '2026-09-12T00:00:00.000Z',
+        })}\n`,
+      );
+      await reconstructManager(runId);
+      const sessionsBefore = createdConfigs.length;
+
+      await expect(mgr.autoloopResume(runId)).rejects.toMatchObject({
+        code: 'AUTOLOOP_RECOVERY_INCOMPLETE',
+        retryable: false,
+      });
+
+      expect(createdConfigs).toHaveLength(sessionsBefore);
+      expect(
+        fs
+          .readFileSync(decisionPath, 'utf8')
+          .split('\n')
+          .filter((line) => line.includes('autoloop_recovery_receipt')),
+      ).toHaveLength(1);
+    });
+
+    it('makes a prepared receipt authoritative through the public workflowResume method', async () => {
+      // Mutation caught: calling kernel.resume directly from workflowResume
+      // bypasses Autoloop recovery receipt authority and boots a second Planner.
+      const runId = 'workflow-resume-prepared-receipt-authority';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const checkpointPath = path.join(TEST_WF_DIR, runId, 'run.json');
+      const checkpointBeforeCrash = fs.readFileSync(checkpointPath, 'utf8');
+      const decisionPath = await appendRecoveryReceiptPair(runId, workspace, 'prepared');
+      await reconstructManager(runId);
+      fs.writeFileSync(checkpointPath, checkpointBeforeCrash);
+      fs.writeFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), '');
+      const decisionBefore = fs.readFileSync(decisionPath, 'utf8');
+      const sessionsBefore = createdConfigs.length;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const boot = vi.spyOn(mgr as any, '_bootAutoloop');
+
+      const [outcome] = await Promise.allSettled([mgr.workflowResume(runId)]);
+      await Promise.resolve();
+
+      expect(outcome).toMatchObject({
+        status: 'rejected',
+        reason: { code: 'AUTOLOOP_RECOVERY_INCOMPLETE', retryable: false },
+      });
+      expect(boot).not.toHaveBeenCalled();
+      expect(createdConfigs).toHaveLength(sessionsBefore);
+      expect(fs.readFileSync(decisionPath, 'utf8')).toBe(decisionBefore);
+    });
+
+    it('coalesces concurrent stored resumes at one recovery boot boundary', async () => {
+      // Mutation caught: independently booting each legacy caller can create
+      // duplicate Planner sessions after both have read the same stored state.
+      const runId = 'legacy-resume-concurrent-recovery';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const checkpoint = path.join(TEST_WF_DIR, runId, 'run.json');
+      const beforeCrash = fs.readFileSync(checkpoint, 'utf8');
+      await reconstructManager(runId);
+      fs.writeFileSync(checkpoint, beforeCrash);
+      fs.writeFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), '');
+
+      let inspected = 0;
+      let bothInspected!: () => void;
+      const bothInspectedBarrier = new Promise<void>((resolve) => {
+        bothInspected = resolve;
+      });
+      let releaseInspections!: () => void;
+      const releaseBarrier = new Promise<void>((resolve) => {
+        releaseInspections = resolve;
+      });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const recover = (mgr as any)._autoloopRecover.bind(mgr);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      vi.spyOn(mgr as any, '_autoloopRecover').mockImplementation(async (...args: unknown[]) => {
+        const options = args[1] as { apply?: boolean } | undefined;
+        if (!options?.apply) {
+          inspected += 1;
+          if (inspected === 2) bothInspected();
+          await releaseBarrier;
+        }
+        return await recover(...args);
+      });
+      const coldBoot = new Error('one coalesced cold boot');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const boot = vi.spyOn(mgr as any, '_resumeAutoloopRun').mockRejectedValue(coldBoot);
+
+      const first = mgr.autoloopResume(runId);
+      const second = mgr.autoloopResume(runId);
+      await bothInspectedBarrier;
+      releaseInspections();
+      const outcomes = await Promise.allSettled([first, second]);
+
+      expect(outcomes).toEqual([
+        { status: 'rejected', reason: coldBoot },
+        { status: 'rejected', reason: coldBoot },
+      ]);
+      expect(boot).toHaveBeenCalledTimes(1);
+      expect(
+        fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .split('\n')
+          .filter((line) => line.includes('autoloop_recovery_receipt')),
+      ).toHaveLength(1);
+    });
+
+    it('passes a stored custom-engine override only to the in-memory recovery boot', async () => {
+      // Mutation caught: recovery boot that drops the supplied custom config
+      // cannot restart this run; persisting it would leak it into durable data.
+      const runId = 'legacy-resume-custom-engine-recovery';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      const customEngine = {
+        name: 'resume-only-custom-engine',
+        bin: 'resume-only-custom-engine-bin',
+        args: { permissionMode: '--permission-mode' },
+      };
+      await mgr.autoloopStart({ runId, workspace, plannerEngine: 'custom', plannerCustomEngine: customEngine });
+      const checkpoint = path.join(TEST_WF_DIR, runId, 'run.json');
+      const beforeCrash = fs.readFileSync(checkpoint, 'utf8');
+      await reconstructManager(runId);
+      fs.writeFileSync(checkpoint, beforeCrash);
+      fs.writeFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), '');
+      const coldBoot = new Error('cold custom-engine boot reached through recovery');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const resume = vi.spyOn(mgr as any, '_resumeAutoloopRun').mockRejectedValue(coldBoot);
+      await expect(mgr.autoloopResume(runId, { plannerCustomEngine: customEngine })).rejects.toBe(coldBoot);
+      expect(resume).toHaveBeenCalledWith(
+        runId,
+        expect.objectContaining({
+          plannerCustomEngine: customEngine,
+        }),
+      );
+      const durableBytes = fs.readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8');
+      expect(durableBytes).not.toContain(customEngine.bin);
+    });
+
     it('persists an exact public Reviewer envelope before its queue delivery', async () => {
       const runId = 'recover-public-review-envelope';
       const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
@@ -9743,64 +10495,77 @@ describe('SessionManager', () => {
       },
     );
 
-    it('validates a cold Planner claim against durable state so disk boot can be reached', async () => {
-      const runId = 'recover-cold-planner-durable-state';
+    it('waits for a foreign live kernel lease before claiming a cold Planner recovery', async () => {
+      // Mutation caught: treating an unchanged foreign lease as sufficient
+      // token evidence appends `prepared` before kernel.resume rejects the
+      // competing owner, permanently wedging recovery after that owner exits.
+      const runId = 'recover-cold-planner-after-foreign-lease-release';
       const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
       await mgr.autoloopStart({ runId, workspace });
+      const recoveredState = structuredClone(mgr.autoloopStatus(runId)!);
+      const checkpointPath = path.join(TEST_WF_DIR, runId, 'run.json');
+      const checkpointBeforeRelease = fs.readFileSync(checkpointPath, 'utf8');
       fs.writeFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), '');
       const fresh = createManager();
-      const recovered = await (fresh as any)._recoveryInput(runId);
-      expect(recovered.assessment).toMatchObject({ phase: 'PLANNING', next_safe_action: 'resume_planner' });
-      const receipt: RecoveryReceipt = {
-        schema_version: 1,
-        record_type: 'autoloop_recovery_receipt',
-        kind: 'autoloop_recovery_receipt',
-        run_id: runId,
-        recovery_token: recovered.assessment.recovery_token,
-        action_sha256: recovered.assessment.action_sha256,
-        action_snapshot: (fresh as any)._recoveryActionSnapshot(recovered),
-        claim_id: '12345678-1234-1234-1234-123456789abc',
-        phase: recovered.assessment.phase,
-        next_safe_action: 'resume_planner',
-        status: 'prepared',
-        recorded_at: '2026-09-12T00:00:00.000Z',
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const receiptRows = (): Record<string, unknown>[] => {
+        const decisions = fs.existsSync(decisionPath) ? fs.readFileSync(decisionPath, 'utf8') : '';
+        return decisions
+          .trim()
+          .split('\n')
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as Record<string, unknown>)
+          .filter((row) => row.record_type === 'autoloop_recovery_receipt');
       };
-      const evidenceDigest = (fresh as any)._recoveryClaimEvidenceDigest(
-        recovered.ledger,
-        (fresh as any)._recoveryClaimCurrentState(runId),
+      let booted = false;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const resume = vi.spyOn(fresh as any, '_resumeAutoloopRun').mockImplementation(async () => {
+        booted = true;
+        return recoveredState;
+      });
+      const getAutoloop = fresh.getAutoloop.bind(fresh);
+      vi.spyOn(fresh, 'getAutoloop').mockImplementation((observedRunId) =>
+        booted && observedRunId === runId
+          ? ({ runner: { state: recoveredState }, dispatcher: {} } as ReturnType<typeof fresh.getAutoloop>)
+          : getAutoloop(observedRunId),
       );
+      const sessionsBefore = createdConfigs.length;
 
-      expect(() =>
-        (fresh as any)._validatePreparedRecoveryAction(
-          recovered.ledger,
-          receipt,
-          { ...recovered, state: structuredClone(recovered.state) },
-          evidenceDigest,
-        ),
-      ).not.toThrow();
-      const coldBootReached = new Error('cold Planner boot reached');
-      const resume = vi.spyOn(fresh as any, '_resumeAutoloopRun').mockRejectedValue(coldBootReached);
-      await expect(
-        fresh.autoloopRecover(runId, {
+      try {
+        const whileOwned = await fresh.autoloopRecover(runId);
+        expect(whileOwned.assessment).toMatchObject({ phase: 'PLANNING', next_safe_action: 'resume_planner' });
+        await expect(
+          fresh.autoloopRecover(runId, {
+            apply: true,
+            recovery_token: whileOwned.assessment.recovery_token,
+          }),
+        ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_INCOMPLETE', retryable: false });
+        expect(resume).not.toHaveBeenCalled();
+        expect(createdConfigs).toHaveLength(sessionsBefore);
+        expect(receiptRows()).toEqual([]);
+
+        await mgr.shutdown();
+        fs.writeFileSync(checkpointPath, checkpointBeforeRelease);
+        fs.writeFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), '');
+
+        const afterRelease = await fresh.autoloopRecover(runId);
+        expect(afterRelease.assessment).toMatchObject({ phase: 'PLANNING', next_safe_action: 'resume_planner' });
+        const applied = await fresh.autoloopRecover(runId, {
           apply: true,
-          recovery_token: recovered.assessment.recovery_token,
-        }),
-      ).rejects.toBe(coldBootReached);
-      expect(resume).toHaveBeenCalledTimes(1);
-      const receipts = fs
-        .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
-        .trim()
-        .split('\n')
-        .map((line) => JSON.parse(line) as Record<string, unknown>)
-        .filter((row) => row.record_type === 'autoloop_recovery_receipt');
-      expect(receipts).toEqual([
-        expect.objectContaining({
-          recovery_token: recovered.assessment.recovery_token,
+          recovery_token: afterRelease.assessment.recovery_token,
+        });
+
+        expect(applied.receipt).toMatchObject({
+          recovery_token: afterRelease.assessment.recovery_token,
           next_safe_action: 'resume_planner',
-          status: 'prepared',
-        }),
-      ]);
-      await fresh.shutdown();
+          status: 'applied',
+        });
+        expect(resume).toHaveBeenCalledTimes(1);
+        expect(createdConfigs).toHaveLength(sessionsBefore);
+        expect(receiptRows().map((row) => row.status)).toEqual(['prepared', 'applied']);
+      } finally {
+        await fresh.shutdown();
+      }
     });
 
     it('reconstructs and applies an exact Reviewer request from disk once across concurrent and repeated callers', async () => {

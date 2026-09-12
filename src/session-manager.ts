@@ -313,7 +313,7 @@ import { isFileLockReleaseError, withFileLock } from './kernel/file-lock.js';
 import { RunKernel, runDir as kernelRunDir } from './kernel/engine.js';
 import { registerDefaultExecutors } from './kernel/nodes/index.js';
 import { autoloopStateFromRecord, makeAutoloopExecutor, type AutoloopHandle } from './kernel/nodes/autoloop.js';
-import { loadRun, readNodeOutput, type RunSummary } from './kernel/store.js';
+import { leaseIsStale, loadRun, readLease, readNodeOutput, type RunSummary } from './kernel/store.js';
 import {
   LEGACY_NODE,
   joinFindings,
@@ -547,6 +547,14 @@ interface SendTimeoutMigrationAuditRecord {
 interface StoredAutoloopResumeContext {
   effectiveSendTimeoutMs: number;
   pendingDispatch: SendTimeoutPayload | null;
+}
+
+/** Resume-only custom configurations must never enter a recovery receipt. */
+interface RecoveryBootOverrides {
+  plannerCustomEngine?: CustomEngineConfig;
+  coderCustomEngine?: CustomEngineConfig;
+  reviewerCustomEngine?: CustomEngineConfig;
+  sendTimeoutMs?: number;
 }
 
 interface PreparedSendTimeoutMigrationAppend {
@@ -2398,6 +2406,24 @@ export class SessionManager implements AgentRuntimeProbe {
    * because they were never written down.
    */
   async workflowResume(runId: string, opts: { secrets?: Record<string, unknown> } = {}): Promise<RunRecord> {
+    const stored = loadRun(runId);
+    if (stored?.workflow === 'autoloop') {
+      const supplied = opts.secrets ?? {};
+      const named =
+        supplied.agentCustomEngines &&
+        typeof supplied.agentCustomEngines === 'object' &&
+        !Array.isArray(supplied.agentCustomEngines)
+          ? (supplied.agentCustomEngines as Record<string, unknown>)
+          : {};
+      await this.autoloopResume(runId, {
+        plannerCustomEngine: (named.planner ?? supplied.plannerCustomEngine) as CustomEngineConfig | undefined,
+        coderCustomEngine: (named.coder ?? supplied.coderCustomEngine) as CustomEngineConfig | undefined,
+        reviewerCustomEngine: (named.reviewer ?? supplied.reviewerCustomEngine) as CustomEngineConfig | undefined,
+      });
+      const resumed = loadRun(runId);
+      if (!resumed) throw new Error(`Workflow run '${runId}' not found after Autoloop recovery`);
+      return resumed;
+    }
     return this.kernel.resume(runId, { secrets: opts.secrets });
   }
 
@@ -4014,6 +4040,8 @@ export class SessionManager implements AgentRuntimeProbe {
   private _autoloopReviewTransactions = new Map<string, Promise<void>>();
   /** One in-process recovery transaction per logical run and token; durable receipts fence restarts. */
   private _autoloopRecoveryTransactions = new Map<string, Promise<RecoveryResult>>();
+  /** One in-process receipt-free stored resume per logical run boundary. */
+  private _autoloopStoredResumeTransactions = new Map<string, Promise<AutoloopState>>();
   private _autoloopReleasedReviewIterations = new Map<string, Map<string, number>>();
   private _autoloopReviewDeleting = new Set<string>();
   private _autoloopReviewDeleteCounts = new Map<string, number>();
@@ -5229,6 +5257,14 @@ export class SessionManager implements AgentRuntimeProbe {
     ) {
       return stale();
     }
+    const local = this.kernel.handle(receipt.run_id, LEGACY_NODE);
+    const lease = readLease(receipt.run_id);
+    if (lease && !local && lease.ownerId !== this.kernel.ownerId && !leaseIsStale(lease)) {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${receipt.run_id}' is still owned by another live workflow kernel`,
+      );
+    }
 
     let exactAction: RecoveryActionSnapshot;
     if (receipt.next_safe_action === 'request_review') {
@@ -5345,6 +5381,30 @@ export class SessionManager implements AgentRuntimeProbe {
     );
   }
 
+  /** Bind recovery authority to the exact kernel ownership generation. */
+  private _recoveryLeaseEvidence(runId: string): string {
+    const lease = readLease(runId);
+    if (!lease) return 'kernel:lease:none';
+    const identity = createHash('sha256')
+      .update(
+        JSON.stringify({
+          runId: lease.runId,
+          incarnationId: lease.incarnationId,
+          ownerId: lease.ownerId,
+          acquisitionId: lease.acquisitionId,
+          fence: lease.fence,
+          pid: lease.pid,
+          host: lease.host,
+          acquiredAt: lease.acquiredAt,
+        }),
+        'utf8',
+      )
+      .digest('hex');
+    // renewedAt is deliberately excluded: heartbeats preserve ownership,
+    // while every new acquisition changes at least acquisitionId and fence.
+    return `kernel:lease:${identity}`;
+  }
+
   /** Byte-fence every durable input used to reconstruct a recovery assessment. */
   private _recoveryClaimEvidenceDigest(ledger: SecureAutoloopLedger, state: AutoloopState): string {
     const digest = createHash('sha256');
@@ -5364,6 +5424,7 @@ export class SessionManager implements AgentRuntimeProbe {
         pending_dispatch: state.pending_dispatch ?? null,
       }),
     );
+    add('kernel-lease', this._recoveryLeaseEvidence(state.run_id));
     add('decisions.jsonl', ledger.readFlatFile('decisions.jsonl'));
     add('agent-generations.jsonl', ledger.readFlatFile('agent-generations.jsonl'));
     for (let iter = 0; iter <= state.iter; iter += 1) {
@@ -5919,6 +5980,12 @@ export class SessionManager implements AgentRuntimeProbe {
         assessment = blockRecoveryAssessment(assessment, `ambiguity:recovery:runner:${live.runner.state.status}`);
       }
     }
+    assessment = rebindRecoveryAction(
+      assessment,
+      assessment.next_safe_action,
+      assessment.action_sha256,
+      this._recoveryLeaseEvidence(runId),
+    );
     return {
       assessment,
       ledger,
@@ -5934,6 +6001,14 @@ export class SessionManager implements AgentRuntimeProbe {
     runId: string,
     options: { apply?: boolean; recovery_token?: string } = {},
   ): Promise<RecoveryResult> {
+    return await this._autoloopRecover(runId, options);
+  }
+
+  private async _autoloopRecover(
+    runId: string,
+    options: { apply?: boolean; recovery_token?: string } = {},
+    bootOverrides: RecoveryBootOverrides = {},
+  ): Promise<RecoveryResult> {
     if (!options.apply) {
       const { assessment } = await this._recoveryInput(runId, { readOnly: true });
       return { assessment };
@@ -5947,7 +6022,7 @@ export class SessionManager implements AgentRuntimeProbe {
     const transactionKey = `${runId}\u0000${options.recovery_token}`;
     const existing = this._autoloopRecoveryTransactions.get(transactionKey);
     if (existing) return await existing;
-    const operation = this._autoloopRecoverApply(runId, options.recovery_token);
+    const operation = this._autoloopRecoverApply(runId, options.recovery_token, bootOverrides);
     this._autoloopRecoveryTransactions.set(transactionKey, operation);
     try {
       return await operation;
@@ -5958,16 +6033,32 @@ export class SessionManager implements AgentRuntimeProbe {
     }
   }
 
-  private async _autoloopRecoverApply(runId: string, token: string): Promise<RecoveryResult> {
+  private async _autoloopRecoverApply(
+    runId: string,
+    token: string,
+    bootOverrides: RecoveryBootOverrides,
+  ): Promise<RecoveryResult> {
     const inspected = await this._recoveryInput(runId, { readOnly: true });
-    const inspectedReceipts = this._recoveryReceiptRows(inspected.ledger, runId).filter(
-      (row) => row.recovery_token === token,
-    );
+    const inspectedAllReceipts = this._recoveryReceiptRows(inspected.ledger, runId);
+    const inspectedReceipts = inspectedAllReceipts.filter((row) => row.recovery_token === token);
     const inspectedApplied = inspectedReceipts.find((row) => row.status === 'applied');
     if (inspectedApplied) {
       // A durable applied pair is the authority for exact replay even when its
       // effect advanced the live state and therefore changed the current token.
       return { assessment: inspected.assessment, receipt: inspectedApplied };
+    }
+    const inspectedAppliedTokens = new Set(
+      inspectedAllReceipts.filter((row) => row.status === 'applied').map((row) => row.recovery_token),
+    );
+    if (
+      inspectedAllReceipts.some((row) => row.status === 'prepared' && !inspectedAppliedTokens.has(row.recovery_token))
+    ) {
+      // A durable prepared claim outranks later state/token drift: its physical
+      // effect may already have happened, so no newer boundary is safe to run.
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${runId}' has an unresolved prepared recovery receipt`,
+      );
     }
     if (token !== inspected.assessment.recovery_token) {
       throw new AutoloopRecoveryError(
@@ -6086,6 +6177,17 @@ export class SessionManager implements AgentRuntimeProbe {
     }
 
     const live = this.getAutoloop(runId);
+    const recoveryBootConfig = (config: Record<string, unknown>): Parameters<SessionManager['_bootAutoloop']>[0] =>
+      ({
+        ...config,
+        // These caller-supplied configs are process-local recovery inputs. In
+        // particular they must not be copied into a receipt or durable spec.
+        plannerCustomEngine: bootOverrides.plannerCustomEngine,
+        coderCustomEngine: bootOverrides.coderCustomEngine,
+        reviewerCustomEngine: bootOverrides.reviewerCustomEngine,
+        sendTimeoutMs: bootOverrides.sendTimeoutMs ?? config.sendTimeoutMs,
+        _secureLedger: ledger,
+      }) as Parameters<SessionManager['_bootAutoloop']>[0];
     let plannerTransitionProven = false;
     if (assessment.next_safe_action === 'resume_planner') {
       if (live) {
@@ -6106,9 +6208,7 @@ export class SessionManager implements AgentRuntimeProbe {
             `Autoloop run '${runId}' cannot resume from disk`,
           );
         }
-        await this._resumeAutoloopRun(runId, { ...config, _secureLedger: ledger } as Parameters<
-          SessionManager['_bootAutoloop']
-        >[0]);
+        await this._resumeAutoloopRun(runId, recoveryBootConfig(config));
         const resumed = this.getAutoloop(runId);
         plannerTransitionProven =
           !!resumed &&
@@ -6128,9 +6228,7 @@ export class SessionManager implements AgentRuntimeProbe {
             `Autoloop run '${runId}' cannot resume from disk`,
           );
         }
-        await this._resumeAutoloopRun(runId, { ...config, _secureLedger: ledger } as Parameters<
-          SessionManager['_bootAutoloop']
-        >[0]);
+        await this._resumeAutoloopRun(runId, recoveryBootConfig(config));
         handle = this.getAutoloop(runId);
       }
       if (!handle || prepared.action_snapshot.type !== 'directive') {
@@ -6160,9 +6258,7 @@ export class SessionManager implements AgentRuntimeProbe {
             `Autoloop run '${runId}' cannot resume Reviewer recovery from disk`,
           );
         }
-        await this._resumeAutoloopRun(runId, { ...config, _secureLedger: ledger } as Parameters<
-          SessionManager['_bootAutoloop']
-        >[0]);
+        await this._resumeAutoloopRun(runId, recoveryBootConfig(config));
         handle = this.getAutoloop(runId);
       }
       if (!handle || prepared.action_snapshot.type !== 'review_request') {
@@ -6545,6 +6641,50 @@ export class SessionManager implements AgentRuntimeProbe {
     return { runId, rolesNeedingCustomEngine: roles };
   }
 
+  /**
+   * Order a receipt-free stored resume against recovery's prepared claim.
+   *
+   * The lock is intentionally synchronous. `start` invokes `_resumeAutoloopRun`,
+   * whose call to `kernel.resume` acquires and checkpoints the durable run lease
+   * before returning its Promise. We release the recovery lock immediately
+   * after that synchronous ownership boundary; we never pretend to hold it
+   * across the asynchronous boot.
+   */
+  private _orderStoredResumeAgainstRecovery(
+    ledger: SecureAutoloopLedger,
+    runId: string,
+    start: () => Promise<AutoloopState>,
+  ): { kind: 'recovery'; receipt: RecoveryReceipt } | { kind: 'legacy'; operation: Promise<AutoloopState> } {
+    const locked = withFileLock(
+      path.join(ledger.directory, '.autoloop-recovery.lock'),
+      () => {
+        // The earlier snapshot only selects this compatibility candidate. The
+        // decision itself is made here, alongside recovery's receipt append.
+        const receipts = this._recoveryReceiptRows(ledger, runId);
+        const appliedTokens = new Set(
+          receipts.filter((row) => row.status === 'applied').map((row) => row.recovery_token),
+        );
+        const unresolved = receipts.find((row) => row.status === 'prepared' && !appliedTokens.has(row.recovery_token));
+        const applied = [...receipts].reverse().find((row) => row.status === 'applied');
+        const authoritative = unresolved ?? applied;
+        if (authoritative) return { kind: 'recovery' as const, receipt: authoritative };
+
+        // Calling an async function runs through its first await synchronously.
+        // `_resumeAutoloopRun` reaches `kernel.resume`, and `kernel.resume`
+        // durably acquires the lease without awaiting, before `start` returns.
+        return { kind: 'legacy' as const, operation: start() };
+      },
+      { waitMs: 500 },
+    );
+    if (!locked.ok) {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${runId}' stored resume lock is ${locked.reason}`,
+      );
+    }
+    return locked.value;
+  }
+
   async autoloopResume(
     runId: string,
     opts: {
@@ -6644,6 +6784,56 @@ export class SessionManager implements AgentRuntimeProbe {
         : null
       : storedContext.pendingDispatch;
 
+    const originalSendTimeoutMs = (config.sendTimeoutMs as number | undefined) ?? DEFAULT_SEND_TIMEOUT_MS;
+    const recoveryReceipts = this._recoveryReceiptRows(secureLedger, runId);
+    const appliedRecoveryTokens = new Set(
+      recoveryReceipts.filter((row) => row.status === 'applied').map((row) => row.recovery_token),
+    );
+    const unresolvedRecoveryReceipt = recoveryReceipts.find(
+      (row) => row.status === 'prepared' && !appliedRecoveryTokens.has(row.recovery_token),
+    );
+    const latestAppliedRecoveryReceipt = [...recoveryReceipts].reverse().find((row) => row.status === 'applied');
+    const authoritativeRecoveryReceipt = unresolvedRecoveryReceipt ?? latestAppliedRecoveryReceipt;
+    const hasRecoveryReceipt = recoveryReceipts.length > 0;
+    const hasLegacyStoredResumeState =
+      !hasRecoveryReceipt &&
+      (storedContext.effectiveSendTimeoutMs !== originalSendTimeoutMs ||
+        pending !== null ||
+        record.state === 'cancelled');
+    if (hasRecoveryReceipt || (!hasTimeoutIncrease && !hasLegacyStoredResumeState)) {
+      // A receipt is authoritative over every compatibility shortcut. Without
+      // one, legacy timeout state and receipt-free cancellation keep their
+      // established path below.
+      const bootOverrides: RecoveryBootOverrides = {
+        plannerCustomEngine: opts.plannerCustomEngine,
+        coderCustomEngine: opts.coderCustomEngine,
+        reviewerCustomEngine: opts.reviewerCustomEngine,
+        sendTimeoutMs: storedContext.effectiveSendTimeoutMs,
+      };
+      const recoveryToken =
+        authoritativeRecoveryReceipt?.recovery_token ?? (await this._autoloopRecover(runId)).assessment.recovery_token;
+      const recovery = await this._autoloopRecover(
+        runId,
+        { apply: true, recovery_token: recoveryToken },
+        bootOverrides,
+      );
+      const recovered = this.getAutoloop(runId);
+      if (recovered) return recovered.runner.state;
+      if (recovery.receipt?.status === 'applied') {
+        const replayedState = autoloopStateFromRecord(record);
+        if (replayedState) return replayedState;
+      }
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${runId}' recovery has no current live state`,
+      );
+    }
+
+    if (!hasTimeoutIncrease) {
+      const existing = this._autoloopStoredResumeTransactions.get(runId);
+      if (existing) return await existing;
+    }
+
     if (hasTimeoutIncrease && pending && opts.pendingDispatchId === undefined) {
       throw new Error(`pendingDispatchId is required to resume timed-out dispatch '${pending.dispatch_id}'`);
     }
@@ -6675,41 +6865,73 @@ export class SessionManager implements AgentRuntimeProbe {
     const preparedMigration = migration ? prepareSendTimeoutMigrationAppend(secureLedger, migration) : undefined;
     let migrationCommitted = false;
     let migrationCommitError: SecureAutoloopLedgerCommitError | undefined;
+    let resumeOperation: Promise<AutoloopState> | undefined;
     try {
       // Custom-engine configs are never persisted (they can carry secrets), so
       // a resume must be given them again by the caller.
-      const state = await this._resumeAutoloopRun(
-        runId,
-        {
-          ...config,
-          // Effective migrations are replayed from append-only audit rather
-          // than written back into the immutable original spec.
-          sendTimeoutMs: nextSendTimeoutMs,
-          plannerCustomEngine: opts.plannerCustomEngine,
-          coderCustomEngine: opts.coderCustomEngine,
-          reviewerCustomEngine: opts.reviewerCustomEngine,
-          _secureLedger: secureLedger,
-        } as Parameters<SessionManager['_bootAutoloop']>[0],
-        {
-          timeoutMigration: hasTimeoutIncrease,
-          commitTimeoutMigration: preparedMigration
-            ? () => {
-                if (migrationCommitted) return;
-                try {
-                  migrationCommitError = commitPreparedSendTimeoutMigration(preparedMigration);
-                } finally {
-                  // Bytes committed is itself a terminal append state even if
-                  // a durability barrier remains incomplete. Any boot retry
-                  // must observe this row, never append the migration again.
-                  migrationCommitted = preparedMigration.append.committed;
+      const ordered = this._orderStoredResumeAgainstRecovery(secureLedger, runId, () =>
+        this._resumeAutoloopRun(
+          runId,
+          {
+            ...config,
+            // Effective migrations are replayed from append-only audit rather
+            // than written back into the immutable original spec.
+            sendTimeoutMs: nextSendTimeoutMs,
+            plannerCustomEngine: opts.plannerCustomEngine,
+            coderCustomEngine: opts.coderCustomEngine,
+            reviewerCustomEngine: opts.reviewerCustomEngine,
+            _secureLedger: secureLedger,
+          } as Parameters<SessionManager['_bootAutoloop']>[0],
+          {
+            timeoutMigration: hasTimeoutIncrease,
+            commitTimeoutMigration: preparedMigration
+              ? () => {
+                  if (migrationCommitted) return;
+                  try {
+                    migrationCommitError = commitPreparedSendTimeoutMigration(preparedMigration);
+                  } finally {
+                    // Bytes committed is itself a terminal append state even if
+                    // a durability barrier remains incomplete. Any boot retry
+                    // must observe this row, never append the migration again.
+                    migrationCommitted = preparedMigration.append.committed;
+                  }
                 }
-              }
-            : undefined,
-        },
+              : undefined,
+          },
+        ),
       );
+      if (ordered.kind === 'recovery') {
+        const recovery = await this._autoloopRecover(
+          runId,
+          { apply: true, recovery_token: ordered.receipt.recovery_token },
+          {
+            plannerCustomEngine: opts.plannerCustomEngine,
+            coderCustomEngine: opts.coderCustomEngine,
+            reviewerCustomEngine: opts.reviewerCustomEngine,
+            sendTimeoutMs: storedContext.effectiveSendTimeoutMs,
+          },
+        );
+        const recovered = this.getAutoloop(runId);
+        if (recovered) return recovered.runner.state;
+        if (recovery.receipt?.status === 'applied') {
+          const replayedRecord = loadRun(runId);
+          const replayedState = replayedRecord ? autoloopStateFromRecord(replayedRecord) : undefined;
+          if (replayedState) return replayedState;
+        }
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' recovery has no current live state`,
+        );
+      }
+      resumeOperation = ordered.operation;
+      if (!hasTimeoutIncrease) this._autoloopStoredResumeTransactions.set(runId, resumeOperation);
+      const state = await resumeOperation;
       if (migrationCommitError) throw migrationCommitError.withAppliedOutcome('send_timeout_migration');
       return state;
     } finally {
+      if (resumeOperation && this._autoloopStoredResumeTransactions.get(runId) === resumeOperation) {
+        this._autoloopStoredResumeTransactions.delete(runId);
+      }
       if (preparedMigration) {
         try {
           preparedMigration.append.close();
