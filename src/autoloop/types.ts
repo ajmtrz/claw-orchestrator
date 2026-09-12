@@ -156,6 +156,35 @@ export interface DeliveryAcknowledgement {
   acknowledged_at: string;
 }
 
+/** Immutable receiver result written before a Coder delivery acknowledgement. */
+export interface DeliveryResult {
+  schema_version: 1;
+  record_type: 'delivery_result';
+  delivery_id: string;
+  payload_sha256: string;
+  result_kind: 'iter_complete' | 'directive_ack';
+  /** `null` for artifact-backed completions; the exact fallback payload for clarifications. */
+  result_payload: unknown;
+}
+
+/**
+ * Append-only evidence that an unacknowledged delivery moved to the next live
+ * physical generation of the same logical role. The original intent remains
+ * immutable; consumers resolve this chain to obtain its effective generation.
+ */
+export interface DeliveryGenerationRebind {
+  schema_version: 1;
+  record_type: 'delivery_generation_rebind';
+  delivery_id: string;
+  idempotency_key: string;
+  kind: DeliveryKind;
+  target_role: DeliveryTargetRole;
+  from_generation: number;
+  to_generation: number;
+  payload_sha256: string;
+  rebound_at: string;
+}
+
 export interface PrepareDeliveryInput {
   idempotency_key: string;
   kind: DeliveryKind;
@@ -169,6 +198,7 @@ export type AutoloopDeliveryOutboxErrorCode =
   | 'AUTOLOOP_DELIVERY_LEDGER_INVALID'
   | 'AUTOLOOP_DELIVERY_IDEMPOTENCY_CONFLICT'
   | 'AUTOLOOP_DELIVERY_ACKNOWLEDGEMENT_CONFLICT'
+  | 'AUTOLOOP_DELIVERY_GENERATION_REBIND_CONFLICT'
   | 'AUTOLOOP_DELIVERY_OUTBOX_LOCK_CONTENDED'
   | 'AUTOLOOP_DELIVERY_OUTBOX_LOCK_CLEANUP_FAILED'
   | 'AUTOLOOP_DELIVERY_COMMITTED_OBSERVATION_FAILED';
@@ -178,6 +208,7 @@ const AUTOLOOP_DELIVERY_OUTBOX_RETRYABILITY = {
   AUTOLOOP_DELIVERY_LEDGER_INVALID: false,
   AUTOLOOP_DELIVERY_IDEMPOTENCY_CONFLICT: false,
   AUTOLOOP_DELIVERY_ACKNOWLEDGEMENT_CONFLICT: false,
+  AUTOLOOP_DELIVERY_GENERATION_REBIND_CONFLICT: false,
   AUTOLOOP_DELIVERY_OUTBOX_LOCK_CONTENDED: true,
   AUTOLOOP_DELIVERY_OUTBOX_LOCK_CLEANUP_FAILED: false,
   AUTOLOOP_DELIVERY_COMMITTED_OBSERVATION_FAILED: false,

@@ -10,6 +10,23 @@ import {
   extractClarification,
 } from '../autoloop/agent-tools.js';
 
+function extractCompletionWithProvenance(tool: 'iter_complete' | 'review_complete', args: Record<string, unknown>) {
+  Object.defineProperties(
+    args,
+    tool === 'iter_complete'
+      ? {
+          summary: { enumerable: true, value: 'done' },
+          eval_output: { enumerable: true, value: {} },
+        }
+      : {
+          decision: { enumerable: true, value: 'hold' },
+          metric: { enumerable: true, value: null },
+          audit_notes: { enumerable: true, value: 'reviewed' },
+        },
+  );
+  return tool === 'iter_complete' ? extractIterComplete([{ tool, args }]) : extractReviewComplete([{ tool, args }]);
+}
+
 describe('parseAgentReply', () => {
   it('extracts blocks from a coder reply', () => {
     const reply = `Fixed the off-by-one in add_two.
@@ -26,6 +43,18 @@ describe('parseAgentReply', () => {
 });
 
 describe('extractIterComplete', () => {
+  it('preserves an exact durable delivery provenance pair for Coder completion', () => {
+    const delivery_id = 'delivery-coder-provenance';
+    const payload_sha256 = 'a'.repeat(64);
+    expect(
+      extractIterComplete([
+        {
+          tool: 'iter_complete',
+          args: { summary: 'done', eval_output: {}, delivery_id, payload_sha256 },
+        },
+      ]),
+    ).toMatchObject({ delivery_id, payload_sha256 });
+  });
   it('returns null when no iter_complete block', () => {
     expect(extractIterComplete([])).toBeNull();
     expect(extractIterComplete([{ tool: 'coder_log', args: { message: 'hi' } }])).toBeNull();
@@ -48,7 +77,88 @@ describe('extractIterComplete', () => {
   });
 });
 
+describe.each(['iter_complete', 'review_complete'] as const)('%s delivery provenance', (tool) => {
+  it('does not accept a pair inherited from the argument prototype', () => {
+    const inherited = Object.create({
+      delivery_id: `delivery-${tool}-inherited`,
+      payload_sha256: 'c'.repeat(64),
+    }) as Record<string, unknown>;
+
+    const completion = extractCompletionWithProvenance(tool, inherited);
+
+    expect(completion).not.toHaveProperty('delivery_id');
+    expect(completion).not.toHaveProperty('payload_sha256');
+  });
+
+  it('rejects accessor-backed provenance without invoking either getter', () => {
+    const provenance = {} as Record<string, unknown>;
+    let getterCalls = 0;
+    Object.defineProperties(provenance, {
+      delivery_id: {
+        enumerable: true,
+        get() {
+          getterCalls += 1;
+          return `delivery-${tool}-accessor`;
+        },
+      },
+      payload_sha256: {
+        enumerable: true,
+        get() {
+          getterCalls += 1;
+          return 'd'.repeat(64);
+        },
+      },
+    });
+
+    const completion = extractCompletionWithProvenance(tool, provenance);
+
+    expect(getterCalls).toBe(0);
+    expect(completion).not.toHaveProperty('delivery_id');
+    expect(completion).not.toHaveProperty('payload_sha256');
+  });
+
+  it('rejects Proxy-backed arguments before any argument inspection trap runs', () => {
+    const target = {} as Record<string, unknown>;
+    let argumentInspectionTraps = 0;
+    const provenance = new Proxy(target, {
+      get(inner, key, receiver) {
+        argumentInspectionTraps += 1;
+        return Reflect.get(inner, key, receiver);
+      },
+      getOwnPropertyDescriptor(inner, key) {
+        argumentInspectionTraps += 1;
+        if (key === 'delivery_id' || key === 'payload_sha256') {
+          return {
+            configurable: true,
+            enumerable: true,
+            value: key === 'delivery_id' ? `delivery-${tool}-proxy` : 'e'.repeat(64),
+            writable: true,
+          };
+        }
+        return Reflect.getOwnPropertyDescriptor(inner, key);
+      },
+    });
+
+    const completion = extractCompletionWithProvenance(tool, provenance);
+
+    expect(argumentInspectionTraps).toBe(0);
+    expect(completion).toBeNull();
+  });
+});
+
 describe('extractReviewComplete', () => {
+  it('preserves an exact durable delivery provenance pair for Reviewer completion', () => {
+    const delivery_id = 'delivery-reviewer-provenance';
+    const payload_sha256 = 'b'.repeat(64);
+    expect(
+      extractReviewComplete([
+        {
+          tool: 'review_complete',
+          args: { decision: 'hold', metric: null, audit_notes: 'needs work', delivery_id, payload_sha256 },
+        },
+      ]),
+    ).toMatchObject({ delivery_id, payload_sha256 });
+  });
   it('parses a typical advance verdict', () => {
     const rc = extractReviewComplete([
       {

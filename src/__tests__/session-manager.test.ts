@@ -361,6 +361,24 @@ function seedCompleteLegacyReviewArtifacts(workspace: string, runId: string, ite
   }
 }
 
+function successfulRoleReplyFromDeliveryPrompt(
+  role: 'coder' | 'reviewer',
+  message: string | unknown[],
+  summary: string,
+): string {
+  expect(typeof message, `${role} durable delivery prompt`).toBe('string');
+  const provenanceMatch = /<autoloop_delivery delivery_id="([^"]+)" payload_sha256="([a-f0-9]{64})">/.exec(
+    String(message),
+  );
+  expect(provenanceMatch, `${role} durable delivery provenance`).not.toBeNull();
+  const provenance = { delivery_id: provenanceMatch![1], payload_sha256: provenanceMatch![2] };
+  const completion =
+    role === 'coder'
+      ? { tool: 'iter_complete', args: { summary, eval_output: {}, files_changed: [], ...provenance } }
+      : { tool: 'review_complete', args: { decision: 'hold', metric: null, audit_notes: summary, ...provenance } };
+  return [summary, '```autoloop', JSON.stringify(completion), '```'].join('\n');
+}
+
 function createManager(overrides?: Record<string, unknown>): InstanceType<typeof SessionManager> {
   const mgr = new SessionManager({
     claudeBin: 'mock-claude',
@@ -7985,6 +8003,7 @@ describe('SessionManager', () => {
         async (role) => {
           const runId = `fatal-${role}-history-exclusion`;
           const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          if (role === 'coder') initializeGitWorkspace(workspace);
           await mgr.autoloopStart({
             runId,
             workspace,
@@ -8034,10 +8053,14 @@ describe('SessionManager', () => {
             ).transcripts[role],
           ).toEqual([]);
 
-          mockSessions[roleIndex].sendImplementation = async () => ({
-            text: role === 'coder' ? 'next coder reply' : 'next reviewer reply',
-            event: { type: 'result', result: 'accepted next turn' },
-          });
+          mockSessions[roleIndex].sendImplementation = async (message) => {
+            const text = successfulRoleReplyFromDeliveryPrompt(
+              role,
+              message,
+              role === 'coder' ? 'next coder reply' : 'next reviewer reply',
+            );
+            return { text, event: { type: 'result', result: text } };
+          };
           if (role === 'coder') {
             await handle.dispatcher.deliver(
               AutoloopMsg.directive(1, {
@@ -8068,6 +8091,7 @@ describe('SessionManager', () => {
         async (role) => {
           const runId = `real-reset-fatal-${role}-history-exclusion`;
           const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          if (role === 'coder') initializeGitWorkspace(workspace);
           let targetGenerationsStarted = 0;
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           (mgr as any)._createSession = (_engine: string, config: SessionConfig): ISession => {
@@ -8080,10 +8104,11 @@ describe('SessionManager', () => {
                 };
               } else {
                 let replacementTurns = 0;
-                mock.sendImplementation = async () => {
+                mock.sendImplementation = async (message) => {
                   replacementTurns += 1;
                   if (replacementTurns === 1) throw new Error(`${role} replacement retry failed`);
-                  return { text: `${role} later success`, event: { type: 'result', result: 'later success' } };
+                  const text = successfulRoleReplyFromDeliveryPrompt(role, message, `${role} later success`);
+                  return { text, event: { type: 'result', result: text } };
                 };
               }
             }
@@ -8575,6 +8600,7 @@ describe('SessionManager', () => {
       it('persists the same omitted defaults that real Planner chat emits and applies', async () => {
         const runId = 'planner-durable-default-effect-equality';
         const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        initializeGitWorkspace(workspace);
         await mgr.autoloopStart({ runId, workspace });
         const handle = mgr.getAutoloop(runId)!;
         const expectedControls: PlannerToolCall[] = [
@@ -8628,6 +8654,14 @@ describe('SessionManager', () => {
         const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents').mockImplementation(async (args) => {
           spawnEffect = JSON.parse(JSON.stringify(args));
           await spawnImplementation(args);
+          mockSessions[1].sendImplementation = async (message) => {
+            const text = successfulRoleReplyFromDeliveryPrompt('coder', message, 'follow-up acknowledgement');
+            return { text, event: { type: 'result', result: text } };
+          };
+          mockSessions[2].sendImplementation = async (message) => {
+            const text = successfulRoleReplyFromDeliveryPrompt('reviewer', message, 'follow-up review');
+            return { text, event: { type: 'result', result: text } };
+          };
         });
 
         try {

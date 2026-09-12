@@ -33,6 +33,9 @@ export interface DirectivePayload {
   constraints: string[];
   success_criteria: string[];
   max_attempts: number;
+  /** Optional durable-delivery metadata; legacy directives omit both fields. */
+  delivery_id?: string;
+  payload_sha256?: string;
 }
 
 export interface DirectiveAckPayload {
@@ -50,6 +53,9 @@ export interface LegacyReviewRequestPayload {
   iter: number;
   ledger_path: string;
   prior_metrics: number[];
+  /** Optional durable-delivery metadata; legacy review requests omit both fields. */
+  delivery_id?: string;
+  payload_sha256?: string;
 }
 
 export interface RequestReviewArgs {
@@ -786,11 +792,38 @@ function canonicalEvalOutput(value: unknown): unknown {
   });
 }
 
+/** Preserve delivery metadata only as one complete, validated pair. */
+function appendDeliveryMetadata(
+  canonical: object,
+  fields: Record<string, unknown>,
+  type: 'directive' | 'review_request',
+): void {
+  const hasDeliveryId = Object.hasOwn(fields, 'delivery_id');
+  const hasPayloadSha256 = Object.hasOwn(fields, 'payload_sha256');
+  if (hasDeliveryId !== hasPayloadSha256) {
+    invalidDeliveryPayload(type, 'contains unsupported incomplete delivery metadata');
+  }
+  if (!hasDeliveryId) return;
+  const deliveryId = fields.delivery_id;
+  const payloadSha256 = fields.payload_sha256;
+  if (
+    typeof deliveryId !== 'string' ||
+    !deliveryId.trim() ||
+    deliveryId.trim() !== deliveryId ||
+    typeof payloadSha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(payloadSha256)
+  ) {
+    invalidDeliveryPayload(type, 'delivery_id or payload_sha256 is invalid');
+  }
+  Object.defineProperty(canonical, 'delivery_id', { enumerable: true, value: deliveryId });
+  Object.defineProperty(canonical, 'payload_sha256', { enumerable: true, value: payloadSha256 });
+}
+
 function canonicalDirectivePayload(payload: unknown): DirectivePayload {
   const fields = canonicalPayloadFields(
     payload,
     'directive',
-    ['goal', 'constraints', 'success_criteria', 'max_attempts'],
+    ['goal', 'constraints', 'success_criteria', 'max_attempts', 'delivery_id', 'payload_sha256'],
     ['goal', 'constraints', 'success_criteria', 'max_attempts'],
   );
   const goal = fields.goal;
@@ -809,6 +842,7 @@ function canonicalDirectivePayload(payload: unknown): DirectivePayload {
   Object.defineProperty(canonical, 'constraints', { enumerable: true, value: constraints });
   Object.defineProperty(canonical, 'success_criteria', { enumerable: true, value: successCriteria });
   Object.defineProperty(canonical, 'max_attempts', { enumerable: true, value: maxAttempts });
+  appendDeliveryMetadata(canonical, fields, 'directive');
   Object.freeze(canonical);
   return canonical;
 }
@@ -1174,6 +1208,8 @@ function canonicalReviewRequestPayload(payload: unknown, envelopeIter: number): 
       'source_iter',
       'scope',
       'idempotency_key',
+      'delivery_id',
+      'payload_sha256',
     ],
     ['iter', 'ledger_path', 'prior_metrics'],
   );
@@ -1227,6 +1263,7 @@ function canonicalReviewRequestPayload(payload: unknown, envelopeIter: number): 
       Object.defineProperty(canonical, key, { enumerable: true, value: checkpoint[key] });
     }
   }
+  appendDeliveryMetadata(canonical, fields, 'review_request');
   Object.freeze(canonical);
   return canonical;
 }

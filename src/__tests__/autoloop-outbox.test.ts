@@ -305,6 +305,233 @@ afterEach(() => {
 });
 
 describe('Autoloop delivery outbox', () => {
+  it('rebinds one unacknowledged delivery to a strictly newer generation without changing its identity', async () => {
+    // Production break caught: recovery either rejects a new physical generation
+    // or mints a second delivery identity after the original send crashed.
+    const { lookupByIdempotencyKey, prepareDelivery } = await import('../autoloop/outbox.js');
+    const workspace = makeWorkspace();
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-generation-rebind', { create: true });
+    const original = prepareDelivery(ledger, {
+      idempotency_key: 'generation-safe-retry',
+      kind: 'coder_directive',
+      target_role: 'coder',
+      target_generation: 4,
+      payload: { directive: 'retry only after the replacement generation is live' },
+    });
+
+    const rebound = prepareDelivery(ledger, {
+      idempotency_key: 'generation-safe-retry',
+      kind: 'coder_directive',
+      target_role: 'coder',
+      target_generation: 5,
+      payload: { directive: 'retry only after the replacement generation is live' },
+    });
+
+    expect(rebound).toMatchObject({
+      delivery_id: original.delivery_id,
+      idempotency_key: original.idempotency_key,
+      kind: original.kind,
+      target_role: original.target_role,
+      target_generation: 5,
+      payload_sha256: original.payload_sha256,
+    });
+    expect(lookupByIdempotencyKey(ledger, original.idempotency_key)).toEqual(rebound);
+    const records = fs
+      .readFileSync(path.join(ledger.directory, 'decisions.jsonl'), 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(records).toContainEqual(
+      expect.objectContaining({
+        record_type: 'delivery_generation_rebind',
+        delivery_id: original.delivery_id,
+        idempotency_key: original.idempotency_key,
+        from_generation: 4,
+        to_generation: 5,
+        payload_sha256: original.payload_sha256,
+      }),
+    );
+  });
+
+  it('keeps an acknowledged delivery a byte-for-byte no-op when a newer generation appears', async () => {
+    // Production break caught: an already delivered message is rebound and sent
+    // again after its in-memory dispatcher cache is lost.
+    const { acknowledgeDelivery, prepareDelivery } = await import('../autoloop/outbox.js');
+    const workspace = makeWorkspace();
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-acknowledged-generation-noop', { create: true });
+    const original = prepareDelivery(ledger, {
+      idempotency_key: 'acknowledged-generation-noop',
+      kind: 'review_request',
+      target_role: 'reviewer',
+      target_generation: 2,
+      payload: { request: 'do not resend this completed review' },
+    });
+    acknowledgeDelivery(ledger, original.delivery_id, original.payload_sha256);
+    const before = fs.readFileSync(path.join(ledger.directory, 'decisions.jsonl'), 'utf8');
+
+    expect(
+      prepareDelivery(ledger, {
+        idempotency_key: original.idempotency_key,
+        kind: original.kind,
+        target_role: original.target_role,
+        target_generation: 3,
+        payload: original.payload,
+      }),
+    ).toEqual(original);
+    expect(fs.readFileSync(path.join(ledger.directory, 'decisions.jsonl'), 'utf8')).toEqual(before);
+  });
+
+  it('rejects forked, stale, and post-acknowledgement generation evidence globally', async () => {
+    // Production break caught: an unrelated forged rebind can make a valid
+    // delivery lookup silently select an ambiguous or already completed route.
+    const { acknowledgeDelivery, lookupByIdempotencyKey, prepareDelivery } = await import('../autoloop/outbox.js');
+    const workspace = makeWorkspace();
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-forked-generation-evidence', { create: true });
+    const original = prepareDelivery(ledger, {
+      idempotency_key: 'forked-generation-evidence',
+      kind: 'coder_directive',
+      target_role: 'coder',
+      target_generation: 1,
+      payload: { directive: 'validate every generation chain' },
+    });
+    prepareDelivery(ledger, {
+      idempotency_key: original.idempotency_key,
+      kind: original.kind,
+      target_role: original.target_role,
+      target_generation: 2,
+      payload: original.payload,
+    });
+    const forged = {
+      schema_version: 1,
+      record_type: 'delivery_generation_rebind',
+      delivery_id: original.delivery_id,
+      idempotency_key: original.idempotency_key,
+      kind: original.kind,
+      target_role: original.target_role,
+      from_generation: 1,
+      to_generation: 3,
+      payload_sha256: original.payload_sha256,
+      rebound_at: '2026-09-11T12:00:00.000Z',
+    };
+    ledger.appendFlatFile('decisions.jsonl', `${JSON.stringify(forged)}\n`, true);
+
+    expect(captureFailure(() => lookupByIdempotencyKey(ledger, original.idempotency_key))).toMatchObject({
+      code: 'AUTOLOOP_DELIVERY_LEDGER_INVALID',
+      retryable: false,
+    });
+
+    const cleanLedger = SecureAutoloopLedger.open(workspace, 'run-post-ack-generation-evidence', { create: true });
+    const acknowledged = prepareDelivery(cleanLedger, {
+      idempotency_key: 'post-ack-generation-evidence',
+      kind: 'review_request',
+      target_role: 'reviewer',
+      target_generation: 1,
+      payload: { request: 'completed' },
+    });
+    acknowledgeDelivery(cleanLedger, acknowledged.delivery_id, acknowledged.payload_sha256);
+    cleanLedger.appendFlatFile(
+      'decisions.jsonl',
+      `${JSON.stringify({ ...forged, delivery_id: acknowledged.delivery_id, idempotency_key: acknowledged.idempotency_key, kind: acknowledged.kind, target_role: acknowledged.target_role, payload_sha256: acknowledged.payload_sha256 })}\n`,
+      true,
+    );
+    expect(captureFailure(() => lookupByIdempotencyKey(cleanLedger, acknowledged.idempotency_key))).toMatchObject({
+      code: 'AUTOLOOP_DELIVERY_LEDGER_INVALID',
+      retryable: false,
+    });
+  });
+
+  it('serializes concurrent newer-generation retries into one rebind record', async () => {
+    const { prepareDelivery } = await import('../autoloop/outbox.js');
+    const workspace = makeWorkspace();
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-concurrent-generation-rebind', { create: true });
+    const original = prepareDelivery(ledger, {
+      idempotency_key: 'concurrent-generation-rebind',
+      kind: 'review_request',
+      target_role: 'reviewer',
+      target_generation: 8,
+      payload: { request: 'one durable retry route' },
+    });
+
+    const attempts = await Promise.all(
+      Array.from({ length: 20 }, () =>
+        Promise.resolve().then(() =>
+          prepareDelivery(ledger, {
+            idempotency_key: original.idempotency_key,
+            kind: original.kind,
+            target_role: original.target_role,
+            target_generation: 9,
+            payload: original.payload,
+          }),
+        ),
+      ),
+    );
+    expect(attempts).toEqual(
+      Array.from({ length: 20 }, () =>
+        expect.objectContaining({ delivery_id: original.delivery_id, target_generation: 9 }),
+      ),
+    );
+    const rebinds = fs
+      .readFileSync(path.join(ledger.directory, 'decisions.jsonl'), 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((row) => row.record_type === 'delivery_generation_rebind');
+    expect(rebinds).toHaveLength(1);
+  });
+
+  it('latches a post-commit rebind ambiguity instead of manufacturing another retry route', async () => {
+    const { prepareDelivery } = await import('../autoloop/outbox.js');
+    const workspace = makeWorkspace();
+    let remainingDecisionBarriers = -1;
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-generation-rebind-barrier-ambiguity', {
+      create: true,
+      testHooks: {
+        beforeDirectorySync: ({ name }) => {
+          if (name === 'decisions.jsonl' && remainingDecisionBarriers-- === 0) {
+            throw new Error('injected rebind directory barrier failure');
+          }
+        },
+      },
+    });
+    const original = prepareDelivery(ledger, {
+      idempotency_key: 'generation-rebind-barrier-ambiguity',
+      kind: 'coder_directive',
+      target_role: 'coder',
+      target_generation: 1,
+      payload: { directive: 'fail closed after ambiguous generation append' },
+    });
+    // The retry first flushes its old durable intent; fail the next directory
+    // barrier, after the new rebind row has been committed.
+    remainingDecisionBarriers = 1;
+
+    const first = captureFailure(() =>
+      prepareDelivery(ledger, {
+        idempotency_key: original.idempotency_key,
+        kind: original.kind,
+        target_role: original.target_role,
+        target_generation: 2,
+        payload: original.payload,
+      }),
+    );
+    const retry = captureFailure(() =>
+      prepareDelivery(ledger, {
+        idempotency_key: original.idempotency_key,
+        kind: original.kind,
+        target_role: original.target_role,
+        target_generation: 2,
+        payload: original.payload,
+      }),
+    );
+    expect(first).toMatchObject({ code: 'AUTOLOOP_DELIVERY_COMMITTED_OBSERVATION_FAILED', committed: true });
+    expect(retry).toBe(first);
+    expect(
+      fs
+        .readFileSync(path.join(ledger.directory, 'decisions.jsonl'), 'utf8')
+        .split('\n')
+        .filter((line) => line.includes('delivery_generation_rebind')),
+    ).toHaveLength(1);
+  });
+
   it('persists the matching acknowledgement before returning it (break: acknowledgement API returns success without a durable row)', async () => {
     // Production break caught: acknowledgeDelivery returns before its acknowledgement is durable in decisions.jsonl.
     const outbox = (await import('../autoloop/outbox.js')) as typeof import('../autoloop/outbox.js') & {
@@ -3538,7 +3765,6 @@ describe('Autoloop delivery outbox', () => {
     ['payload', { payload: { directive: 'changed' } }],
     ['kind', { kind: 'review_request' }],
     ['role', { target_role: 'reviewer' }],
-    ['generation', { target_generation: 6 }],
   ] as const)('rejects a same-key delivery whose %s conflicts with the persisted intent', async (_field, changed) => {
     const { prepareDelivery } = await import('../autoloop/outbox.js');
     const workspace = makeWorkspace();
@@ -3562,6 +3788,35 @@ describe('Autoloop delivery outbox', () => {
     expect(failure.message).toMatch(/idempotency key.*conflicts with its persisted intent/i);
     expect(fs.readFileSync(ledgerPath)).toEqual(before);
     expect(persistedDeliveryIntents(ledger.directory)).toHaveLength(1);
+  });
+
+  it('rejects a stale or lower generation rebind without changing the ledger', async () => {
+    const { prepareDelivery } = await import('../autoloop/outbox.js');
+    const workspace = makeWorkspace();
+    const ledger = SecureAutoloopLedger.open(workspace, 'run-stale-generation-rebind', { create: true });
+    const original = prepareDelivery(ledger, {
+      idempotency_key: 'stale-generation-rebind',
+      kind: 'coder_directive',
+      target_role: 'coder',
+      target_generation: 5,
+      payload: { directive: 'never route an old physical generation' },
+    });
+    const before = fs.readFileSync(path.join(ledger.directory, 'decisions.jsonl'), 'utf8');
+
+    const failure = captureFailure(() =>
+      prepareDelivery(ledger, {
+        idempotency_key: original.idempotency_key,
+        kind: original.kind,
+        target_role: original.target_role,
+        target_generation: 4,
+        payload: original.payload,
+      }),
+    );
+    expect(failure).toMatchObject({
+      code: 'AUTOLOOP_DELIVERY_GENERATION_REBIND_CONFLICT',
+      retryable: false,
+    });
+    expect(fs.readFileSync(path.join(ledger.directory, 'decisions.jsonl'), 'utf8')).toEqual(before);
   });
 
   it('gives two concurrent callers one durable intent and one delivery identity', async () => {

@@ -12,7 +12,9 @@ import {
 import {
   AutoloopDeliveryOutboxError,
   type DeliveryAcknowledgement,
+  type DeliveryGenerationRebind,
   type DeliveryIntent,
+  type DeliveryResult,
   type PrepareDeliveryInput,
 } from './types.js';
 
@@ -45,11 +47,15 @@ interface DecisionLedgerIndex {
   readonly intentsByIdempotencyKey: Map<string, DeliveryIntent[]>;
   readonly intentsByDeliveryId: Map<string, DeliveryIntent[]>;
   readonly acknowledgementsByDeliveryId: Map<string, DeliveryAcknowledgement[]>;
+  readonly resultsByDeliveryId: Map<string, DeliveryResult[]>;
+  readonly rebindsByDeliveryId: Map<string, DeliveryGenerationRebind[]>;
 }
 
-type DeliveryLedgerRow =
+export type DeliveryLedgerRow =
   | { readonly kind: 'intent'; readonly rowNumber: number; readonly intent: DeliveryIntent }
-  | { readonly kind: 'acknowledgement'; readonly rowNumber: number; readonly acknowledgement: DeliveryAcknowledgement };
+  | { readonly kind: 'acknowledgement'; readonly rowNumber: number; readonly acknowledgement: DeliveryAcknowledgement }
+  | { readonly kind: 'result'; readonly rowNumber: number; readonly result: DeliveryResult }
+  | { readonly kind: 'rebind'; readonly rowNumber: number; readonly rebind: DeliveryGenerationRebind };
 
 type DecisionLedgerRead =
   | { readonly kind: 'missing' }
@@ -92,6 +98,10 @@ function idempotencyConflict(message: string, options?: ErrorOptions): never {
 
 function acknowledgementConflict(message: string, options?: ErrorOptions): never {
   throw new AutoloopDeliveryOutboxError('AUTOLOOP_DELIVERY_ACKNOWLEDGEMENT_CONFLICT', message, options);
+}
+
+function generationRebindConflict(message: string, options?: ErrorOptions): never {
+  throw new AutoloopDeliveryOutboxError('AUTOLOOP_DELIVERY_GENERATION_REBIND_CONFLICT', message, options);
 }
 
 function canonicalLedgerDirectory(ledger: SecureAutoloopLedger): string {
@@ -338,6 +348,24 @@ function serializeDeliveryAcknowledgement(acknowledgement: DeliveryAcknowledgeme
   );
 }
 
+function serializeDeliveryResult(result: DeliveryResult, canonicalPayload: string): string {
+  return (
+    `{"schema_version":1,"record_type":"delivery_result","delivery_id":${JSON.stringify(result.delivery_id)}` +
+    `,"payload_sha256":${JSON.stringify(result.payload_sha256)},"result_kind":${JSON.stringify(result.result_kind)}` +
+    `,"result_payload":${canonicalPayload}}`
+  );
+}
+
+function serializeDeliveryGenerationRebind(rebind: DeliveryGenerationRebind): string {
+  return (
+    `{"schema_version":1,"record_type":"delivery_generation_rebind","delivery_id":${JSON.stringify(rebind.delivery_id)}` +
+    `,"idempotency_key":${JSON.stringify(rebind.idempotency_key)},"kind":${JSON.stringify(rebind.kind)}` +
+    `,"target_role":${JSON.stringify(rebind.target_role)},"from_generation":${String(rebind.from_generation)}` +
+    `,"to_generation":${String(rebind.to_generation)},"payload_sha256":${JSON.stringify(rebind.payload_sha256)}` +
+    `,"rebound_at":${JSON.stringify(rebind.rebound_at)}}`
+  );
+}
+
 function sameDeliveryIntent(left: DeliveryIntent, right: DeliveryIntent): boolean {
   return (
     left.schema_version === right.schema_version &&
@@ -367,6 +395,26 @@ const DELIVERY_INTENT_FIELDS = new Set([
   'created_at',
 ]);
 const DELIVERY_ACKNOWLEDGEMENT_FIELDS = new Set(['schema_version', 'delivery_id', 'payload_sha256', 'acknowledged_at']);
+const DELIVERY_RESULT_FIELDS = new Set([
+  'schema_version',
+  'record_type',
+  'delivery_id',
+  'payload_sha256',
+  'result_kind',
+  'result_payload',
+]);
+const DELIVERY_GENERATION_REBIND_FIELDS = new Set([
+  'schema_version',
+  'record_type',
+  'delivery_id',
+  'idempotency_key',
+  'kind',
+  'target_role',
+  'from_generation',
+  'to_generation',
+  'payload_sha256',
+  'rebound_at',
+]);
 const DELIVERY_SHAPE_FIELDS = [
   'delivery_id',
   'idempotency_key',
@@ -427,6 +475,71 @@ function parseDeliveryAcknowledgement(value: unknown, rowNumber: number): Delive
   return undefined;
 }
 
+function parseDeliveryGenerationRebind(value: unknown, rowNumber: number): DeliveryGenerationRebind | undefined {
+  if (!isRecord(value) || !Object.hasOwn(value, 'record_type')) return undefined;
+  if (value.record_type !== 'delivery_generation_rebind') return undefined;
+  if (
+    !hasExactEnumerableDataFields(value, DELIVERY_GENERATION_REBIND_FIELDS) ||
+    value.schema_version !== 1 ||
+    value.record_type !== 'delivery_generation_rebind' ||
+    typeof value.delivery_id !== 'string' ||
+    !value.delivery_id.trim() ||
+    value.delivery_id.trim() !== value.delivery_id ||
+    Buffer.byteLength(value.delivery_id, 'utf8') > MAX_DELIVERY_IDEMPOTENCY_KEY_BYTES ||
+    typeof value.idempotency_key !== 'string' ||
+    !value.idempotency_key.trim() ||
+    value.idempotency_key.trim() !== value.idempotency_key ||
+    Buffer.byteLength(value.idempotency_key, 'utf8') > MAX_DELIVERY_IDEMPOTENCY_KEY_BYTES ||
+    (value.kind !== 'coder_directive' && value.kind !== 'review_request') ||
+    (value.target_role !== 'coder' && value.target_role !== 'reviewer') ||
+    (value.kind === 'coder_directive' && value.target_role !== 'coder') ||
+    (value.kind === 'review_request' && value.target_role !== 'reviewer') ||
+    !Number.isSafeInteger(value.from_generation) ||
+    (value.from_generation as number) < 0 ||
+    !Number.isSafeInteger(value.to_generation) ||
+    (value.to_generation as number) <= (value.from_generation as number) ||
+    typeof value.payload_sha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(value.payload_sha256) ||
+    !isCanonicalTimestamp(value.rebound_at)
+  ) {
+    invalidLedger(`decisions.jsonl record ${rowNumber} is not a valid delivery generation rebind`);
+  }
+  return value as unknown as DeliveryGenerationRebind;
+}
+
+function isDirectiveAckResultPayload(value: unknown): boolean {
+  if (!isRecord(value) || !hasExactEnumerableDataFields(value, new Set(['understood', 'clarification']))) {
+    return false;
+  }
+  return value.understood === false && typeof value.clarification === 'string';
+}
+
+function parseDeliveryResult(value: unknown, rowNumber: number): DeliveryResult | undefined {
+  if (!isRecord(value) || !Object.hasOwn(value, 'record_type')) return undefined;
+  if (value.record_type !== 'delivery_result') return undefined;
+  if (
+    !hasExactEnumerableDataFields(value, DELIVERY_RESULT_FIELDS) ||
+    value.schema_version !== 1 ||
+    typeof value.delivery_id !== 'string' ||
+    !value.delivery_id.trim() ||
+    value.delivery_id.trim() !== value.delivery_id ||
+    Buffer.byteLength(value.delivery_id, 'utf8') > MAX_DELIVERY_IDEMPOTENCY_KEY_BYTES ||
+    typeof value.payload_sha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(value.payload_sha256) ||
+    (value.result_kind !== 'iter_complete' && value.result_kind !== 'directive_ack') ||
+    (value.result_kind === 'iter_complete' && value.result_payload !== null) ||
+    (value.result_kind === 'directive_ack' && !isDirectiveAckResultPayload(value.result_payload))
+  ) {
+    invalidLedger(`decisions.jsonl record ${rowNumber} is not a valid delivery result`);
+  }
+  try {
+    canonicalJson(value.result_payload);
+  } catch (error) {
+    return invalidLedger(`decisions.jsonl record ${rowNumber} is not a valid delivery result`, { cause: error });
+  }
+  return value as unknown as DeliveryResult;
+}
+
 function isDeliveryShaped(value: Record<string, unknown>): boolean {
   return (
     value.kind === 'coder_directive' ||
@@ -481,6 +594,18 @@ function parseDeliveryIntent(value: unknown, rowNumber: number): DeliveryIntent 
   }
 
   return value as unknown as DeliveryIntent;
+}
+
+/** Parse one mixed decisions.jsonl row with the exact durable outbox validators. */
+export function parseOutboxDecisionLedgerRow(value: unknown, rowNumber: number): DeliveryLedgerRow | undefined {
+  const acknowledgement = parseDeliveryAcknowledgement(value, rowNumber);
+  if (acknowledgement !== undefined) return { kind: 'acknowledgement', rowNumber, acknowledgement };
+  const rebind = parseDeliveryGenerationRebind(value, rowNumber);
+  if (rebind !== undefined) return { kind: 'rebind', rowNumber, rebind };
+  const result = parseDeliveryResult(value, rowNumber);
+  if (result !== undefined) return { kind: 'result', rowNumber, result };
+  const intent = parseDeliveryIntent(value, rowNumber);
+  return intent === undefined ? undefined : { kind: 'intent', rowNumber, intent };
 }
 
 function readExactLedgerBytes(fd: number, start: number, length: number): Buffer {
@@ -590,15 +715,20 @@ function parseDecisionLedgerRows(
 ): {
   intents: DeliveryIntent[];
   acknowledgements: DeliveryAcknowledgement[];
+  results: DeliveryResult[];
+  rebinds: DeliveryGenerationRebind[];
   deliveryRows: DeliveryLedgerRow[];
   rowCount: number;
 } {
-  if (contents === '') return { intents: [], acknowledgements: [], deliveryRows: [], rowCount: 0 };
+  if (contents === '')
+    return { intents: [], acknowledgements: [], results: [], rebinds: [], deliveryRows: [], rowCount: 0 };
   if (!contents.endsWith('\n')) invalidLedger('decisions.jsonl has an incomplete final record');
 
   const lines = contents.slice(0, -1).split('\n');
   const intents: DeliveryIntent[] = [];
   const acknowledgements: DeliveryAcknowledgement[] = [];
+  const results: DeliveryResult[] = [];
+  const rebinds: DeliveryGenerationRebind[] = [];
   const deliveryRows: DeliveryLedgerRow[] = [];
   lines.forEach((line, index) => {
     const rowNumber = rowOffset + index + 1;
@@ -612,19 +742,15 @@ function parseDecisionLedgerRows(
     } catch (error) {
       return invalidLedger(`decisions.jsonl record ${rowNumber} is malformed`, { cause: error });
     }
-    const acknowledgement = parseDeliveryAcknowledgement(row, rowNumber);
-    if (acknowledgement !== undefined) {
-      acknowledgements.push(acknowledgement);
-      deliveryRows.push({ kind: 'acknowledgement', rowNumber, acknowledgement });
-      return;
-    }
-    const intent = parseDeliveryIntent(row, rowNumber);
-    if (intent !== undefined) {
-      intents.push(intent);
-      deliveryRows.push({ kind: 'intent', rowNumber, intent });
-    }
+    const deliveryRow = parseOutboxDecisionLedgerRow(row, rowNumber);
+    if (deliveryRow === undefined) return;
+    deliveryRows.push(deliveryRow);
+    if (deliveryRow.kind === 'intent') intents.push(deliveryRow.intent);
+    else if (deliveryRow.kind === 'acknowledgement') acknowledgements.push(deliveryRow.acknowledgement);
+    else if (deliveryRow.kind === 'result') results.push(deliveryRow.result);
+    else rebinds.push(deliveryRow.rebind);
   });
-  return { intents, acknowledgements, deliveryRows, rowCount: lines.length };
+  return { intents, acknowledgements, results, rebinds, deliveryRows, rowCount: lines.length };
 }
 
 function addIndexedIntents(index: Map<string, DeliveryIntent[]>, intents: readonly DeliveryIntent[]): void {
@@ -654,10 +780,31 @@ function addIndexedAcknowledgements(
   }
 }
 
-function validateDeliveryGraph(deliveryRows: readonly DeliveryLedgerRow[]): void {
+function addIndexedResults(index: Map<string, DeliveryResult[]>, results: readonly DeliveryResult[]): void {
+  for (const result of results) {
+    const matching = index.get(result.delivery_id);
+    if (matching === undefined) index.set(result.delivery_id, [result]);
+    else matching.push(result);
+  }
+}
+
+function addIndexedRebinds(
+  index: Map<string, DeliveryGenerationRebind[]>,
+  rebinds: readonly DeliveryGenerationRebind[],
+): void {
+  for (const rebind of rebinds) {
+    const matching = index.get(rebind.delivery_id);
+    if (matching === undefined) index.set(rebind.delivery_id, [rebind]);
+    else matching.push(rebind);
+  }
+}
+
+export function validateOutboxDecisionLedgerGraph(deliveryRows: readonly DeliveryLedgerRow[]): void {
   const intentsByDeliveryId = new Map<string, DeliveryLedgerRow & { readonly kind: 'intent' }>();
   const intentsByIdempotencyKey = new Map<string, DeliveryLedgerRow & { readonly kind: 'intent' }>();
   const acknowledgementsByDeliveryId = new Map<string, DeliveryLedgerRow & { readonly kind: 'acknowledgement' }>();
+  const resultsByDeliveryId = new Map<string, DeliveryLedgerRow & { readonly kind: 'result' }>();
+  const effectiveGenerations = new Map<string, number>();
 
   for (const row of deliveryRows) {
     if (row.kind === 'intent') {
@@ -669,6 +816,55 @@ function validateDeliveryGraph(deliveryRows: readonly DeliveryLedgerRow[]): void
       }
       intentsByDeliveryId.set(row.intent.delivery_id, row);
       intentsByIdempotencyKey.set(row.intent.idempotency_key, row);
+      effectiveGenerations.set(row.intent.delivery_id, row.intent.target_generation);
+      continue;
+    }
+
+    if (row.kind === 'rebind') {
+      const intent = intentsByDeliveryId.get(row.rebind.delivery_id);
+      if (intent === undefined) {
+        invalidLedger(`decisions.jsonl record ${row.rowNumber} rebinds no earlier delivery intent`);
+      }
+      if (
+        intent.intent.idempotency_key !== row.rebind.idempotency_key ||
+        intent.intent.kind !== row.rebind.kind ||
+        intent.intent.target_role !== row.rebind.target_role ||
+        intent.intent.payload_sha256 !== row.rebind.payload_sha256
+      ) {
+        invalidLedger(`decisions.jsonl record ${row.rowNumber} does not preserve its delivery intent identity`);
+      }
+      if (acknowledgementsByDeliveryId.has(row.rebind.delivery_id)) {
+        invalidLedger(`decisions.jsonl record ${row.rowNumber} rebinds an already acknowledged delivery`);
+      }
+      const effective = effectiveGenerations.get(row.rebind.delivery_id);
+      if (effective === undefined || row.rebind.from_generation !== effective) {
+        invalidLedger(`decisions.jsonl record ${row.rowNumber} forks or stale-rebinds its delivery generation`);
+      }
+      if (row.rebind.to_generation <= effective) {
+        invalidLedger(`decisions.jsonl record ${row.rowNumber} lowers its delivery generation`);
+      }
+      effectiveGenerations.set(row.rebind.delivery_id, row.rebind.to_generation);
+      continue;
+    }
+
+    if (row.kind === 'result') {
+      const intent = intentsByDeliveryId.get(row.result.delivery_id);
+      if (intent === undefined)
+        invalidLedger(`decisions.jsonl record ${row.rowNumber} records a result for no earlier delivery intent`);
+      if (
+        intent.intent.kind !== 'coder_directive' ||
+        intent.intent.target_role !== 'coder' ||
+        intent.intent.payload_sha256 !== row.result.payload_sha256
+      ) {
+        invalidLedger(`decisions.jsonl record ${row.rowNumber} does not match its Coder delivery intent`);
+      }
+      if (acknowledgementsByDeliveryId.has(row.result.delivery_id)) {
+        invalidLedger(`decisions.jsonl record ${row.rowNumber} records a result after acknowledgement`);
+      }
+      if (resultsByDeliveryId.has(row.result.delivery_id)) {
+        invalidLedger(`decisions.jsonl record ${row.rowNumber} duplicates a delivery result`);
+      }
+      resultsByDeliveryId.set(row.result.delivery_id, row);
       continue;
     }
 
@@ -699,14 +895,18 @@ function readDeliveryIntentIndex(ledger: SecureAutoloopLedger): DecisionLedgerIn
 
   const parsed = parseDecisionLedgerRows(read.contents, read.rowOffset);
   const deliveryRows = [...(read.previous?.deliveryRows ?? []), ...parsed.deliveryRows];
-  validateDeliveryGraph(deliveryRows);
+  validateOutboxDecisionLedgerGraph(deliveryRows);
   const intentsByIdempotencyKey = read.previous?.intentsByIdempotencyKey ?? new Map<string, DeliveryIntent[]>();
   const intentsByDeliveryId = read.previous?.intentsByDeliveryId ?? new Map<string, DeliveryIntent[]>();
   const acknowledgementsByDeliveryId =
     read.previous?.acknowledgementsByDeliveryId ?? new Map<string, DeliveryAcknowledgement[]>();
+  const resultsByDeliveryId = read.previous?.resultsByDeliveryId ?? new Map<string, DeliveryResult[]>();
+  const rebindsByDeliveryId = read.previous?.rebindsByDeliveryId ?? new Map<string, DeliveryGenerationRebind[]>();
   addIndexedIntents(intentsByIdempotencyKey, parsed.intents);
   addIndexedIntentsByDeliveryId(intentsByDeliveryId, parsed.intents);
   addIndexedAcknowledgements(acknowledgementsByDeliveryId, parsed.acknowledgements);
+  addIndexedResults(resultsByDeliveryId, parsed.results);
+  addIndexedRebinds(rebindsByDeliveryId, parsed.rebinds);
   const index: DecisionLedgerIndex = {
     dev: read.dev,
     ino: read.ino,
@@ -719,6 +919,8 @@ function readDeliveryIntentIndex(ledger: SecureAutoloopLedger): DecisionLedgerIn
     intentsByIdempotencyKey,
     intentsByDeliveryId,
     acknowledgementsByDeliveryId,
+    resultsByDeliveryId,
+    rebindsByDeliveryId,
   };
   decisionLedgerIndexes.set(ledger, index);
   return index;
@@ -732,6 +934,16 @@ function cloneDeliveryAcknowledgement(acknowledgement: DeliveryAcknowledgement):
   return { ...acknowledgement };
 }
 
+function cloneDeliveryResult(result: DeliveryResult): DeliveryResult {
+  return { ...result, result_payload: structuredClone(result.result_payload) };
+}
+
+function effectiveDeliveryIntent(index: DecisionLedgerIndex | undefined, intent: DeliveryIntent): DeliveryIntent {
+  const chain = index?.rebindsByDeliveryId.get(intent.delivery_id) ?? [];
+  const effective = chain.length === 0 ? intent.target_generation : chain[chain.length - 1]!.to_generation;
+  return { ...cloneDeliveryIntent(intent), target_generation: effective };
+}
+
 function findDeliveryIntent(
   ledger: SecureAutoloopLedger,
   idempotencyKey: string,
@@ -742,7 +954,7 @@ function findDeliveryIntent(
     idempotencyConflict(`Delivery idempotency key '${idempotencyKey}' has duplicate persisted intents`);
   }
   return {
-    intent: matching[0] === undefined ? undefined : cloneDeliveryIntent(matching[0]),
+    intent: matching[0] === undefined ? undefined : effectiveDeliveryIntent(index, matching[0]),
     fileBytes: index?.fileBytes ?? 0,
     dev: index?.dev,
     ino: index?.ino,
@@ -755,8 +967,10 @@ function findDeliveryById(
 ): {
   intent: DeliveryIntent | undefined;
   acknowledgement: DeliveryAcknowledgement | undefined;
+  result: DeliveryResult | undefined;
   intentCount: number;
   acknowledgementCount: number;
+  resultCount: number;
   fileBytes: number;
   dev: number | undefined;
   ino: number | undefined;
@@ -764,12 +978,15 @@ function findDeliveryById(
   const index = readDeliveryIntentIndex(ledger);
   const intents = index?.intentsByDeliveryId.get(deliveryId) ?? [];
   const acknowledgements = index?.acknowledgementsByDeliveryId.get(deliveryId) ?? [];
+  const results = index?.resultsByDeliveryId.get(deliveryId) ?? [];
   if (intents.length > 1) idempotencyConflict(`Delivery id '${deliveryId}' has duplicate persisted intents`);
   if (acknowledgements.length > 1) {
     invalidLedger(`Delivery id '${deliveryId}' has ambiguous persisted acknowledgements`);
   }
+  if (results.length > 1) invalidLedger(`Delivery id '${deliveryId}' has ambiguous persisted results`);
   const intent = intents[0];
   const acknowledgement = acknowledgements[0];
+  const result = results[0];
   if (
     intent !== undefined &&
     acknowledgement !== undefined &&
@@ -778,10 +995,12 @@ function findDeliveryById(
     invalidLedger(`Delivery acknowledgement for '${deliveryId}' does not match its persisted intent digest`);
   }
   return {
-    intent: intent === undefined ? undefined : cloneDeliveryIntent(intent),
+    intent: intent === undefined ? undefined : effectiveDeliveryIntent(index, intent),
     acknowledgement: acknowledgement === undefined ? undefined : cloneDeliveryAcknowledgement(acknowledgement),
+    result: result === undefined ? undefined : cloneDeliveryResult(result),
     intentCount: intents.length,
     acknowledgementCount: acknowledgements.length,
+    resultCount: results.length,
     fileBytes: index?.fileBytes ?? 0,
     dev: index?.dev,
     ino: index?.ino,
@@ -895,6 +1114,8 @@ function observeAppendedDeliveryIntent(
   const intentsByDeliveryId = cached?.intentsByDeliveryId ?? new Map<string, DeliveryIntent[]>();
   const acknowledgementsByDeliveryId =
     cached?.acknowledgementsByDeliveryId ?? new Map<string, DeliveryAcknowledgement[]>();
+  const resultsByDeliveryId = cached?.resultsByDeliveryId ?? new Map<string, DeliveryResult[]>();
+  const rebindsByDeliveryId = cached?.rebindsByDeliveryId ?? new Map<string, DeliveryGenerationRebind[]>();
   addIndexedIntents(intentsByIdempotencyKey, [cloneDeliveryIntent(intent)]);
   addIndexedIntentsByDeliveryId(intentsByDeliveryId, [cloneDeliveryIntent(intent)]);
   const tailSource = Buffer.concat([cached?.tail ?? Buffer.alloc(0), appended]);
@@ -913,6 +1134,8 @@ function observeAppendedDeliveryIntent(
     intentsByIdempotencyKey,
     intentsByDeliveryId,
     acknowledgementsByDeliveryId,
+    resultsByDeliveryId,
+    rebindsByDeliveryId,
   });
   return cloneDeliveryIntent(intent);
 }
@@ -971,6 +1194,8 @@ function observeAppendedDeliveryAcknowledgement(
   const intentsByDeliveryId = cached?.intentsByDeliveryId ?? new Map<string, DeliveryIntent[]>();
   const acknowledgementsByDeliveryId =
     cached?.acknowledgementsByDeliveryId ?? new Map<string, DeliveryAcknowledgement[]>();
+  const resultsByDeliveryId = cached?.resultsByDeliveryId ?? new Map<string, DeliveryResult[]>();
+  const rebindsByDeliveryId = cached?.rebindsByDeliveryId ?? new Map<string, DeliveryGenerationRebind[]>();
   addIndexedAcknowledgements(acknowledgementsByDeliveryId, [cloneDeliveryAcknowledgement(acknowledgement)]);
   const tailSource = Buffer.concat([cached?.tail ?? Buffer.alloc(0), appended]);
   decisionLedgerIndexes.set(ledger, {
@@ -992,6 +1217,8 @@ function observeAppendedDeliveryAcknowledgement(
     intentsByIdempotencyKey,
     intentsByDeliveryId,
     acknowledgementsByDeliveryId,
+    resultsByDeliveryId,
+    rebindsByDeliveryId,
   });
   return {
     acknowledgement: cloneDeliveryAcknowledgement(acknowledgement),
@@ -1014,12 +1241,214 @@ function closePreparedAppend(prepared: SecureAutoloopPreparedAppend, primaryErro
   }
 }
 
+function appendDeliveryGenerationRebind(
+  ledger: SecureAutoloopLedger,
+  existing: DeliveryIntent,
+  nextGeneration: number,
+  now: () => Date,
+): DeliveryIntent {
+  const rebind: DeliveryGenerationRebind = {
+    schema_version: 1,
+    record_type: 'delivery_generation_rebind',
+    delivery_id: existing.delivery_id,
+    idempotency_key: existing.idempotency_key,
+    kind: existing.kind,
+    target_role: existing.target_role,
+    from_generation: existing.target_generation,
+    to_generation: nextGeneration,
+    payload_sha256: existing.payload_sha256,
+    rebound_at: deliveryCreatedAt(now),
+  };
+  const serialized = serializeDeliveryGenerationRebind(rebind);
+  const before = findDeliveryById(ledger, existing.delivery_id);
+  if (before.acknowledgement !== undefined) return before.intent!;
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_DECISION_LEDGER_ROW_BYTES) {
+    invalidInput(`Delivery generation rebind row exceeds the ${MAX_DECISION_LEDGER_ROW_BYTES}-byte limit`);
+  }
+  if (before.fileBytes + Buffer.byteLength(serialized, 'utf8') + 1 > MAX_DECISION_LEDGER_BYTES) {
+    invalidLedger(`Delivery generation rebind would exceed the ${MAX_DECISION_LEDGER_BYTES}-byte ledger limit`);
+  }
+  const prepared = ledger.prepareFlatFileAppend('decisions.jsonl', `${serialized}\n`);
+  try {
+    prepared.commitDurable();
+    const flushed = ledger.flushFlatFile('decisions.jsonl');
+    decisionLedgerIndexes.delete(ledger);
+    const observed = findDeliveryIntent(ledger, existing.idempotency_key);
+    if (
+      !observed.intent ||
+      observed.intent.delivery_id !== existing.delivery_id ||
+      observed.intent.target_generation !== nextGeneration ||
+      observed.intent.payload_sha256 !== existing.payload_sha256 ||
+      observed.dev !== flushed.dev ||
+      observed.ino !== flushed.ino
+    ) {
+      invalidLedger('Delivery generation rebind was not observed at its exact durable decision-ledger chain');
+    }
+    const closeFailure = closePreparedAppend(prepared);
+    if (closeFailure !== undefined) {
+      throw committedObservationFailure(
+        'Committed delivery generation rebind could not close its descriptor',
+        closeFailure,
+      );
+    }
+    return observed.intent;
+  } catch (error) {
+    closePreparedAppend(prepared, error);
+    if (!prepared.committed) throw error;
+    const failure =
+      error instanceof AutoloopDeliveryOutboxError && error.committed
+        ? error
+        : committedObservationFailure('Committed delivery generation rebind could not be safely observed', error);
+    committedObservationFailures.set(canonicalLedgerDirectory(ledger), failure);
+    throw failure;
+  }
+}
+
 export function lookupByIdempotencyKey(
   ledger: SecureAutoloopLedger,
   idempotencyKey: string,
 ): DeliveryIntent | undefined {
   validateIdempotencyKey(idempotencyKey);
   return findDeliveryIntent(ledger, idempotencyKey).intent;
+}
+
+/** Read the exact durable acknowledgement for an intent without mutating it. */
+export function lookupAcknowledgementByIdempotencyKey(
+  ledger: SecureAutoloopLedger,
+  idempotencyKey: string,
+): DeliveryAcknowledgement | undefined {
+  validateIdempotencyKey(idempotencyKey);
+  const intent = findDeliveryIntent(ledger, idempotencyKey);
+  if (!intent.intent) return undefined;
+  const record = findDeliveryById(ledger, intent.intent.delivery_id);
+  if (!record.acknowledgement) return undefined;
+  const flushed = ledger.flushFlatFile('decisions.jsonl');
+  if (
+    record.dev === undefined ||
+    record.ino === undefined ||
+    flushed.dev !== record.dev ||
+    flushed.ino !== record.ino
+  ) {
+    invalidLedger('Existing delivery acknowledgement durability barrier covered a different decisions.jsonl identity');
+  }
+  const observed = findDeliveryById(ledger, intent.intent.delivery_id);
+  if (
+    !observed.intent ||
+    !observed.acknowledgement ||
+    observed.intent.delivery_id !== intent.intent.delivery_id ||
+    observed.intent.payload_sha256 !== intent.intent.payload_sha256 ||
+    observed.acknowledgement.payload_sha256 !== intent.intent.payload_sha256 ||
+    observed.dev !== flushed.dev ||
+    observed.ino !== flushed.ino
+  ) {
+    invalidLedger('Existing delivery acknowledgement could not be observed with its exact persisted intent');
+  }
+  return observed.acknowledgement;
+}
+
+/** Read the one immutable Coder result that was persisted before acknowledgement. */
+export function lookupDeliveryResultByIdempotencyKey(
+  ledger: SecureAutoloopLedger,
+  idempotencyKey: string,
+): DeliveryResult | undefined {
+  validateIdempotencyKey(idempotencyKey);
+  const intent = findDeliveryIntent(ledger, idempotencyKey).intent;
+  if (!intent) return undefined;
+  const record = findDeliveryById(ledger, intent.delivery_id);
+  if (record.resultCount > 1) invalidLedger(`Delivery id '${intent.delivery_id}' has ambiguous persisted results`);
+  return record.result;
+}
+
+/**
+ * Durably persist the Coder's recoverable result before its delivery ACK. The
+ * row is keyed by the existing intent, so an exact retry is a no-op and a
+ * competing result is a non-retryable conflict.
+ */
+export function persistDeliveryResult(
+  ledger: SecureAutoloopLedger,
+  intent: DeliveryIntent,
+  resultKind: DeliveryResult['result_kind'],
+  resultPayload: unknown,
+): DeliveryResult {
+  validateDeliveryId(intent.delivery_id);
+  validatePayloadSha256(intent.payload_sha256);
+  const canonicalPayload = canonicalJson(resultPayload);
+  const result: DeliveryResult = {
+    schema_version: 1,
+    record_type: 'delivery_result',
+    delivery_id: intent.delivery_id,
+    payload_sha256: intent.payload_sha256,
+    result_kind: resultKind,
+    result_payload: JSON.parse(canonicalPayload) as unknown,
+  };
+  // Reuse the same strict row validator used for cold ledger input before any
+  // append so malformed result discriminators/payloads cannot become durable.
+  if (!parseDeliveryResult(result, 0)) invalidInput('Delivery result is invalid');
+  const serialized = serializeDeliveryResult(result, canonicalPayload);
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_DECISION_LEDGER_ROW_BYTES) {
+    invalidInput(`Delivery result row exceeds the ${MAX_DECISION_LEDGER_ROW_BYTES}-byte limit`);
+  }
+  ledger.assertIdentity();
+  const locked = withFileLock(
+    path.join(ledger.directory, '.delivery-outbox.lock'),
+    () => {
+      ledger.assertIdentity();
+      const existing = findDeliveryById(ledger, intent.delivery_id);
+      if (
+        !existing.intent ||
+        existing.intent.kind !== 'coder_directive' ||
+        existing.intent.target_role !== 'coder' ||
+        existing.intent.payload_sha256 !== intent.payload_sha256
+      ) {
+        acknowledgementConflict(`Delivery result does not match Coder delivery '${intent.delivery_id}'`);
+      }
+      if (existing.acknowledgement) {
+        acknowledgementConflict(
+          `Delivery result for '${intent.delivery_id}' cannot be persisted after acknowledgement`,
+        );
+      }
+      if (existing.result) {
+        if (
+          existing.result.result_kind !== result.result_kind ||
+          canonicalJson(existing.result.result_payload) !== canonicalPayload
+        ) {
+          acknowledgementConflict(`Delivery result for '${intent.delivery_id}' conflicts with its persisted result`);
+        }
+        return existing.result;
+      }
+      if (existing.fileBytes + Buffer.byteLength(serialized, 'utf8') + 1 > MAX_DECISION_LEDGER_BYTES) {
+        invalidLedger(`Delivery result would exceed the ${MAX_DECISION_LEDGER_BYTES}-byte ledger limit`);
+      }
+      ledger.appendFlatFile('decisions.jsonl', `${serialized}\n`, true);
+      decisionLedgerIndexes.delete(ledger);
+      const observed = findDeliveryById(ledger, intent.delivery_id);
+      if (
+        observed.resultCount !== 1 ||
+        !observed.result ||
+        observed.result.result_kind !== result.result_kind ||
+        observed.result.payload_sha256 !== result.payload_sha256 ||
+        canonicalJson(observed.result.result_payload) !== canonicalPayload
+      ) {
+        invalidLedger(`Delivery result for '${intent.delivery_id}' was not durably observed`);
+      }
+      return observed.result;
+    },
+    { waitMs: DELIVERY_OUTBOX_LOCK_WAIT_MS },
+  );
+  if (!locked.ok) {
+    if (locked.reason === 'cleanup_failed') {
+      throw new AutoloopDeliveryOutboxError(
+        'AUTOLOOP_DELIVERY_OUTBOX_LOCK_CLEANUP_FAILED',
+        `Autoloop delivery outbox lock cleanup failed after a published acquisition: ${locked.error}`,
+        { cause: locked.cause },
+      );
+    }
+    throw new AutoloopDeliveryOutboxError(
+      'AUTOLOOP_DELIVERY_OUTBOX_LOCK_CONTENDED',
+      `Autoloop delivery outbox is contended: ${locked.error}`,
+    );
+  }
+  return locked.value;
 }
 
 /** Persist one receiver acknowledgement for the exact intent digest, or return its original durable record. */
@@ -1252,7 +1681,6 @@ export function prepareDelivery(
           if (
             existing.kind !== kind ||
             existing.target_role !== target_role ||
-            existing.target_generation !== target_generation ||
             existing.payload_sha256 !== payloadSha256
           ) {
             idempotencyConflict(`Delivery idempotency key '${idempotency_key}' conflicts with its persisted intent`);
@@ -1265,7 +1693,15 @@ export function prepareDelivery(
           if (!observed || !sameDeliveryIntent(observed, existing)) {
             invalidLedger('Existing delivery intent was not observed at its exact durable decision-ledger row');
           }
-          return observed;
+          const delivery = findDeliveryById(ledger, existing.delivery_id);
+          if (delivery.acknowledgement !== undefined) return observed;
+          if (target_generation === observed.target_generation) return observed;
+          if (target_generation < observed.target_generation) {
+            generationRebindConflict(
+              `Delivery idempotency key '${idempotency_key}' cannot rebind from generation ${observed.target_generation} to an older generation ${target_generation}`,
+            );
+          }
+          return appendDeliveryGenerationRebind(ledger, observed, target_generation, options.now ?? (() => new Date()));
         }
         validateDeliveryRoute(kind, target_role);
 

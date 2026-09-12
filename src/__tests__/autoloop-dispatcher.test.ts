@@ -16,6 +16,7 @@ import { execFileSync, type ChildProcess } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 
 import { ClaudeAgentDispatcher } from '../autoloop/dispatcher.js';
+import { acknowledgeDelivery, prepareDelivery } from '../autoloop/outbox.js';
 import { SecureAutoloopLedger } from '../autoloop/secure-ledger.js';
 import {
   applyPlannerToolCalls,
@@ -31,6 +32,7 @@ import {
   AutoloopRoutingError,
   type AnyAutoloopMessage,
   type CheckpointReviewRequestPayload,
+  canonicalizeMessage,
   Msg,
   validateMessage,
 } from '../autoloop/messages.js';
@@ -54,6 +56,47 @@ interface StubCalls {
   reserveAgentGeneration: ReturnType<typeof vi.fn>;
   getStatus: ReturnType<typeof vi.fn>;
   compactSession: ReturnType<typeof vi.fn>;
+}
+
+function bindStubAgentOutputToPrompt(name: string, prompt: string, output: string): string {
+  const provenanceMatch = /<autoloop_delivery delivery_id="([^"]+)" payload_sha256="([a-f0-9]{64})">/.exec(prompt);
+  if (!provenanceMatch) return output;
+  const provenance = { delivery_id: provenanceMatch[1], payload_sha256: provenanceMatch[2] };
+  let rebound = false;
+  const rewritten = output.replace(/```autoloop\s*\n([\s\S]*?)\n```/g, (block, body: string) => {
+    try {
+      const parsed = JSON.parse(body.trim()) as { tool?: unknown; args?: unknown };
+      if (
+        parsed.tool !== 'iter_complete' &&
+        parsed.tool !== 'request_clarification' &&
+        parsed.tool !== 'review_complete'
+      ) {
+        return block;
+      }
+      if (typeof parsed.args !== 'object' || parsed.args === null || Array.isArray(parsed.args)) return block;
+      rebound = true;
+      return `\`\`\`autoloop\n${JSON.stringify({
+        tool: parsed.tool,
+        args: { ...(parsed.args as Record<string, unknown>), ...provenance },
+      })}\n\`\`\``;
+    } catch {
+      return block;
+    }
+  });
+  if (rebound || output.includes('```autoloop')) return rewritten;
+  if (name.endsWith('-coder')) {
+    return `${output}\n\`\`\`autoloop\n${JSON.stringify({
+      tool: 'request_clarification',
+      args: { question: output || 'Clarification required.', ...provenance },
+    })}\n\`\`\``;
+  }
+  if (name.endsWith('-reviewer')) {
+    return `${output}\n\`\`\`autoloop\n${JSON.stringify({
+      tool: 'review_complete',
+      args: { decision: 'hold', metric: null, audit_notes: output, ...provenance },
+    })}\n\`\`\``;
+  }
+  return output;
 }
 
 function makeStubManager(
@@ -88,13 +131,14 @@ function makeStubManager(
         claudeSessionId: reservations.get(config.name)?.session_id,
       };
     }),
-    sendMessage: vi.fn(async () => {
+    sendMessage: vi.fn(async (name: string, prompt: string) => {
       if (throwsRemaining > 0) {
         throwsRemaining -= 1;
         throw new Error('subprocess died');
       }
-      const output = opts.sendOutputs?.[sendIndex] ?? opts.sendOutput ?? '';
+      const rawOutput = opts.sendOutputs?.[sendIndex] ?? opts.sendOutput ?? '';
       sendIndex += 1;
+      const output = bindStubAgentOutputToPrompt(name, prompt, rawOutput);
       return { output, error: undefined };
     }),
     stopSession: vi.fn(async (name: string) => {
@@ -434,6 +478,23 @@ function decisionRows(ledgerDir: string, kind: string): Array<Record<string, unk
     .filter(Boolean)
     .map((line) => JSON.parse(line) as Record<string, unknown>)
     .filter((entry) => entry.kind === kind);
+}
+
+function deliveryProvenanceFromPrompt(prompt: string): { delivery_id: string; payload_sha256: string } {
+  const match = /<autoloop_delivery delivery_id="([^"]+)" payload_sha256="([a-f0-9]{64})">/.exec(prompt);
+  expect(match, 'durable delivery prompt provenance').not.toBeNull();
+  return { delivery_id: match![1], payload_sha256: match![2] };
+}
+
+function durableDecisionRows(ledgerDir: string): Array<Record<string, unknown>> {
+  const target = path.join(ledgerDir, 'decisions.jsonl');
+  if (!fs.existsSync(target)) return [];
+  return fs
+    .readFileSync(target, 'utf8')
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
 describe('Planner control argument shape', () => {
@@ -2328,7 +2389,7 @@ describe('ClaudeAgentDispatcher — Reviewer-only checkpoint requests', () => {
       'autoloop-r1-reviewer',
     ]);
     expect(calls.sendMessage).toHaveBeenCalledTimes(1);
-    expect(calls.sendMessage.mock.calls[0][1]).toBe(
+    expect(calls.sendMessage.mock.calls[0][1]).toContain(
       [
         '[review_request iter=0]',
         'Artifacts staged from run source-run iter 3 at: iter-0/ (directive.json, diff.patch, eval_output.json)',
@@ -4483,6 +4544,192 @@ describe('ClaudeAgentDispatcher — recoverable send timeout and dispatch identi
     expect(calls.sendMessage).toHaveBeenCalledTimes(2);
   });
 
+  it('rejects a settled warm Coder dispatch with changed content and timestamp before replaying its result or effects', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher();
+    const first = fixedIdentity(
+      Msg.directive(6, {
+        goal: 'preserve this directive',
+        constraints: ['keep scope'],
+        success_criteria: ['one exact result'],
+        max_attempts: 1,
+      }),
+      'warm-coder-content-conflict',
+    );
+    const changed = fixedIdentity(
+      Msg.directive(6, {
+        goal: 'replace this directive',
+        constraints: ['change scope'],
+        success_criteria: ['a different result'],
+        max_attempts: 2,
+      }),
+      'warm-coder-content-conflict',
+      '2026-09-03T00:00:01.000Z',
+    );
+
+    const firstResult = await dispatcher.deliver(first);
+    const directiveBeforeConflict = fs.readFileSync(path.join(ledgerDir, 'iter', '6', 'directive.json'));
+    await expect(dispatcher.deliver({ ...first })).resolves.toEqual(firstResult);
+
+    await expect(dispatcher.deliver(changed)).rejects.toMatchObject({
+      name: 'AutoloopDeliveryOutboxError',
+      code: 'AUTOLOOP_DELIVERY_IDEMPOTENCY_CONFLICT',
+      retryable: false,
+    });
+
+    expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(1);
+    expect(calls.startSession).toHaveBeenCalledTimes(1);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(1);
+    expect(fs.readFileSync(path.join(ledgerDir, 'iter', '6', 'directive.json'))).toEqual(directiveBeforeConflict);
+  });
+
+  it('rejects a settled warm Reviewer dispatch with changed content and timestamp before replaying its result or staging', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher();
+    ensureCompleteReviewArtifacts(dispatcher, 7);
+    const stage = vi.spyOn(
+      dispatcher as unknown as { stageReviewSandbox: (iter: number) => { priorVerdict: boolean } },
+      'stageReviewSandbox',
+    );
+    const first = fixedIdentity(
+      Msg.reviewRequest(7, {
+        iter: 7,
+        ledger_path: ledgerDir,
+        prior_metrics: [1],
+        checkpoint_sha: 'a'.repeat(40),
+        source_run_id: 'source-run',
+        source_iter: 1,
+        scope: ['correctness'],
+        idempotency_key: 'warm-reviewer-content-conflict',
+      }),
+      'warm-reviewer-content-conflict',
+    );
+    const changed = fixedIdentity(
+      Msg.reviewRequest(7, {
+        iter: 7,
+        ledger_path: ledgerDir,
+        prior_metrics: [99],
+        checkpoint_sha: 'b'.repeat(40),
+        source_run_id: 'other-source-run',
+        source_iter: 2,
+        scope: ['security'],
+        idempotency_key: 'warm-reviewer-content-conflict',
+      }),
+      'warm-reviewer-content-conflict',
+      '2026-09-03T00:00:01.000Z',
+    );
+
+    const firstResult = await dispatcher.deliver(first);
+    await expect(dispatcher.deliver({ ...first })).resolves.toEqual(firstResult);
+
+    await expect(dispatcher.deliver(changed)).rejects.toMatchObject({
+      name: 'AutoloopDeliveryOutboxError',
+      code: 'AUTOLOOP_DELIVERY_IDEMPOTENCY_CONFLICT',
+      retryable: false,
+    });
+
+    expect(stage).toHaveBeenCalledTimes(1);
+    expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(1);
+    expect(calls.startSession).toHaveBeenCalledTimes(1);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects an in-flight Coder dispatch with changed content and timestamp before it can coalesce to the stale result', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher();
+    let releaseSend!: (result: { output: string; error: undefined }) => void;
+    const sendGate = new Promise<{ output: string; error: undefined }>((resolve) => {
+      releaseSend = resolve;
+    });
+    calls.sendMessage.mockImplementation(async (name: string, prompt: string) => {
+      const result = await sendGate;
+      return { ...result, output: bindStubAgentOutputToPrompt(name, prompt, result.output) };
+    });
+    const first = fixedIdentity(
+      Msg.directive(8, { goal: 'original', constraints: [], success_criteria: ['original'], max_attempts: 1 }),
+      'inflight-coder-content-conflict',
+    );
+    const changed = fixedIdentity(
+      Msg.directive(8, { goal: 'changed', constraints: ['new'], success_criteria: ['changed'], max_attempts: 2 }),
+      'inflight-coder-content-conflict',
+      '2026-09-03T00:00:01.000Z',
+    );
+
+    const initial = dispatcher.deliver(first);
+    await vi.waitFor(() => expect(calls.sendMessage).toHaveBeenCalledTimes(1));
+    const conflict = dispatcher.deliver(changed);
+    const directiveBeforeRelease = fs.readFileSync(path.join(ledgerDir, 'iter', '8', 'directive.json'));
+    releaseSend({ output: '', error: undefined });
+
+    await initial;
+    await expect(conflict).rejects.toMatchObject({
+      name: 'AutoloopDeliveryOutboxError',
+      code: 'AUTOLOOP_DELIVERY_IDEMPOTENCY_CONFLICT',
+      retryable: false,
+    });
+    expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(1);
+    expect(calls.startSession).toHaveBeenCalledTimes(1);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(1);
+    expect(fs.readFileSync(path.join(ledgerDir, 'iter', '8', 'directive.json'))).toEqual(directiveBeforeRelease);
+  });
+
+  it('rejects an in-flight Reviewer dispatch with changed content and timestamp before it can coalesce to the stale result or stage', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher();
+    ensureCompleteReviewArtifacts(dispatcher, 9);
+    const stage = vi.spyOn(
+      dispatcher as unknown as { stageReviewSandbox: (iter: number) => { priorVerdict: boolean } },
+      'stageReviewSandbox',
+    );
+    let releaseSend!: (result: { output: string; error: undefined }) => void;
+    const sendGate = new Promise<{ output: string; error: undefined }>((resolve) => {
+      releaseSend = resolve;
+    });
+    calls.sendMessage.mockImplementation(async (name: string, prompt: string) => {
+      const result = await sendGate;
+      return { ...result, output: bindStubAgentOutputToPrompt(name, prompt, result.output) };
+    });
+    const first = fixedIdentity(
+      Msg.reviewRequest(9, {
+        iter: 9,
+        ledger_path: ledgerDir,
+        prior_metrics: [1],
+        checkpoint_sha: 'a'.repeat(40),
+        source_run_id: 'source-run',
+        source_iter: 1,
+        scope: ['correctness'],
+        idempotency_key: 'inflight-reviewer-content-conflict',
+      }),
+      'inflight-reviewer-content-conflict',
+    );
+    const changed = fixedIdentity(
+      Msg.reviewRequest(9, {
+        iter: 9,
+        ledger_path: ledgerDir,
+        prior_metrics: [99],
+        checkpoint_sha: 'b'.repeat(40),
+        source_run_id: 'other-source-run',
+        source_iter: 2,
+        scope: ['security'],
+        idempotency_key: 'inflight-reviewer-content-conflict',
+      }),
+      'inflight-reviewer-content-conflict',
+      '2026-09-03T00:00:01.000Z',
+    );
+
+    const initial = dispatcher.deliver(first);
+    await vi.waitFor(() => expect(calls.sendMessage).toHaveBeenCalledTimes(1));
+    const conflict = dispatcher.deliver(changed);
+    releaseSend({ output: '', error: undefined });
+
+    await initial;
+    await expect(conflict).rejects.toMatchObject({
+      name: 'AutoloopDeliveryOutboxError',
+      code: 'AUTOLOOP_DELIVERY_IDEMPOTENCY_CONFLICT',
+      retryable: false,
+    });
+    expect(stage).toHaveBeenCalledTimes(1);
+    expect(calls.reserveAgentGeneration).toHaveBeenCalledTimes(1);
+    expect(calls.startSession).toHaveBeenCalledTimes(1);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
   it('bounds the retained dispatch cache while still coalescing a recent re-delivery', async () => {
     const { dispatcher, calls } = makeDispatcher();
     calls.sendMessage.mockResolvedValue({ output: 'Planner reply', error: undefined });
@@ -4506,6 +4753,72 @@ describe('ClaudeAgentDispatcher — recoverable send timeout and dispatch identi
     await dispatcher.deliver(fixedIdentity(Msg.chat(1, { text: 'turn 190' }), 'logical-bulk-190'));
     expect(calls.sendMessage.mock.calls.length).toBe(sendsBeforeReplay);
     expect(sendsAfterRecent).toBeGreaterThan(0);
+  });
+
+  it('does not evict an exact cold retry in flight after its rejected conflict leaves a stale settled marker', async () => {
+    vi.useFakeTimers();
+    const first = makeDispatcher({ sendTimeoutMs: 7_200_000 });
+    const original = fixedIdentity(
+      Msg.directive(10, {
+        goal: 'retain the durable original intent',
+        constraints: [],
+        success_criteria: ['one physical retry'],
+        max_attempts: 1,
+      }),
+      'cold-retry-stale-settled-marker',
+    );
+    const conflicting = fixedIdentity(
+      Msg.directive(10, {
+        goal: 'conflicting cold intent',
+        constraints: ['different immutable content'],
+        success_criteria: ['must not run'],
+        max_attempts: 2,
+      }),
+      original.msg_id,
+      '2026-09-03T00:00:01.000Z',
+    );
+    first.calls.sendMessage.mockRejectedValue(genuineSendTimeout());
+    const coldIntent = first.dispatcher.deliver(original);
+    await vi.runAllTimersAsync();
+    expect(sendTimeout(await coldIntent).payload.agent).toBe('coder');
+    await first.dispatcher.shutdown('test-cold-unacknowledged-stale-marker');
+    vi.useRealTimers();
+
+    const cold = makeDispatcher({ secureLedger: first.dispatcher.secureLedgerCapability });
+    await expect(cold.dispatcher.deliver(conflicting)).rejects.toMatchObject({
+      name: 'AutoloopDeliveryOutboxError',
+      code: 'AUTOLOOP_DELIVERY_IDEMPOTENCY_CONFLICT',
+      retryable: false,
+    });
+
+    let releaseCoder!: (value: { output: string; error: undefined }) => void;
+    const coderHeld = new Promise<{ output: string; error: undefined }>((resolve) => {
+      releaseCoder = resolve;
+    });
+    cold.calls.sendMessage.mockImplementation(async (name: string, prompt: string) => {
+      if (name.endsWith('-coder')) {
+        const result = await coderHeld;
+        return { ...result, output: bindStubAgentOutputToPrompt(name, prompt, result.output) };
+      }
+      return { output: 'retained dispatch pressure', error: undefined };
+    });
+
+    const retry = cold.dispatcher.deliver(original);
+    await vi.waitFor(() =>
+      expect(cold.calls.sendMessage.mock.calls.filter(([name]) => (name as string).endsWith('-coder'))).toHaveLength(1),
+    );
+
+    for (let i = 0; i < 64; i += 1) {
+      await cold.dispatcher.deliver(
+        fixedIdentity(Msg.chat(10, { text: `cache pressure ${i}` }), `cache-pressure-${i}`),
+      );
+    }
+
+    const concurrentExactRetry = cold.dispatcher.deliver(original);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(cold.calls.sendMessage.mock.calls.filter(([name]) => (name as string).endsWith('-coder'))).toHaveLength(1);
+    releaseCoder({ output: '', error: undefined });
+    await expect(Promise.all([retry, concurrentExactRetry])).resolves.toHaveLength(2);
   });
 
   it('derives the same ID across dispatcher instances without using envelope time, but separates message identities', async () => {
@@ -6039,7 +6352,7 @@ describe('ClaudeAgentDispatcher — canonical immutable delivery payloads', () =
     const firstCompactionGate = new Promise<void>((resolve) => {
       releaseFirstCompaction = resolve;
     });
-    calls.sendMessage.mockImplementation(async (_name, prompt: string) => {
+    calls.sendMessage.mockImplementation(async (name: string, prompt: string) => {
       const iter = Number(/^\[review_request iter=(\d+)\]/.exec(prompt)?.[1]);
       sendOrder.push(iter);
       observedSandbox.push({
@@ -6049,7 +6362,7 @@ describe('ClaudeAgentDispatcher — canonical immutable delivery payloads', () =
           .filter((entry) => entry.startsWith('iter-'))
           .sort(),
       });
-      return { output: reviewerReply, error: undefined };
+      return { output: bindStubAgentOutputToPrompt(name, prompt, reviewerReply), error: undefined };
     });
     calls.compactSession.mockImplementationOnce(async () => {
       signalFirstCompaction();
@@ -6059,11 +6372,7 @@ describe('ClaudeAgentDispatcher — canonical immutable delivery payloads', () =
       Msg.reviewRequest(0, { iter: 0, ledger_path: ledgerDir, prior_metrics: [0] }),
       'review-serialized-0',
     );
-    const duplicateMessage = fixedIdentity(
-      Msg.reviewRequest(0, { iter: 0, ledger_path: ledgerDir, prior_metrics: [0] }),
-      'review-serialized-0',
-      '2035-01-01T00:00:00.000Z',
-    );
+    const duplicateMessage = { ...firstMessage };
     const secondMessage = fixedIdentity(
       Msg.reviewRequest(1, { iter: 1, ledger_path: ledgerDir, prior_metrics: [0, 1] }),
       'review-serialized-1',
@@ -6114,7 +6423,10 @@ describe('ClaudeAgentDispatcher — canonical immutable delivery payloads', () =
     ensureCompleteReviewArtifacts(dispatcher, 1);
     calls.sendMessage
       .mockRejectedValueOnce(genuineSendTimeout())
-      .mockResolvedValue({ output: reviewerReply, error: undefined });
+      .mockImplementationOnce(async (name: string, prompt: string) => ({
+        output: bindStubAgentOutputToPrompt(name, prompt, reviewerReply),
+        error: undefined,
+      }));
 
     const first = dispatcher.deliver(
       fixedIdentity(Msg.reviewRequest(0, { iter: 0, ledger_path: ledgerDir, prior_metrics: [] }), 'review-timeout-0'),
@@ -6150,7 +6462,10 @@ describe('ClaudeAgentDispatcher — canonical immutable delivery payloads', () =
     calls.sendMessage
       .mockRejectedValueOnce(new Error('first Reviewer process failed'))
       .mockRejectedValueOnce(new Error('replacement Reviewer process failed'))
-      .mockResolvedValue({ output: reviewerReply, error: undefined });
+      .mockImplementationOnce(async (name: string, prompt: string) => ({
+        output: bindStubAgentOutputToPrompt(name, prompt, reviewerReply),
+        error: undefined,
+      }));
 
     const first = dispatcher.deliver(
       fixedIdentity(Msg.reviewRequest(0, { iter: 0, ledger_path: ledgerDir, prior_metrics: [] }), 'review-fatal-0'),
@@ -6217,7 +6532,7 @@ describe('ClaudeAgentDispatcher — canonical immutable delivery payloads', () =
     const firstSendGate = new Promise<void>((resolve) => {
       releaseFirstSend = resolve;
     });
-    calls.sendMessage.mockImplementation(async () => {
+    calls.sendMessage.mockImplementation(async (_name: string, _prompt: string) => {
       signalFirstSend();
       await firstSendGate;
       return { output: reviewerReply, error: undefined };
@@ -6306,7 +6621,7 @@ describe('ClaudeAgentDispatcher — canonical immutable delivery payloads', () =
 
     expect(ordinaryReads).toBe(0);
     for (const field of ['iter', 'ledger_path', 'prior_metrics']) expect(descriptorReads.get(field)).toBe(1);
-    expect(calls.sendMessage.mock.calls[0][1]).toBe(
+    expect(calls.sendMessage.mock.calls[0][1]).toContain(
       [
         '[review_request iter=4]',
         'Artifacts staged at: iter-4/ (directive.json, diff.patch, eval_output.json)',
@@ -6742,6 +7057,1656 @@ describe('ClaudeAgentDispatcher — canonical immutable delivery payloads', () =
     expect(calls.sendMessage.mock.calls[0][1]).toContain('prior_metrics: [1,2]');
     expect(calls.sendMessage.mock.calls[0][1]).not.toContain('attacker-chosen');
   });
+});
+
+describe('ClaudeAgentDispatcher — durable outbox delivery integration', () => {
+  it('accepts legacy delivery envelopes and preserves paired outbox metadata when supplied', () => {
+    const deliveryId = 'delivery-compatible-1';
+    const payloadSha256 = 'a'.repeat(64);
+    const legacyDirective = Msg.directive(2, {
+      goal: 'legacy remains valid',
+      constraints: [],
+      success_criteria: [],
+      max_attempts: 1,
+    });
+    const legacyReview = Msg.reviewRequest(2, { iter: 2, ledger_path: '/ledger', prior_metrics: [] });
+
+    expect(canonicalizeMessage(legacyDirective).payload).not.toHaveProperty('delivery_id');
+    expect(canonicalizeMessage(legacyReview).payload).not.toHaveProperty('payload_sha256');
+    expect(
+      canonicalizeMessage({
+        ...legacyDirective,
+        payload: { ...legacyDirective.payload, delivery_id: deliveryId, payload_sha256: payloadSha256 },
+      }).payload,
+    ).toMatchObject({ delivery_id: deliveryId, payload_sha256: payloadSha256 });
+    expect(
+      canonicalizeMessage({
+        ...legacyReview,
+        payload: { ...legacyReview.payload, delivery_id: deliveryId, payload_sha256: payloadSha256 },
+      }).payload,
+    ).toMatchObject({ delivery_id: deliveryId, payload_sha256: payloadSha256 });
+  });
+
+  it('tolerates canonical intent, rebind, and ACK rows before persisting a later Planner control', async () => {
+    const plannerReply = [
+      'Dispatch the next bounded iteration.',
+      '```autoloop',
+      JSON.stringify({
+        tool: 'send_directive',
+        args: {
+          goal: 'continue after an acknowledged delivery',
+          constraints: [],
+          success_criteria: [],
+          max_attempts: 1,
+        },
+      }),
+      '```',
+    ].join('\n');
+    const { dispatcher, ledgerDir } = makeDispatcher({}, { sendOutput: plannerReply });
+    const first = prepareDelivery(dispatcher.secureLedgerCapability, {
+      idempotency_key: 'prior-canonical-delivery',
+      kind: 'coder_directive',
+      target_role: 'coder',
+      target_generation: 1,
+      payload: { prompt: 'prior delivery' },
+    });
+    const rebound = prepareDelivery(dispatcher.secureLedgerCapability, {
+      idempotency_key: 'prior-canonical-delivery',
+      kind: 'coder_directive',
+      target_role: 'coder',
+      target_generation: 2,
+      payload: { prompt: 'prior delivery' },
+    });
+    acknowledgeDelivery(dispatcher.secureLedgerCapability, rebound.delivery_id, rebound.payload_sha256);
+
+    await expect(dispatcher.deliver(Msg.chat(0, { text: 'continue' }))).resolves.toEqual([
+      expect.objectContaining({
+        type: 'directive',
+        payload: expect.objectContaining({ goal: 'continue after an acknowledged delivery' }),
+      }),
+    ]);
+
+    expect(rebound.delivery_id).toBe(first.delivery_id);
+    expect(decisionRows(ledgerDir, 'planner_turn_control')).toHaveLength(1);
+  });
+
+  it('allows a cold request_review after a canonical delivery ACK', async () => {
+    const first = makeDispatcher();
+    const intent = prepareDelivery(first.dispatcher.secureLedgerCapability, {
+      idempotency_key: 'prior-ack-before-cold-review',
+      kind: 'coder_directive',
+      target_role: 'coder',
+      target_generation: 1,
+      payload: { prompt: 'already delivered' },
+    });
+    acknowledgeDelivery(first.dispatcher.secureLedgerCapability, intent.delivery_id, intent.payload_sha256);
+    const checkpoint = initializeCheckpointRepository(first.workspace);
+    writeSourceReviewArtifacts(first.workspace, 'source-run', 3, checkpoint.patch);
+    const cold = makeDispatcher({ secureLedger: first.dispatcher.secureLedgerCapability });
+
+    await expect(
+      cold.dispatcher.requestReview(
+        {
+          checkpoint_sha: checkpoint.sha,
+          source_run_id: 'source-run',
+          source_iter: 3,
+          scope: ['durability'],
+          idempotency_key: 'cold-review-after-ack',
+        },
+        0,
+      ),
+    ).resolves.toMatchObject({
+      status: 'prepared',
+      target: 'reviewer',
+      idempotency_key: 'cold-review-after-ack',
+    });
+
+    expect(requestReviewDecisions(first.ledgerDir)).toHaveLength(1);
+    expect(cold.calls.startSession).not.toHaveBeenCalled();
+    expect(cold.calls.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      'intent',
+      {
+        schema_version: 1,
+        delivery_id: 'malformed-intent',
+        idempotency_key: 'malformed-intent',
+        kind: 'coder_directive',
+        target_role: 'coder',
+        target_generation: 1,
+        payload: { prompt: 'digest does not match' },
+        payload_sha256: '0'.repeat(64),
+        created_at: '2026-09-11T12:00:00.000Z',
+      },
+    ],
+    [
+      'acknowledgement',
+      {
+        schema_version: 1,
+        delivery_id: 'malformed-ack',
+        payload_sha256: 'a'.repeat(64),
+        acknowledged_at: '2026-09-11T12:00:00.000Z',
+        kind: 'audit',
+      },
+    ],
+    [
+      'generation rebind',
+      {
+        schema_version: 1,
+        record_type: 'delivery_generation_rebind',
+        delivery_id: 'malformed-rebind',
+        idempotency_key: 'malformed-rebind',
+        kind: 'coder_directive',
+        target_role: 'coder',
+        from_generation: 2,
+        to_generation: 1,
+        payload_sha256: 'b'.repeat(64),
+        rebound_at: '2026-09-11T12:00:00.000Z',
+      },
+    ],
+  ] as const)(
+    'fails closed on a malformed outbox %s row before Planner control persistence or effects',
+    async (_label, row) => {
+      const plannerReply = [
+        '```autoloop',
+        JSON.stringify({
+          tool: 'send_directive',
+          args: { goal: 'must not run', constraints: [], success_criteria: [], max_attempts: 1 },
+        }),
+        '```',
+      ].join('\n');
+      const { dispatcher, ledgerDir } = makeDispatcher({}, { sendOutput: plannerReply });
+      dispatcher.secureLedgerCapability.appendFlatFile('decisions.jsonl', `${JSON.stringify(row)}\n`);
+
+      await expect(dispatcher.deliver(Msg.chat(0, { text: 'validate the ledger first' }))).rejects.toMatchObject({
+        code: 'AUTOLOOP_CONTROL_NOT_PERSISTED',
+        message: expect.stringMatching(/delivery|acknowledgement|rebind|intent/i),
+      });
+
+      expect(decisionRows(ledgerDir, 'planner_turn_control')).toEqual([]);
+    },
+  );
+
+  it.each(['coder', 'reviewer'] as const)(
+    'rejects Proxy-backed %s provenance as typed non-retryable input before result effects',
+    async (role) => {
+      const { dispatcher, calls, ledgerDir, workspace } = makeDispatcher({}, { contextPercent: 90 });
+      if (role === 'coder') initializeCheckpointRepository(workspace);
+      else ensureCompleteReviewArtifacts(dispatcher, 0);
+      const runGit = vi.fn(async () => ({ code: 0, out: '', err: '' }));
+      (dispatcher as unknown as { runGit: typeof runGit }).runGit = runGit;
+      const surfaced = vi.fn();
+      dispatcher.on(role === 'coder' ? 'coder_reply' : 'reviewer_reply', surfaced);
+      let expectedProvenance: { delivery_id: string; payload_sha256: string } | undefined;
+      calls.sendMessage.mockImplementation(async (_name: string, prompt: string) => {
+        expectedProvenance = deliveryProvenanceFromPrompt(prompt);
+        const completion =
+          role === 'coder'
+            ? { tool: 'iter_complete', args: { summary: 'must not persist', eval_output: { metric: 1 } } }
+            : {
+                tool: 'review_complete',
+                args: { decision: 'advance', metric: 1, audit_notes: 'must not persist' },
+              };
+        return { output: `\`\`\`autoloop\n${JSON.stringify(completion)}\n\`\`\``, error: undefined };
+      });
+      const originalParse = JSON.parse;
+      let provenanceInspectionTraps = 0;
+      const parseSpy = vi.spyOn(JSON, 'parse').mockImplementation((text: string) => {
+        const parsed = originalParse(text) as unknown;
+        if (
+          typeof parsed === 'object' &&
+          parsed !== null &&
+          !Array.isArray(parsed) &&
+          ((parsed as { tool?: unknown }).tool === 'iter_complete' ||
+            (parsed as { tool?: unknown }).tool === 'review_complete')
+        ) {
+          const record = parsed as { args: Record<string, unknown> };
+          record.args = new Proxy(record.args, {
+            get(target, key, receiver) {
+              provenanceInspectionTraps += 1;
+              return Reflect.get(target, key, receiver);
+            },
+            getOwnPropertyDescriptor(target, key) {
+              provenanceInspectionTraps += 1;
+              if ((key === 'delivery_id' || key === 'payload_sha256') && expectedProvenance) {
+                return {
+                  configurable: true,
+                  enumerable: true,
+                  value: expectedProvenance[key],
+                  writable: true,
+                };
+              }
+              return Reflect.getOwnPropertyDescriptor(target, key);
+            },
+          });
+        }
+        return parsed;
+      });
+      const message =
+        role === 'coder'
+          ? fixedIdentity(
+              Msg.directive(0, {
+                goal: 'reject Proxy provenance',
+                constraints: [],
+                success_criteria: [],
+                max_attempts: 1,
+              }),
+              'proxy-coder-provenance',
+            )
+          : fixedIdentity(
+              Msg.reviewRequest(0, { iter: 0, ledger_path: ledgerDir, prior_metrics: [] }),
+              'proxy-reviewer-provenance',
+            );
+      let thrown: unknown;
+
+      try {
+        await dispatcher.deliver(message);
+      } catch (error) {
+        thrown = error;
+      } finally {
+        parseSpy.mockRestore();
+      }
+
+      expect(thrown).toMatchObject({
+        name: 'AutoloopOperationError',
+        code: 'AUTOLOOP_CONTROL_MALFORMED',
+        retryable: false,
+      });
+      expect(provenanceInspectionTraps).toBe(0);
+      expect(durableDecisionRows(ledgerDir).filter((row) => Object.hasOwn(row, 'acknowledged_at'))).toEqual([]);
+      expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'eval_output.json'))).toBe(role === 'reviewer');
+      expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'coder_summary.txt'))).toBe(role === 'reviewer');
+      expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'diff.patch'))).toBe(role === 'reviewer');
+      expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'verdict.json'))).toBe(false);
+      expect(fs.existsSync(path.join(ledgerDir, 'chat.jsonl'))).toBe(false);
+      expect(surfaced).not.toHaveBeenCalled();
+      expect(calls.compactSession).not.toHaveBeenCalled();
+      expect(runGit).not.toHaveBeenCalled();
+    },
+  );
+
+  const invalidProvenanceCases = [
+    ['omitted', () => ({})],
+    [
+      'incomplete',
+      (expected: { delivery_id: string; payload_sha256: string }) => ({ delivery_id: expected.delivery_id }),
+    ],
+    ['malformed', () => ({ delivery_id: ' padded-delivery-id ', payload_sha256: 'A'.repeat(64) })],
+    [
+      'mismatched',
+      (expected: { delivery_id: string; payload_sha256: string }) => ({
+        delivery_id: `${expected.delivery_id}-forged`,
+        payload_sha256: expected.payload_sha256,
+      }),
+    ],
+  ] satisfies Array<[string, (expected: { delivery_id: string; payload_sha256: string }) => Record<string, unknown>]>;
+
+  it.each(
+    (['coder', 'reviewer'] as const).flatMap((role) =>
+      invalidProvenanceCases.map(([label, mutate]) => [role, label, mutate] as const),
+    ),
+  )(
+    'stops a %s %s provenance reply before result, audit, compaction, or runner-visible progress',
+    async (role, _label, mutate) => {
+      const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { contextPercent: 90 });
+      const runGit = vi.fn(async () => ({ code: 0, out: '', err: '' }));
+      (dispatcher as unknown as { runGit: typeof runGit }).runGit = runGit;
+      if (role === 'reviewer') ensureCompleteReviewArtifacts(dispatcher, 0);
+      const surfaced = vi.fn();
+      dispatcher.on(role === 'coder' ? 'coder_reply' : 'reviewer_reply', surfaced);
+      calls.sendMessage.mockImplementation(async (_name: string, prompt: string) => {
+        const expected = deliveryProvenanceFromPrompt(prompt);
+        const provenance = mutate(expected);
+        const tool = role === 'coder' ? 'iter_complete' : 'review_complete';
+        const args =
+          role === 'coder'
+            ? { summary: 'must not persist', eval_output: { metric: 1 }, ...provenance }
+            : { decision: 'advance', metric: 1, audit_notes: 'must not persist', ...provenance };
+        return {
+          output: `unsafe ${role} progress\n\`\`\`autoloop\n${JSON.stringify({ tool, args })}\n\`\`\``,
+          error: undefined,
+        };
+      });
+      const message =
+        role === 'coder'
+          ? fixedIdentity(
+              Msg.directive(0, {
+                goal: 'reject invalid receiver provenance',
+                constraints: [],
+                success_criteria: [],
+                max_attempts: 1,
+              }),
+              `invalid-coder-${_label}`,
+            )
+          : fixedIdentity(
+              Msg.reviewRequest(0, { iter: 0, ledger_path: ledgerDir, prior_metrics: [] }),
+              `invalid-reviewer-${_label}`,
+            );
+
+      await expect(dispatcher.deliver(message)).rejects.toMatchObject({
+        name: 'AutoloopOperationError',
+        code: 'AUTOLOOP_CONTROL_MALFORMED',
+        retryable: false,
+        message: expect.stringMatching(/delivery|provenance|payload digest/i),
+      });
+
+      const iterDir = path.join(ledgerDir, 'iter', '0');
+      if (role === 'coder') {
+        expect(fs.existsSync(path.join(iterDir, 'eval_output.json'))).toBe(false);
+        expect(fs.existsSync(path.join(iterDir, 'coder_summary.txt'))).toBe(false);
+        expect(fs.existsSync(path.join(iterDir, 'diff.patch'))).toBe(false);
+        expect(runGit).not.toHaveBeenCalled();
+      } else {
+        expect(fs.existsSync(path.join(iterDir, 'verdict.json'))).toBe(false);
+        expect(fs.existsSync(path.join(iterDir, 'evidence'))).toBe(false);
+      }
+      expect(durableDecisionRows(ledgerDir).filter((row) => Object.hasOwn(row, 'acknowledged_at'))).toEqual([]);
+      expect(fs.existsSync(path.join(ledgerDir, 'chat.jsonl'))).toBe(false);
+      expect(surfaced).not.toHaveBeenCalled();
+      expect(calls.compactSession).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ['a nested non-finite value from JSON 1e999', '{"nested":[1e999]}'],
+    ['an over-depth eval output', `${'{"nested":'.repeat(65)}null${'}'.repeat(65)}`],
+  ] as const)(
+    'rejects a live Coder completion with %s before artifacts, Git, result persistence, acknowledgement, or progress',
+    async (_label, evalOutput) => {
+      const iter = 14;
+      const { dispatcher, calls, ledgerDir, workspace } = makeDispatcher({}, { contextPercent: 90 });
+      initializeCheckpointRepository(workspace);
+      const initialHead = execFileSync('git', ['rev-parse', '--verify', 'HEAD'], {
+        cwd: workspace,
+        encoding: 'utf8',
+      }).trim();
+      const runGit = vi.fn(async () => ({ code: 0, out: '', err: '' }));
+      (dispatcher as unknown as { runGit: typeof runGit }).runGit = runGit;
+      const surfaced = vi.fn();
+      dispatcher.on('coder_reply', surfaced);
+      calls.sendMessage.mockImplementation(async (_name: string, prompt: string) => {
+        const provenance = deliveryProvenanceFromPrompt(prompt);
+        return {
+          output:
+            'untrusted live progress\n```autoloop\n' +
+            `{"tool":"iter_complete","args":{"summary":"must reject","eval_output":${evalOutput},` +
+            `"delivery_id":${JSON.stringify(provenance.delivery_id)},` +
+            `"payload_sha256":${JSON.stringify(provenance.payload_sha256)}}}\n` +
+            '```',
+          error: undefined,
+        };
+      });
+
+      await expect(
+        dispatcher.deliver(
+          fixedIdentity(
+            Msg.directive(iter, {
+              goal: 'reject invalid live Coder evaluation output',
+              constraints: [],
+              success_criteria: [],
+              max_attempts: 1,
+            }),
+            `live-invalid-eval-${_label}`,
+          ),
+        ),
+      ).rejects.toMatchObject({
+        name: 'AutoloopRoutingError',
+        message: expect.stringMatching(/eval_output.*finite|eval_output.*depth/i),
+      });
+
+      const iterDir = path.join(ledgerDir, 'iter', String(iter));
+      expect(fs.existsSync(path.join(iterDir, 'eval_output.json'))).toBe(false);
+      expect(fs.existsSync(path.join(iterDir, 'coder_summary.txt'))).toBe(false);
+      expect(fs.existsSync(path.join(iterDir, 'diff.patch'))).toBe(false);
+      expect(runGit).not.toHaveBeenCalled();
+      expect(execFileSync('git', ['rev-parse', '--verify', 'HEAD'], { cwd: workspace, encoding: 'utf8' }).trim()).toBe(
+        initialHead,
+      );
+      expect(durableDecisionRows(ledgerDir).filter((row) => row.record_type === 'delivery_result')).toEqual([]);
+      expect(durableDecisionRows(ledgerDir).filter((row) => Object.hasOwn(row, 'acknowledged_at'))).toEqual([]);
+      expect(fs.existsSync(path.join(ledgerDir, 'chat.jsonl'))).toBe(false);
+      expect(surfaced).not.toHaveBeenCalled();
+      expect(calls.compactSession).not.toHaveBeenCalled();
+      expect(calls.sendMessage).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('requires exact provenance before returning a Coder clarification fallback', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { contextPercent: 90 });
+    const surfaced = vi.fn();
+    dispatcher.on('coder_reply', surfaced);
+    calls.sendMessage.mockResolvedValue({
+      output:
+        'Need direction.\n```autoloop\n' +
+        JSON.stringify({ tool: 'request_clarification', args: { question: 'May I change the evaluator?' } }) +
+        '\n```',
+      error: undefined,
+    });
+
+    await expect(
+      dispatcher.deliver(
+        fixedIdentity(
+          Msg.directive(0, {
+            goal: 'clarify safely',
+            constraints: [],
+            success_criteria: [],
+            max_attempts: 1,
+          }),
+          'clarification-without-provenance',
+        ),
+      ),
+    ).rejects.toMatchObject({
+      name: 'AutoloopOperationError',
+      code: 'AUTOLOOP_CONTROL_MALFORMED',
+      retryable: false,
+    });
+
+    expect(durableDecisionRows(ledgerDir).filter((row) => Object.hasOwn(row, 'acknowledged_at'))).toEqual([]);
+    expect(fs.existsSync(path.join(ledgerDir, 'chat.jsonl'))).toBe(false);
+    expect(surfaced).not.toHaveBeenCalled();
+    expect(calls.compactSession).not.toHaveBeenCalled();
+  });
+
+  it('acknowledges an exact Coder clarification before returning its fallback', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher();
+    calls.sendMessage.mockImplementation(async (_name: string, prompt: string) => {
+      const provenance = deliveryProvenanceFromPrompt(prompt);
+      return {
+        output:
+          'Need direction.\n```autoloop\n' +
+          JSON.stringify({
+            tool: 'request_clarification',
+            args: { question: 'May I change the evaluator?', ...provenance },
+          }) +
+          '\n```',
+        error: undefined,
+      };
+    });
+
+    const replies = await dispatcher.deliver(
+      fixedIdentity(
+        Msg.directive(0, {
+          goal: 'clarify safely',
+          constraints: [],
+          success_criteria: [],
+          max_attempts: 1,
+        }),
+        'clarification-with-exact-provenance',
+      ),
+    );
+
+    expect(replies).toEqual([
+      expect.objectContaining({
+        type: 'directive_ack',
+        payload: expect.objectContaining({ understood: false, clarification: 'Need direction.' }),
+      }),
+    ]);
+    expect(durableDecisionRows(ledgerDir).filter((row) => Object.hasOwn(row, 'acknowledged_at'))).toHaveLength(1);
+    expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'eval_output.json'))).toBe(false);
+  });
+
+  it('rejects an acknowledged Coder replay with the same routing identity but changed logical directive content before effects', async () => {
+    const first = makeDispatcher();
+    first.calls.sendMessage.mockImplementation(async (_name: string, prompt: string) => {
+      const provenance = deliveryProvenanceFromPrompt(prompt);
+      return {
+        output: `\`\`\`autoloop\n${JSON.stringify({ tool: 'iter_complete', args: { summary: 'durable', eval_output: {}, ...provenance } })}\n\`\`\``,
+        error: undefined,
+      };
+    });
+    (first.dispatcher as unknown as { runGit: () => Promise<{ code: number; out: string; err: string }> }).runGit =
+      async () => ({ code: 0, out: '', err: '' });
+    const message = fixedIdentity(
+      Msg.directive(2, {
+        goal: 'preserve the original directive',
+        constraints: ['keep scope'],
+        success_criteria: ['exact delivery'],
+        max_attempts: 1,
+      }),
+      'acknowledged-coder-logical-identity',
+    );
+    await first.dispatcher.deliver(message);
+    const directiveBeforeReplay = fs.readFileSync(path.join(first.ledgerDir, 'iter', '2', 'directive.json'));
+    const cold = makeDispatcher({ secureLedger: first.dispatcher.secureLedgerCapability });
+    const changed = fixedIdentity(
+      Msg.directive(2, {
+        goal: 'changed after acknowledgement',
+        constraints: ['changed constraint'],
+        success_criteria: ['changed success criterion'],
+        max_attempts: 2,
+      }),
+      'acknowledged-coder-logical-identity',
+      '2026-09-03T00:00:01.000Z',
+    );
+
+    await expect(cold.dispatcher.deliver(changed)).rejects.toMatchObject({
+      name: 'AutoloopDeliveryOutboxError',
+      code: 'AUTOLOOP_DELIVERY_IDEMPOTENCY_CONFLICT',
+      retryable: false,
+    });
+
+    expect(cold.calls.reserveAgentGeneration).not.toHaveBeenCalled();
+    expect(cold.calls.startSession).not.toHaveBeenCalled();
+    expect(cold.calls.sendMessage).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(first.ledgerDir, 'iter', '2', 'directive.json'))).toEqual(directiveBeforeReplay);
+    expect(fs.existsSync(path.join(first.ledgerDir, 'chat.jsonl'))).toBe(false);
+  });
+
+  it('rejects an acknowledged Reviewer replay with the same routing identity but changed checkpoint evidence before effects', async () => {
+    const first = makeDispatcher();
+    ensureCompleteReviewArtifacts(first.dispatcher, 3);
+    first.calls.sendMessage.mockImplementation(async (_name: string, prompt: string) => {
+      const provenance = deliveryProvenanceFromPrompt(prompt);
+      return {
+        output: `\`\`\`autoloop\n${JSON.stringify({ tool: 'review_complete', args: { decision: 'hold', metric: null, audit_notes: 'durable', ...provenance } })}\n\`\`\``,
+        error: undefined,
+      };
+    });
+    const message = fixedIdentity(
+      Msg.reviewRequest(3, {
+        iter: 3,
+        ledger_path: first.ledgerDir,
+        prior_metrics: [1],
+        checkpoint_sha: 'a'.repeat(40),
+        source_run_id: 'source-run',
+        source_iter: 1,
+        scope: ['correctness'],
+        idempotency_key: 'review-logical-identity',
+      }),
+      'acknowledged-reviewer-logical-identity',
+    );
+    await first.dispatcher.deliver(message);
+    fs.rmSync(path.join(first.ledgerDir, 'reviewer_sandbox'), { recursive: true, force: true });
+    const cold = makeDispatcher({ secureLedger: first.dispatcher.secureLedgerCapability });
+    const changed = fixedIdentity(
+      Msg.reviewRequest(3, {
+        iter: 3,
+        ledger_path: first.ledgerDir,
+        prior_metrics: [99],
+        checkpoint_sha: 'b'.repeat(40),
+        source_run_id: 'source-run',
+        source_iter: 2,
+        scope: ['security'],
+        idempotency_key: 'review-logical-identity',
+      }),
+      'acknowledged-reviewer-logical-identity',
+      '2026-09-03T00:00:01.000Z',
+    );
+
+    await expect(cold.dispatcher.deliver(changed)).rejects.toMatchObject({
+      name: 'AutoloopDeliveryOutboxError',
+      code: 'AUTOLOOP_DELIVERY_IDEMPOTENCY_CONFLICT',
+      retryable: false,
+    });
+
+    expect(cold.calls.reserveAgentGeneration).not.toHaveBeenCalled();
+    expect(cold.calls.startSession).not.toHaveBeenCalled();
+    expect(cold.calls.sendMessage).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(first.ledgerDir, 'reviewer_sandbox'))).toBe(false);
+  });
+
+  it('persists and cold-recovers an exact acknowledged Coder clarification without a new role-local effect', async () => {
+    const first = makeDispatcher();
+    first.calls.sendMessage.mockImplementation(async (_name: string, prompt: string) => {
+      const provenance = deliveryProvenanceFromPrompt(prompt);
+      return {
+        output:
+          'Need direction.\n```autoloop\n' +
+          JSON.stringify({
+            tool: 'request_clarification',
+            args: { question: 'May I change the evaluator?', ...provenance },
+          }) +
+          '\n```',
+        error: undefined,
+      };
+    });
+    const message = fixedIdentity(
+      Msg.directive(4, {
+        goal: 'clarify durably',
+        constraints: [],
+        success_criteria: [],
+        max_attempts: 1,
+      }),
+      'acknowledged-clarification-cold-retry',
+    );
+
+    const initial = await first.dispatcher.deliver(message);
+    const rows = durableDecisionRows(first.ledgerDir);
+    const resultIndex = rows.findIndex((row) => row.record_type === 'delivery_result');
+    const acknowledgementIndex = rows.findIndex((row) => Object.hasOwn(row, 'acknowledged_at'));
+    expect(resultIndex).toBeGreaterThanOrEqual(0);
+    expect(resultIndex).toBeLessThan(acknowledgementIndex);
+    expect(rows[resultIndex]).toMatchObject({
+      result_kind: 'directive_ack',
+      result_payload: initial[0]?.payload,
+    });
+    const decisionsBeforeReplay = fs.readFileSync(path.join(first.ledgerDir, 'decisions.jsonl'));
+    const cold = makeDispatcher({ secureLedger: first.dispatcher.secureLedgerCapability });
+
+    await expect(cold.dispatcher.deliver(message)).resolves.toEqual([
+      expect.objectContaining({ type: 'directive_ack', payload: initial[0]?.payload }),
+    ]);
+    expect(cold.calls.reserveAgentGeneration).not.toHaveBeenCalled();
+    expect(cold.calls.startSession).not.toHaveBeenCalled();
+    expect(cold.calls.sendMessage).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(first.ledgerDir, 'decisions.jsonl'))).toEqual(decisionsBeforeReplay);
+    expect(fs.existsSync(path.join(first.ledgerDir, 'iter', '4', 'eval_output.json'))).toBe(false);
+    expect(fs.existsSync(path.join(first.ledgerDir, 'chat.jsonl'))).toBe(false);
+  });
+
+  it.each(['coder', 'reviewer'] as const)(
+    'rejects a cold unacknowledged %s delivery with changed logical content before effects and permits the exact retry',
+    async (role) => {
+      vi.useFakeTimers();
+      const first = makeDispatcher({ sendTimeoutMs: 7_200_000 });
+      const original =
+        role === 'coder'
+          ? fixedIdentity(
+              Msg.directive(6, {
+                goal: 'preserve unacknowledged intent identity',
+                constraints: [],
+                success_criteria: [],
+                max_attempts: 1,
+              }),
+              'cold-unacknowledged-coder-conflict',
+            )
+          : fixedIdentity(
+              Msg.reviewRequest(6, { iter: 6, ledger_path: first.ledgerDir, prior_metrics: [] }),
+              'cold-unacknowledged-reviewer-conflict',
+            );
+      if (role === 'reviewer') ensureCompleteReviewArtifacts(first.dispatcher, 6);
+      first.calls.sendMessage.mockRejectedValue(genuineSendTimeout());
+      const pending = first.dispatcher.deliver(original);
+      void pending.catch(() => undefined);
+      await vi.runAllTimersAsync();
+      expect(sendTimeout(await pending).payload.agent).toBe(role);
+      await first.dispatcher.shutdown('test-unacknowledged-recovery');
+
+      const cold = makeDispatcher({ secureLedger: first.dispatcher.secureLedgerCapability });
+      const changed =
+        role === 'coder'
+          ? fixedIdentity(
+              Msg.directive(6, {
+                goal: 'preserve unacknowledged intent identity',
+                constraints: [],
+                success_criteria: [],
+                max_attempts: 1,
+                delivery_id: 'metadata-only-conflict',
+                payload_sha256: 'a'.repeat(64),
+              }),
+              original.msg_id,
+            )
+          : fixedIdentity(
+              Msg.reviewRequest(6, {
+                iter: 6,
+                ledger_path: first.ledgerDir,
+                prior_metrics: [99],
+              }),
+              original.msg_id,
+            );
+
+      await expect(cold.dispatcher.deliver(changed)).rejects.toMatchObject({
+        name: 'AutoloopDeliveryOutboxError',
+        code: 'AUTOLOOP_DELIVERY_IDEMPOTENCY_CONFLICT',
+        retryable: false,
+      });
+      expect(cold.calls.reserveAgentGeneration).not.toHaveBeenCalled();
+      expect(cold.calls.startSession).not.toHaveBeenCalled();
+      expect(cold.calls.sendMessage).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(first.ledgerDir, 'reviewer_sandbox'))).toBe(role === 'reviewer');
+
+      await expect(cold.dispatcher.deliver(original)).resolves.toHaveLength(1);
+      expect(cold.calls.sendMessage).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('fails closed when an acknowledged cold Reviewer replay is missing the persisted timestamp', async () => {
+    const first = makeDispatcher();
+    ensureCompleteReviewArtifacts(first.dispatcher, 7);
+    const message = fixedIdentity(
+      Msg.reviewRequest(7, { iter: 7, ledger_path: first.ledgerDir, prior_metrics: [] }),
+      'acknowledged-reviewer-missing-ts',
+    );
+    await first.dispatcher.deliver(message);
+    const verdictPath = path.join(first.ledgerDir, 'iter', '7', 'verdict.json');
+    fs.writeFileSync(
+      verdictPath,
+      JSON.stringify({
+        schema_version: LEDGER_SCHEMA_VERSION,
+        iter: 7,
+        decision: 'advance',
+        metric: null,
+        audit_notes: 'corrupt replay evidence',
+      }),
+    );
+    const cold = makeDispatcher({ secureLedger: first.dispatcher.secureLedgerCapability });
+
+    await expect(cold.dispatcher.deliver(message)).rejects.toMatchObject({
+      name: 'AutoloopDeliveryOutboxError',
+      code: 'AUTOLOOP_DELIVERY_LEDGER_INVALID',
+      retryable: false,
+    });
+    expect(cold.calls.reserveAgentGeneration).not.toHaveBeenCalled();
+    expect(cold.calls.startSession).not.toHaveBeenCalled();
+    expect(cold.calls.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['has an unknown envelope field', (verdict: Record<string, unknown>) => ({ ...verdict, unexpected: true })],
+    ['has a non-finite metric', (verdict: Record<string, unknown>) => ({ ...verdict, metric: '1e999' })],
+    ['marks accepted without evidence', (verdict: Record<string, unknown>) => ({ ...verdict, accepted: true })],
+    ['has evidence without accepted', (verdict: Record<string, unknown>) => ({ ...verdict, evidence_id: 'iter-8' })],
+    [
+      'marks rejected evidence as accepted',
+      (verdict: Record<string, unknown>) => ({ ...verdict, accepted: false, evidence_id: 'iter-8' }),
+    ],
+  ] as const)('fails closed when an acknowledged cold Reviewer replay %s', async (_case, mutate) => {
+    const first = makeDispatcher();
+    ensureCompleteReviewArtifacts(first.dispatcher, 8);
+    const message = fixedIdentity(
+      Msg.reviewRequest(8, { iter: 8, ledger_path: first.ledgerDir, prior_metrics: [] }),
+      `acknowledged-reviewer-corrupt-${_case}`,
+    );
+    await first.dispatcher.deliver(message);
+    const verdictPath = path.join(first.ledgerDir, 'iter', '8', 'verdict.json');
+    const verdict = mutate({
+      schema_version: LEDGER_SCHEMA_VERSION,
+      iter: 8,
+      ts: '2026-09-03T00:00:00.000Z',
+      decision: 'advance',
+      metric: 1,
+      audit_notes: 'corrupt replay evidence',
+    });
+    const serialized =
+      _case === 'has a non-finite metric'
+        ? JSON.stringify(verdict).replace('"metric":"1e999"', '"metric":1e999')
+        : JSON.stringify(verdict);
+    fs.writeFileSync(verdictPath, serialized);
+    const cold = makeDispatcher({ secureLedger: first.dispatcher.secureLedgerCapability });
+
+    await expect(cold.dispatcher.deliver(message)).rejects.toMatchObject({
+      name: 'AutoloopDeliveryOutboxError',
+      code: 'AUTOLOOP_DELIVERY_LEDGER_INVALID',
+      retryable: false,
+    });
+    expect(cold.calls.reserveAgentGeneration).not.toHaveBeenCalled();
+    expect(cold.calls.startSession).not.toHaveBeenCalled();
+    expect(cold.calls.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['hold', 'iter-11'],
+    ['rollback', 'iter-11'],
+    ['advance', 'iter-not-11'],
+  ] as const)(
+    'rejects impossible accepted %s Reviewer recovery evidence before a runner-visible verdict or target hit',
+    async (decision, evidence_id) => {
+      const iter = 11;
+      const first = makeDispatcher({
+        contract: {
+          id: 'recover-accepted-verdict',
+          checks: [{ id: 'workspace', spec: { type: 'file', path: '.', exists: true } }],
+        },
+      });
+      ensureCompleteReviewArtifacts(first.dispatcher, iter);
+      first.calls.sendMessage.mockImplementation(async (_name: string, prompt: string) => {
+        const provenance = deliveryProvenanceFromPrompt(prompt);
+        return {
+          output: `\`\`\`autoloop\n${JSON.stringify({
+            tool: 'review_complete',
+            args: { decision: 'advance', metric: 1, audit_notes: 'accepted initially', ...provenance },
+          })}\n\`\`\``,
+          error: undefined,
+        };
+      });
+      const message = fixedIdentity(
+        Msg.reviewRequest(iter, { iter, ledger_path: first.ledgerDir, prior_metrics: [] }),
+        `impossible-accepted-${decision}-${evidence_id}`,
+      );
+      await first.dispatcher.deliver(message);
+      fs.writeFileSync(
+        path.join(first.ledgerDir, 'iter', String(iter), 'verdict.json'),
+        JSON.stringify({
+          schema_version: LEDGER_SCHEMA_VERSION,
+          iter,
+          ts: '2026-09-03T00:00:00.000Z',
+          decision,
+          metric: 1,
+          audit_notes: 'corrupt accepted recovery evidence',
+          accepted: true,
+          evidence_id,
+        }),
+      );
+      const decisionsBefore = fs.readFileSync(path.join(first.ledgerDir, 'decisions.jsonl'));
+      const cold = makeDispatcher({ secureLedger: first.dispatcher.secureLedgerCapability });
+      const targetHit = vi.fn();
+      cold.dispatcher.on('target_hit', targetHit);
+
+      await expect(cold.dispatcher.deliver(message)).rejects.toMatchObject({
+        name: 'AutoloopDeliveryOutboxError',
+        code: 'AUTOLOOP_DELIVERY_LEDGER_INVALID',
+        retryable: false,
+      });
+      expect(targetHit).not.toHaveBeenCalled();
+      expect(cold.calls.reserveAgentGeneration).not.toHaveBeenCalled();
+      expect(cold.calls.startSession).not.toHaveBeenCalled();
+      expect(cold.calls.sendMessage).not.toHaveBeenCalled();
+      expect(fs.readFileSync(path.join(first.ledgerDir, 'decisions.jsonl'))).toEqual(decisionsBefore);
+    },
+  );
+
+  it('recovers only an advance verdict with its exact iter evidence id', async () => {
+    const iter = 12;
+    const first = makeDispatcher({
+      contract: {
+        id: 'recover-exact-accepted-verdict',
+        checks: [{ id: 'workspace', spec: { type: 'file', path: '.', exists: true } }],
+      },
+    });
+    ensureCompleteReviewArtifacts(first.dispatcher, iter);
+    first.calls.sendMessage.mockImplementation(async (_name: string, prompt: string) => {
+      const provenance = deliveryProvenanceFromPrompt(prompt);
+      return {
+        output: `\`\`\`autoloop\n${JSON.stringify({
+          tool: 'review_complete',
+          args: { decision: 'advance', metric: 1, audit_notes: 'accepted initially', ...provenance },
+        })}\n\`\`\``,
+        error: undefined,
+      };
+    });
+    const message = fixedIdentity(
+      Msg.reviewRequest(iter, { iter, ledger_path: first.ledgerDir, prior_metrics: [] }),
+      'exact-accepted-recovery',
+    );
+    await first.dispatcher.deliver(message);
+    const cold = makeDispatcher({ secureLedger: first.dispatcher.secureLedgerCapability });
+
+    await expect(cold.dispatcher.deliver(message)).resolves.toEqual([
+      expect.objectContaining({
+        type: 'review_verdict',
+        payload: expect.objectContaining({ decision: 'advance', accepted: true, evidence_id: `iter-${iter}` }),
+      }),
+    ]);
+    expect(cold.calls.reserveAgentGeneration).not.toHaveBeenCalled();
+    expect(cold.calls.startSession).not.toHaveBeenCalled();
+    expect(cold.calls.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when an acknowledged cold Coder replay has an extra eval envelope field', async () => {
+    const first = makeDispatcher();
+    (first.dispatcher as unknown as { runGit: () => Promise<{ code: number; out: string; err: string }> }).runGit =
+      async () => ({ code: 0, out: '', err: '' });
+    first.calls.sendMessage.mockImplementation(async (_name: string, prompt: string) => {
+      const provenance = deliveryProvenanceFromPrompt(prompt);
+      return {
+        output: `\`\`\`autoloop\n${JSON.stringify({ tool: 'iter_complete', args: { summary: 'durable', eval_output: {}, ...provenance } })}\n\`\`\``,
+        error: undefined,
+      };
+    });
+    const message = fixedIdentity(
+      Msg.directive(9, { goal: 'validate eval envelope', constraints: [], success_criteria: [], max_attempts: 1 }),
+      'acknowledged-coder-extra-eval-envelope',
+    );
+    await first.dispatcher.deliver(message);
+    fs.writeFileSync(
+      path.join(first.ledgerDir, 'iter', '9', 'eval_output.json'),
+      JSON.stringify({ schema_version: LEDGER_SCHEMA_VERSION, iter: 9, eval_output: {}, unexpected: true }),
+    );
+    const cold = makeDispatcher({ secureLedger: first.dispatcher.secureLedgerCapability });
+
+    await expect(cold.dispatcher.deliver(message)).rejects.toMatchObject({
+      name: 'AutoloopDeliveryOutboxError',
+      code: 'AUTOLOOP_DELIVERY_LEDGER_INVALID',
+      retryable: false,
+    });
+    expect(cold.calls.reserveAgentGeneration).not.toHaveBeenCalled();
+    expect(cold.calls.startSession).not.toHaveBeenCalled();
+    expect(cold.calls.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['a nested non-finite number', '{"schema_version":1,"iter":13,"eval_output":{"nested":[1e999]}}'],
+    [
+      'an over-depth nested eval output',
+      `{"schema_version":1,"iter":13,"eval_output":${'{"nested":'.repeat(66)}null${'}'.repeat(66)}}`,
+    ],
+  ] as const)(
+    'fails closed when an acknowledged cold Coder replay has %s before a runner-visible artifact or progress effect',
+    async (_case, serialized) => {
+      const iter = 13;
+      const first = makeDispatcher();
+      (first.dispatcher as unknown as { runGit: () => Promise<{ code: number; out: string; err: string }> }).runGit =
+        async () => ({ code: 0, out: '', err: '' });
+      first.calls.sendMessage.mockImplementation(async (_name: string, prompt: string) => {
+        const provenance = deliveryProvenanceFromPrompt(prompt);
+        return {
+          output: `\`\`\`autoloop\n${JSON.stringify({
+            tool: 'iter_complete',
+            args: { summary: 'durable', eval_output: {}, ...provenance },
+          })}\n\`\`\``,
+          error: undefined,
+        };
+      });
+      const message = fixedIdentity(
+        Msg.directive(iter, {
+          goal: 'validate nested eval recovery',
+          constraints: [],
+          success_criteria: [],
+          max_attempts: 1,
+        }),
+        `invalid-nested-eval-${_case}`,
+      );
+      await first.dispatcher.deliver(message);
+      fs.writeFileSync(path.join(first.ledgerDir, 'iter', String(iter), 'eval_output.json'), serialized);
+      const decisionsBefore = fs.readFileSync(path.join(first.ledgerDir, 'decisions.jsonl'));
+      const cold = makeDispatcher({ secureLedger: first.dispatcher.secureLedgerCapability });
+
+      await expect(cold.dispatcher.deliver(message)).rejects.toMatchObject({
+        name: 'AutoloopDeliveryOutboxError',
+        code: 'AUTOLOOP_DELIVERY_LEDGER_INVALID',
+        retryable: false,
+      });
+      expect(cold.calls.reserveAgentGeneration).not.toHaveBeenCalled();
+      expect(cold.calls.startSession).not.toHaveBeenCalled();
+      expect(cold.calls.sendMessage).not.toHaveBeenCalled();
+      expect(fs.readFileSync(path.join(first.ledgerDir, 'decisions.jsonl'))).toEqual(decisionsBefore);
+    },
+  );
+
+  it.each([
+    ['missing', (rows: Array<Record<string, unknown>>) => rows.filter((row) => row.record_type !== 'delivery_result')],
+    [
+      'wrong discriminator',
+      (rows: Array<Record<string, unknown>>) =>
+        rows.map((row) => (row.record_type === 'delivery_result' ? { ...row, result_kind: 'review_complete' } : row)),
+    ],
+    [
+      'wrong payload',
+      (rows: Array<Record<string, unknown>>) =>
+        rows.map((row) =>
+          row.record_type === 'delivery_result' ? { ...row, result_payload: { understood: 'not-a-boolean' } } : row,
+        ),
+    ],
+  ] as const)(
+    'fails closed without mutation when an acknowledged Coder clarification has a %s durable result',
+    async (_case, mutate) => {
+      const first = makeDispatcher();
+      first.calls.sendMessage.mockImplementation(async (_name: string, prompt: string) => {
+        const provenance = deliveryProvenanceFromPrompt(prompt);
+        return {
+          output: `\`\`\`autoloop\n${JSON.stringify({ tool: 'request_clarification', args: { question: 'Need direction', ...provenance } })}\n\`\`\``,
+          error: undefined,
+        };
+      });
+      const message = fixedIdentity(
+        Msg.directive(5, {
+          goal: 'detect corrupt clarification result',
+          constraints: [],
+          success_criteria: [],
+          max_attempts: 1,
+        }),
+        'corrupt-clarification-result',
+      );
+      await first.dispatcher.deliver(message);
+      const decisionsPath = path.join(first.ledgerDir, 'decisions.jsonl');
+      const mutated = `${mutate(durableDecisionRows(first.ledgerDir))
+        .map((row) => JSON.stringify(row))
+        .join('\n')}\n`;
+      fs.writeFileSync(decisionsPath, mutated);
+      const coldLedger = SecureAutoloopLedger.open(first.workspace, 'r1', { create: false });
+      const cold = makeDispatcher({ secureLedger: coldLedger });
+
+      await expect(cold.dispatcher.deliver(message)).rejects.toMatchObject({
+        name: 'AutoloopDeliveryOutboxError',
+        code: 'AUTOLOOP_DELIVERY_LEDGER_INVALID',
+        retryable: false,
+      });
+      expect(cold.calls.reserveAgentGeneration).not.toHaveBeenCalled();
+      expect(cold.calls.startSession).not.toHaveBeenCalled();
+      expect(cold.calls.sendMessage).not.toHaveBeenCalled();
+      expect(fs.readFileSync(decisionsPath, 'utf8')).toBe(mutated);
+    },
+  );
+
+  it('stops a missing Reviewer completion instead of persisting or returning a fallback verdict', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher();
+    ensureCompleteReviewArtifacts(dispatcher, 0);
+    const surfaced = vi.fn();
+    dispatcher.on('reviewer_reply', surfaced);
+    calls.sendMessage.mockResolvedValue({ output: 'No verdict was emitted.', error: undefined });
+
+    await expect(
+      dispatcher.deliver(
+        fixedIdentity(
+          Msg.reviewRequest(0, { iter: 0, ledger_path: ledgerDir, prior_metrics: [] }),
+          'reviewer-no-verdict-provenance',
+        ),
+      ),
+    ).rejects.toMatchObject({
+      name: 'AutoloopOperationError',
+      code: 'AUTOLOOP_CONTROL_MALFORMED',
+      retryable: false,
+    });
+
+    expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'verdict.json'))).toBe(false);
+    expect(durableDecisionRows(ledgerDir).filter((row) => Object.hasOwn(row, 'acknowledged_at'))).toEqual([]);
+    expect(fs.existsSync(path.join(ledgerDir, 'chat.jsonl'))).toBe(false);
+    expect(surfaced).not.toHaveBeenCalled();
+    expect(calls.compactSession).not.toHaveBeenCalled();
+  });
+
+  it('persists a Coder intent before transport and its matching acknowledgement before releasing the reply', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'Need one clarification first.' });
+    (dispatcher as unknown as { runGit: () => Promise<{ code: number; out: string; err: string }> }).runGit =
+      async () => ({
+        code: 0,
+        out: '',
+        err: '',
+      });
+    let observedBeforeTransport: Array<Record<string, unknown>> = [];
+
+    calls.sendMessage.mockImplementation(async (_name: string, prompt: string) => {
+      observedBeforeTransport = fs
+        .readFileSync(path.join(ledgerDir, 'decisions.jsonl'), 'utf8')
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      const provenance = /delivery_id="([^"]+)" payload_sha256="([a-f0-9]{64})"/.exec(prompt);
+      return {
+        output: `\`\`\`autoloop\n${JSON.stringify({ tool: 'iter_complete', args: { summary: 'durable', eval_output: {}, delivery_id: provenance?.[1], payload_sha256: provenance?.[2] } })}\n\`\`\``,
+        error: undefined,
+      };
+    });
+
+    const replies = await dispatcher.deliver(
+      fixedIdentity(
+        Msg.directive(2, { goal: 'ship durable delivery', constraints: [], success_criteria: [], max_attempts: 1 }),
+        'durable-coder-2',
+      ),
+    );
+
+    const intent = observedBeforeTransport.find((row) => row.kind === 'coder_directive');
+    expect(intent).toMatchObject({
+      schema_version: 1,
+      idempotency_key: expect.stringMatching(/^dispatch_[a-f0-9]{64}$/),
+      target_role: 'coder',
+      target_generation: 1,
+      payload_sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    expect(observedBeforeTransport.some((row) => row.delivery_id === intent?.delivery_id && row.acknowledged_at)).toBe(
+      false,
+    );
+    expect(replies).toEqual([expect.objectContaining({ type: 'iter_artifacts', iter: 2 })]);
+
+    const persisted = fs
+      .readFileSync(path.join(ledgerDir, 'decisions.jsonl'), 'utf8')
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(persisted).toContainEqual(
+      expect.objectContaining({
+        schema_version: 1,
+        delivery_id: intent?.delivery_id,
+        payload_sha256: intent?.payload_sha256,
+        acknowledged_at: expect.any(String),
+      }),
+    );
+  });
+
+  it('recovers an acknowledged Coder delivery before a cold dispatcher starts or stages work', async () => {
+    const { dispatcher, calls } = makeDispatcher();
+    (dispatcher as unknown as { runGit: () => Promise<{ code: number; out: string; err: string }> }).runGit =
+      async () => ({
+        code: 0,
+        out: '',
+        err: '',
+      });
+    calls.sendMessage.mockImplementation(async (_name: string, prompt: string) => {
+      const provenance = /delivery_id="([^"]+)" payload_sha256="([a-f0-9]{64})"/.exec(prompt);
+      return {
+        output: `\`\`\`autoloop\n${JSON.stringify({ tool: 'iter_complete', args: { summary: 'durable', eval_output: {}, delivery_id: provenance?.[1], payload_sha256: provenance?.[2] } })}\n\`\`\``,
+        error: undefined,
+      };
+    });
+    const message = fixedIdentity(
+      Msg.directive(3, {
+        goal: 'acknowledged delivery must not repeat',
+        constraints: [],
+        success_criteria: [],
+        max_attempts: 1,
+      }),
+      'acknowledged-coder-retry',
+    );
+
+    await dispatcher.deliver(message);
+    const cold = makeDispatcher({ secureLedger: dispatcher.secureLedgerCapability });
+    const coldRunGit = vi.fn(async () => ({ code: 0, out: '', err: '' }));
+    (cold.dispatcher as unknown as { runGit: typeof coldRunGit }).runGit = coldRunGit;
+
+    await expect(cold.dispatcher.deliver(message)).resolves.toEqual([
+      expect.objectContaining({ type: 'iter_artifacts' }),
+    ]);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(1);
+    expect(cold.calls.reserveAgentGeneration).not.toHaveBeenCalled();
+    expect(cold.calls.startSession).not.toHaveBeenCalled();
+    expect(cold.calls.sendMessage).not.toHaveBeenCalled();
+    expect(coldRunGit).not.toHaveBeenCalled();
+  });
+
+  it('persists a Reviewer request before transport and its matching acknowledgement before releasing the verdict', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'Review needs follow-up.' });
+    ensureCompleteReviewArtifacts(dispatcher, 4);
+    let observedBeforeTransport: Array<Record<string, unknown>> = [];
+
+    calls.sendMessage.mockImplementation(async (_name: string, prompt: string) => {
+      observedBeforeTransport = fs
+        .readFileSync(path.join(ledgerDir, 'decisions.jsonl'), 'utf8')
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      const provenance = /delivery_id="([^"]+)" payload_sha256="([a-f0-9]{64})"/.exec(prompt);
+      return {
+        output: `\`\`\`autoloop\n${JSON.stringify({ tool: 'review_complete', args: { decision: 'hold', metric: null, audit_notes: 'durable', delivery_id: provenance?.[1], payload_sha256: provenance?.[2] } })}\n\`\`\``,
+        error: undefined,
+      };
+    });
+
+    const replies = await dispatcher.deliver(
+      fixedIdentity(
+        Msg.reviewRequest(4, { iter: 4, ledger_path: ledgerDir, prior_metrics: [0.5] }),
+        'durable-review-4',
+      ),
+    );
+
+    const intent = observedBeforeTransport.find((row) => row.kind === 'review_request');
+    expect(intent).toMatchObject({
+      schema_version: 1,
+      idempotency_key: expect.stringMatching(/^dispatch_[a-f0-9]{64}$/),
+      target_role: 'reviewer',
+      target_generation: 1,
+      payload_sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    expect(observedBeforeTransport.some((row) => row.delivery_id === intent?.delivery_id && row.acknowledged_at)).toBe(
+      false,
+    );
+    expect(replies).toEqual([expect.objectContaining({ type: 'review_verdict', iter: 4 })]);
+
+    const persisted = fs
+      .readFileSync(path.join(ledgerDir, 'decisions.jsonl'), 'utf8')
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(persisted).toContainEqual(
+      expect.objectContaining({
+        schema_version: 1,
+        delivery_id: intent?.delivery_id,
+        payload_sha256: intent?.payload_sha256,
+        acknowledged_at: expect.any(String),
+      }),
+    );
+  });
+
+  it('recovers an acknowledged Reviewer verdict before a cold dispatcher stages or starts a Reviewer', async () => {
+    const first = makeDispatcher();
+    ensureCompleteReviewArtifacts(first.dispatcher, 5);
+    first.calls.sendMessage.mockImplementation(async (_name: string, prompt: string) => {
+      const provenance = deliveryProvenanceFromPrompt(prompt);
+      return {
+        output: `\`\`\`autoloop\n${JSON.stringify({
+          tool: 'review_complete',
+          args: { decision: 'hold', metric: null, audit_notes: 'durable replay', ...provenance },
+        })}\n\`\`\``,
+        error: undefined,
+      };
+    });
+    const message = fixedIdentity(
+      Msg.reviewRequest(5, { iter: 5, ledger_path: first.ledgerDir, prior_metrics: [] }),
+      'acknowledged-reviewer-cold-retry',
+    );
+    await first.dispatcher.deliver(message);
+    const sandbox = path.join(first.ledgerDir, 'reviewer_sandbox');
+    fs.rmSync(sandbox, { recursive: true, force: true });
+    const cold = makeDispatcher({ secureLedger: first.dispatcher.secureLedgerCapability });
+
+    await expect(cold.dispatcher.deliver(message)).resolves.toEqual([
+      expect.objectContaining({
+        type: 'review_verdict',
+        payload: expect.objectContaining({ decision: 'hold', audit_notes: 'durable replay' }),
+      }),
+    ]);
+
+    expect(fs.existsSync(sandbox)).toBe(false);
+    expect(cold.calls.reserveAgentGeneration).not.toHaveBeenCalled();
+    expect(cold.calls.startSession).not.toHaveBeenCalled();
+    expect(cold.calls.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it.each(['coder', 'reviewer'] as const)(
+    'does not release a %s result when the durable acknowledgement append fails',
+    async (role) => {
+      const iter = 6;
+      const acknowledgementFailure = new Error(`injected ${role} acknowledgement failure`);
+      let failAcknowledgement = false;
+      const secureLedger = SecureAutoloopLedger.open(tmpRoot, 'r1', {
+        create: true,
+        testHooks: {
+          beforeFileMutation: (event) => {
+            if (failAcknowledgement && event.name === 'decisions.jsonl' && event.operation === 'append') {
+              failAcknowledgement = false;
+              throw acknowledgementFailure;
+            }
+          },
+          afterNestedPublish: (event) => {
+            if (role === 'reviewer' && event.relativePath === `iter/${iter}/verdict.json`) {
+              failAcknowledgement = true;
+            }
+          },
+        },
+      });
+      const { dispatcher, calls, ledgerDir } = makeDispatcher({ secureLedger }, { contextPercent: 90 });
+      if (role === 'reviewer') ensureCompleteReviewArtifacts(dispatcher, iter);
+      const surfaced = vi.fn();
+      dispatcher.on(role === 'coder' ? 'coder_reply' : 'reviewer_reply', surfaced);
+      const runGit = vi.fn(async () => {
+        if (runGit.mock.calls.length === 2) failAcknowledgement = true;
+        return { code: 0, out: '', err: '' };
+      });
+      (dispatcher as unknown as { runGit: typeof runGit }).runGit = runGit;
+      calls.sendMessage.mockImplementation(async (_name: string, prompt: string) => {
+        const provenance = deliveryProvenanceFromPrompt(prompt);
+        const completion =
+          role === 'coder'
+            ? {
+                tool: 'iter_complete',
+                args: { summary: 'durable before ack', eval_output: { metric: 1 }, ...provenance },
+              }
+            : {
+                tool: 'review_complete',
+                args: { decision: 'hold', metric: null, audit_notes: 'durable before ack', ...provenance },
+              };
+        return {
+          output: `must not surface\n\`\`\`autoloop\n${JSON.stringify(completion)}\n\`\`\``,
+          error: undefined,
+        };
+      });
+      const message =
+        role === 'coder'
+          ? fixedIdentity(
+              Msg.directive(iter, {
+                goal: 'fail the acknowledgement safely',
+                constraints: [],
+                success_criteria: [],
+                max_attempts: 1,
+              }),
+              'coder-acknowledgement-failure',
+            )
+          : fixedIdentity(
+              Msg.reviewRequest(iter, { iter, ledger_path: ledgerDir, prior_metrics: [] }),
+              'reviewer-acknowledgement-failure',
+            );
+      let thrown: unknown;
+
+      try {
+        await dispatcher.deliver(message);
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toBe(acknowledgementFailure);
+      expect(durableDecisionRows(ledgerDir).filter((row) => Object.hasOwn(row, 'acknowledged_at'))).toEqual([]);
+      if (role === 'coder') {
+        expect(fs.existsSync(path.join(ledgerDir, 'iter', String(iter), 'eval_output.json'))).toBe(true);
+        expect(fs.existsSync(path.join(ledgerDir, 'iter', String(iter), 'coder_summary.txt'))).toBe(true);
+        expect(fs.existsSync(path.join(ledgerDir, 'iter', String(iter), 'diff.patch'))).toBe(true);
+        expect(runGit).toHaveBeenCalledTimes(2);
+      } else {
+        expect(fs.existsSync(path.join(ledgerDir, 'iter', String(iter), 'verdict.json'))).toBe(true);
+      }
+      expect(fs.existsSync(path.join(ledgerDir, 'chat.jsonl'))).toBe(false);
+      expect(surfaced).not.toHaveBeenCalled();
+      expect(calls.compactSession).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ['coder', 'warm'],
+    ['coder', 'cold'],
+    ['reviewer', 'warm'],
+    ['reviewer', 'cold'],
+  ] as const)(
+    'recovers a %s durable result after an acknowledgement append failure on an exact %s retry without new role effects',
+    async (role, retryMode) => {
+      const iter = 16;
+      const acknowledgementFailure = new Error(`injected ${role} acknowledgement failure`);
+      let decisionsAppendAttempts = 0;
+      let acknowledgementAppendFailed = false;
+      const acknowledgementAppendAttempt = role === 'coder' ? 3 : 2;
+      const secureLedger = SecureAutoloopLedger.open(tmpRoot, 'r1', {
+        create: true,
+        testHooks: {
+          beforeFileMutation: (event) => {
+            if (event.name === 'decisions.jsonl' && event.operation === 'append') {
+              decisionsAppendAttempts += 1;
+            }
+            if (!acknowledgementAppendFailed && decisionsAppendAttempts === acknowledgementAppendAttempt) {
+              acknowledgementAppendFailed = true;
+              throw acknowledgementFailure;
+            }
+          },
+        },
+      });
+      const first = makeDispatcher({ secureLedger }, { contextPercent: 90 });
+      if (role === 'reviewer') ensureCompleteReviewArtifacts(first.dispatcher, iter);
+      const roleReply = vi.fn();
+      const targetHit = vi.fn();
+      first.dispatcher.on(role === 'coder' ? 'coder_reply' : 'reviewer_reply', roleReply);
+      first.dispatcher.on('target_hit', targetHit);
+      const runGit = vi.fn(async () => {
+        return { code: 0, out: '', err: '' };
+      });
+      (first.dispatcher as unknown as { runGit: typeof runGit }).runGit = runGit;
+      first.calls.sendMessage.mockImplementation(async (_name: string, prompt: string) => {
+        const provenance = deliveryProvenanceFromPrompt(prompt);
+        const completion =
+          role === 'coder'
+            ? {
+                tool: 'iter_complete',
+                args: { summary: 'recover only', eval_output: { metric: 16 }, ...provenance },
+              }
+            : {
+                tool: 'review_complete',
+                args: { decision: 'hold', metric: null, audit_notes: 'recover only', ...provenance },
+              };
+        return { output: `\`\`\`autoloop\n${JSON.stringify(completion)}\n\`\`\``, error: undefined };
+      });
+      const message =
+        role === 'coder'
+          ? fixedIdentity(
+              Msg.directive(iter, {
+                goal: 'recover the persisted Coder result without repeating effects',
+                constraints: [],
+                success_criteria: [],
+                max_attempts: 1,
+              }),
+              `recover-unacknowledged-${role}-${retryMode}`,
+            )
+          : fixedIdentity(
+              Msg.reviewRequest(iter, { iter, ledger_path: first.ledgerDir, prior_metrics: [] }),
+              `recover-unacknowledged-${role}-${retryMode}`,
+            );
+
+      await expect(first.dispatcher.deliver(message)).rejects.toBe(acknowledgementFailure);
+      const rowsBeforeRecovery = durableDecisionRows(first.ledgerDir);
+      expect(rowsBeforeRecovery.filter((row) => row.record_type === 'delivery_result')).toHaveLength(
+        role === 'coder' ? 1 : 0,
+      );
+      expect(rowsBeforeRecovery.filter((row) => Object.hasOwn(row, 'acknowledged_at'))).toHaveLength(0);
+      const artifactNames =
+        role === 'coder'
+          ? (['eval_output.json', 'coder_summary.txt', 'diff.patch'] as const)
+          : (['verdict.json'] as const);
+      const artifactsBeforeRecovery = artifactNames.map((name) =>
+        fs.readFileSync(path.join(first.ledgerDir, 'iter', String(iter), name)),
+      );
+      const firstEffects = {
+        reserve: first.calls.reserveAgentGeneration.mock.calls.length,
+        start: first.calls.startSession.mock.calls.length,
+        send: first.calls.sendMessage.mock.calls.length,
+        git: runGit.mock.calls.length,
+        compact: first.calls.compactSession.mock.calls.length,
+        rebind: rowsBeforeRecovery.filter((row) => row.record_type === 'delivery_generation_rebind').length,
+      };
+      const retry =
+        retryMode === 'warm' ? first : makeDispatcher({ secureLedger: first.dispatcher.secureLedgerCapability });
+
+      const [firstRecovery, secondRecovery] = await Promise.all([
+        retry.dispatcher.deliver(message),
+        retry.dispatcher.deliver(message),
+      ]);
+      const expected =
+        role === 'coder'
+          ? [
+              expect.objectContaining({
+                type: 'iter_artifacts',
+                payload: expect.objectContaining({ eval_output: { metric: 16 } }),
+              }),
+            ]
+          : [
+              expect.objectContaining({
+                type: 'review_verdict',
+                payload: expect.objectContaining({ audit_notes: 'recover only' }),
+              }),
+            ];
+      expect(firstRecovery).toEqual(expected);
+      expect(secondRecovery).toEqual(expected);
+
+      const rowsAfterRecovery = durableDecisionRows(first.ledgerDir);
+      expect(rowsAfterRecovery.filter((row) => row.record_type === 'delivery_result')).toHaveLength(
+        role === 'coder' ? 1 : 0,
+      );
+      expect(rowsAfterRecovery.filter((row) => Object.hasOwn(row, 'acknowledged_at'))).toHaveLength(1);
+      expect(rowsAfterRecovery.filter((row) => row.record_type === 'delivery_generation_rebind')).toHaveLength(
+        firstEffects.rebind,
+      );
+      for (let index = 0; index < artifactNames.length; index += 1) {
+        expect(fs.readFileSync(path.join(first.ledgerDir, 'iter', String(iter), artifactNames[index]))).toEqual(
+          artifactsBeforeRecovery[index],
+        );
+      }
+      expect(retry.calls.reserveAgentGeneration).toHaveBeenCalledTimes(retryMode === 'warm' ? firstEffects.reserve : 0);
+      expect(retry.calls.startSession).toHaveBeenCalledTimes(retryMode === 'warm' ? firstEffects.start : 0);
+      expect(retry.calls.sendMessage).toHaveBeenCalledTimes(retryMode === 'warm' ? firstEffects.send : 0);
+      expect(retry.calls.compactSession).toHaveBeenCalledTimes(retryMode === 'warm' ? firstEffects.compact : 0);
+      expect(runGit).toHaveBeenCalledTimes(firstEffects.git);
+      expect(fs.existsSync(path.join(first.ledgerDir, 'chat.jsonl'))).toBe(false);
+      expect(roleReply).not.toHaveBeenCalled();
+      expect(targetHit).not.toHaveBeenCalled();
+    },
+  );
+
+  it('does not emit target_hit or Reviewer progress when a passing-contract acknowledgement fails', async () => {
+    const iter = 7;
+    const acknowledgementFailure = new Error('injected accepted verdict acknowledgement failure');
+    let failAcknowledgement = false;
+    const secureLedger = SecureAutoloopLedger.open(tmpRoot, 'r1', {
+      create: true,
+      testHooks: {
+        beforeFileMutation: (event) => {
+          if (failAcknowledgement && event.name === 'decisions.jsonl' && event.operation === 'append') {
+            failAcknowledgement = false;
+            throw acknowledgementFailure;
+          }
+        },
+        afterNestedPublish: (event) => {
+          if (event.relativePath === `iter/${iter}/verdict.json`) failAcknowledgement = true;
+        },
+      },
+    });
+    const { dispatcher, calls, ledgerDir } = makeDispatcher(
+      {
+        secureLedger,
+        contract: {
+          id: 'accepted-verdict-ack-failure',
+          checks: [{ id: 'workspace-exists', spec: { type: 'file', path: '.', exists: true } }],
+        },
+      },
+      { contextPercent: 90 },
+    );
+    ensureCompleteReviewArtifacts(dispatcher, iter);
+    calls.sendMessage.mockImplementation(async (_name: string, prompt: string) => {
+      const provenance = deliveryProvenanceFromPrompt(prompt);
+      return {
+        output: `accepted result must not surface\n\`\`\`autoloop\n${JSON.stringify({
+          tool: 'review_complete',
+          args: { decision: 'advance', metric: 1, audit_notes: 'contract passed', ...provenance },
+        })}\n\`\`\``,
+        error: undefined,
+      };
+    });
+    const targetHit = vi.fn();
+    const reviewerReply = vi.fn();
+    dispatcher.on('target_hit', targetHit);
+    dispatcher.on('reviewer_reply', reviewerReply);
+    let thrown: unknown;
+
+    try {
+      await dispatcher.deliver(
+        fixedIdentity(
+          Msg.reviewRequest(iter, { iter, ledger_path: ledgerDir, prior_metrics: [] }),
+          'accepted-verdict-ack-failure',
+        ),
+      );
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBe(acknowledgementFailure);
+    expect(targetHit).not.toHaveBeenCalled();
+    expect(reviewerReply).not.toHaveBeenCalled();
+    expect(calls.compactSession).not.toHaveBeenCalled();
+    expect(durableDecisionRows(ledgerDir).filter((row) => Object.hasOwn(row, 'acknowledged_at'))).toEqual([]);
+    expect(fs.existsSync(path.join(ledgerDir, 'iter', String(iter), 'verdict.json'))).toBe(true);
+    expect(fs.existsSync(path.join(ledgerDir, 'chat.jsonl'))).toBe(false);
+  });
+
+  it('emits target_hit only after the accepted verdict and its delivery ACK are persisted', async () => {
+    const iter = 8;
+    const ordering: string[] = [];
+    let verdictPublished = false;
+    const secureLedger = SecureAutoloopLedger.open(tmpRoot, 'r1', {
+      create: true,
+      testHooks: {
+        beforeFileMutation: (event) => {
+          if (verdictPublished && event.name === 'decisions.jsonl' && event.operation === 'append') {
+            ordering.push('ack_append');
+          }
+        },
+        afterNestedPublish: (event) => {
+          if (event.relativePath === `iter/${iter}/verdict.json`) {
+            verdictPublished = true;
+            ordering.push('verdict');
+          }
+        },
+      },
+    });
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({
+      secureLedger,
+      contract: {
+        id: 'accepted-verdict-ordering',
+        checks: [{ id: 'workspace-exists', spec: { type: 'file', path: '.', exists: true } }],
+      },
+    });
+    ensureCompleteReviewArtifacts(dispatcher, iter);
+    calls.sendMessage.mockImplementation(async (_name: string, prompt: string) => {
+      const provenance = deliveryProvenanceFromPrompt(prompt);
+      return {
+        output: `\`\`\`autoloop\n${JSON.stringify({
+          tool: 'review_complete',
+          args: { decision: 'advance', metric: 1, audit_notes: 'contract passed', ...provenance },
+        })}\n\`\`\``,
+        error: undefined,
+      };
+    });
+    let durableRowsAtTarget: Array<Record<string, unknown>> = [];
+    const targetHit = vi.fn(() => {
+      durableRowsAtTarget = durableDecisionRows(ledgerDir);
+      ordering.push('target_hit');
+    });
+    dispatcher.on('target_hit', targetHit);
+
+    await expect(
+      dispatcher.deliver(
+        fixedIdentity(
+          Msg.reviewRequest(iter, { iter, ledger_path: ledgerDir, prior_metrics: [] }),
+          'accepted-verdict-ordering',
+        ),
+      ),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        type: 'review_verdict',
+        payload: expect.objectContaining({ accepted: true, evidence_id: `iter-${iter}` }),
+      }),
+    ]);
+
+    expect(targetHit).toHaveBeenCalledTimes(1);
+    expect(ordering).toEqual(['verdict', 'ack_append', 'target_hit']);
+    expect(durableRowsAtTarget.filter((row) => Object.hasOwn(row, 'acknowledged_at'))).toHaveLength(1);
+    expect(fs.existsSync(path.join(ledgerDir, 'iter', String(iter), 'verdict.json'))).toBe(true);
+  });
+
+  it.each(['coder', 'reviewer'] as const)(
+    'persists and uses a %s generation rebind before reset retry delivery',
+    async (role) => {
+      vi.useFakeTimers();
+      const iter = 7;
+      const { dispatcher, calls, ledgerDir } = makeDispatcher();
+      if (role === 'reviewer') ensureCompleteReviewArtifacts(dispatcher, iter);
+      const runGit = vi.fn(async () => ({ code: 0, out: '', err: '' }));
+      (dispatcher as unknown as { runGit: typeof runGit }).runGit = runGit;
+      let attempts = 0;
+      const observedPrompts: Array<{ delivery_id: string; payload_sha256: string }> = [];
+      let rebindsBeforeRetry: Array<Record<string, unknown>> = [];
+      calls.sendMessage.mockImplementation(async (_name: string, prompt: string) => {
+        attempts += 1;
+        observedPrompts.push(deliveryProvenanceFromPrompt(prompt));
+        if (attempts === 1) throw new Error(`first ${role} transport failed`);
+        rebindsBeforeRetry = durableDecisionRows(ledgerDir).filter(
+          (row) => row.record_type === 'delivery_generation_rebind',
+        );
+        const provenance = observedPrompts[1];
+        const completion =
+          role === 'coder'
+            ? { tool: 'iter_complete', args: { summary: 'rebound', eval_output: {}, ...provenance } }
+            : {
+                tool: 'review_complete',
+                args: { decision: 'hold', metric: null, audit_notes: 'rebound', ...provenance },
+              };
+        return { output: `\`\`\`autoloop\n${JSON.stringify(completion)}\n\`\`\``, error: undefined };
+      });
+      const message =
+        role === 'coder'
+          ? fixedIdentity(
+              Msg.directive(iter, {
+                goal: 'preserve delivery identity across reset',
+                constraints: [],
+                success_criteria: [],
+                max_attempts: 1,
+              }),
+              'coder-reset-rebind',
+            )
+          : fixedIdentity(
+              Msg.reviewRequest(iter, { iter, ledger_path: ledgerDir, prior_metrics: [] }),
+              'reviewer-reset-rebind',
+            );
+
+      const pending = dispatcher.deliver(message);
+      void pending.catch(() => undefined);
+      await vi.runAllTimersAsync();
+      await expect(pending).resolves.toEqual([
+        expect.objectContaining({ type: role === 'coder' ? 'iter_artifacts' : 'review_verdict' }),
+      ]);
+
+      expect(observedPrompts).toHaveLength(2);
+      expect(observedPrompts[1]).toEqual(observedPrompts[0]);
+      expect(rebindsBeforeRetry).toEqual([
+        expect.objectContaining({
+          record_type: 'delivery_generation_rebind',
+          delivery_id: observedPrompts[0].delivery_id,
+          from_generation: 1,
+          to_generation: 2,
+          payload_sha256: observedPrompts[0].payload_sha256,
+        }),
+      ]);
+      expect(calls.sendMessage).toHaveBeenCalledTimes(2);
+      expect(calls.startSession).toHaveBeenCalledTimes(2);
+    },
+  );
 });
 
 describe('ClaudeAgentDispatcher — durable directive ordering and review iteration authority', () => {
@@ -7550,7 +9515,7 @@ describe('ClaudeAgentDispatcher — durable directive ordering and review iterat
     const directive = fixedIdentity(Msg.directive(2, directivePayload), 'directive-order-2');
     await dispatcher.deliver(directive);
 
-    expect(events).toEqual(['persist:start', 'persist:complete', 'reserve', 'start', 'heartbeat', 'send']);
+    expect(events).toEqual(['persist:start', 'persist:complete', 'reserve', 'start', 'send']);
     const directivePath = path.join(ledgerDir, 'iter', '2', 'directive.json');
     const firstBytes = fs.readFileSync(directivePath);
     expect(JSON.parse(firstBytes.toString('utf8'))).toEqual({
