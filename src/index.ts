@@ -2081,6 +2081,69 @@ const plugin = {
       },
     });
 
+    // ─── Tool: autoloop_recover ──────────────────────────────────
+
+    registerTool({
+      name: 'autoloop_recover',
+      description: 'Inspect a durable Autoloop recovery, or apply its token-fenced next safe action.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          run_id: { type: 'string', description: 'Run id to inspect or recover' },
+          apply: { type: 'boolean', description: 'Apply the assessed recovery action (default false)' },
+          recovery_token: { type: 'string', description: 'Exact token returned by recovery inspection' },
+        },
+        required: ['run_id'],
+      },
+      execute: async (_id, args) => {
+        if (typeof args !== 'object' || args === null || Array.isArray(args)) {
+          throw new Error('recover arguments must be an object');
+        }
+        const descriptors = Object.getOwnPropertyDescriptors(args);
+        const allowedKeys = new Set(['run_id', 'apply', 'recovery_token']);
+        for (const key of Reflect.ownKeys(args)) {
+          if (typeof key !== 'string' || !allowedKeys.has(key)) {
+            throw new Error(`recover contains unsupported field '${String(key)}'`);
+          }
+        }
+        for (const key of allowedKeys) {
+          if (!Object.hasOwn(descriptors, key) && key in args) {
+            throw new Error(`recover ${key} must be an own data property`);
+          }
+        }
+        const runIdDescriptor = descriptors.run_id;
+        if (!runIdDescriptor || !Object.hasOwn(runIdDescriptor, 'value') || typeof runIdDescriptor.value !== 'string') {
+          throw new Error('recover run_id must be an own string data property');
+        }
+        const applyDescriptor = descriptors.apply;
+        if (
+          applyDescriptor &&
+          (!Object.hasOwn(applyDescriptor, 'value') || typeof applyDescriptor.value !== 'boolean')
+        ) {
+          throw new Error('recover apply must be an own boolean data property');
+        }
+        const tokenDescriptor = descriptors.recovery_token;
+        if (
+          tokenDescriptor &&
+          (!Object.hasOwn(tokenDescriptor, 'value') || typeof tokenDescriptor.value !== 'string')
+        ) {
+          throw new Error('recover recovery_token must be an own string data property');
+        }
+        const options = Object.create(null) as { apply?: boolean; recovery_token?: string };
+        if (applyDescriptor) options.apply = applyDescriptor.value as boolean;
+        if (tokenDescriptor) options.recovery_token = tokenDescriptor.value as string;
+        try {
+          const result = await getManager().autoloopRecover(runIdDescriptor.value, options);
+          return autoloopPublicToolResult({ ok: true, ...result });
+        } catch (error) {
+          const failure = toPublicAutoloopFailure(error);
+          if (failure) return autoloopPublicToolResult({ ok: false, error: failure });
+          throw error;
+        }
+      },
+    });
+
     // ─── Tool: autoloop_reset_agent ──────────────────────────────
 
     registerTool({

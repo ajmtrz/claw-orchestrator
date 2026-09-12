@@ -29,7 +29,13 @@ export type AutoloopRoleName = AutoloopAgentRole;
 
 export type AutoloopChatStateCode = 'AUTOLOOP_SEND_TIMEOUT' | 'AUTOLOOP_RUN_PAUSED' | 'AUTOLOOP_RUN_TERMINAL';
 
-export type PublicAutoloopFailureCode = AutoloopOperationErrorCode | AutoloopChatStateCode;
+export type AutoloopRecoveryErrorCode =
+  | 'AUTOLOOP_RECOVERY_TOKEN_REQUIRED'
+  | 'AUTOLOOP_RECOVERY_TOKEN_STALE'
+  | 'AUTOLOOP_RECOVERY_MANUAL_RESOLUTION_REQUIRED'
+  | 'AUTOLOOP_RECOVERY_INCOMPLETE';
+
+export type PublicAutoloopFailureCode = AutoloopOperationErrorCode | AutoloopChatStateCode | AutoloopRecoveryErrorCode;
 
 /** Stable, data-only failure value shared by MCP and embedded HTTP/SSE. */
 export interface PublicAutoloopFailure {
@@ -170,11 +176,7 @@ export class AutoloopRecoveryError extends Error {
   readonly retryable = false;
 
   constructor(
-    readonly code:
-      | 'AUTOLOOP_RECOVERY_TOKEN_REQUIRED'
-      | 'AUTOLOOP_RECOVERY_TOKEN_STALE'
-      | 'AUTOLOOP_RECOVERY_MANUAL_RESOLUTION_REQUIRED'
-      | 'AUTOLOOP_RECOVERY_INCOMPLETE',
+    readonly code: AutoloopRecoveryErrorCode,
     message: string,
   ) {
     super(message);

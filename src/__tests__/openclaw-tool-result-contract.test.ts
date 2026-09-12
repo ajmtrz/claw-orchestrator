@@ -110,8 +110,8 @@ describe('OpenClaw tool result contract', () => {
     await expect(promise).rejects.toBe(error);
   });
 
-  it('keeps the 77 legacy tools and adds only request_review in exact manifest parity', () => {
-    const task4bTools = ['autoloop_request_review'];
+  it('keeps the 77 legacy tools and adds request_review and recover in exact manifest parity', () => {
+    const task4bTools = ['autoloop_request_review', 'autoloop_recover'];
     const internalOnlyTools = ['autoloop_spawn_coder', 'autoloop_spawn_reviewer'];
     const legacyTools = [
       'session_start',
@@ -196,10 +196,10 @@ describe('OpenClaw tool result contract', () => {
       readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../openclaw.plugin.json'), 'utf8'),
     ) as { contracts: { tools: string[] } };
 
-    expect(registration.registeredNames).toHaveLength(78);
-    expect(new Set(registration.registeredNames)).toHaveLength(78);
-    expect(manifest.contracts.tools).toHaveLength(78);
-    expect(new Set(manifest.contracts.tools)).toHaveLength(78);
+    expect(registration.registeredNames).toHaveLength(79);
+    expect(new Set(registration.registeredNames)).toHaveLength(79);
+    expect(manifest.contracts.tools).toHaveLength(79);
+    expect(new Set(manifest.contracts.tools)).toHaveLength(79);
     expect([...manifest.contracts.tools].sort()).toEqual([...registration.registeredNames].sort());
     expect(registration.registeredNames.filter((name) => !task4bTools.includes(name)).sort()).toEqual(
       [...legacyTools].sort(),

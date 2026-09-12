@@ -9,6 +9,7 @@ import { SessionManager } from '../session-manager.js';
 import { EmbeddedServer } from '../embedded-server.js';
 import { AutoloopOperationError } from '../autoloop/dispatcher.js';
 import { AutoloopRunner } from '../autoloop/runner.js';
+import { AutoloopRecoveryError } from '../autoloop/types.js';
 import { SecureAutoloopLedger, SecureAutoloopLedgerCommitError } from '../autoloop/secure-ledger.js';
 import type { AutoloopState } from '../autoloop/types.js';
 import {
@@ -4410,6 +4411,143 @@ describe('POST /autoloop/:id/request_review', () => {
       expect(requestReview).not.toHaveBeenCalled();
     } finally {
       requestReview.mockRestore();
+    }
+  });
+});
+
+describe('POST /autoloop/:id/recover', () => {
+  let manager: SessionManager;
+  let server: EmbeddedServer;
+  let port: number;
+  let token: string;
+
+  beforeAll(async () => {
+    manager = new SessionManager({});
+    server = new EmbeddedServer(manager, await freePort());
+    port = await server.start();
+    token = fs.readFileSync(path.join(os.homedir(), '.openclaw', 'server-token'), 'utf-8').trim();
+  });
+  afterAll(async () => {
+    await server.stop();
+    await manager.shutdown();
+  });
+
+  it('treats an empty JSON body as inspection and applies the exact caller token without transport decisions', async () => {
+    // Production mutation caught: treating an empty body as malformed, altering
+    // a recovery token, or reconstructing recovery behavior in HTTP changes a
+    // caller-visible recovery decision.
+    const recover = vi
+      .spyOn(manager as never, 'autoloopRecover' as never)
+      .mockResolvedValueOnce({ assessment: { recovery_token: 'inspect-token', next_safe_action: 'none' } } as never)
+      .mockResolvedValueOnce({
+        assessment: { recovery_token: 'apply-token', next_safe_action: 'none' },
+        receipt: { status: 'applied', recovery_token: 'apply-token' },
+      } as never);
+    try {
+      const inspection = await fetch(`http://127.0.0.1:${port}/autoloop/run/recover`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: '',
+      });
+      expect(inspection.status).toBe(200);
+      await expect(inspection.json()).resolves.toEqual({
+        ok: true,
+        assessment: { recovery_token: 'inspect-token', next_safe_action: 'none' },
+      });
+      expect(recover).toHaveBeenLastCalledWith('run', {});
+
+      const applied = await fetch(`http://127.0.0.1:${port}/autoloop/run/recover`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ apply: true, recovery_token: 'apply-token' }),
+      });
+      expect(applied.status).toBe(200);
+      await expect(applied.json()).resolves.toEqual({
+        ok: true,
+        assessment: { recovery_token: 'apply-token', next_safe_action: 'none' },
+        receipt: { status: 'applied', recovery_token: 'apply-token' },
+      });
+      expect(recover).toHaveBeenLastCalledWith('run', { apply: true, recovery_token: 'apply-token' });
+    } finally {
+      recover.mockRestore();
+    }
+  });
+
+  it('rejects malformed recovery payloads and preserves the public domain-error projection', async () => {
+    // Production mutation caught: forwarding malformed wire values into the
+    // core or discarding the established structured Autoloop failure shape.
+    const recover = vi.spyOn(manager as never, 'autoloopRecover' as never);
+    try {
+      const malformed = await fetch(`http://127.0.0.1:${port}/autoloop/run/recover`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ apply: 'true' }),
+      });
+      expect(malformed.status).toBe(400);
+      await expect(malformed.json()).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/apply/i) });
+      expect(recover).not.toHaveBeenCalled();
+
+      recover.mockRejectedValueOnce(
+        new AutoloopOperationError('AUTOLOOP_ENGINE_FAILURE', 'recovery domain failure') as never,
+      );
+      const domainFailure = await fetch(`http://127.0.0.1:${port}/autoloop/run/recover`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: '{}',
+      });
+      expect(domainFailure.status).toBe(500);
+      await expect(domainFailure.json()).resolves.toEqual({
+        ok: false,
+        error: { code: 'AUTOLOOP_ENGINE_FAILURE', message: 'recovery domain failure', retryable: true },
+      });
+    } finally {
+      recover.mockRestore();
+    }
+  });
+
+  it.each([
+    ['AUTOLOOP_RECOVERY_TOKEN_REQUIRED', 'token required', 400, { apply: true }],
+    ['AUTOLOOP_RECOVERY_TOKEN_STALE', 'token stale', 409, { apply: true, recovery_token: 'stale-token' }],
+    ['AUTOLOOP_RECOVERY_MANUAL_RESOLUTION_REQUIRED', 'manual resolution required', 409, {}],
+    ['AUTOLOOP_RECOVERY_INCOMPLETE', 'recovery incomplete', 409, {}],
+  ] as const)(
+    'projects the typed recovery failure %s at its deliberate HTTP status',
+    async (code, message, status, body) => {
+      // Production mutation caught: message-regex routing of typed recovery
+      // errors makes stable code/status behavior depend on mutable prose.
+      const recover = vi
+        .spyOn(manager as never, 'autoloopRecover' as never)
+        .mockRejectedValueOnce(new AutoloopRecoveryError(code, message) as never);
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/autoloop/run/recover`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify(body),
+        });
+        expect(response.status).toBe(status);
+        await expect(response.json()).resolves.toEqual({ ok: false, error: { code, message, retryable: false } });
+      } finally {
+        recover.mockRestore();
+      }
+    },
+  );
+
+  it('does not call recovery for route IDs outside the exact recover route shape', async () => {
+    // Production mutation caught: a permissive path matcher could dispatch an
+    // ambiguous route identity to the recovery core.
+    const recover = vi.spyOn(manager as never, 'autoloopRecover' as never);
+    try {
+      for (const invalidPath of ['/autoloop//recover', '/autoloop/run/extra/recover']) {
+        const response = await fetch(`http://127.0.0.1:${port}${invalidPath}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: '{}',
+        });
+        expect(response.status).toBe(404);
+      }
+      expect(recover).not.toHaveBeenCalled();
+    } finally {
+      recover.mockRestore();
     }
   });
 });

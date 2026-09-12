@@ -397,6 +397,7 @@ import type {
   AgentRuntimeLiveness,
   AgentRuntimeProbe,
   AutoloopChatStateCode,
+  AutoloopRecoveryErrorCode,
   AutoloopState,
   RecoveryAgentEvidence,
   RecoveryActionSnapshot,
@@ -628,6 +629,13 @@ const AUTOLOOP_CHAT_STATE_RETRYABILITY = Object.freeze({
   AUTOLOOP_RUN_TERMINAL: false,
 } as const satisfies Record<AutoloopChatStateCode, boolean>);
 
+const AUTOLOOP_RECOVERY_ERROR_RETRYABILITY = Object.freeze({
+  AUTOLOOP_RECOVERY_TOKEN_REQUIRED: false,
+  AUTOLOOP_RECOVERY_TOKEN_STALE: false,
+  AUTOLOOP_RECOVERY_MANUAL_RESOLUTION_REQUIRED: false,
+  AUTOLOOP_RECOVERY_INCOMPLETE: false,
+} as const satisfies Record<AutoloopRecoveryErrorCode, boolean>);
+
 const COMMITTED_AUTOLOOP_LEDGER_ERROR_CODES = new Set<PublicAutoloopFailureCode>([
   'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
   'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
@@ -639,14 +647,18 @@ function isAutoloopChatStateCode(value: unknown): value is AutoloopChatStateCode
   return typeof value === 'string' && Object.hasOwn(AUTOLOOP_CHAT_STATE_RETRYABILITY, value);
 }
 
+function isAutoloopRecoveryErrorCode(value: unknown): value is AutoloopRecoveryErrorCode {
+  return typeof value === 'string' && Object.hasOwn(AUTOLOOP_RECOVERY_ERROR_RETRYABILITY, value);
+}
+
 function isPublicAutoloopFailureCode(value: unknown): value is PublicAutoloopFailureCode {
-  return isAutoloopOperationErrorCode(value) || isAutoloopChatStateCode(value);
+  return isAutoloopOperationErrorCode(value) || isAutoloopChatStateCode(value) || isAutoloopRecoveryErrorCode(value);
 }
 
 function publicAutoloopFailureRetryable(code: PublicAutoloopFailureCode): boolean {
-  return isAutoloopOperationErrorCode(code)
-    ? AUTOLOOP_OPERATION_ERROR_RETRYABILITY[code]
-    : AUTOLOOP_CHAT_STATE_RETRYABILITY[code];
+  if (isAutoloopOperationErrorCode(code)) return AUTOLOOP_OPERATION_ERROR_RETRYABILITY[code];
+  if (isAutoloopChatStateCode(code)) return AUTOLOOP_CHAT_STATE_RETRYABILITY[code];
+  return AUTOLOOP_RECOVERY_ERROR_RETRYABILITY[code];
 }
 
 function isCommittedAutoloopLedgerErrorCode(code: PublicAutoloopFailureCode): boolean {
@@ -745,6 +757,13 @@ export function toPublicAutoloopFailure(error: unknown): Readonly<PublicAutoloop
       ...(committed ? { committed: true as const } : {}),
       retryable: AUTOLOOP_OPERATION_ERROR_RETRYABILITY[code],
     });
+  }
+
+  if (error instanceof AutoloopRecoveryError) {
+    const code = ownDataValue(error, 'code');
+    const message = ownDataValue(error, 'message');
+    if (!isAutoloopRecoveryErrorCode(code) || typeof message !== 'string') return undefined;
+    return publicData({ code, message, retryable: AUTOLOOP_RECOVERY_ERROR_RETRYABILITY[code] });
   }
 
   if (error instanceof Error && ownDataValue(error, 'name') === 'AutoloopChatStateError') {

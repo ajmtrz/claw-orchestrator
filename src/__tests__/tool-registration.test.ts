@@ -4,6 +4,7 @@ import * as os from 'node:os';
 import plugin from '../index.js';
 import { SessionManager, toPublicAutoloopFailure } from '../session-manager.js';
 import { AutoloopOperationError } from '../autoloop/dispatcher.js';
+import { AutoloopRecoveryError } from '../autoloop/types.js';
 import { Msg } from '../autoloop/messages.js';
 import { AutoloopRunner } from '../autoloop/runner.js';
 import { SecureAutoloopLedgerCommitError } from '../autoloop/secure-ledger.js';
@@ -407,6 +408,133 @@ describe('plugin tool registration', () => {
     ];
     for (const name of NEW_4_2_0_TOOLS) {
       expect(byName.has(name), `missing v4.2.0 tool: ${name}`).toBe(true);
+    }
+  });
+});
+
+describe('Task 6 Slice 6.2 public recovery MCP boundary', () => {
+  it('registers the recovery schema, delegates inspection and apply unchanged, and projects typed domain errors', async () => {
+    // Production mutation caught: omitting this transport adapter, changing the
+    // caller-supplied recovery token, or bypassing the established typed-error
+    // projection makes recovery unsafe or opaque at the MCP boundary.
+    const registration = collectRegistration();
+    const tool = registration.tools.find((candidate) => candidate.name === 'autoloop_recover');
+    const recover = vi.spyOn(SessionManager.prototype as never, 'autoloopRecover' as never);
+    try {
+      expect(tool).toBeDefined();
+      expect(tool!.parameters).toEqual({
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          run_id: { type: 'string', description: 'Run id to inspect or recover' },
+          apply: { type: 'boolean', description: 'Apply the assessed recovery action (default false)' },
+          recovery_token: { type: 'string', description: 'Exact token returned by recovery inspection' },
+        },
+        required: ['run_id'],
+      });
+
+      recover
+        .mockResolvedValueOnce({ assessment: { recovery_token: 'inspect-token', next_safe_action: 'none' } } as never)
+        .mockResolvedValueOnce({
+          assessment: { recovery_token: 'apply-token', next_safe_action: 'none' },
+          receipt: { status: 'applied', recovery_token: 'apply-token' },
+        } as never)
+        .mockRejectedValueOnce(
+          new AutoloopOperationError('AUTOLOOP_ENGINE_FAILURE', 'recovery domain failure') as never,
+        );
+
+      await expect(tool!.execute('recover-inspect', { run_id: 'run-1' })).resolves.toMatchObject({
+        details: { ok: true, assessment: { recovery_token: 'inspect-token', next_safe_action: 'none' } },
+      });
+      expect(recover).toHaveBeenLastCalledWith('run-1', {});
+
+      await expect(
+        tool!.execute('recover-apply', { run_id: 'run-1', apply: true, recovery_token: 'apply-token' }),
+      ).resolves.toMatchObject({
+        details: {
+          ok: true,
+          assessment: { recovery_token: 'apply-token', next_safe_action: 'none' },
+          receipt: { status: 'applied', recovery_token: 'apply-token' },
+        },
+      });
+      expect(recover).toHaveBeenLastCalledWith('run-1', { apply: true, recovery_token: 'apply-token' });
+
+      await expect(tool!.execute('recover-error', { run_id: 'run-1' })).resolves.toMatchObject({
+        details: {
+          ok: false,
+          error: {
+            code: 'AUTOLOOP_ENGINE_FAILURE',
+            message: 'recovery domain failure',
+            retryable: true,
+          },
+        },
+      });
+    } finally {
+      registration.services[0]?.stop();
+      recover.mockRestore();
+    }
+  });
+
+  it('rejects recovery arguments unless every supplied field is an own data property of the exact public shape', async () => {
+    // Production mutation caught: reading arbitrary properties directly lets
+    // inherited values, accessors, unknown keys, and truthy wire values cross
+    // the MCP boundary into a recovery effect.
+    const registration = collectRegistration();
+    const tool = registration.tools.find((candidate) => candidate.name === 'autoloop_recover')!;
+    const recover = vi.spyOn(SessionManager.prototype as never, 'autoloopRecover' as never);
+    const inheritedRunId = Object.create({ run_id: 'inherited-run' }) as Record<string, unknown>;
+    const inheritedToken = Object.create({ recovery_token: 'inherited-token' }) as Record<string, unknown>;
+    Object.defineProperty(inheritedToken, 'run_id', { value: 'run-1', enumerable: true });
+    const accessorRunId = {} as Record<string, unknown>;
+    Object.defineProperty(accessorRunId, 'run_id', { get: () => 'run-1', enumerable: true });
+    const accessorToken = { run_id: 'run-1' } as Record<string, unknown>;
+    Object.defineProperty(accessorToken, 'recovery_token', { get: () => 'token', enumerable: true });
+
+    try {
+      for (const args of [
+        inheritedRunId,
+        inheritedToken,
+        accessorRunId,
+        accessorToken,
+        { run_id: 1 },
+        { run_id: 'run-1', recovery_token: 1 },
+        { run_id: 'run-1', apply: 'false' },
+        { run_id: 'run-1', unexpected: true },
+      ] as Record<string, unknown>[]) {
+        await expect(tool.execute('recover-invalid', args)).rejects.toThrow();
+      }
+      expect(recover).not.toHaveBeenCalled();
+    } finally {
+      registration.services[0]?.stop();
+      recover.mockRestore();
+    }
+  });
+
+  it.each([
+    ['AUTOLOOP_RECOVERY_TOKEN_REQUIRED', 'apply requires a recovery token'],
+    ['AUTOLOOP_RECOVERY_TOKEN_STALE', 'recovery token is stale'],
+    ['AUTOLOOP_RECOVERY_MANUAL_RESOLUTION_REQUIRED', 'recovery requires manual resolution'],
+    ['AUTOLOOP_RECOVERY_INCOMPLETE', 'recovery is incomplete'],
+  ] as const)('projects the typed recovery failure %s as non-retryable MCP data', async (code, message) => {
+    // Production mutation caught: omitting a recovery code from the public
+    // mapper turns a known safe recovery outcome into an opaque MCP failure.
+    const registration = collectRegistration();
+    const tool = registration.tools.find((candidate) => candidate.name === 'autoloop_recover')!;
+    const recover = vi
+      .spyOn(SessionManager.prototype as never, 'autoloopRecover' as never)
+      .mockRejectedValueOnce(new AutoloopRecoveryError(code, message) as never);
+    const args =
+      code === 'AUTOLOOP_RECOVERY_TOKEN_REQUIRED'
+        ? { run_id: 'run-1', apply: true }
+        : { run_id: 'run-1', apply: true, recovery_token: 'stale-token' };
+
+    try {
+      await expect(tool.execute('recover-typed-error', args)).resolves.toMatchObject({
+        details: { ok: false, error: { code, message, retryable: false } },
+      });
+    } finally {
+      registration.services[0]?.stop();
+      recover.mockRestore();
     }
   });
 });

@@ -16,6 +16,7 @@ import { SessionManager, toPublicAutoloopFailure } from './session-manager.js';
 import { sanitizeCwd, validateRegex } from './validation.js';
 import { resolveSecretRefs } from './kernel/secrets.js';
 import { validateAutoloopTimeoutConfig } from './autoloop/types.js';
+import { AutoloopRecoveryError } from './autoloop/types.js';
 import { canonicalizeRequestReviewArgs } from './autoloop/messages.js';
 import type { EffortLevel, EngineType } from './types.js';
 import { handleChatCompletion } from './openai-compat.js';
@@ -49,6 +50,16 @@ function safeOwnErrorMessage(error: unknown): string {
 }
 
 function autoloopErrorStatus(error: unknown): number {
+  if (error instanceof AutoloopRecoveryError) {
+    switch (error.code) {
+      case 'AUTOLOOP_RECOVERY_TOKEN_REQUIRED':
+        return 400;
+      case 'AUTOLOOP_RECOVERY_TOKEN_STALE':
+      case 'AUTOLOOP_RECOVERY_MANUAL_RESOLUTION_REQUIRED':
+      case 'AUTOLOOP_RECOVERY_INCOMPLETE':
+        return 409;
+    }
+  }
   const message = safeOwnErrorMessage(error);
   if (/^Autoloop run '.+' not found$/.test(message)) return 404;
   if (/^Autoloop run '.+' not found in registry$/.test(message)) return 404;
@@ -69,6 +80,7 @@ function autoloopErrorStatus(error: unknown): number {
   if (/^(?:allow_decrease|activity_lease_ms|autoloop_hard_timeout_ms) is not supported\b/.test(message)) return 400;
   if (/^pending dispatch\b/.test(message)) return 400;
   if (/^(?:request_review|Invalid request_review)\b/i.test(message)) return 400;
+  if (/^recover (?:contains unsupported field|apply\b|recovery_token\b)/.test(message)) return 400;
   if (/^autoloop_spawn_(?:coder|reviewer) run_id\b/.test(message)) return 400;
   if (/^Cannot request review after the Autoloop run became terminal$/.test(message)) return 400;
   if (/^Autoloop run '.+' is terminal and cannot accept a review request$/.test(message)) return 400;
@@ -1395,6 +1407,67 @@ export class EmbeddedServer {
           }
           const request = canonicalizeRequestReviewArgs(requestBody);
           const result = await this.manager.autoloopRequestReview(v2RequestReviewMatch[1], request);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(stringifyAutoloopPublicJson({ ok: true, ...result }));
+        } catch (error) {
+          const status = autoloopErrorStatus(error);
+          const publicFailure = toPublicAutoloopFailure(error);
+          res.writeHead(status, { 'Content-Type': 'application/json' });
+          res.end(
+            stringifyAutoloopPublicJson({
+              ok: false,
+              error: publicFailure ?? safeOwnErrorMessage(error),
+            }),
+          );
+        }
+        return;
+      }
+
+      // ─── Autoloop — inspect or apply durable recovery ─────────
+      //
+      // POST /autoloop/<run_id>/recover
+      //
+      // The SessionManager owns every recovery decision. This adapter only
+      // validates the public shape and passes its explicitly supplied options
+      // through without normalizing the recovery token.
+      const v2RecoverMatch = path.match(/^\/autoloop\/([^/]+)\/recover$/);
+      if (v2RecoverMatch) {
+        if (method !== 'POST') {
+          res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'POST' });
+          res.end(stringifyAutoloopPublicJson({ ok: false, error: 'Method not allowed' }));
+          return;
+        }
+        if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(stringifyAutoloopPublicJson({ ok: false, error: 'Recovery payload is invalid' }));
+          return;
+        }
+        try {
+          const descriptors = Object.getOwnPropertyDescriptors(body);
+          const allowedKeys = new Set(['apply', 'recovery_token']);
+          for (const key of Reflect.ownKeys(body)) {
+            if (typeof key !== 'string' || !allowedKeys.has(key)) {
+              throw new Error(`recover contains unsupported field '${String(key)}'`);
+            }
+          }
+          const applyDescriptor = descriptors.apply;
+          if (applyDescriptor && !Object.hasOwn(applyDescriptor, 'value')) {
+            throw new Error('recover apply must be an own data property');
+          }
+          const tokenDescriptor = descriptors.recovery_token;
+          if (tokenDescriptor && !Object.hasOwn(tokenDescriptor, 'value')) {
+            throw new Error('recover recovery_token must be an own data property');
+          }
+          if (applyDescriptor && applyDescriptor.value !== undefined && typeof applyDescriptor.value !== 'boolean') {
+            throw new Error('recover apply must be a boolean');
+          }
+          if (tokenDescriptor && tokenDescriptor.value !== undefined && typeof tokenDescriptor.value !== 'string') {
+            throw new Error('recover recovery_token must be a string');
+          }
+          const options: { apply?: boolean; recovery_token?: string } = {};
+          if (applyDescriptor?.value !== undefined) options.apply = applyDescriptor.value as boolean;
+          if (tokenDescriptor?.value !== undefined) options.recovery_token = tokenDescriptor.value as string;
+          const result = await this.manager.autoloopRecover(v2RecoverMatch[1], options);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(stringifyAutoloopPublicJson({ ok: true, ...result }));
         } catch (error) {
