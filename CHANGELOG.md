@@ -5,12 +5,96 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.4.0] - 2026-09-13
+
+Antigravity turns that did nothing no longer pass as successes, and Autoloop's Planner writes its
+plan, goal and spawn as one step. Thanks to @ajmtrz (#105).
+
+### Fixed
+
+- **Antigravity no longer treats an exit-0 empty response as a successful
+  turn.** The invariant applies at the adapter boundary, so Autoloop and every
+  other SessionManager caller now reject missing, blank, and whitespace-only
+  replies while keeping a captured conversation id available for an explicit
+  retry. agy 1.1.26 can produce this shape when plan mode soft-denies a tool
+  confirmation; a narrow marker from the freshly cleared current-turn log adds
+  a fixed sanitized diagnosis without exposing the log. Recovery does not
+  retry automatically or widen the Planner beyond `--mode plan`. agy 1.2.2 can
+  report the same denial with `status: SUCCESS` and a non-empty reply; refused
+  tool names now flow through `SendResult.permissionDenials` without dropping
+  that reply.
+- **Autoloop Planner control batches are in-band-only and failure-atomic for
+  artifacts.** The dispatcher prevalidates the complete fenced-control batch,
+  rejects duplicate plan/goal/spawn controls, stages exact `plan.md` and
+  `goal.json` bytes as one rollback-capable replacement, and materializes both
+  before at most one subagent spawn. A malformed block or artifact failure now
+  leaves prior files unchanged and emits neither spawn nor an initial
+  directive; the Planner's existing read-only isolation is unchanged.
+
+### Added
+
+- **A real-subprocess agy 1.1.26 Planner regression fixture** reproduces the
+  first-turn soft denial and blank result, then verifies that the resumed
+  conversation returns fenced plan/goal/spawn controls, exact artifacts exist
+  before the single spawn, and no failed-turn effect leaks through.
+
+## [7.3.0] - 2026-09-13
+
+### Added
+
+- **`session_handoff` — continue a conversation on another engine.** Starts a new session on the
+  target engine (or the same engine with another model) in the source's working directory, and
+  carries the conversation into it, so the new agent picks up where the old one stopped. The source
+  keeps running untouched; the two go separate ways from there.
+  - No engine can resume another's session, and each keeps its history in its own undocumented
+    on-disk format, so the conversation travels as text: a `<conversation_history>` block in front
+    of the new session's first message, after which the new engine holds it itself. Nothing is
+    written into either engine's session store, and it works across every engine, custom ones
+    included. Every turn in the block is fenced against the block's own tags.
+  - What was said is recorded per session as it is sent and answered. The engine's history buffer
+    is not used for this: it is capped by event count, and on a long session the opening request is
+    the first thing it drops.
+  - When the conversation is longer than `maxChars` (default 240,000 characters), the opening
+    request is kept, the newest turns fill the rest, and one line records how many turns in
+    between were left out.
+  - The new session inherits the engine-neutral settings — permission and sandbox mode, effort,
+    spend cap, system prompts, extra directories — and none that were written for the source
+    engine. A second handoff carries the whole conversation, not only the part the middle session
+    saw. A first send that fails on the new engine keeps the history for the retry.
+  - Verified end to end over MCP against the installed engines: a fact planted in a Claude session
+    was recalled by Codex after a handoff, and again by Claude after a second handoff back, which
+    also named Codex as the engine it had taken over from.
+
+## [7.2.0] - 2026-09-13
+
+Weekly engine sweep. Five engines upgraded in place, every live turn through the real wrapper,
+registry 25 models with no drift.
+
+### Added
+
+- **`SendResult.permissionDenials` — the tool calls the engine refused during a turn.** A refused
+  call does not fail the turn. Measured on Claude Code 2.1.269 with `--permission-prompts none`,
+  which a session gets whenever no prompt tool is configured: asked to write a file, the turn ended
+  `subtype: 'success'` with `is_error: false`, the Bash call listed as denied in the result event, and
+  no file on disk. It counted in `turnsSucceeded` and set no `error`. `sendMessage` — the one path
+  every caller goes through — dropped that event, so council agents, autoloop roles, and MCP callers
+  all saw a clean success. The field is present only when something was refused, and it reaches
+  `session_send` and every other caller unchanged.
+
+### Changed
+
+- Tested versions: Claude Code 2.1.260 → 2.1.269, Codex 0.153.2 → 0.154.0, Antigravity
+  1.1.25 → 1.2.2, Grok Build 1.0.13 → 1.0.30, OpenCode 1.18.27 → 1.18.30.
+- Codex 0.154.0's `--worktree` is deliberately not passed. Measured: edits land in a
+  Codex-managed worktree on a detached HEAD rather than in the session's working directory, and the
+  event stream does not report where. Acceptance contracts and evidence read the session's working
+  directory, so they would verify an untouched tree.
+
 ## [7.1.1] - 2026-09-04
 
 The weekly sweep now checks the model registry, and its first run found two more wrong prices.
 
 ### Fixed
-
 - **`o4-mini` was priced at half its real cost.** OpenAI publishes four identically shaped tables
   per model — Standard, Batch, Flex, Fast — and this entry had been copied from the Batch column:
   `0.55 / 4.4` against a Standard `1.1 / 4.4`. Every run on it under-reported spend by 2x.
@@ -18,7 +102,6 @@ The weekly sweep now checks the model registry, and its first run found two more
   full input price instead of a quarter of it.
 
 ### Added
-
 - **The sweep diffs `src/models.ts` against both vendors' published price tables.** Until now it
   only checked engines, so a repriced model was invisible to it: a wrong cost does not crash, it
   just stays wrong. Both vendors publish their tables as markdown, so this needs no model to read

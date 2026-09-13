@@ -9,7 +9,8 @@
 import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import * as fs from 'node:fs';
+import fsDefault, * as fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { execFileSync, type ChildProcess } from 'node:child_process';
@@ -530,7 +531,7 @@ describe('Planner control argument shape', () => {
 });
 
 describe('Planner control batch application', () => {
-  it('stops after a failed spawn without applying later file, policy, or message effects', async () => {
+  it('materializes artifacts atomically before a failed spawn and suppresses later effects', async () => {
     const effects: PlannerToolEffects = {
       spawnCoder: vi.fn(async () => undefined),
       spawnReviewer: vi.fn(async () => undefined),
@@ -538,7 +539,7 @@ describe('Planner control batch application', () => {
         throw new Error('spawn failed before completion');
       }),
       updatePushPolicy: vi.fn(),
-      writePlanFile: vi.fn(async () => undefined),
+      writePlanFiles: vi.fn(async () => undefined),
     };
     const controls: PlannerToolCall[] = [
       { tool: 'spawn_subagents', args: {} },
@@ -555,7 +556,19 @@ describe('Planner control batch application', () => {
       errors: [{ tool: 'spawn_subagents', error: 'spawn failed before completion' }],
     });
     expect(effects.spawnSubagents).toHaveBeenCalledTimes(1);
-    expect(effects.writePlanFile).not.toHaveBeenCalled();
+    expect(effects.writePlanFiles).toHaveBeenCalledTimes(1);
+    expect(effects.writePlanFiles).toHaveBeenCalledWith([
+      {
+        file: 'plan.md',
+        content: '# Must not be written',
+        commitMessage: 'autoloop: planner writes plan.md',
+      },
+      {
+        file: 'goal.json',
+        content: '{"goal":"must not be written"}',
+        commitMessage: 'autoloop: planner writes goal.json',
+      },
+    ]);
     expect(effects.updatePushPolicy).not.toHaveBeenCalled();
   });
 });
@@ -627,7 +640,7 @@ describe('Planner durable control content bounds', () => {
       spawnReviewer: vi.fn(async () => undefined),
       spawnSubagents: vi.fn(async () => undefined),
       updatePushPolicy: vi.fn(),
-      writePlanFile: vi.fn(async () => undefined),
+      writePlanFiles: vi.fn(async () => undefined),
     };
     const oversizedGoal = contentOfBytes('write_goal', EXPECTED_MAX_PLANNER_CONTROL_CONTENT_BYTES + 1);
     const controls: PlannerToolCall[] = [
@@ -649,7 +662,7 @@ describe('Planner durable control content bounds', () => {
     });
     expect(effects.spawnSubagents).not.toHaveBeenCalled();
     expect(effects.updatePushPolicy).not.toHaveBeenCalled();
-    expect(effects.writePlanFile).not.toHaveBeenCalled();
+    expect(effects.writePlanFiles).not.toHaveBeenCalled();
   });
 });
 
@@ -1247,6 +1260,10 @@ describe('ClaudeAgentDispatcher — generation-fenced agent leases', () => {
   });
 });
 
+function plannerControl(tool: string, args: Record<string, unknown>): string {
+  return `\`\`\`autoloop\n${JSON.stringify({ tool, args })}\n\`\`\``;
+}
+
 describe('ClaudeAgentDispatcher — role engine configuration', () => {
   it('spawnReviewer starts only a Reviewer generation', async () => {
     const { dispatcher, calls } = makeDispatcher();
@@ -1322,7 +1339,12 @@ describe('ClaudeAgentDispatcher — role engine configuration', () => {
     await dispatcher.deliver(Msg.chat(0, { text: 'hello' }));
     await dispatcher.spawnSubagents();
 
-    expect(findStart(calls, 'planner')).toMatchObject({ engine: 'claude', model: 'opus' });
+    expect(findStart(calls, 'planner')).toMatchObject({
+      engine: 'claude',
+      model: 'opus',
+      permissionMode: 'manual',
+      sandboxMode: 'read-only',
+    });
     expect(findStart(calls, 'coder')).toMatchObject({ engine: 'claude', model: 'sonnet' });
     expect(findStart(calls, 'reviewer')).toMatchObject({ engine: 'claude', model: 'sonnet' });
   });
@@ -1356,10 +1378,16 @@ describe('ClaudeAgentDispatcher — role engine configuration', () => {
 
     await dispatcher.deliver(Msg.chat(0, { text: 'inspect this repository' }));
 
-    expect(findStart(calls, 'planner')).toMatchObject({
+    const start = findStart(calls, 'planner');
+    expect(start).toMatchObject({
       permissionMode: 'manual',
       sandboxMode: 'read-only',
     });
+    expect(start).not.toHaveProperty('permissionMode', 'bypassPermissions');
+    const systemPrompt = start.systemPrompt as string;
+    expect(systemPrompt).toMatch(/native shell\/file tools must not create `plan\.md` or `goal\.json`/i);
+    expect(systemPrompt).toContain('fenced in-band controls');
+    expect(systemPrompt).toContain('`write_plan`, `write_goal`, and approved `spawn_subagents`');
     const prompt = calls.sendMessage.mock.calls[0][1] as string;
     expect(prompt).toContain('<autoloop_role_instructions>');
     expect(prompt).toContain('Planner');
@@ -4321,6 +4349,112 @@ describe('ClaudeAgentDispatcher — Reviewer-only checkpoint requests', () => {
         } as never),
       ),
     ).toThrow(/scope.*prototype|scope.*inherited/i);
+  });
+});
+
+describe('ClaudeAgentDispatcher — Planner control transactions', () => {
+  it('rejects a malformed control batch without writes, spawn, or an initial directive', async () => {
+    const originalPlan = '# original plan\n';
+    const originalGoal = '{"original":true}\n';
+    fs.writeFileSync(path.join(tmpRoot, 'plan.md'), originalPlan);
+    fs.writeFileSync(path.join(tmpRoot, 'goal.json'), originalGoal);
+    const spawn = vi.fn(async () => undefined);
+    const reply = [
+      plannerControl('write_plan', { content: '# replacement plan\n' }),
+      '```autoloop\n{malformed json\n```',
+      plannerControl('spawn_subagents', { initial_directive: { goal: 'must not run' } }),
+    ].join('\n');
+    const { dispatcher } = makeDispatcher({ onSpawnSubagents: spawn }, { sendOutput: reply });
+
+    await expect(dispatcher.deliver(Msg.chat(0, { text: 'apply the batch' }))).rejects.toMatchObject({
+      code: 'AUTOLOOP_CONTROL_MALFORMED',
+    });
+
+    expect(fs.readFileSync(path.join(tmpRoot, 'plan.md'), 'utf-8')).toBe(originalPlan);
+    expect(fs.readFileSync(path.join(tmpRoot, 'goal.json'), 'utf-8')).toBe(originalGoal);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it('restores pre-existing artifacts and suppresses spawn when an artifact write fails', async () => {
+    const originalPlan = '# original plan\n';
+    const originalGoal = '{"original":true}\n';
+    const replacementPlan = '# replacement plan\n';
+    const replacementGoal = '{"replacement":true}\n';
+    const planPath = path.join(tmpRoot, 'plan.md');
+    const goalPath = path.join(tmpRoot, 'goal.json');
+    fs.writeFileSync(planPath, originalPlan);
+    fs.writeFileSync(goalPath, originalGoal);
+    const spawn = vi.fn(async () => undefined);
+    const reply = [
+      plannerControl('write_plan', { content: replacementPlan }),
+      plannerControl('write_goal', { content: replacementGoal }),
+      plannerControl('spawn_subagents', { initial_directive: { goal: 'must not run' } }),
+    ].join('\n');
+    const { dispatcher } = makeDispatcher({ onSpawnSubagents: spawn }, { sendOutput: reply });
+
+    // Fail the second visible replacement, after plan.md has been replaced,
+    // so the transaction must restore the first file from its byte snapshot.
+    const originalRenameSync = fsDefault.renameSync;
+    let failed = false;
+    fsDefault.renameSync = ((from: fs.PathLike, to: fs.PathLike) => {
+      if (!failed && path.resolve(String(to)) === goalPath) {
+        failed = true;
+        throw new Error('simulated artifact replacement failure');
+      }
+      return originalRenameSync(from, to);
+    }) as typeof fs.renameSync;
+    syncBuiltinESMExports();
+    try {
+      await expect(dispatcher.deliver(Msg.chat(0, { text: 'apply the batch' }))).rejects.toMatchObject({
+        code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+      });
+    } finally {
+      fsDefault.renameSync = originalRenameSync;
+      syncBuiltinESMExports();
+    }
+
+    expect(fs.readFileSync(planPath, 'utf-8')).toBe(originalPlan);
+    expect(fs.readFileSync(goalPath, 'utf-8')).toBe(originalGoal);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it('materializes exact artifacts before exactly one spawn and initial directive', async () => {
+    const plan = '# exact plan\n\nNo normalization.\n';
+    const goal = '{\n  "scalar": null,\n  "gates": []\n}\n';
+    const observedAtSpawn: Array<{ plan: string; goal: string }> = [];
+    const spawn = vi.fn(async () => {
+      observedAtSpawn.push({
+        plan: fs.readFileSync(path.join(tmpRoot, 'plan.md'), 'utf-8'),
+        goal: fs.readFileSync(path.join(tmpRoot, 'goal.json'), 'utf-8'),
+      });
+    });
+    const reply = [
+      plannerControl('spawn_subagents', { initial_directive: { goal: 'ship exact artifacts' } }),
+      plannerControl('write_plan', { content: plan }),
+      plannerControl('write_goal', { content: goal }),
+    ].join('\n');
+    const { dispatcher } = makeDispatcher({ onSpawnSubagents: spawn }, { sendOutput: reply });
+
+    const emitted = await dispatcher.deliver(Msg.chat(0, { text: 'approved' }));
+
+    expect(observedAtSpawn).toEqual([{ plan, goal }]);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(emitted.filter((message) => message.type === 'directive')).toHaveLength(1);
+  });
+
+  it('rejects duplicate spawn controls without duplicate startup or directives', async () => {
+    const spawn = vi.fn(async () => undefined);
+    const reply = [
+      plannerControl('spawn_subagents', { initial_directive: { goal: 'first' } }),
+      plannerControl('spawn_subagents', { initial_directive: { goal: 'second' } }),
+    ].join('\n');
+    const { dispatcher } = makeDispatcher({ onSpawnSubagents: spawn }, { sendOutput: reply });
+
+    await expect(dispatcher.deliver(Msg.chat(0, { text: 'approved once' }))).rejects.toMatchObject({
+      code: 'AUTOLOOP_CONTROL_MALFORMED',
+    });
+
+    expect(spawn).not.toHaveBeenCalled();
   });
 });
 

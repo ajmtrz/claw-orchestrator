@@ -3218,7 +3218,7 @@ describe('SessionManager', () => {
         expect(createdConfigs[0]).toMatchObject({
           name: `autoloop-${runId}-planner`,
           engine: plannerEngine,
-          permissionMode: plannerEngine === 'claude' ? 'plan' : 'manual',
+          permissionMode: 'manual',
           sandboxMode: 'read-only',
         });
       },
@@ -5339,7 +5339,7 @@ describe('SessionManager', () => {
         }
       });
 
-      it('keeps a committed spawn marked when a later operational control fails', async () => {
+      it('suppresses spawn when the preceding atomic artifact transaction fails', async () => {
         const runId = 'planner-spawn-before-operational-failure';
         const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
         await mgr.autoloopStart({ runId, workspace });
@@ -5384,12 +5384,12 @@ describe('SessionManager', () => {
               },
             },
           ]);
-          expect(decisions.filter((row) => row.kind === 'spawn_subagents')).toHaveLength(1);
-          expect(mockSessions).toHaveLength(3);
+          expect(decisions.filter((row) => row.kind === 'spawn_subagents')).toHaveLength(0);
+          expect(mockSessions).toHaveLength(1);
           expect(handle.runner.state).toMatchObject({
-            status: 'running',
+            status: 'planning',
             iter: 0,
-            subagents_spawned: true,
+            subagents_spawned: false,
             consecutive_phase_errors: 1,
           });
         } finally {
@@ -8643,7 +8643,7 @@ describe('SessionManager', () => {
           {
             spawnSubagents: async () => undefined,
             updatePushPolicy,
-            writePlanFile: async () => undefined,
+            writePlanFiles: async () => undefined,
           },
           0,
         );
@@ -8837,9 +8837,11 @@ describe('SessionManager', () => {
           expectedControls,
         );
         expect(runGit(workspace, 'log', '-2', '--format=%s').trim().split('\n')).toEqual([
-          String(expectedControls[1].args.commit_message),
           String(expectedControls[0].args.commit_message),
+          'test baseline',
         ]);
+        expect(fs.readFileSync(path.join(workspace, 'plan.md'), 'utf8')).toBe(planContent);
+        expect(fs.readFileSync(path.join(workspace, 'goal.json'), 'utf8')).toBe(goalContent);
       });
 
       it.each(['pause_loop', 'terminate'] as const)(
@@ -8948,7 +8950,7 @@ describe('SessionManager', () => {
             {
               spawnSubagents: async () => undefined,
               updatePushPolicy: () => undefined,
-              writePlanFile: async () => undefined,
+              writePlanFiles: async () => undefined,
             },
             0,
           );
@@ -8987,7 +8989,7 @@ describe('SessionManager', () => {
         { tool: 'write_plan' as const, file: 'plan.md' as const, content: '# must not be written' },
         { tool: 'write_goal' as const, file: 'goal.json' as const, content: '{"must_not":"be written"}' },
       ])(
-        'aborts $tool after termination begins during an earlier persisted spawn effect',
+        'keeps the atomically materialized $tool when termination begins during the later spawn effect',
         async ({ tool, file, content }) => {
           const runId = `planner-terminal-batch-${tool}`;
           const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
@@ -9017,8 +9019,8 @@ describe('SessionManager', () => {
             status: 'terminated',
             status_reason: 'terminal-during-spawn-effect',
           });
-          expect(fs.existsSync(path.join(workspace, file))).toBe(false);
-          expect(runGit(workspace, 'rev-parse', 'HEAD').trim()).toBe(originalHead);
+          expect(fs.readFileSync(path.join(workspace, file), 'utf8')).toBe(content);
+          expect(runGit(workspace, 'rev-parse', 'HEAD').trim()).not.toBe(originalHead);
 
           const decisions = fs
             .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')

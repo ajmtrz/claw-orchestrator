@@ -68,6 +68,7 @@ import {
   canonicalPlannerControlsJson,
   parsePlannerReply,
   validatePlannerToolCalls,
+  type PlannerArtifactWrite,
   type PlannerToolCall,
   type PlannerToolEffects,
   type PlannerToolName,
@@ -3337,7 +3338,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
           engine: this.plannerSelection.engine,
           model: this.roleModel('planner', this.plannerSelection),
           customEngine: this.plannerSelection.engine === 'custom' ? this.plannerSelection.customEngine : undefined,
-          permissionMode: this.plannerSelection.engine === 'claude' ? 'plan' : 'manual',
+          permissionMode: 'manual',
           sandboxMode: 'read-only',
           systemPrompt: this.plannerSystemPrompt,
           // Hard role boundary: Planner must NEVER author content files itself.
@@ -3361,6 +3362,98 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       return { turns: stats.turns, turnsSucceeded: stats.turnsSucceeded };
     } catch {
       return undefined;
+    }
+  }
+
+  /**
+   * Replace a Planner turn's complete artifact set or leave the prior set
+   * untouched. Every new body is staged before the first visible rename; if a
+   * later rename fails, already-replaced targets are restored from byte
+   * snapshots before the error reaches the control handler.
+   */
+  private replacePlannerArtifacts(writes: readonly PlannerArtifactWrite[]): void {
+    const nonce = randomUUID();
+    const entries = writes.map((write, index) => {
+      const target = path.join(this.config.workspace, write.file);
+      let stat: fs.Stats | undefined;
+      try {
+        stat = fs.lstatSync(target);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      const existed = stat !== undefined;
+      if (stat && !stat.isFile()) throw new Error(`${write.file} exists but is not a regular file`);
+      return {
+        ...write,
+        target,
+        staged: path.join(this.config.workspace, `.${write.file}.${nonce}.${index}.tmp`),
+        existed,
+        original: existed ? fs.readFileSync(target) : undefined,
+        originalMode: stat ? stat.mode & 0o777 : undefined,
+      };
+    });
+    const replaced: typeof entries = [];
+
+    try {
+      for (const entry of entries) {
+        const fd = fs.openSync(entry.staged, 'wx', 0o600);
+        try {
+          fs.writeFileSync(fd, entry.content, { encoding: 'utf-8' });
+          fs.fsyncSync(fd);
+        } finally {
+          fs.closeSync(fd);
+        }
+      }
+      for (const entry of entries) {
+        fs.renameSync(entry.staged, entry.target);
+        replaced.push(entry);
+        if (entry.originalMode !== undefined) fs.chmodSync(entry.target, entry.originalMode);
+      }
+      if (entries.length > 0) this.syncCreatedControlFileDirectory(entries[0].target);
+    } catch (error) {
+      const rollbackErrors: string[] = [];
+      for (const entry of [...replaced].reverse()) {
+        try {
+          if (!entry.existed) {
+            if (fs.existsSync(entry.target)) fs.unlinkSync(entry.target);
+            continue;
+          }
+          const restore = `${entry.staged}.restore`;
+          try {
+            const fd = fs.openSync(restore, 'wx', entry.originalMode ?? 0o600);
+            try {
+              fs.writeFileSync(fd, entry.original!);
+              fs.fsyncSync(fd);
+            } finally {
+              fs.closeSync(fd);
+            }
+            fs.renameSync(restore, entry.target);
+            if (entry.originalMode !== undefined) fs.chmodSync(entry.target, entry.originalMode);
+          } finally {
+            if (fs.existsSync(restore)) fs.unlinkSync(restore);
+          }
+        } catch (rollbackError) {
+          rollbackErrors.push(`${entry.file}: ${(rollbackError as Error).message}`);
+        }
+      }
+      for (const entry of entries) {
+        try {
+          if (fs.existsSync(entry.staged)) fs.unlinkSync(entry.staged);
+        } catch (cleanupError) {
+          rollbackErrors.push(`${entry.file} staging cleanup: ${(cleanupError as Error).message}`);
+        }
+      }
+      if (replaced.length > 0) {
+        try {
+          this.syncCreatedControlFileDirectory(replaced[0].target);
+        } catch (rollbackError) {
+          rollbackErrors.push(`artifact rollback directory sync: ${(rollbackError as Error).message}`);
+        }
+      }
+      if (rollbackErrors.length > 0) {
+        throw new Error(`${(error as Error).message}; artifact rollback failed: ${rollbackErrors.join('; ')}`);
+      }
+      throw error;
     }
   }
 
@@ -3538,14 +3631,17 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
           });
         }
       },
-      writePlanFile: async (file, content, commitMessage) => {
+      writePlanFiles: async (writes) => {
         // Author plan.md / goal.json on the Planner's behalf. The Planner
         // can't Write/Edit directly (disallowedTools), so this autoloop tool
-        // is the single legitimate authoring path. Best-effort git commit
-        // keeps the ledger honest.
-        const target = path.join(this.config.workspace, file);
-        this.writeControlFileAtomically(target, content);
-        await this.gitCommit(file, commitMessage ?? `autoloop: planner writes ${file}`);
+        // is the single legitimate authoring path. Materialize the entire set
+        // before commit or any spawn effect.
+        this.replacePlannerArtifacts(writes);
+        const filenames = writes.map(({ file }) => file);
+        const commitMessage =
+          writes.find(({ commitMessage: candidate }) => candidate)?.commitMessage ??
+          `autoloop: planner writes ${filenames.join(', ')}`;
+        await this.gitCommit(filenames, commitMessage);
       },
     };
     const controlTools = normalizedControls.map(({ tool }) => tool);
@@ -4309,7 +4405,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
 
   // ─── git helper for write_plan_committed / write_goal_committed ──────────
 
-  private async gitCommit(filename: string, message: string): Promise<void> {
+  private async gitCommit(filenames: readonly string[], message: string): Promise<void> {
     const run = (argv: string[], input?: string): Promise<{ code: number; out: string; err: string }> =>
       new Promise((resolve) => {
         const child = spawn(argv[0], argv.slice(1), {
@@ -4327,40 +4423,42 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
 
     const detailFor = (result: { code: number; out: string; err: string }): string =>
       (result.err || result.out || `exit ${result.code}`).trim().slice(0, 300);
+    const label = filenames.join(', ');
     const repository = await run(['git', 'rev-parse', '--is-inside-work-tree']);
     if (repository.code !== 0) {
       if (/not a git repository/i.test(repository.err + repository.out)) {
-        this.logger.info?.(`[autoloop] commit_${filename}: workspace is not a git repository`);
+        this.logger.info?.(`[autoloop] commit_${label}: workspace is not a git repository`);
         return;
       }
-      throw new Error(`git rev-parse failed for ${filename} (code=${repository.code}): ${detailFor(repository)}`);
+      throw new Error(`git rev-parse failed for ${label} (code=${repository.code}): ${detailFor(repository)}`);
     }
     if (repository.out.trim() !== 'true') {
-      throw new Error(`git rev-parse did not confirm a work tree for ${filename}`);
+      throw new Error(`git rev-parse did not confirm a work tree for ${label}`);
     }
 
-    // Planner owns exactly one control artifact. Scope every git operation to
-    // that path so pre-existing staged or dirty product work remains untouched.
-    const status = await run(['git', 'status', '--porcelain', '--', filename]);
+    // Planner owns exactly this validated artifact set. Scope every git
+    // operation to those paths so unrelated staged or dirty product work
+    // remains untouched.
+    const status = await run(['git', 'status', '--porcelain', '--', ...filenames]);
     if (status.code !== 0) {
-      throw new Error(`git status failed for ${filename} (code=${status.code}): ${detailFor(status)}`);
+      throw new Error(`git status failed for ${label} (code=${status.code}): ${detailFor(status)}`);
     }
     if (status.out.trim() === '') {
-      this.logger.info?.(`[autoloop] commit_${filename}: no changes to commit`);
+      this.logger.info?.(`[autoloop] commit_${label}: no changes to commit`);
       return;
     }
-    const priorIndex = await run(['git', 'ls-files', '--stage', '--', filename]);
+    const priorIndex = await run(['git', 'ls-files', '--stage', '--', ...filenames]);
     if (priorIndex.code !== 0) {
-      throw new Error(`git ls-files failed for ${filename} (code=${priorIndex.code}): ${detailFor(priorIndex)}`);
+      throw new Error(`git ls-files failed for ${label} (code=${priorIndex.code}): ${detailFor(priorIndex)}`);
     }
-    const add = await run(['git', 'add', '--', filename]);
+    const add = await run(['git', 'add', '--', ...filenames]);
     if (add.code !== 0) {
-      throw new Error(`git add failed for ${filename} (code=${add.code}): ${detailFor(add)}`);
+      throw new Error(`git add failed for ${label} (code=${add.code}): ${detailFor(add)}`);
     }
-    const commit = await run(['git', 'commit', '--only', '-m', message, '--', filename]);
+    const commit = await run(['git', 'commit', '--only', '-m', message, '--', ...filenames]);
     if (commit.code !== 0) {
       const detail = detailFor(commit);
-      const removeCurrent = await run(['git', 'update-index', '--force-remove', '--', filename]);
+      const removeCurrent = await run(['git', 'update-index', '--force-remove', '--', ...filenames]);
       let restoreError = removeCurrent.code === 0 ? '' : detailFor(removeCurrent);
       if (!restoreError && priorIndex.out.length > 0) {
         const restore = await run(['git', 'update-index', '--index-info'], priorIndex.out);
@@ -4368,7 +4466,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       }
       // Surface, don't just log: a silent commit failure leaves the file on disk
       // but uncommitted, so the next Coder iter sees inconsistent git state.
-      const failure = `git commit failed for ${filename} (code=${commit.code}): ${detail}`;
+      const failure = `git commit failed for ${label} (code=${commit.code}): ${detail}`;
       const surfaced = restoreError ? `${failure}; index restoration failed: ${restoreError}` : failure;
       this.logger.error?.(`[autoloop] ${surfaced}`);
       this.emit('planner_error', new Error(surfaced));

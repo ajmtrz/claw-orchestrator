@@ -153,13 +153,14 @@ export interface PlannerToolEffects {
   releaseReviewRequest?: (idempotencyKey: string, payload: CheckpointReviewRequestPayload) => void;
   /** Apply an already validated/canonical in-memory push-policy delta. */
   updatePushPolicy: (delta: Record<string, unknown>) => void;
-  /**
-   * Write content to <workspace>/<file> (plan.md or goal.json), then
-   * best-effort `git add && git commit`. The Planner has no Write/Edit
-   * tools — this autoloop tool is the only path to author plan.md/goal.json,
-   * which physically prevents the Planner from doing Coder work.
-   */
-  writePlanFile: (file: 'plan.md' | 'goal.json', content: string, commitMessage?: string) => Promise<void>;
+  /** Atomically materialize the complete plan/goal write set before later effects. */
+  writePlanFiles: (writes: readonly PlannerArtifactWrite[]) => Promise<void>;
+}
+
+export interface PlannerArtifactWrite {
+  file: 'plan.md' | 'goal.json';
+  content: string;
+  commitMessage?: string;
 }
 
 // ─── Tool execution ──────────────────────────────────────────────────────────
@@ -173,6 +174,7 @@ export interface PlannerToolHandlerResult {
 
 interface PreparedPlannerToolCall {
   tool: string;
+  artifact?: PlannerArtifactWrite;
   apply: () => Promise<AnyAutoloopMessage[]> | AnyAutoloopMessage[];
 }
 
@@ -672,6 +674,15 @@ export function validatePlannerToolCalls(calls: readonly PlannerToolCall[]): Pla
     }
   }
   if (errors.length > 0) return { calls: [], errors, blocked_policy_silence: [] };
+  for (const singleton of ['write_plan', 'write_goal', 'spawn_subagents'] as const) {
+    if (validated.filter(({ tool }) => tool === singleton).length > 1) {
+      return {
+        calls: [],
+        errors: [{ tool: singleton, error: `duplicate ${singleton} control in one Planner batch` }],
+        blocked_policy_silence: [],
+      };
+    }
+  }
   if (validated.length === 0 && blockedPolicySilence.length > 0) {
     return {
       calls: [],
@@ -861,20 +872,16 @@ function preparePlannerToolCall(call: PlannerToolCall, fx: PlannerToolEffects, i
       const { content, commit_message } = call.args as { content: string; commit_message?: string };
       return {
         tool: call.tool,
-        apply: async () => {
-          await fx.writePlanFile('plan.md', content, commit_message);
-          return [];
-        },
+        artifact: { file: 'plan.md', content, commitMessage: commit_message },
+        apply: () => [],
       };
     }
     case 'write_goal': {
       const { content, commit_message } = call.args as { content: string; commit_message?: string };
       return {
         tool: call.tool,
-        apply: async () => {
-          await fx.writePlanFile('goal.json', content, commit_message);
-          return [];
-        },
+        artifact: { file: 'goal.json', content, commitMessage: commit_message },
+        apply: () => [],
       };
     }
     default:
@@ -926,7 +933,22 @@ export async function applyValidatedPlannerToolCalls(
 
   for (const call of validation.calls) prepared.push(preparePlannerToolCall(call, fx, iter));
 
+  const artifacts = prepared.flatMap(({ artifact }) => (artifact ? [artifact] : []));
+  if (artifacts.length > 0) {
+    try {
+      fx.assertActive?.();
+      await fx.writePlanFiles(artifacts);
+      fx.assertActive?.();
+    } catch (err) {
+      return {
+        emitted_messages: [],
+        errors: [{ tool: artifacts.map(({ file }) => file).join(','), error: (err as Error).message }],
+      };
+    }
+  }
+
   for (const control of prepared) {
+    if (control.artifact) continue;
     let messages: AnyAutoloopMessage[] = [];
     try {
       fx.assertActive?.();
