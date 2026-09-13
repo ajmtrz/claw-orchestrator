@@ -2,8 +2,9 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { DEFAULT_SERVER_PORT } from '../constants.js';
 import plugin from '../index.js';
-import { validatePlannerToolCalls } from '../autoloop/planner-tools.js';
+import { parsePlannerReply, validatePlannerToolCalls, type PlannerToolCall } from '../autoloop/planner-tools.js';
 
 interface RegisteredTool {
   name: string;
@@ -28,8 +29,15 @@ function registeredTools(): RegisteredTool[] {
   return tools;
 }
 
+function section(reference: string, heading: string): string {
+  const start = reference.indexOf(heading);
+  expect(start).toBeGreaterThanOrEqual(0);
+  const nextHeading = reference.indexOf('\n## ', start + heading.length);
+  return reference.slice(start, nextHeading === -1 ? undefined : nextHeading);
+}
+
 describe('Autoloop documentation contract', () => {
-  it('documents recovery fields, errors, and HTTP routes that match the public registrations', () => {
+  it('documents production-derived embedded recovery and review routes, schemas, and error statuses', () => {
     const reference = documentation();
     const tools = new Map(registeredTools().map((tool) => [tool.name, tool]));
     const recover = tools.get('autoloop_recover');
@@ -48,24 +56,33 @@ describe('Autoloop documentation contract', () => {
       additionalProperties: false,
       required: ['run_id', 'checkpoint_sha', 'source_run_id', 'source_iter', 'scope', 'idempotency_key'],
     });
+    const recovery = section(reference, '## Durable recovery and Reviewer-only requests');
+    const recoverRoute = `POST http://127.0.0.1:${DEFAULT_SERVER_PORT}/autoloop/my-run/recover`;
+    const reviewRoute = `POST http://127.0.0.1:${DEFAULT_SERVER_PORT}/autoloop/my-run/request_review`;
+
     expect(reference).toContain('`autoloop_recover`');
     expect(reference).toContain('`run_id`, `apply?`, `recovery_token?`');
-    expect(reference).toContain('POST http://127.0.0.1:18789/autoloop/my-run/recover');
-    expect(reference).toContain('POST http://127.0.0.1:18789/autoloop/my-run/request_review');
+    expect(recovery).toContain(recoverRoute);
+    expect(recovery).toContain(reviewRoute);
+    expect(recovery).toContain('"apply":true,"recovery_token":"<inspection-token>"');
+    expect(recovery).toContain(
+      '"checkpoint_sha":"<40-hex-sha>","source_run_id":"my-run","source_iter":7,"scope":["security"],"idempotency_key":"review-7"',
+    );
     for (const [code, status] of [
       ['AUTOLOOP_RECOVERY_TOKEN_REQUIRED', 'HTTP 400'],
       ['AUTOLOOP_RECOVERY_TOKEN_STALE', 'HTTP 409'],
       ['AUTOLOOP_RECOVERY_MANUAL_RESOLUTION_REQUIRED', 'HTTP 409'],
       ['AUTOLOOP_RECOVERY_INCOMPLETE', 'HTTP 409'],
     ]) {
-      expect(reference).toContain(code);
-      expect(reference).toContain(status);
+      expect(recovery).toContain(`| \`${code}\` | ${status} |`);
     }
   });
 
-  it('documents independent control examples that the Planner accepts, while rejected combinations remain rejected', () => {
+  it('parses and validates the documented independent Planner control examples', () => {
     const reference = documentation();
-    const validControls = [
+    const independentControls = section(reference, '### Independent controls and Reviewer-only delivery');
+    const documented = parsePlannerReply(independentControls);
+    const expected: PlannerToolCall[] = [
       { tool: 'spawn_coder', args: { coder_engine: 'codex', coder_model: 'gpt-5.6-sol' } },
       { tool: 'spawn_reviewer', args: { reviewer_engine: 'codex', reviewer_model: 'gpt-5.6-sol' } },
       {
@@ -78,14 +95,19 @@ describe('Autoloop documentation contract', () => {
           idempotency_key: 'review-7',
         },
       },
-    ] as const;
+    ];
 
-    for (const control of validControls) {
-      expect(validatePlannerToolCalls([control])).toMatchObject({ errors: [], calls: [control] });
+    expect(documented.parse_errors).toEqual([]);
+    expect(documented.calls).toEqual(expected);
+    for (const control of documented.calls) {
+      const validation = validatePlannerToolCalls([control]);
+      expect(validation.errors).toEqual([]);
+      expect(validation.blocked_policy_silence).toEqual([]);
+      expect(validation.calls).toEqual([control]);
     }
     expect(
       validatePlannerToolCalls([
-        validControls[0],
+        documented.calls[0],
         { tool: 'notify_user', args: { level: 'info', summary: 'not allowed with a singleton control' } },
       ]),
     ).toMatchObject({
@@ -93,9 +115,6 @@ describe('Autoloop documentation contract', () => {
       errors: [{ tool: 'spawn_coder', error: expect.stringMatching(/only Planner control/) }],
     });
 
-    expect(reference).toContain('`spawn_coder`');
-    expect(reference).toContain('`spawn_reviewer`');
-    expect(reference).toContain('`request_review`');
-    expect(reference).toContain('only Planner control in its batch');
+    expect(independentControls).toContain('only Planner control in its batch');
   });
 });

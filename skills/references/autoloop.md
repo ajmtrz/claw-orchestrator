@@ -185,10 +185,10 @@ Inspect first, then use the returned token only for the exact current action:
 ```
 
 ```bash
-curl -X POST http://127.0.0.1:18789/autoloop/my-run/recover \
+curl -X POST http://127.0.0.1:18796/autoloop/my-run/recover \
   -H 'content-type: application/json' -d '{}'
 
-curl -X POST http://127.0.0.1:18789/autoloop/my-run/recover \
+curl -X POST http://127.0.0.1:18796/autoloop/my-run/recover \
   -H 'content-type: application/json' \
   -d '{"apply":true,"recovery_token":"<inspection-token>"}'
 ```
@@ -216,8 +216,23 @@ its batch”. `spawn_subagents` remains the compatible joint-start control.
 It is Reviewer-only, does not start a Coder or continuation run, and repeating
 the same identity does not enqueue a duplicate request.
 
+The following are complete, individually valid Planner control blocks; emit one
+block as its complete control batch:
+
+```autoloop
+{"tool":"spawn_coder","args":{"coder_engine":"codex","coder_model":"gpt-5.6-sol"}}
+```
+
+```autoloop
+{"tool":"spawn_reviewer","args":{"reviewer_engine":"codex","reviewer_model":"gpt-5.6-sol"}}
+```
+
+```autoloop
+{"tool":"request_review","args":{"checkpoint_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_run_id":"source-run","source_iter":7,"scope":["security"],"idempotency_key":"review-7"}}
+```
+
 ```bash
-curl -X POST http://127.0.0.1:18789/autoloop/my-run/request_review \
+curl -X POST http://127.0.0.1:18796/autoloop/my-run/request_review \
   -H 'content-type: application/json' \
   -d '{"checkpoint_sha":"<40-hex-sha>","source_run_id":"my-run","source_iter":7,"scope":["security"],"idempotency_key":"review-7"}'
 ```
