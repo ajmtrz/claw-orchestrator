@@ -158,8 +158,97 @@ curl -X POST http://127.0.0.1:18789/v1/openclaw/tools/autoloop_stop \
 | `autoloop_chat`        | `run_id`, `text`                                                                                | Send a chat message to the Planner; returns the Planner's reply.                                                   |
 | `autoloop_status`      | `run_id`                                                                                        | Current state (status, iter, push count, subagents_spawned).                                                       |
 | `autoloop_list`        | —                                                                                               | All active runs in this manager process.                                                                           |
+| `autoloop_recover`     | `run_id`, `apply?`, `recovery_token?`                                                         | Inspect durable evidence by default; apply only the exact inspected action behind its current token.               |
 | `autoloop_stop`        | `run_id`, `reason?`                                                                             | Terminate; stops Planner / Coder / Reviewer.                                                                       |
 | `autoloop_reset_agent` | `run_id`, `agent` ('planner' / 'coder' / 'reviewer'), `force?`, `eager_restart?`                | Reset one subagent. Planner reset requires `force: true`.                                                          |
+| `autoloop_request_review` | `run_id`, `checkpoint_sha`, `source_run_id`, `source_iter`, `scope`, `idempotency_key`       | Persist and queue one idempotent Reviewer-only request for an existing source checkpoint.                          |
+
+## Durable recovery and Reviewer-only requests
+
+Recovery is evidence-first: inspection is read-only and reconstructs its
+effective phase from append-only artifacts, delivery intent/acknowledgement
+identity, and generation evidence. It does not infer a missing effect from
+process memory. The effective phases are `PLANNING`, `AWAITING_CODER`,
+`CODER_RUNNING`, `AWAITING_REVIEW`, `REVIEWER_RUNNING`, `PAUSED_RECOVERABLE`,
+`BLOCKED`, and `COMPLETED`. `BLOCKED` requires `manual_resolution`.
+
+### Inspect, then apply
+
+Inspect first, then use the returned token only for the exact current action:
+
+```json
+{"tool":"autoloop_recover","arguments":{"run_id":"my-run"}}
+```
+
+```json
+{"tool":"autoloop_recover","arguments":{"run_id":"my-run","apply":true,"recovery_token":"<inspection-token>"}}
+```
+
+```bash
+curl -X POST http://127.0.0.1:18789/autoloop/my-run/recover \
+  -H 'content-type: application/json' -d '{}'
+
+curl -X POST http://127.0.0.1:18789/autoloop/my-run/recover \
+  -H 'content-type: application/json' \
+  -d '{"apply":true,"recovery_token":"<inspection-token>"}'
+```
+
+Changing evidence makes a token stale; inspect again. Reapplying a durably
+applied token is idempotent, but an unresolved prepared effect fails closed.
+Replay an unacknowledged outbox identity only when it remains recoverable; this
+does not promise physical exactly-once execution or universal automatic retry.
+
+| Recovery error | HTTP status | Operator action |
+| --- | --- | --- |
+| `AUTOLOOP_RECOVERY_TOKEN_REQUIRED` | HTTP 400 | Inspect first, then supply the returned token with `apply: true`. |
+| `AUTOLOOP_RECOVERY_TOKEN_STALE` | HTTP 409 | Evidence changed; inspect again and use the new token. |
+| `AUTOLOOP_RECOVERY_MANUAL_RESOLUTION_REQUIRED` | HTTP 409 | Preserve evidence and resolve ambiguity; do not retry blindly. |
+| `AUTOLOOP_RECOVERY_INCOMPLETE` | HTTP 409 | Investigate incomplete durable evidence before another effect. |
+
+### Independent controls and Reviewer-only delivery
+
+The Planner may use independent `spawn_coder`, `spawn_reviewer`, or
+`request_review` controls. Each is the only Planner control in its batch;
+combining one with any other control is rejected with “only Planner control in
+its batch”. `spawn_subagents` remains the compatible joint-start control.
+`request_review` binds the full `checkpoint_sha`, `source_run_id`,
+`source_iter`, `scope`, and `idempotency_key`; its `scope` accepts 1–128 items.
+It is Reviewer-only, does not start a Coder or continuation run, and repeating
+the same identity does not enqueue a duplicate request.
+
+```bash
+curl -X POST http://127.0.0.1:18789/autoloop/my-run/request_review \
+  -H 'content-type: application/json' \
+  -d '{"checkpoint_sha":"<40-hex-sha>","source_run_id":"my-run","source_iter":7,"scope":["security"],"idempotency_key":"review-7"}'
+```
+
+`autoloop_reset_agent` reports success only after the prior generation is
+released and, when requested, eager replacement owns a newer generation.
+Occupied or unknown ownership is a typed failure, not evidence that a prior
+agent stopped. Legacy artifacts are inspected read-only and are never rewritten
+to invent generation or outbox evidence.
+
+HTTP `POST /autoloop/<id>/chat` returning **202** means only that the message
+was queued; a later `planner_error` can still be terminal. The in-process MCP
+`autoloop_chat` path awaits the Planner reply instead.
+
+### Failure map and operator limits
+
+| Original failure | Root cause | Invariant and deterministic coverage |
+| --- | --- | --- |
+| Wrong directive replay after Planner confirmation | Volatile current directive replaced persisted identity. | I3–I5: recipient bytes/hash equal the confirmed original; a newer distractor is never sent (`autoloop-outbox`, `autoloop-dispatcher`, four-engine matrix). |
+| Expired activity lease leaves recoverable work paused | Physical liveness was confused with durable phase. | I6–I8: artifacts reconstruct only the exact next action; live/unknown owners remain protected and repeated apply shares one receipt (`autoloop-recovery`, `session-manager`, matrix). |
+| Dead session name blocks recreation | Reservation outlived its physical owner. | I1/I7: proved-absent owners release once, a higher generation may reuse the name, and stale owners are rejected (`autoloop-dispatcher`, durable E2E, matrix). |
+| Reset reports success without replacement | Reset did not verify its postcondition. | I1/I7: release plus requested eager replacement is proved; occupied or unknown state returns typed failure (`session-manager`, durable E2E, matrix). |
+| Empty chat succeeds without persisted control | Transport exit was mistaken for logical success. | I2: empty/missing session, required-tool denial, malformed or missing control fail with no phase advance; asynchronous failure is durable (`agy-planner-e2e`, `session-manager`, `embedded-server-launcher`, matrix). |
+| Existing checkpoint cannot reach Reviewer alone | Joint lifecycle coupled Reviewer to Coder. | I3/I8: one source-bound verdict, no Coder start, no new logical run, and retry adds no duplicate delivery (`autoloop-planner-tools`, durable E2E, matrix). |
+
+Roll out by inspecting a representative stopped or failed run first, recording
+its evidence and token, then applying only an unambiguous action. Preserve
+append-only evidence and the prior operator procedure for local revert
+containment. Unknown external effects, incomplete evidence, and ambiguous
+ownership require manual resolution; this guidance does not instruct recovery
+of a customer run.
 
 ## Planner-emitted control tools
 
@@ -183,6 +272,9 @@ removes partial files, and suppresses both spawn and directives.
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `notify_user`        | `level` ('info' / 'warn' / 'decision' / 'error'), `summary`, `detail?`, `channel?` ('auto' / 'wechat' / 'webchat' / 'both' / 'email') | Push you out-of-band.                                                                                                                                                                                                                                                                |
 | `spawn_subagents`    | `coder_engine?`, `coder_model?`, `reviewer_engine?`, `reviewer_model?`, `initial_directive?`                                          | Start Coder + Reviewer. Omitted values inherit run defaults. An engine change without a model uses the new engine's default. Once a role session has started, changing its engine/model is rejected. Custom configs cannot be emitted by Planner. Only after explicit user approval. |
+| `spawn_coder`        | `coder_engine?`, `coder_model?`                                                                                                       | Independently start Coder. This must be the only Planner control in its batch. |
+| `spawn_reviewer`     | `reviewer_engine?`, `reviewer_model?`                                                                                                 | Independently start Reviewer. This must be the only Planner control in its batch. |
+| `request_review`     | `checkpoint_sha`, `source_run_id`, `source_iter`, `scope`, `idempotency_key`                                                        | Queue a source-bound Reviewer-only request. This must be the only Planner control in its batch. |
 | `send_directive`     | `goal`, `constraints?`, `success_criteria?`, `max_attempts?`                                                                          | Next iter's instruction to Coder.                                                                                                                                                                                                                                                    |
 | `pause_loop`         | `reason`                                                                                                                              | Halt subloop at next iter boundary; chat keeps working.                                                                                                                                                                                                                              |
 | `resume_loop`        | —                                                                                                                                     | Resume after pause.                                                                                                                                                                                                                                                                  |

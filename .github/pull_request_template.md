@@ -23,3 +23,14 @@ How was this tested?
 - [ ] Self-reviewed
 - [ ] CHANGELOG.md updated (for user-facing changes)
 - [ ] No `package-lock.json` in diff
+
+## Durable recovery (if applicable)
+
+- [ ] Incident and affected recovery boundary are stated.
+- [ ] Root cause is recorded.
+- [ ] Invariant preventing recurrence is explicit.
+- [ ] Focused regression-test evidence demonstrates the invariant.
+- [ ] Inspect-first rollout and monitoring are documented.
+- [ ] Safe rollback or containment procedure is documented.
+- [ ] Non-goals are explicit.
+- [ ] Remaining risks and manual-resolution conditions are stated.
