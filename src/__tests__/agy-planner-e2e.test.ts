@@ -20,7 +20,17 @@ const value = (flag) => {
 };
 const conversation = value('--conversation');
 process.stdout.write(JSON.stringify({ event: 'init', conversation_id: '${CONVERSATION_ID}' }) + '\\n');
-if (conversation === undefined) {
+if (process.env.AUTOLOOP_E2E_AGY_EMPTY_REPLY === '1') {
+  process.stdout.write(JSON.stringify({
+    event: 'result',
+    result: {
+      conversation_id: '${CONVERSATION_ID}',
+      status: 'SUCCESS',
+      response: '',
+      usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0 },
+    },
+  }) + '\\n');
+} else if (conversation === undefined) {
   process.stdout.write(JSON.stringify({
     event: 'result',
     result: {
@@ -44,6 +54,41 @@ if (conversation === undefined) {
 `;
 
 describe('AGY Planner strict success contract', () => {
+  it('rejects a successful AGY turn whose logical reply is empty', async () => {
+    // Production break caught: an engine transport success with an empty
+    // logical reply advances the Planner boundary as if it were a real turn.
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-planner-empty-reply-'));
+    const fixturePath = path.join(workspace, 'agy-fixture.mjs');
+    fs.writeFileSync(fixturePath, AGY_FIXTURE, { mode: 0o755 });
+    const previousAgyBin = process.env.AGY_BIN;
+    const previousEmptyReply = process.env.AUTOLOOP_E2E_AGY_EMPTY_REPLY;
+    process.env.AGY_BIN = fixturePath;
+    process.env.AUTOLOOP_E2E_AGY_EMPTY_REPLY = '1';
+    const manager = new SessionManager({ maxConcurrentSessions: 1 }, nullLogger);
+    const dispatcher = new ClaudeAgentDispatcher({
+      manager,
+      runId: `agy-empty-reply-${randomUUID()}`,
+      workspace,
+      plannerEngine: 'agy',
+      logger: nullLogger,
+    });
+
+    try {
+      await expect(dispatcher.deliver(Msg.chat(0, { text: 'produce an empty logical reply' }))).rejects.toMatchObject({
+        code: 'AUTOLOOP_EMPTY_REPLY',
+        retryable: true,
+      });
+    } finally {
+      await dispatcher.shutdown('agy-empty-reply-cleanup', { purge: true });
+      await manager.shutdown();
+      if (previousAgyBin === undefined) delete process.env.AGY_BIN;
+      else process.env.AGY_BIN = previousAgyBin;
+      if (previousEmptyReply === undefined) delete process.env.AUTOLOOP_E2E_AGY_EMPTY_REPLY;
+      else process.env.AUTOLOOP_E2E_AGY_EMPTY_REPLY = previousEmptyReply;
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
   it('rejects a denied turn and reuses its conversation for a successful retry', async () => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-planner-success-contract-'));
     const fixturePath = path.join(workspace, 'agy-fixture.mjs');
