@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { verifyBundle, verifySeries, verifyLegacyCase, LEGACY_TITLES, SOURCE_URL as verifySource } from './verify.mjs';
 import { captureExecution, collect, SOURCE_URL as collectorSource } from './collect.mjs';
@@ -23,6 +24,63 @@ const tap =
 const originalCommit = '1559595d688fd91e2d9d9073c395f66d222afd83';
 const originalBundle = 'evidence/candidate/legacy-1789355466078-105035dd-ce89-4fb4-a876-56d398fb81d4/bundle.json';
 const artifactRoot = path.join(project, '.artifacts', run);
+const firstCorrection = 'a0a6fdaf188d107d9eacd760984685ada813da1e';
+const firstCorrectionDirectory = path.join(
+  artifactRoot,
+  'evidence/candidate/legacy-1789359636920-7c9e02d9-4e71-4c01-a83b-087501a6396d',
+);
+const firstCorrectionDigest = '8f28667ee4ee9db372d767ea08178bbd0823ac87763fff849381f907cf240c99';
+
+test('audits controller commit then receipt verification under the controller Node path', () => {
+  fs.mkdirSync(scratch, { recursive: true });
+  const directory = fs.mkdtempSync(path.join(scratch, 'controller-finalization-'));
+  const code = `import { auditLegacyFinalization } from ${JSON.stringify(collectorSource)};
+    const result = auditLegacyFinalization(${JSON.stringify(firstCorrection)}, ${JSON.stringify(firstCorrectionDirectory)}, ${JSON.stringify(firstCorrectionDigest)}, 'a89dc369113aaeaefb469625f4c4532d83e481a85dccde392e4f4f6967836f3d');
+    console.log(JSON.stringify({runtime:process.execPath, ...result.result}));`;
+  // This is an already-installed controller executable, not a copied binary or
+  // changed runtime configuration. The audit executes the complete receipt
+  // construction/verification path using actual committed Git objects.
+  const argv = ['proxy', '/home/openclaw/.openclaw/tools/node-v26.7.0/bin/node', '--input-type=module', '-'];
+  const result = spawnSync('rtk', argv, { cwd: project, input: code, encoding: 'utf8' });
+  fs.writeFileSync(path.join(directory, 'stdout.txt'), result.stdout);
+  fs.writeFileSync(path.join(directory, 'stderr.txt'), result.stderr);
+  fs.writeFileSync(
+    path.join(directory, 'execution.json'),
+    JSON.stringify({ argv: ['rtk', ...argv], status: result.status, signal: result.signal, commit: firstCorrection }),
+  );
+  assert.equal(result.status, 0, result.stderr);
+  const observed = JSON.parse(result.stdout);
+  assert.equal(observed.committed_head, firstCorrection);
+  assert.equal(observed.committed_tree, 'e4f0fdbe301d8b6843447d4dae12505ce6ca0c73');
+  assert.equal(observed.postcommit_verified, true);
+  assert.equal(observed.cases, 25);
+});
+
+test('rejects altered historical tool bytes despite refreshed manifest and bundle hashes', () => {
+  const directory = fs.mkdtempSync(path.join(scratch, 'controller-tool-tamper-'));
+  fs.cpSync(firstCorrectionDirectory, directory, { recursive: true });
+  const inputFile = path.join(directory, 'inputs.json');
+  const manifest = JSON.parse(fs.readFileSync(inputFile));
+  manifest.tools[1].sha256 = '0'.repeat(64);
+  const inputBytes = JSON.stringify(manifest, null, 2) + '\n';
+  fs.writeFileSync(inputFile, inputBytes);
+  const bundleFile = path.join(directory, 'bundle.json');
+  const bundle = JSON.parse(fs.readFileSync(bundleFile));
+  bundle.input_manifest.sha256 = digest(inputBytes);
+  bundle.tool_sha256 = digest(JSON.stringify(manifest.tools));
+  const bytes = JSON.stringify(bundle, null, 2) + '\n';
+  fs.writeFileSync(bundleFile, bytes);
+  assert.throws(
+    () =>
+      collector.auditLegacyFinalization(
+        firstCorrection,
+        directory,
+        digest(bytes),
+        'a89dc369113aaeaefb469625f4c4532d83e481a85dccde392e4f4f6967836f3d',
+      ),
+    /historical tool|tool.*bytes/i,
+  );
+});
 function originalCommitLink() {
   const files = JSON.parse(
     fs.readFileSync(path.join(artifactRoot, 'evidence/candidate/slice1-finish-002/candidate-files.json')),
@@ -39,6 +97,76 @@ function originalCommitLink() {
     },
     files: files.sort((a, b) => a.path.localeCompare(b.path)),
   };
+}
+
+for (const [name, change, expected] of [
+  [
+    'head',
+    (x) => {
+      x.commit = originalCommit;
+    },
+    /head/i,
+  ],
+  [
+    'tree',
+    (x) => {
+      x.tree = originalCommitLink().tree;
+    },
+    /tree/i,
+  ],
+  [
+    'parent',
+    (x) => {
+      x.parent = firstCorrection;
+    },
+    /parent/i,
+  ],
+  [
+    'base',
+    (x) => {
+      x.base = originalCommit;
+    },
+    /base/i,
+  ],
+  [
+    'missing history',
+    (x) => {
+      delete x.history;
+    },
+    /history/i,
+  ],
+  [
+    'replayed history',
+    (x) => {
+      x.history = [x.original];
+    },
+    /history/i,
+  ],
+  [
+    'original anchor hash',
+    (x) => {
+      x.original.bundle.sha256 = '0'.repeat(64);
+    },
+    /bundle/i,
+  ],
+  [
+    'candidate bundle hash',
+    (x) => {
+      x.candidate.bundle.sha256 = '0'.repeat(64);
+    },
+    /hash/i,
+  ],
+]) {
+  test(`rejects complete controller receipt with wrong ${name}`, () => {
+    const { receipt } = collector.auditLegacyFinalization(
+      firstCorrection,
+      firstCorrectionDirectory,
+      firstCorrectionDigest,
+      'a89dc369113aaeaefb469625f4c4532d83e481a85dccde392e4f4f6967836f3d',
+    );
+    change(receipt);
+    assert.throws(() => collector.verifyReceiptData(receipt, firstCorrection), expected);
+  });
 }
 
 test('binds preserved precommit evidence to the actual immutable Slice 1 Git commit', () => {

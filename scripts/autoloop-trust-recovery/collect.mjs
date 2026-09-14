@@ -376,7 +376,7 @@ const LEGACY_SOURCES = [
   ...Object.keys(LEGACY_BASELINES).map((kind) => `.worktrees/trust-recovery-r1/${kind}/src/session-manager.ts`),
 ].map((file) => path.join(PROJECT, file));
 
-function legacySnapshot() {
+export function legacySnapshot() {
   const snapshot = inputSnapshot(LEGACY_FILES);
   const entry = (file) => ({ path: file, sha256: sha256(fs.readFileSync(file)) });
   for (const [kind, head] of Object.entries(LEGACY_BASELINES)) {
@@ -635,6 +635,11 @@ function verifyLegacyObservations(values, directory, candidateHead) {
 // Immutable anchor from the approved Slice 1 review. It is historical evidence,
 // never rewritten as a claim that a newer commit produced these observations.
 const ORIGINAL_COMMIT = '1559595d688fd91e2d9d9073c395f66d222afd83';
+const FIRST_CORRECTION = 'a0a6fdaf188d107d9eacd760984685ada813da1e';
+const FIRST_CORRECTION_BUNDLE = {
+  path: 'evidence/candidate/legacy-1789359636920-7c9e02d9-4e71-4c01-a83b-087501a6396d/bundle.json',
+  sha256: '8f28667ee4ee9db372d767ea08178bbd0823ac87763fff849381f907cf240c99',
+};
 const ORIGINAL_BUNDLE = {
   path: 'evidence/candidate/legacy-1789355466078-105035dd-ce89-4fb4-a876-56d398fb81d4/bundle.json',
   sha256: 'a89dc369113aaeaefb469625f4c4532d83e481a85dccde392e4f4f6967836f3d',
@@ -686,7 +691,20 @@ function commitFile(commit, file, seen = new Set()) {
   return commitFile(commit, target, new Set([...seen, file]));
 }
 
-function committedSnapshot(commit, parent) {
+function historicalTools(manifest) {
+  ensure(Array.isArray(manifest.tools) && manifest.tools.length === 2, 'Wrong historical tool inventory');
+  equal(manifest.tools.map((tool) => path.basename(tool.path)).sort(), ['node', 'rtk'], 'Wrong historical tool names');
+  return manifest.tools.map((tool) => {
+    ensure(path.isAbsolute(tool.path) && fs.statSync(tool.path).isFile(), 'Missing historical tool file');
+    // The execution path belongs to the historical process. Recompute its
+    // executable bytes independently; the verifier's PATH is not that process.
+    const actual = sha256(fs.readFileSync(tool.path));
+    equal(actual, tool.sha256, `Historical tool bytes differ: ${tool.path}`);
+    return { path: tool.path, sha256: actual };
+  });
+}
+
+function committedSnapshot(commit, parent, historicalManifest) {
   const current = legacySnapshot();
   const names = [...commitTree(commit).keys()].filter(
     (file) =>
@@ -708,7 +726,7 @@ function committedSnapshot(commit, parent) {
       tracked: [...tracked.values()].sort((a, b) => a.path.localeCompare(b.path)),
       harness: LEGACY_FILES.toSorted().map(entry),
       dependencies: current.manifest.dependencies,
-      tools: current.manifest.tools,
+      tools: historicalTools(historicalManifest),
     },
   };
 }
@@ -774,7 +792,8 @@ export function verifyLegacyCommitLink(link, expectedCommit) {
   // Preserve its bytes/hash, while comparing every complete section to Git.
   equal(patchSections(patch), patchSections(actualPatch), 'Complete patch differs from actual Git objects');
   equal(link.files, changedCommitFiles(link.parent, expectedCommit), 'Changed file bytes or Git objects differ');
-  const snapshot = committedSnapshot(expectedCommit, link.parent);
+  const manifest = JSON.parse(readArtifact(directory, bundle.input_manifest));
+  const snapshot = committedSnapshot(expectedCommit, link.parent, manifest);
   const contract = legacyContract(snapshot, directory, {
     patch_sha256: sha256(patch),
     test_source_sha256s: LEGACY_FILES.map((file) => sha256(commitFile(expectedCommit, file))),
@@ -791,7 +810,7 @@ function makeCommitLink(commit, bundleRef) {
     parent,
     commit,
     tree: git('rev-parse', `${commit}^{tree}`).trim(),
-    bundle: bundleRef,
+    bundle: { ...bundleRef },
     patch: {
       path: path.posix.join(path.posix.dirname(bundleRef.path), bundle.patch.path),
       sha256: bundle.patch.sha256,
@@ -800,14 +819,20 @@ function makeCommitLink(commit, bundleRef) {
   };
 }
 
+function receiptParent(head) {
+  ensure(head !== ORIGINAL_COMMIT, 'Corrective controller commit does not exist yet');
+  const parent = head === FIRST_CORRECTION ? ORIGINAL_COMMIT : FIRST_CORRECTION;
+  equal(git('show', '-s', '--format=%P', head).trim(), parent, 'Wrong corrective commit parent');
+  return parent;
+}
+
 function frozenHead() {
   ensure(
     git('status', '--porcelain=v1', '--untracked-files=all') === '',
     'Postcommit verification requires clean, frozen source',
   );
   const head = git('rev-parse', 'HEAD').trim();
-  ensure(head !== ORIGINAL_COMMIT, 'Corrective controller commit does not exist yet');
-  equal(git('show', '-s', '--format=%P', head).trim(), ORIGINAL_COMMIT, 'Wrong corrective commit parent');
+  receiptParent(head);
   // Check actual current bytes as well as Git status (which can hide files
   // marked assume-unchanged). A receipt cannot certify an uncommitted module.
   for (const file of LEGACY_FILES)
@@ -819,16 +844,23 @@ function frozenHead() {
   return head;
 }
 
-function verifyReceiptData(receipt, head) {
+export function verifyReceiptData(receipt, head) {
   equal(receipt.schema_version, 1, 'Wrong receipt schema');
   equal(receipt.run_id, RUN_ID, 'Wrong receipt run');
   equal(receipt.kind, 'legacy-postcommit', 'Wrong receipt kind');
   equal(receipt.commit, head, 'Wrong receipt head');
-  equal(receipt.parent, ORIGINAL_COMMIT, 'Wrong receipt parent');
+  equal(receipt.parent, receiptParent(head), 'Wrong receipt parent');
   equal(receipt.base, BASE, 'Wrong receipt base');
   equal(receipt.tree, git('rev-parse', `${head}^{tree}`).trim(), 'Wrong receipt tree');
   equal(receipt.original.bundle, ORIGINAL_BUNDLE, 'Wrong original bundle hash or path');
   verifyLegacyCommitLink(receipt.original, ORIGINAL_COMMIT);
+  const extended = head !== FIRST_CORRECTION;
+  ensure(Array.isArray(receipt.history) && receipt.history.length === (extended ? 1 : 0), 'Wrong receipt history');
+  if (extended) {
+    equal(receipt.history[0].bundle, FIRST_CORRECTION_BUNDLE, 'Wrong first correction bundle hash or path');
+    equal(receipt.history[0].parent, ORIGINAL_COMMIT, 'Wrong first correction parent');
+    verifyLegacyCommitLink(receipt.history[0], FIRST_CORRECTION);
+  }
   const result = verifyLegacyCommitLink(receipt.candidate, head);
   return { ...result, committed_head: head, committed_tree: receipt.tree, postcommit_verified: true };
 }
@@ -843,22 +875,11 @@ export function verifyLegacyReceipt() {
 /** Controller-only ordering: execute this committed CLI after its atomic commit. */
 export function finalizeLegacy(directory, bundleSha256, originalSha256) {
   const head = frozenHead();
-  equal(originalSha256, ORIGINAL_BUNDLE.sha256, 'Wrong original bundle hash');
-  const relative = path.relative(ARTIFACT_ROOT, path.resolve(directory));
-  ensure(/^evidence\/candidate\/[^/]+$/.test(relative), 'Wrong candidate bundle scope');
-  const bundleRef = { path: `${relative}/bundle.json`, sha256: bundleSha256 };
-  const receipt = {
-    schema_version: 1,
-    run_id: RUN_ID,
-    kind: 'legacy-postcommit',
-    base: BASE,
-    parent: ORIGINAL_COMMIT,
-    commit: head,
-    tree: git('rev-parse', `${head}^{tree}`).trim(),
-    original: makeCommitLink(ORIGINAL_COMMIT, ORIGINAL_BUNDLE),
-    candidate: makeCommitLink(head, bundleRef),
-  };
-  verifyReceiptData(receipt, head);
+  ensure(
+    /^evidence\/candidate\/[^/]+$/.test(path.relative(ARTIFACT_ROOT, path.resolve(directory))),
+    'Wrong candidate bundle scope',
+  );
+  const { receipt } = auditLegacyFinalization(head, directory, bundleSha256, originalSha256);
   const pointerPath = path.join(ARTIFACT_ROOT, 'reports', `legacy-committed-${head}.json`);
   if (fs.existsSync(pointerPath)) {
     const existing = verifyLegacyReceipt();
@@ -871,11 +892,32 @@ export function finalizeLegacy(directory, bundleSha256, originalSha256) {
   );
   const reference = writeArtifact(attempt, 'receipt.json', JSON.stringify(receipt, null, 2) + '\n');
   reference.path = path.relative(ARTIFACT_ROOT, path.join(attempt, reference.path));
-  // The separately hashed receipt and its immutable lookup are both generated
-  // artifacts. Neither changes the historical bundle nor advances source HEAD.
   containedPath(ARTIFACT_ROOT, 'reports');
   writeArtifact(path.dirname(pointerPath), path.basename(pointerPath), JSON.stringify({ receipt: reference }) + '\n');
   return verifyLegacyReceipt();
+}
+
+/** Read-only audit of the same complete pipeline, against an existing commit.
+ * This never publishes a receipt or claims that the current worktree is frozen.
+ */
+export function auditLegacyFinalization(head, directory, bundleSha256, originalSha256) {
+  equal(originalSha256, ORIGINAL_BUNDLE.sha256, 'Wrong original bundle hash');
+  const relative = path.relative(ARTIFACT_ROOT, path.resolve(directory));
+  ensure(/^evidence\/(candidate|sensitivity)\/[^/]+$/.test(relative), 'Wrong audit bundle scope');
+  const bundleRef = { path: `${relative}/bundle.json`, sha256: bundleSha256 };
+  const receipt = {
+    schema_version: 1,
+    run_id: RUN_ID,
+    kind: 'legacy-postcommit',
+    base: BASE,
+    parent: receiptParent(head),
+    commit: head,
+    tree: git('rev-parse', `${head}^{tree}`).trim(),
+    original: makeCommitLink(ORIGINAL_COMMIT, ORIGINAL_BUNDLE),
+    history: head === FIRST_CORRECTION ? [] : [makeCommitLink(FIRST_CORRECTION, FIRST_CORRECTION_BUNDLE)],
+    candidate: makeCommitLink(head, bundleRef),
+  };
+  return { receipt, result: verifyReceiptData(receipt, head) };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
