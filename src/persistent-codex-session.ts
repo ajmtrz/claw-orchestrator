@@ -321,6 +321,7 @@ export class PersistentCodexSession extends BaseOneShotSession {
       let assistantText = '';
       let lastUsage: CodexTurnCompleted['usage'] | undefined;
       let turnError: string | undefined;
+      let turnCompleted = false;
       let settled = false;
 
       const proc = spawn(this.engineBin, args, {
@@ -396,6 +397,7 @@ export class PersistentCodexSession extends BaseOneShotSession {
             break;
           }
           case 'turn.completed': {
+            turnCompleted = true;
             const tc = event as CodexTurnCompleted;
             if (tc.usage) lastUsage = tc.usage;
             break;
@@ -442,6 +444,10 @@ export class PersistentCodexSession extends BaseOneShotSession {
 
         // Drain any final partial line as an event attempt.
         if (stdoutBuf.trim()) handleEvent(stdoutBuf);
+
+        if (code === 0 && !turnError && !turnCompleted) {
+          turnError = 'Codex exited without a turn.completed event';
+        }
 
         // One expression for the outcome: it feeds the counter here and the
         // `stop_reason` below. Classifying on the exit code alone reported

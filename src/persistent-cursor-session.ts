@@ -143,6 +143,9 @@ export class PersistentCursorSession extends BaseOneShotSession {
 
     return new Promise<TurnResult>((resolve, reject) => {
       const resultText = { value: '' };
+      let sawStructuredTurn = false;
+      let sawResult = false;
+      let turnError: string | undefined;
       let stderr = '';
       let settled = false;
       let gotUsageFromEvents = false;
@@ -169,6 +172,13 @@ export class PersistentCursorSession extends BaseOneShotSession {
         if (!line.trim()) return;
         try {
           const event = JSON.parse(line) as Record<string, unknown>;
+          if (event.type === 'system' || event.type === 'assistant') sawStructuredTurn = true;
+          if (event.type === 'result') {
+            sawResult = true;
+            if (event.is_error || event.stop_reason === 'error') {
+              turnError = String(event.result || 'Cursor reported a failed result');
+            }
+          }
           this._handleStreamEvent(event, options, resultText, () => {
             gotUsageFromEvents = true;
           });
@@ -203,7 +213,10 @@ export class PersistentCursorSession extends BaseOneShotSession {
 
         // One expression for the outcome, feeding the counter here and the
         // `stop_reason` below.
-        const ok = code === 0;
+        if (code === 0 && sawStructuredTurn && !sawResult && !turnError) {
+          turnError = 'Cursor exited before its stream-json result event';
+        }
+        const ok = code === 0 && !turnError;
         this._recordTurnComplete(ok);
 
         // Fallback: estimate tokens if stream events didn't provide usage
@@ -225,7 +238,9 @@ export class PersistentCursorSession extends BaseOneShotSession {
         this.emit(SESSION_EVENT.RESULT, event);
         this.emit(SESSION_EVENT.TURN_COMPLETE, event);
 
-        if (code !== 0) {
+        if (turnError) {
+          reject(new Error(turnError));
+        } else if (code !== 0) {
           reject(new Error(stderr || `Cursor exited with code ${code}`));
         } else {
           resolve({ text: resultText.value, event });

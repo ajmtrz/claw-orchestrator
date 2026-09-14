@@ -232,6 +232,8 @@ export class PersistentAgySession extends BaseOneShotSession {
 
     return new Promise<TurnResult>((resolve, reject) => {
       let resultText = '';
+      let sawStructuredTurn = false;
+      let sawResult = false;
       let stderr = '';
       let settled = false;
       let turnUsage: AgyUsage | undefined;
@@ -288,10 +290,12 @@ export class PersistentAgySession extends BaseOneShotSession {
           this.emit(SESSION_EVENT.TEXT, raw);
           return;
         }
+        if (evt.event === 'init') sawStructuredTurn = true;
         if (evt.event === 'init' && evt.conversation_id && !this.agyConversationId) {
           this.agyConversationId = evt.conversation_id;
         }
         if (evt.event === 'result' && evt.result) {
+          sawResult = true;
           const r = evt.result;
           if (r.conversation_id && !this.agyConversationId) this.agyConversationId = r.conversation_id;
           if (typeof r.response === 'string') {
@@ -327,6 +331,10 @@ export class PersistentAgySession extends BaseOneShotSession {
         clearTimeout(timer);
         this.currentProc = null;
         if (pending) handleLine(pending, false);
+
+        if (code === 0 && sawStructuredTurn && !sawResult && !turnError && resultText.trim()) {
+          turnError = 'Antigravity exited before its stream-json result event';
+        }
 
         const text = resultText.replace(/\n$/, '');
         const emptyResponse = text.trim().length === 0;

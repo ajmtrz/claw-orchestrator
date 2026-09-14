@@ -20,6 +20,97 @@ export function trustDigest(bytes: string | Buffer): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
+/** External CLI fixture behavior only: it never writes an Autoloop ledger. */
+export function trustNativeResponse(
+  config: { directory: string; reply: string; scenario?: string; boundary?: string; cold?: boolean },
+  prompt: string,
+): string {
+  if (config.scenario !== 'delivery' && config.scenario !== 'review') return config.reply;
+  const match = /<autoloop_delivery delivery_id="([^"]+)" payload_sha256="([a-f0-9]{64})">/.exec(prompt);
+  if (!match) return prompt.includes('[system]') ? 'receipt acknowledged' : config.reply;
+  let reviewInspection;
+  if (config.scenario === 'review') {
+    const request =
+      /\[review_request iter=(\d+)\][\s\S]*?Artifacts staged from run (\S+) iter (\d+) at: (iter-\d+)\//.exec(prompt);
+    const checkpoint = /^checkpoint_sha: ([a-f0-9]{40})$/m.exec(prompt);
+    const scope = /^scope: (.+)$/m.exec(prompt);
+    const prior = /^prior_verdict: (prior_verdict\.json|\(none\))$/m.exec(prompt);
+    if (!request || !checkpoint || !scope || !prior) throw new Error('Incomplete review request identity');
+    // Cursor deliberately runs from a separate permissions cwd; its real
+    // artifact workspace is the explicit native --workspace argument.
+    const workspaceArg = process.argv.indexOf('--workspace');
+    const workspace = workspaceArg >= 0 ? process.argv[workspaceArg + 1] : process.cwd();
+    const readArtifact = (relative: string) => {
+      const bytes = fs.readFileSync(path.join(workspace, relative));
+      return { bytes_base64: bytes.toString('base64'), bytes: bytes.length, sha256: trustDigest(bytes) };
+    };
+    reviewInspection = {
+      cwd: process.cwd(),
+      workspace,
+      request: {
+        target_iter: Number(request[1]),
+        source_run_id: request[2],
+        source_iter: Number(request[3]),
+        checkpoint_sha: checkpoint[1],
+        scope: JSON.parse(scope[1]),
+      },
+      artifacts: Object.fromEntries(
+        ['directive.json', 'diff.patch', 'eval_output.json', 'coder_summary.txt'].map((name) => [
+          name,
+          readArtifact(request[4] + '/' + name),
+        ]),
+      ),
+      prior_verdict: prior[1] === '(none)' ? null : readArtifact(prior[1]),
+    };
+  }
+  const received = {
+    delivery_id: match[1],
+    payload_sha256: match[2],
+    prompt,
+    pid: process.pid,
+    ...(reviewInspection ? { review_inspection: reviewInspection } : {}),
+  };
+  const receiptFd = fs.openSync(path.join(config.directory, 'recipient.jsonl'), 'a');
+  try {
+    fs.writeSync(receiptFd, JSON.stringify(received) + '\n');
+    fs.fsyncSync(receiptFd);
+  } finally {
+    fs.closeSync(receiptFd);
+  }
+  const effects = path.join(config.directory, 'receiver-effects.jsonl');
+  const prior = fs.existsSync(effects)
+    ? fs
+        .readFileSync(effects, 'utf8')
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+    : [];
+  if (!prior.some((row) => row.delivery_id === match[1])) {
+    const fd = fs.openSync(effects, 'a');
+    fs.writeSync(fd, JSON.stringify(received) + '\n');
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+  }
+  if (!config.cold && config.boundary === 'after-capture') {
+    fs.writeFileSync(
+      path.join(config.directory, 'barrier.json'),
+      JSON.stringify({ boundary: config.boundary, pid: process.pid, delivery_id: match[1] }),
+      { flag: 'wx' },
+    );
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+  }
+  const identity = { delivery_id: match[1], payload_sha256: match[2] };
+  const call =
+    config.scenario === 'review'
+      ? {
+          tool: 'review_complete',
+          args: { decision: 'hold', metric: null, audit_notes: 'existing checkpoint inspected', ...identity },
+        }
+      : { tool: 'request_clarification', args: { question: 'clarify the exact directive', ...identity } };
+  return '```autoloop\n' + JSON.stringify(call) + '\n```';
+}
+
 export function trustDirectory(directory: string): string {
   const absolute = path.resolve(directory);
   const relative = path.relative(trustArtifacts, absolute);

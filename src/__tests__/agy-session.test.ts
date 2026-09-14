@@ -769,6 +769,7 @@ describe('PersistentAgySession', () => {
           mockProc,
           JSON.stringify({ event: 'init', conversation_id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }) + '\n',
         );
+        feedText(mockProc, JSON.stringify({ event: 'result', result: { status: 'SUCCESS', response: 'OK' } }) + '\n');
         succeedProc(mockProc);
       }, 10);
       await p;

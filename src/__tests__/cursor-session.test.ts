@@ -116,7 +116,10 @@ describe('PersistentCursorSession', () => {
 
       const p1 = session.send('first', { waitForComplete: true });
       setTimeout(() => {
-        feedLines(mockProc, [JSON.stringify({ type: 'system', session_id: 'chat-abc123' })]);
+        feedLines(mockProc, [
+          JSON.stringify({ type: 'system', session_id: 'chat-abc123' }),
+          JSON.stringify({ type: 'result', result: 'OK' }),
+        ]);
         closeProc(mockProc, 0);
       }, 10);
       await p1;
@@ -260,6 +263,7 @@ describe('PersistentCursorSession', () => {
             type: 'assistant',
             message: { role: 'assistant', content: [{ type: 'text', text: 'world!' }] },
           }),
+          JSON.stringify({ type: 'result', result: 'Hello world!' }),
         ]);
         closeProc(mockProc, 0);
       }, 10);
@@ -357,6 +361,7 @@ describe('PersistentCursorSession', () => {
             type: 'assistant',
             message: { role: 'assistant', content: [{ type: 'text', text: 'some response text here' }] },
           }),
+          JSON.stringify({ type: 'result', result: 'some response text here' }),
         ]);
         closeProc(mockProc, 0);
       }, 10);
