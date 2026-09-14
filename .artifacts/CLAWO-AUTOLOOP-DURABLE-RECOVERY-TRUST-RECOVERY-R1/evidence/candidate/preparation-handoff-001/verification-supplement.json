@@ -1,0 +1,79 @@
+{
+  "complete_patch_check": {
+    "argv": [
+      "rtk",
+      "proxy",
+      "git",
+      "apply",
+      "--check",
+      "--whitespace=error-all",
+      "--directory=.artifacts/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1/evidence/candidate/preparation-handoff-001/patch-check",
+      ".artifacts/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1/evidence/candidate/preparation-handoff-001/candidate.patch"
+    ],
+    "cwd": "/home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery",
+    "process_id": 7,
+    "started_at": "2026-09-14T01:49:03.725128+00:00",
+    "ended_at": "2026-09-14T01:49:03.728054+00:00",
+    "exit_code": 0,
+    "stdout": {
+      "path": "complete-patch-check.stdout.txt",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "stderr": {
+      "path": "complete-patch-check.stderr.txt",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "collector_integration": {
+    "argv": [
+      "rtk",
+      "proxy",
+      "node",
+      "scripts/autoloop-trust-recovery/collect.mjs",
+      "validator"
+    ],
+    "cwd": "/home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery",
+    "process_id": 11,
+    "started_at": "2026-09-14T01:49:03.728210+00:00",
+    "ended_at": "2026-09-14T01:49:04.434064+00:00",
+    "exit_code": 0,
+    "stdout": {
+      "path": "collector-integration.stdout.txt",
+      "sha256": "6346a09e7a1fa096b97b9dc123ef85fa18d342b7ed1ba6253e364abcb8e2034d"
+    },
+    "stderr": {
+      "path": "collector-integration.stderr.txt",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "read_only_bundle_verification": {
+    "argv": [
+      "rtk",
+      "proxy",
+      "node",
+      "scripts/autoloop-trust-recovery/verify.mjs",
+      "preparation",
+      "/home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/.artifacts/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1/evidence/candidate/validator-1789350543924-f932f816-bbc3-4247-92b3-51d4ba2cea5e"
+    ],
+    "cwd": "/home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery",
+    "process_id": 139,
+    "started_at": "2026-09-14T01:49:04.434874+00:00",
+    "ended_at": "2026-09-14T01:49:04.500610+00:00",
+    "exit_code": 13,
+    "stdout": {
+      "path": "read-only-bundle-verification.stdout.txt",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "stderr": {
+      "path": "read-only-bundle-verification.stderr.txt",
+      "sha256": "9eeed9cbf46cff6c35c6e6c6a7f56878b6672119d714b5147b5c0fef1db6cdbd"
+    }
+  },
+  "collector_bundle": {
+    "directory": ".artifacts/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1/evidence/candidate/validator-1789350543924-f932f816-bbc3-4247-92b3-51d4ba2cea5e",
+    "sha256": "68f888df328db2c316844b979bdde85446a327fcb307367b0f9f14237e646626"
+  },
+  "verified_artifacts_unchanged": true,
+  "no_index_check_interpretation": "The additional git diff --no-index --check invocations returned 1 with empty stdout/stderr for new files. They were preserved as raw nonzero results, not relabeled raw PASS. The complete new-file patch is independently checked with git apply --check --whitespace=error-all.",
+  "initial_capture_driver": "Its exit 1 came from treating no-index difference status as a failed gate; all three required checks exited 0. No implementation bytes were changed."
+}

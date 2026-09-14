@@ -1,0 +1,681 @@
+✖ recomputes digest, durable event order and row count from referenced bytes (1.893597ms)
+✖ rejects fabricated invariant booleans (0.592104ms)
+✖ rejects missing artifacts (0.380835ms)
+✖ rejects changed artifact hashes (0.404037ms)
+✖ rejects wrong subject kind (0.378953ms)
+✖ rejects wrong candidate head (0.43078ms)
+✖ rejects wrong input manifest (0.446667ms)
+✖ rejects hidden process failure (0.388991ms)
+✖ rejects a terminating signal (0.433744ms)
+✖ rejects a timeout (0.446238ms)
+✖ rejects zero selected tests (0.360269ms)
+✖ rejects required skips (0.454034ms)
+✖ rejects fabricated parsed values (0.361651ms)
+✖ rejects reordered observation declarations (0.477752ms)
+✖ rejects fabricated event sequence (0.410109ms)
+✖ rejects a missing fault observation (0.368215ms)
+✖ rejects removed predicates (0.299236ms)
+✖ rejects weakened row-count predicate (0.371312ms)
+✖ rejects Coder-authored review claims (0.337536ms)
+✖ rejects unrecorded dirty test bytes (0.346908ms)
+✖ rejects missing RED patch (0.30625ms)
+✖ rejects incorrect command identity (0.330673ms)
+✖ rejects duplicate execution identity (0.369125ms)
+✖ rejects unknown observation execution (0.359949ms)
+✖ rejects fabricated observer identity (0.307386ms)
+✖ rejects out-of-run path traversal (0.303847ms)
+✖ rejects absolute artifact paths (0.275865ms)
+✖ rejects symlinked artifacts even when their target has the expected bytes (0.488069ms)
+✖ a recomputed hash cannot hide a failed test in raw TAP (1.122721ms)
+✖ a green report cannot hide a failed raw stdout stream (0.411906ms)
+✖ rejects cancellation and unhandled errors even with exit zero (0.444089ms)
+✖ recomputes predicates after both the event bytes and declared values change (0.498289ms)
+✖ detects source import misattribution from the import receipt (0.470358ms)
+✖ refuses synthetic booleans as fixed literal predicates (0.450775ms)
+✖ accepts only complete ordered repetitions with distinct execution identities (0.644391ms)
+ℹ tests 35
+ℹ suites 0
+ℹ pass 0
+ℹ fail 35
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 62.950007
+
+✖ failing tests:
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:108:1
+✖ recomputes digest, durable event order and row count from referenced bytes (1.893597ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + undefined
+  - 'directive A\n'
+  
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:111:10)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.start (node:internal/test_runner/test:1257:17)
+      at startSubtestAfterBootstrap (node:internal/test_runner/harness:387:17) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: 'directive A\n',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects fabricated invariant booleans (0.592104ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:387:3) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /schema|additional/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects missing artifacts (0.380835ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /artifact|ENOENT/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects changed artifact hashes (0.404037ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /hash/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects wrong subject kind (0.378953ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /subject/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects wrong candidate head (0.43078ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /head/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects wrong input manifest (0.446667ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /manifest/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects hidden process failure (0.388991ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /execution|exit/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects a terminating signal (0.433744ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /execution|signal/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects a timeout (0.446238ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /execution|timeout/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects zero selected tests (0.360269ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /test/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects required skips (0.454034ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /skip|test/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects fabricated parsed values (0.361651ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /value/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects reordered observation declarations (0.477752ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /order|sequence/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects fabricated event sequence (0.410109ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /sequence/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects a missing fault observation (0.368215ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /fault|observation/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects removed predicates (0.299236ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /assertion|schema/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects weakened row-count predicate (0.371312ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /assertion|contract/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects Coder-authored review claims (0.337536ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /schema|additional/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects unrecorded dirty test bytes (0.346908ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /patch|test|unfrozen/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects missing RED patch (0.30625ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /patch|unfrozen/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects incorrect command identity (0.330673ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /command|argv/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects duplicate execution identity (0.369125ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /execution|duplicate/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects unknown observation execution (0.359949ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /execution/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects fabricated observer identity (0.307386ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /observer/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects out-of-run path traversal (0.303847ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /path|artifact/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:143:3
+✖ rejects absolute artifact paths (0.275865ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:146:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /path|artifact/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:150:1
+✖ rejects symlinked artifacts even when their target has the expected bytes (0.488069ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:154:10)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /symlink|artifact/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:157:1
+✖ a recomputed hash cannot hide a failed test in raw TAP (1.122721ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:161:10)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /report|fail|TAP/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:164:1
+✖ a green report cannot hide a failed raw stdout stream (0.411906ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:167:10)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /stdout|report|fail|TAP/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:170:1
+✖ rejects cancellation and unhandled errors even with exit zero (0.444089ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:175:12)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /report|cancel|unhandled|TAP/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:179:1
+✖ recomputes predicates after both the event bytes and declared values change (0.498289ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:185:10)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /one-ack|row-count/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:188:1
+✖ detects source import misattribution from the import receipt (0.470358ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:192:10)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /import|source/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:195:1
+✖ refuses synthetic booleans as fixed literal predicates (0.450775ms)
+  AssertionError [ERR_ASSERTION]: Missing expected exception.
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:199:10)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: /boolean|predicate|schema/i,
+    operator: 'throws',
+    diff: 'simple'
+  }
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:202:1
+✖ accepts only complete ordered repetitions with distinct execution identities (0.644391ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  0 !== 2
+  
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:210:10)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:969:18)
+      at Test.postRun (node:internal/test_runner/test:1537:19)
+      at Test.run (node:internal/test_runner/test:1462:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 0,
+    expected: 2,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

@@ -1,0 +1,23 @@
+{
+  "argv": [
+    "rtk",
+    "proxy",
+    "node",
+    "scripts/autoloop-trust-recovery/verify.mjs",
+    "preparation",
+    "/home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/.artifacts/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1/evidence/candidate/validator-1789350543924-f932f816-bbc3-4247-92b3-51d4ba2cea5e"
+  ],
+  "cwd": "/home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery",
+  "process_id": 139,
+  "started_at": "2026-09-14T01:49:04.434874+00:00",
+  "ended_at": "2026-09-14T01:49:04.500610+00:00",
+  "exit_code": 13,
+  "stdout": {
+    "path": "read-only-bundle-verification.stdout.txt",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "stderr": {
+    "path": "read-only-bundle-verification.stderr.txt",
+    "sha256": "9eeed9cbf46cff6c35c6e6c6a7f56878b6672119d714b5147b5c0fef1db6cdbd"
+  }
+}

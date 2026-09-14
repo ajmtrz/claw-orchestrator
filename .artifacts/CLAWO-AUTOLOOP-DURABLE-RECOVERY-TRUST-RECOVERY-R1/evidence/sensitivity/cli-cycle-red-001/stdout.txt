@@ -1,0 +1,81 @@
+✔ recomputes digest, durable event order and row count from referenced bytes (5.735321ms)
+✔ rejects fabricated invariant booleans (0.76614ms)
+✔ rejects missing artifacts (0.962882ms)
+✔ rejects changed artifact hashes (0.990938ms)
+✔ rejects wrong subject kind (0.476678ms)
+✔ rejects wrong candidate head (0.458366ms)
+✔ rejects wrong input manifest (0.493208ms)
+✔ rejects hidden process failure (0.613729ms)
+✔ rejects a recorded spawn error with exit zero (0.781546ms)
+✔ rejects success without an observed process (0.633151ms)
+✔ rejects a terminating signal (0.58891ms)
+✔ rejects a timeout (0.523396ms)
+✔ rejects zero selected tests (0.799881ms)
+✔ rejects required skips (0.757023ms)
+✔ rejects fabricated parsed values (0.769123ms)
+✔ rejects reordered observation declarations (0.692293ms)
+✔ rejects fabricated event sequence (1.285498ms)
+✔ rejects a missing fault observation (0.657891ms)
+✔ rejects removed predicates (0.617018ms)
+✔ rejects weakened row-count predicate (0.517373ms)
+✔ rejects Coder-authored review claims (0.325146ms)
+✔ rejects unrecorded dirty test bytes (0.432453ms)
+✔ rejects missing RED patch (0.587099ms)
+✔ rejects an unfrozen snapshot relabeled as frozen (0.39233ms)
+✔ rejects substituted RED patch bytes (0.598915ms)
+✔ rejects substituted test source bytes (0.426819ms)
+✔ rejects incorrect command identity (0.414819ms)
+✔ rejects duplicate execution identity (0.567451ms)
+✔ rejects unknown observation execution (0.560424ms)
+✔ rejects fabricated observer identity (0.74475ms)
+✔ rejects out-of-run path traversal (0.556326ms)
+✔ rejects absolute artifact paths (1.017342ms)
+✔ rejects symlinked artifacts even when their target has the expected bytes (0.705001ms)
+✔ a recomputed hash cannot hide a failed test in raw TAP (0.670465ms)
+✔ a green report cannot hide a failed raw stdout stream (0.601696ms)
+✔ rejects cancellation and unhandled errors even with exit zero (1.183295ms)
+✔ recomputes predicates after both the event bytes and declared values change (1.928802ms)
+✔ detects source import misattribution from the import receipt (0.813238ms)
+✔ refuses synthetic booleans as fixed literal predicates (0.439884ms)
+✔ accepts only complete ordered repetitions with distinct execution identities (2.699359ms)
+✔ reads a JSON event from an exact byte range and rejects an invalid range (0.911313ms)
+✔ collector retains real child stdout, stderr, argv, cwd, exit and test inventory (21.443737ms)
+✔ collector kills its timed-out process and retains its terminating signal (105.723015ms)
+✔ collector preserves spawn failure rather than inventing a successful process (3.782432ms)
+✔ collector redacts known credential forms and records the applied rules (18.219374ms)
+✔ collector refuses overwrites and output paths outside the run artifact root before spawning (1.027794ms)
+✔ collector cannot use a symlink to redirect output into a protected directory (0.578022ms)
+✔ collector rejects unknown groups and refuses heavy groups without a frozen candidate (0.196173ms)
+✔ requires an independent contract instead of inferring acceptance from a bundle (0.43023ms)
+✔ validates literal, equality and byte-preserving prefix predicates against event values (3.160798ms)
+✔ validates Vitest inventory and rejects hidden failures even when success remains true (3.713263ms)
+✔ a green Vitest report cannot hide a failing test in raw stdout (0.70147ms)
+✖ Preparation CLI resolves its imports and reports missing evidence without writing (69.9374ms)
+ℹ tests 53
+ℹ suites 0
+ℹ pass 52
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 348.105467
+
+✖ failing tests:
+
+test at scripts/autoloop-trust-recovery/verify.test.mjs:680:1
+✖ Preparation CLI resolves its imports and reports missing evidence without writing (69.9374ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  13 !== 1
+  
+      at TestContext.<anonymous> (file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.test.mjs:691:10)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async Test.run (node:internal/test_runner/test:1404:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:969:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 13,
+    expected: 1,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

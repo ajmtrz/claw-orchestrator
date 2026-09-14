@@ -1,0 +1,1 @@
+{"success":true,"numTotalTests":1,"numPassedTests":1,"numFailedTests":0,"numFailedTestSuites":0,"numPendingTests":0,"testResults":[{"name":"/fixture/test.ts","status":"passed","message":"","assertionResults":[{"fullName":"a case","status":"passed","failureMessages":[]}]}]}

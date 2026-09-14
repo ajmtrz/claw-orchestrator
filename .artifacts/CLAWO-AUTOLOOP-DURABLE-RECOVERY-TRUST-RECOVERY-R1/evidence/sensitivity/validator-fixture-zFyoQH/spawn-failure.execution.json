@@ -1,0 +1,31 @@
+{
+  "id": "spawn-failure",
+  "argv": [
+    "/home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/.artifacts/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1/evidence/sensitivity/validator-fixture-zFyoQH/missing-command"
+  ],
+  "cwd": "/home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/.artifacts/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1/evidence/sensitivity/validator-fixture-zFyoQH",
+  "started_at": "2026-09-14T01:50:04.487Z",
+  "ended_at": "2026-09-14T01:50:04.488Z",
+  "process_id": null,
+  "exit_code": -2,
+  "signal": null,
+  "timed_out": false,
+  "spawn_error": "spawn /home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/.artifacts/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1/evidence/sensitivity/validator-fixture-zFyoQH/missing-command ENOENT",
+  "stdout": {
+    "path": "spawn-failure.stdout.txt",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "stderr": {
+    "path": "spawn-failure.stderr.txt",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "report": {
+    "path": "spawn-failure.stdout.txt",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "report_format": "node-tap",
+  "discovered_test_ids": [],
+  "executed_test_ids": [],
+  "skipped_test_ids": [],
+  "redactions": []
+}

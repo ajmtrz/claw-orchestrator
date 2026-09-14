@@ -1,0 +1,6 @@
+Warning: Detected unsettled top-level await at file:///home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/scripts/autoloop-trust-recovery/verify.mjs:348
+    const { verifyPreparation } = await import('./collect.mjs');
+                                  ^
+
+
+

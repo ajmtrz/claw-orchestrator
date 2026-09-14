@@ -1,0 +1,491 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:clawo:trust-recovery:evidence:1",
+  "title": "Trust recovery evidence bundle v1",
+  "description": "References are contained within one attempt. Predicates require a separate trusted contract; validity alone is not an incident or review verdict.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "case_id",
+    "requirement_ids",
+    "subject_kind",
+    "base",
+    "head",
+    "tree",
+    "frozen",
+    "input_manifest",
+    "harness_sha256",
+    "dependency_sha256",
+    "tool_sha256",
+    "patch",
+    "test_sources",
+    "source_imports",
+    "executions",
+    "observations",
+    "assertions"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "run_id": {
+      "const": "CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1"
+    },
+    "case_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "requirement_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "subject_kind": {
+      "enum": [
+        "upstream",
+        "start",
+        "candidate",
+        "sensitivity"
+      ]
+    },
+    "base": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{40}$"
+    },
+    "head": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{40}$"
+    },
+    "tree": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{40}$"
+    },
+    "frozen": {
+      "type": "boolean"
+    },
+    "input_manifest": {
+      "$ref": "#/definitions/artifact"
+    },
+    "harness_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "dependency_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "tool_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "patch": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/artifact"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "test_sources": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/artifact"
+      },
+      "minItems": 0
+    },
+    "source_imports": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/source"
+      },
+      "minItems": 0
+    },
+    "executions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/execution"
+      },
+      "minItems": 1
+    },
+    "observations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/observation"
+      },
+      "minItems": 0
+    },
+    "assertions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/assertion"
+      },
+      "minItems": 0
+    }
+  },
+  "definitions": {
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tracked",
+        "harness",
+        "dependencies",
+        "tools"
+      ],
+      "properties": {
+        "tracked": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/input"
+          },
+          "minItems": 1
+        },
+        "harness": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/input"
+          },
+          "minItems": 1
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/input"
+          },
+          "minItems": 1
+        },
+        "tools": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/input"
+          },
+          "minItems": 1
+        }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "argv",
+        "cwd",
+        "started_at",
+        "ended_at",
+        "process_id",
+        "exit_code",
+        "signal",
+        "timed_out",
+        "stdout",
+        "stderr",
+        "report",
+        "report_format",
+        "discovered_test_ids",
+        "executed_test_ids",
+        "skipped_test_ids",
+        "redactions"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "argv": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
+        "cwd": {
+          "type": "string",
+          "minLength": 1
+        },
+        "started_at": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ended_at": {
+          "type": "string",
+          "minLength": 1
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "signal": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timed_out": {
+          "type": "boolean"
+        },
+        "stdout": {
+          "$ref": "#/definitions/artifact"
+        },
+        "stderr": {
+          "$ref": "#/definitions/artifact"
+        },
+        "report": {
+          "$ref": "#/definitions/artifact"
+        },
+        "report_format": {
+          "enum": [
+            "node-tap",
+            "vitest-json"
+          ]
+        },
+        "discovered_test_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 0,
+          "uniqueItems": true
+        },
+        "executed_test_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 0,
+          "uniqueItems": true
+        },
+        "skipped_test_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 0,
+          "uniqueItems": true
+        },
+        "redactions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "artifact",
+              "rule",
+              "occurrences"
+            ],
+            "properties": {
+              "artifact": {
+                "enum": [
+                  "stdout",
+                  "stderr",
+                  "report"
+                ]
+              },
+              "rule": {
+                "type": "string",
+                "minLength": 1
+              },
+              "occurrences": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          },
+          "minItems": 0
+        }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "artifact",
+        "sequence",
+        "process_id",
+        "observer_id",
+        "execution_id",
+        "value"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "artifact": {
+          "$ref": "#/definitions/artifact"
+        },
+        "pointer": {
+          "type": "string",
+          "pattern": "^(?:/.*)?$"
+        },
+        "byte_range": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "observer_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "execution_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "value": {}
+      },
+      "oneOf": [
+        {
+          "required": [
+            "pointer"
+          ],
+          "not": {
+            "required": [
+              "byte_range"
+            ]
+          }
+        },
+        {
+          "required": [
+            "byte_range"
+          ],
+          "not": {
+            "required": [
+              "pointer"
+            ]
+          }
+        }
+      ]
+    },
+    "assertion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "predicate",
+        "observations"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "predicate": {
+          "enum": [
+            "equal",
+            "literal",
+            "digest-equal",
+            "ordered",
+            "row-count",
+            "prefix-preserved"
+          ]
+        },
+        "observations": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "expected": {
+          "type": [
+            "string",
+            "number",
+            "object",
+            "array",
+            "null"
+          ]
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256",
+        "observation_id"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "observation_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

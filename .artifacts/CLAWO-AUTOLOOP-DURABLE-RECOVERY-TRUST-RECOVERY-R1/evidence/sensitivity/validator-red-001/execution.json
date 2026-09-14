@@ -1,0 +1,20 @@
+{
+  "purpose": "validator TDD RED against a deliberately permissive empty API; not behavioral incident evidence",
+  "argv": [
+    "rtk",
+    "proxy",
+    "node",
+    "--test",
+    "scripts/autoloop-trust-recovery/verify.test.mjs"
+  ],
+  "cwd": "/home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery",
+  "started_at": "2026-09-14T01:26:16.189727+00:00",
+  "ended_at": "2026-09-14T01:26:16.279807+00:00",
+  "exit_code": 1,
+  "artifacts": {
+    "stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout.tap": "da7ca6a7a6c4ba1bcd22f3ff8899a526472fa03814a5b21db8cd674bab696669",
+    "verify.mjs": "94d430a23289dc983fb91053ccf79f8228d68a700e24bd38fe8c41793b97fece",
+    "verify.test.mjs": "b0106d9ff1d0d225d15094f6b69c3b37daff9184a4c9cd52e65825fd18b44ab4"
+  }
+}

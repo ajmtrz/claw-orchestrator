@@ -1,0 +1,22 @@
+{
+  "purpose": "RED: verifier CLI top-level-await import cycle exits 13 instead of returning a structured missing-evidence rejection",
+  "argv": [
+    "rtk",
+    "proxy",
+    "node",
+    "--test",
+    "scripts/autoloop-trust-recovery/verify.test.mjs"
+  ],
+  "cwd": "/home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery",
+  "started_at": "2026-09-14T01:50:04.228572+00:00",
+  "ended_at": "2026-09-14T01:50:04.599040+00:00",
+  "exit_code": 1,
+  "artifacts": {
+    "collect.mjs": "908432dc4392495b53385109268a41dc0b1eb4307679b28056934440190864aa",
+    "evidence.schema.json": "a53353ec75ca9e24a51eca8a5988a878f5f8fc31b79d68227b43da05d2d679ec",
+    "stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout.txt": "c0092e76d8e9436290c3283b74ae7c790ea205a31f2f1fd2a07f72645392695c",
+    "verify.mjs": "90832febd2085f9b7a69a797f0f5cede97ac946e1191f7bc0e0e31309434425f",
+    "verify.test.mjs": "9c8f9a241af16c0bb774d9aafc694e925ec439c0fc1a468437b674371d1e105f"
+  }
+}

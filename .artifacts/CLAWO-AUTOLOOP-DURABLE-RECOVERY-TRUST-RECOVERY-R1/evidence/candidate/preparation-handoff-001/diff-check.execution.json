@@ -1,0 +1,22 @@
+{
+  "argv": [
+    "rtk",
+    "proxy",
+    "git",
+    "diff",
+    "--check"
+  ],
+  "cwd": "/home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery",
+  "process_id": 60,
+  "started_at": "2026-09-14T01:47:19.805741+00:00",
+  "ended_at": "2026-09-14T01:47:19.808601+00:00",
+  "exit_code": 0,
+  "stdout": {
+    "path": "diff-check.stdout.txt",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "stderr": {
+    "path": "diff-check.stderr.txt",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "purpose": "snapshot identity regression RED",
+  "argv": [
+    "rtk",
+    "proxy",
+    "node",
+    "--test",
+    "scripts/autoloop-trust-recovery/verify.test.mjs"
+  ],
+  "cwd": "/home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery",
+  "started_at": "2026-09-14T01:38:32.266305+00:00",
+  "ended_at": "2026-09-14T01:38:32.560007+00:00",
+  "exit_code": 1,
+  "artifacts": {
+    "collect.mjs": "79eeddb883994e860518515c56e66d441d44c56f3e7f0e058ec4e203d8d06a0a",
+    "evidence.schema.json": "e71d310524f82e4e633f7eb0ecf040ddd4258b064a074ef295b55055d74ced91",
+    "stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout.txt": "4823b674831809cb431d068b2a4b352fa6d3d63cd0b3f6beb19efca0ac1246b6",
+    "verify.mjs": "d57863a1c60b3d89300900009c5001be33a131b439b522b92ce4baf9a228435e",
+    "verify.test.mjs": "ee3deac47c2d6ff39b49ab557530f3467d4a4e3d2964cfc7a209e7cb3a4d0f8b"
+  }
+}

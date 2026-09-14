@@ -1,0 +1,1 @@
+{"directory":"/home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/.artifacts/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1/evidence/candidate/validator-1789350543924-f932f816-bbc3-4247-92b3-51d4ba2cea5e","bundle_sha256":"68f888df328db2c316844b979bdde85446a327fcb307367b0f9f14237e646626","exit_code":0}

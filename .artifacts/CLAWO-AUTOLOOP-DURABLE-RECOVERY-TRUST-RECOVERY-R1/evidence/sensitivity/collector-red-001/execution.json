@@ -1,0 +1,22 @@
+{
+  "purpose": "collector TDD RED; validator unit tests also executed",
+  "argv": [
+    "rtk",
+    "proxy",
+    "node",
+    "--test",
+    "scripts/autoloop-trust-recovery/verify.test.mjs"
+  ],
+  "cwd": "/home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery",
+  "started_at": "2026-09-14T01:32:43.111409+00:00",
+  "ended_at": "2026-09-14T01:32:43.254133+00:00",
+  "exit_code": 1,
+  "artifacts": {
+    "collect.mjs": "21f14e98c751670d046bd53dd347436592916e824cca637e333374ecc395600f",
+    "evidence.schema.json": "e169f6d66cf283e1cbfd4b5b9c9fc95a7ca57ce2384dbf5746630e12f5e7af42",
+    "stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout.txt": "de9d456742cd6bc150b7ea8f22c8f9771351d4349879616884db73b088e4e036",
+    "verify.mjs": "d57863a1c60b3d89300900009c5001be33a131b439b522b92ce4baf9a228435e",
+    "verify.test.mjs": "8c10631a8df9ee92fcfa8286c0ed6a6467f16a213c3409836c50794038e8e7d9"
+  }
+}

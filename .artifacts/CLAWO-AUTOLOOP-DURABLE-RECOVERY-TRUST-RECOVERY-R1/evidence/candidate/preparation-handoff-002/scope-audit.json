@@ -1,0 +1,1767 @@
+{
+  "initial_task_files": 243,
+  "current_task_files": 243,
+  "added": [],
+  "removed": [],
+  "changes": [
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1/chat.jsonl",
+      "before": {
+        "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1/chat.jsonl",
+        "size": 12346,
+        "mtime_ns": 1789348848101972220,
+        "symlink": false,
+        "sha256": "a5c393d1ebf0958ae8bcc57e76719c78c251ff4ac89be363efc5040afd426892"
+      },
+      "after": {
+        "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1/chat.jsonl",
+        "size": 13863,
+        "mtime_ns": 1789350289983471716,
+        "symlink": false,
+        "sha256": "bd6f0ffffebeeedc0560888a143d517ac522ce54f6d25d094f7c04fb5d2fb431"
+      },
+      "original_prefix_preserved": true
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1/decisions.jsonl",
+      "before": {
+        "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1/decisions.jsonl",
+        "size": 1418,
+        "mtime_ns": 1789348848094227278,
+        "symlink": false,
+        "sha256": "40c244d101a05885434dcb4834aafc283c03e2adc6d80d5089a35895e532f7fa"
+      },
+      "after": {
+        "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1/decisions.jsonl",
+        "size": 2150,
+        "mtime_ns": 1789350165657634888,
+        "symlink": false,
+        "sha256": "0caf8f8962cbdcfbb74466f4cd5161348f291aa8bfa1da6247e9c10e8115851d"
+      },
+      "original_prefix_preserved": true
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1/iter/0/directive.json",
+      "before": {
+        "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1/iter/0/directive.json",
+        "size": 2392,
+        "mtime_ns": 1789348848101972220,
+        "symlink": false,
+        "sha256": "7f6d4e27890175d460b0aba3a1813e794efcbae2fdac3fed1a99c3e094a95460"
+      },
+      "after": {
+        "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1/iter/0/directive.json",
+        "size": 2610,
+        "mtime_ns": 1789350289983471716,
+        "symlink": false,
+        "sha256": "7772fff11647e022ee8d87bba7a28437cc8aad67b2ab4e6fd6bc1be954382f6d"
+      },
+      "original_prefix_preserved": false
+    }
+  ],
+  "current_inventory": [
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/chat.jsonl",
+      "size": 26595,
+      "mtime_ns": 1788571644047203233,
+      "symlink": false,
+      "sha256": "3f0b520921e6fa6c86a039fe02ac071560ab6d7896bd3de6151dbc7000d50155"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/decisions.jsonl",
+      "size": 2373,
+      "mtime_ns": 1788572464964729822,
+      "symlink": false,
+      "sha256": "63d52eb18a6145ca5aeb48434bb7188172177e5a858533b7caf59ef9cf0b2850"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/instructions/global-AGENTS.md",
+      "size": 36702,
+      "mtime_ns": 1788564420520042080,
+      "symlink": false,
+      "sha256": "9cc0b00ab3be15fb2d932dc5b5047d4285969fdd949df504cd64e262c72b0850"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/iter/0/coder_summary.txt",
+      "size": 1101,
+      "mtime_ns": 1788566422109146271,
+      "symlink": false,
+      "sha256": "4106684b66516364b8d0154a58c9a763cbb5df9c68dafcb9ced9a7b537cdc9df"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/iter/0/diff.patch",
+      "size": 24533,
+      "mtime_ns": 1788566422141146712,
+      "symlink": false,
+      "sha256": "2f2150b9ba5bc4fd876d3d61b5bf2c5011b63c22f90790d0be42c6757a7629f9"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/iter/0/directive.json",
+      "size": 1864,
+      "mtime_ns": 1788566258122827032,
+      "symlink": false,
+      "sha256": "ffdad0d2d47f8a310515a93f2ea7bca2630252108b49201bd7a4c2aa8c7758d1"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/iter/0/eval_output.json",
+      "size": 1508,
+      "mtime_ns": 1788566422109146271,
+      "symlink": false,
+      "sha256": "da65eb688de6065c7c358b438eb446b52b7130ba0bc793202dd69dd3d5151f0b"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/iter/0/verdict.json",
+      "size": 1338,
+      "mtime_ns": 1788566550946980354,
+      "symlink": false,
+      "sha256": "85d38f10b838827fb7bafe6460b743b4653101c1148580a031d9aa97f142b902"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/iter/1/coder_summary.txt",
+      "size": 121,
+      "mtime_ns": 1788567207028282789,
+      "symlink": false,
+      "sha256": "eac80e8a8242b61ac3f668ae04495051e07a930f18eac876018b9dbf36e36b83"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/iter/1/diff.patch",
+      "size": 2659,
+      "mtime_ns": 1788567207040282957,
+      "symlink": false,
+      "sha256": "99d80876d4d3367af8d43e9e53bf2bffb49aa000bd118dd587ed2551d347f14e"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/iter/1/directive.json",
+      "size": 1442,
+      "mtime_ns": 1788567195428116850,
+      "symlink": false,
+      "sha256": "51447b245ad776da01f5dacfa99bf2dd8fcc3d884870110412aba9831b21eeac"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/iter/1/eval_output.json",
+      "size": 1386,
+      "mtime_ns": 1788567207028282789,
+      "symlink": false,
+      "sha256": "d643bdb8c5355f9902d294536cff57c3f9926d8cc028bb8ed5aa243b15dd967f"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/iter/1/verdict.json",
+      "size": 1272,
+      "mtime_ns": 1788567351374320276,
+      "symlink": false,
+      "sha256": "6cd45f36ae204d2f26142d28390a51084c6b68735b36555569b68d94867d6b01"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/iter/2/coder_summary.txt",
+      "size": 2443,
+      "mtime_ns": 1788569350926683609,
+      "symlink": false,
+      "sha256": "91fbd6689743c7390d158a7dbd31bb5592d3574e7c09249557cb4e04caf9bd22"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/iter/2/diff.patch",
+      "size": 61183,
+      "mtime_ns": 1788569350946683892,
+      "symlink": false,
+      "sha256": "e5eb79eef84e8b461d21dfc1bfaf9a9fd8d555d3de2ff23a383dc9a4439c4a7a"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/iter/2/directive.json",
+      "size": 3047,
+      "mtime_ns": 1788567394006932164,
+      "symlink": false,
+      "sha256": "19e2c6cb787af982d9a0204cd01947023896aee73344a8cc7bacc94e2f3076a5"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/iter/2/eval_output.json",
+      "size": 4446,
+      "mtime_ns": 1788569350926683609,
+      "symlink": false,
+      "sha256": "afe0b57f755251ca77af1c9f22297a32fe7891bfb63737a6a7e2fbab282761d5"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/iter/2/verdict.json",
+      "size": 1591,
+      "mtime_ns": 1788569465828309343,
+      "symlink": false,
+      "sha256": "d20af43db9b9ea029187a06e3a9329e78194955421f59f75cc0a3aa33655ed80"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/iter/3/directive.json",
+      "size": 1580,
+      "mtime_ns": 1788571548013834666,
+      "symlink": false,
+      "sha256": "448064864bc02bf75365d7bb75798e9fcf96b12783e7c886df67cc4a2c412065"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/push_log.jsonl",
+      "size": 136,
+      "mtime_ns": 1788569350986684454,
+      "symlink": false,
+      "sha256": "07b5fd997a8e1e6af57f799d42be6346994a5afd0ae78357711eff85ce5970ba"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/reviewer_sandbox/goal.json",
+      "size": 4376,
+      "mtime_ns": 1788569350991637375,
+      "symlink": false,
+      "sha256": "071b5b1e0f8bb583906fd067db53d1bdd7d8ef0e71c9179a0d0a479ad18f3b00"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/reviewer_sandbox/iter-2/coder_summary.txt",
+      "size": 2443,
+      "mtime_ns": 1788569350990944136,
+      "symlink": false,
+      "sha256": "91fbd6689743c7390d158a7dbd31bb5592d3574e7c09249557cb4e04caf9bd22"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/reviewer_sandbox/iter-2/diff.patch",
+      "size": 61183,
+      "mtime_ns": 1788569350990979911,
+      "symlink": false,
+      "sha256": "e5eb79eef84e8b461d21dfc1bfaf9a9fd8d555d3de2ff23a383dc9a4439c4a7a"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/reviewer_sandbox/iter-2/directive.json",
+      "size": 3047,
+      "mtime_ns": 1788569350991012424,
+      "symlink": false,
+      "sha256": "19e2c6cb787af982d9a0204cd01947023896aee73344a8cc7bacc94e2f3076a5"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/reviewer_sandbox/iter-2/eval_output.json",
+      "size": 4446,
+      "mtime_ns": 1788569350991298947,
+      "symlink": false,
+      "sha256": "afe0b57f755251ca77af1c9f22297a32fe7891bfb63737a6a7e2fbab282761d5"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/reviewer_sandbox/plan.md",
+      "size": 5739,
+      "mtime_ns": 1788569350991324390,
+      "symlink": false,
+      "sha256": "627fe61304d5f4d09d0340ad0aba1d4af5ca0e32d255fcd36addb056778ab079"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/reviewer_sandbox/prior_verdict.json",
+      "size": 1272,
+      "mtime_ns": 1788569350991664519,
+      "symlink": false,
+      "sha256": "6cd45f36ae204d2f26142d28390a51084c6b68735b36555569b68d94867d6b01"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R1/reviewer_sandbox/reviewer_memory.md",
+      "size": 2224,
+      "mtime_ns": 1788569457032182134,
+      "symlink": false,
+      "sha256": "df41b26d053387c18693d96acea955a92736b0f000419fb5b00b9b5de00d85b4"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/chat.jsonl",
+      "size": 36176,
+      "mtime_ns": 1788912198878302935,
+      "symlink": false,
+      "sha256": "bcd4e8724ac518d6908c0a706a5ae7bf4d78dfa62f14de3ea220d476c81fc56b"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/checkpoints/task4a-accepted.json",
+      "size": 858,
+      "mtime_ns": 1788910583915459909,
+      "symlink": false,
+      "sha256": "00256ecdd6a88af61ecd10ad33b156524c2a0742eebe6f3a3709e03d9cf3a6d3"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/checkpoints/task4b-internal-only-surface-review-hold.json",
+      "size": 2871,
+      "mtime_ns": 1788956706562641248,
+      "symlink": false,
+      "sha256": "5e9ca67a485873000da284a876fbf6e5ab309d589dcfe4ecc390e8c195e4e0f8"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/checkpoints/task4b-lineage-pause.json",
+      "size": 1224,
+      "mtime_ns": 1788913190843602995,
+      "symlink": false,
+      "sha256": "2e4899f2616de7fe2e38e8c883df619fa45793811c95db734ca1aeadf5dcc051"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/checkpoints/task4b-orphan-red-retired.json",
+      "size": 985,
+      "mtime_ns": 1788913009531271918,
+      "symlink": false,
+      "sha256": "f64f914ff22b018adb0a3d2bd6324aca7195e0c9a28d16526971178e7235f851"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/checkpoints/task4b-public-surface-decision.json",
+      "size": 2570,
+      "mtime_ns": 1788956220234098353,
+      "symlink": false,
+      "sha256": "af9e478bc0b1cfb2dc53b2d4779b9413e0b47df98e14379e4eb5b91166997aa8"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/checkpoints/task4b-seventh-path-pause.json",
+      "size": 1664,
+      "mtime_ns": 1788943048056970060,
+      "symlink": false,
+      "sha256": "18f52a3876bc60c3587baee67c14015d715837dc5c6045a6f7f02f058cc7e375"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/decisions.jsonl",
+      "size": 2856,
+      "mtime_ns": 1788917953627036563,
+      "symlink": false,
+      "sha256": "aa7e21eb04adba802717abdae4c522042553f9433978e758c84a3fa4ab6ef2db"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/iter/0/coder_summary.txt",
+      "size": 10670,
+      "mtime_ns": 1788906657832038531,
+      "symlink": false,
+      "sha256": "c4d814562a832065872ad2e5684068934fe4dfb113662cc0fbe71c8279afa40b"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/iter/0/diff.patch",
+      "size": 30539,
+      "mtime_ns": 1788906657848038842,
+      "symlink": false,
+      "sha256": "9034192adfdf419f98867be71374317264672111642673cee561f02c369279f3"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/iter/0/directive.json",
+      "size": 2864,
+      "mtime_ns": 1788911468143271298,
+      "symlink": false,
+      "sha256": "15b9c36aa583404f8d9385d9300f1e75e9ddeecfb3bc7637477ad7a3208bf3ef"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/iter/0/eval_output.json",
+      "size": 3845,
+      "mtime_ns": 1788906657832038531,
+      "symlink": false,
+      "sha256": "1ee0a98c5c0fbeafb936ce14430c0e1ef7e80708e7cf8e9a25377cf89c4444eb"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/iter/0/verdict.json",
+      "size": 1408,
+      "mtime_ns": 1788907338819982685,
+      "symlink": false,
+      "sha256": "8775044b2062b91bfc4a73467ca963fd8aab84c8f445d59bb10013afdd0e5bf2"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/iter/1/coder_summary.txt",
+      "size": 1006,
+      "mtime_ns": 1788908443779819081,
+      "symlink": false,
+      "sha256": "de64dc314011557fb047f0592cb45279d7bd191e5666baeb256c3a102cdd3cbb"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/iter/1/diff.patch",
+      "size": 0,
+      "mtime_ns": 1788908443791819064,
+      "symlink": false,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/iter/1/directive.json",
+      "size": 1958,
+      "mtime_ns": 1788907524775955465,
+      "symlink": false,
+      "sha256": "2a96c8d92d783a69b0b24514794ecf307b74023d25da60e648d1e1c1ebb8932a"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/iter/1/eval_output.json",
+      "size": 15946,
+      "mtime_ns": 1788910029199533604,
+      "symlink": false,
+      "sha256": "7c071106a9df9231d75044bef80beace9cc76c03695a7c74d2a5a30458284fad"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/iter/1/verdict.json",
+      "size": 660,
+      "mtime_ns": 1788909103151637463,
+      "symlink": false,
+      "sha256": "7338aba9527a2024e5c704178cbd4d804945ef659124fa4e4aec66b07c78fe01"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/iter/2/directive.json",
+      "size": 2866,
+      "mtime_ns": 1788913081998953344,
+      "symlink": false,
+      "sha256": "85e01930b9824ec0c264930070177e448cd528910d7c40b5c0bfd88518d18169"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/push_log.jsonl",
+      "size": 734,
+      "mtime_ns": 1788909438371628738,
+      "symlink": false,
+      "sha256": "2c0614aeec64b39a7d90f964d2d0ebb6885ca85339550488e79051e80aab9fb4"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/reviewer_sandbox/audit-base.tar",
+      "size": 10240,
+      "mtime_ns": 1788908953263640857,
+      "symlink": false,
+      "sha256": "05879de1fade083c0a28bb8b8d7ab2f876192a73f854b29ade43c6aa6f17a53e"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/reviewer_sandbox/audit-candidate.tar",
+      "size": 10240,
+      "mtime_ns": 1788908953283640677,
+      "symlink": false,
+      "sha256": "5d86669dface8f8bf922ca59556afe7fca4cedd61bdef9a9e1c5d93ed93fb080"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/reviewer_sandbox/goal.json",
+      "size": 2131,
+      "mtime_ns": 1788908443993509415,
+      "symlink": false,
+      "sha256": "55f8f5c292dfed345c6d8cfce8b6d1b9f16cebfb3b69e3594e48553cd6fac307"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/reviewer_sandbox/iter-1/coder_summary.txt",
+      "size": 1006,
+      "mtime_ns": 1788908443993088654,
+      "symlink": false,
+      "sha256": "de64dc314011557fb047f0592cb45279d7bd191e5666baeb256c3a102cdd3cbb"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/reviewer_sandbox/iter-1/diff.patch",
+      "size": 0,
+      "mtime_ns": 1788908443791819064,
+      "symlink": false,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/reviewer_sandbox/iter-1/directive.json",
+      "size": 1958,
+      "mtime_ns": 1788908443993138983,
+      "symlink": false,
+      "sha256": "2a96c8d92d783a69b0b24514794ecf307b74023d25da60e648d1e1c1ebb8932a"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/reviewer_sandbox/iter-1/eval_output.json",
+      "size": 15674,
+      "mtime_ns": 1788908443993175682,
+      "symlink": false,
+      "sha256": "055a302f072376f60cb16393a7188aae4fc285905fa1645b59511c738333164c"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/reviewer_sandbox/plan.md",
+      "size": 3610,
+      "mtime_ns": 1788908443993218011,
+      "symlink": false,
+      "sha256": "0a0f08aaabf4c61d61153f5c67808618c33cc6cc7d4f1425a715ab87a4133aa8"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/reviewer_sandbox/prior_verdict.json",
+      "size": 1408,
+      "mtime_ns": 1788908443993688617,
+      "symlink": false,
+      "sha256": "8775044b2062b91bfc4a73467ca963fd8aab84c8f445d59bb10013afdd0e5bf2"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R2/reviewer_sandbox/reviewer_memory.md",
+      "size": 1705,
+      "mtime_ns": 1788907304931961260,
+      "symlink": false,
+      "sha256": "148f5ec2808f8a8f1cb1c0dfc5fa30d353f160e2ffde7eae499c5c72bb7fa56f"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R3/chat.jsonl",
+      "size": 5572,
+      "mtime_ns": 1788595538563853921,
+      "symlink": false,
+      "sha256": "e0aa03010961ae442863b0983de88b669eef292b71cd40269b558d91871619b1"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R3/decisions.jsonl",
+      "size": 677,
+      "mtime_ns": 1788595687421082787,
+      "symlink": false,
+      "sha256": "d51c193ddae4a85b2e5a2765345823d83f7f428a9be4efc6cfef950d0a0125b3"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R4/chat.jsonl",
+      "size": 8016,
+      "mtime_ns": 1788988302815275711,
+      "symlink": false,
+      "sha256": "5749460e06aef9416d195b11a417b9157163d38d6708d2a1f0d25c3cffe3cb95"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R4/decisions.jsonl",
+      "size": 1650,
+      "mtime_ns": 1788994254959812236,
+      "symlink": false,
+      "sha256": "927838f7394609223449071c566eca1386f820321f3f47c329a209650a8b2031"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-20260905-R4/snapshots/preflight-binding.json",
+      "size": 1700,
+      "mtime_ns": 1788987036521020785,
+      "symlink": false,
+      "sha256": "62d0983a71078ffc3b46d25389b74f989a20ad61a18b4e12a19a742ac4dbcca8"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/agent-binding-reprioritization-superseded.json",
+      "size": 2187,
+      "mtime_ns": 1789040605597017873,
+      "symlink": false,
+      "sha256": "b98649e2ba45680356679dc8d3ad40df6091148e84e5f3895c1e9a22de565473"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/post-upstream-merge-planner-binding-blocked.json",
+      "size": 2242,
+      "mtime_ns": 1789264299624443956,
+      "symlink": false,
+      "sha256": "1af18a0ab2e4dcc96ea745c92145f61999812bb6dc65f57cb71bc6b541b0faa1"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/pre-upstream-merge.json",
+      "size": 1678,
+      "mtime_ns": 1789262033049306340,
+      "symlink": false,
+      "sha256": "11b85a533c3f346f33bf0808ea3be15c8be05dd903486ab1a866d1bb0b990b66"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/state-aware-replacement-branch-a-blocked.json",
+      "size": 4930,
+      "mtime_ns": 1789264882396404768,
+      "symlink": false,
+      "sha256": "ddbc6ab40d7427903900f5cbfd90ab8a040c83372d66e0012948830ad937ade4"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-recovery-preflight.json",
+      "size": 1252,
+      "mtime_ns": 1788996872282157423,
+      "symlink": false,
+      "sha256": "c7b82ace421f2683fedb061f6aa3228a1f8737e85be93422870ea2bb809f3c03"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-accepted.json",
+      "size": 1160,
+      "mtime_ns": 1789106055033617960,
+      "symlink": false,
+      "sha256": "78ee5d25e0ee1fba3d0c8233285c667a20818450b9eda0215fa05eb11327a9e9"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-claude-review-binding-council.yaml",
+      "size": 3983,
+      "mtime_ns": 1789030942428989898,
+      "symlink": false,
+      "sha256": "53d6de6955138f2331d6da12c338bc5164b028e5d72a9af127e561057ad3fa73"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-claude-review-binding-migration.json",
+      "size": 3051,
+      "mtime_ns": 1789030942428989898,
+      "symlink": false,
+      "sha256": "0debb0f0b14804e70cf66587f15a69e8b292a124cdcf86d916806b1f23f6f507"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-claude-review-round1-adjudication.json",
+      "size": 3874,
+      "mtime_ns": 1789032181828922653,
+      "symlink": false,
+      "sha256": "f298b6dc48cb63cd3ea35bc97faaed6abafb6f17d3dbcf1b86532a948a778e4f"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-claude-review-round2-snapshot.json",
+      "size": 2309,
+      "mtime_ns": 1789035682041835074,
+      "symlink": false,
+      "sha256": "1e1d996f452d63bf63644d19d117135d30b2deec57174dd91ffffab320078c0d"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-clean-pause-claude-session-limit.json",
+      "size": 2544,
+      "mtime_ns": 1789035799775348095,
+      "symlink": false,
+      "sha256": "511e07ce688b73a522007518b6553e79ebecbbcecd8cc880cb1d3c9f23a8b66b"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-clean-pause-config-migrated.json",
+      "size": 3097,
+      "mtime_ns": 1789037724612036476,
+      "symlink": false,
+      "sha256": "815f424e8faf7dd566078a87889ed6968effaeb4056f2edfb1d86c1f94782d32"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-clean-pause-cursor-quota.json",
+      "size": 2807,
+      "mtime_ns": 1789008486353862675,
+      "symlink": false,
+      "sha256": "500ed502e649fd5b5615dda82d5dea7c5d5995bc7047b779c7e3dac013b3e5e8"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-codex-config-migration-council.yaml",
+      "size": 3958,
+      "mtime_ns": 1789037596510380229,
+      "symlink": false,
+      "sha256": "7535e69d085a9c1ce454c242160cbe761ddd1338170919715b4232bcb3ce8269"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-codex-config-migration.json",
+      "size": 4708,
+      "mtime_ns": 1789037672987367723,
+      "symlink": false,
+      "sha256": "188d6734ab94e78735e8056d2178e61864383c0d04667a260b51b85e00176550"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-review-round3-retry1-snapshot.json",
+      "size": 1736,
+      "mtime_ns": 1789007998040603483,
+      "symlink": false,
+      "sha256": "a301dc5b0982604a8c88af9ef75aabf99e3ce0f192fc76a3c8461868f2012281"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-review-round3-snapshot.json",
+      "size": 1858,
+      "mtime_ns": 1789007551671732127,
+      "symlink": false,
+      "sha256": "e103b390be809de2b4e749cb39460210b724834d59c43ac7f8b4480e0aa6e3fc"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-reviewer-write-violation-round4.json",
+      "size": 1490,
+      "mtime_ns": 1789043026856093037,
+      "symlink": false,
+      "sha256": "dc6bb5743e78a5dc10434341845d210d5983bc2c3067a1b54796174b988bc9d2"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-round15-fence-authorized.json",
+      "size": 3581,
+      "mtime_ns": 1789088327977152636,
+      "symlink": false,
+      "sha256": "7a61072629a7a6ad5dc288f364f8ca77f12838fd87c7c98c2cf6262687b33057"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-round16-engine-fence-authorized.json",
+      "size": 2392,
+      "mtime_ns": 1789089815057979065,
+      "symlink": false,
+      "sha256": "5789fd7b02b681a461e3d2f4d9afb3e46c39594d33b0e2e7e394991a407a5e7a"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-round16-engine-scope-gate.json",
+      "size": 5771,
+      "mtime_ns": 1789089172757868137,
+      "symlink": false,
+      "sha256": "93ac4a982e4dc1900de2685f8980910d8945fdd00103f87d57a52a27a04b2a00"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-round16-review-candidate.json",
+      "size": 2987,
+      "mtime_ns": 1789092495819087999,
+      "symlink": false,
+      "sha256": "bbdf63b3d64872f5516c8f191b090b6eff541a713bf732810556a5a15cff2418"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-round16-review-hold-adjudication.json",
+      "size": 6146,
+      "mtime_ns": 1789094374825073882,
+      "symlink": false,
+      "sha256": "27fb614b0499c469f56ae67bbac473906a710157ce32bed0f14d02b77823e6e5"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-round17-review-candidate.json",
+      "size": 3674,
+      "mtime_ns": 1789097221728566217,
+      "symlink": false,
+      "sha256": "13749975952723467b6bb08a43dc6d173bfd3eba2f3b31bfa0b3fbfb213cc9f4"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-round17-review-hold-adjudication.json",
+      "size": 3596,
+      "mtime_ns": 1789098706415242103,
+      "symlink": false,
+      "sha256": "c9e922a6d2c152ec80e8be1549eab7ed00cf95651e1d37f982111d5cd9f9c123"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-round18-review-candidate.json",
+      "size": 3944,
+      "mtime_ns": 1789101425627582124,
+      "symlink": false,
+      "sha256": "a81771a5c980fbc6e49e7c936209f47daa83eee5be7ec2710f940881c84e758b"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-round18-review-hold-adjudication.json",
+      "size": 3916,
+      "mtime_ns": 1789103163337047135,
+      "symlink": false,
+      "sha256": "206f5af692e439a3a72b62a7a5116fe5f295d0e20571723970b094a26766126b"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-round19-review-candidate.json",
+      "size": 4041,
+      "mtime_ns": 1789104698553352572,
+      "symlink": false,
+      "sha256": "20a701f3f33ccdb3a81e327997a57f0e116da768c29146abf7e46b9f6c79628f"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-round6-fence-authorized.json",
+      "size": 2821,
+      "mtime_ns": 1789056536980305873,
+      "symlink": false,
+      "sha256": "e0b2fa5862b872327d3bef6a90816db1ff9e690a0a98b37f4ded3367a89642e6"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice51-round6-scope-gate.json",
+      "size": 3882,
+      "mtime_ns": 1789055221230246486,
+      "symlink": false,
+      "sha256": "eb802c93d59e678110106206de63cdf88080effed611004f88b7ee054703caec"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice52-accepted-commit.json",
+      "size": 1230,
+      "mtime_ns": 1789121899046495261,
+      "symlink": false,
+      "sha256": "3c875382746871fefdbd9e6f8cf1d8619afc49ca40aec4cd230b29eb64f07a17"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice52-clean-pause-review-infrastructure.json",
+      "size": 3086,
+      "mtime_ns": 1789116605985315290,
+      "symlink": false,
+      "sha256": "f32401b10d3ad367ac86ddf6bc5772cffbaff708ac3f159b0ea305a772f0d07f"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice52-codex-review-round5-dispatch.json",
+      "size": 1241,
+      "mtime_ns": 1789117828633356613,
+      "symlink": false,
+      "sha256": "457e10d61ca8b245b382bfc92687055953ce0504d2a19ea9523821ae1eb5a7e1"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice52-codex-review-round5-hold.json",
+      "size": 2989,
+      "mtime_ns": 1789118850843576694,
+      "symlink": false,
+      "sha256": "886a7052fe8793fbb6ee50977d28f3e603643667299abda0fd6565aa065e949f"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice52-codex-review-round6-advance.json",
+      "size": 2700,
+      "mtime_ns": 1789121534485316408,
+      "symlink": false,
+      "sha256": "234b97c8b410f3a3e004c23e6a5aea9ffbc4770ae40a71f883a418183e5e4c55"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice52-codex-review-round6-dispatch.json",
+      "size": 956,
+      "mtime_ns": 1789120677122862959,
+      "symlink": false,
+      "sha256": "424bd6822dbb25968047b258aa2c9e0e8d1a6c356417449c7350b6ad982ea4ac"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice52-codex-review-round6-start.json",
+      "size": 2455,
+      "mtime_ns": 1789120626484912700,
+      "symlink": false,
+      "sha256": "7c730b4ba92c38ca2cd224f570121c810f7a28192b3e9a9e4e10f2d3b8129dd9"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice52-freeze-adjudication.json",
+      "size": 1414,
+      "mtime_ns": 1789107378317428376,
+      "symlink": false,
+      "sha256": "7b14096ae123e18170319fe0e6f5479b09892164ba6be3d549a7a5eae70ba050"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice52-review-candidate.json",
+      "size": 1603,
+      "mtime_ns": 1789107877773153901,
+      "symlink": false,
+      "sha256": "fe9d2145d23289935256576314c4088eb7423f218ab6b117051d600f2c8c4de5"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice52-review-hold-round1.json",
+      "size": 2411,
+      "mtime_ns": 1789108788390806607,
+      "symlink": false,
+      "sha256": "249a99d497ff50b8e779ce16adce9fbb620f9aed54807e98dd639e03e7ac269e"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice52-review-hold-round2.json",
+      "size": 2754,
+      "mtime_ns": 1789110730952861859,
+      "symlink": false,
+      "sha256": "d429bec0955c8d965495853ccfd479b8914ba8393b58512ac2a277875aa4f647"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice52-review-hold-round3.json",
+      "size": 3257,
+      "mtime_ns": 1789112445628484164,
+      "symlink": false,
+      "sha256": "e5b78d37fc04fa1eaed2d6111a3767e6bc604a56238ce85424095de17318d11b"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice52-review-hold-round4.json",
+      "size": 3558,
+      "mtime_ns": 1789114476355453331,
+      "symlink": false,
+      "sha256": "4857746bde6f17f8dcab8beacfb485670a2f3536ddd7c6a6b46311ec65f1b5aa"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice52-review-round4-start.json",
+      "size": 2494,
+      "mtime_ns": 1789113770821715833,
+      "symlink": false,
+      "sha256": "b50369856d8f187e1c84e87e60642a6c7e6d2e0627beaab2e10652158b74f847"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice52-review-round5-start.json",
+      "size": 2766,
+      "mtime_ns": 1789116298575347676,
+      "symlink": false,
+      "sha256": "d8e1aca652eef9fe48cce435c836c584288453ea72d9c33dbe8d685a84b4d095"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice52-reviewer-binding-reconciliation-20260911-01.json",
+      "size": 3243,
+      "mtime_ns": 1789117675209123031,
+      "symlink": false,
+      "sha256": "891965b3bfb679e22dd23268922b72a04e2d83706ffb39d8268e7bd6c5f96c33"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice52-round4-freeze-reconciliation.json",
+      "size": 1917,
+      "mtime_ns": 1789114704454199056,
+      "symlink": false,
+      "sha256": "308d3b6ddc0a49a3697e2fba8f7b8e6c7c15573f349e673d708405d90572232a"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice52-start.json",
+      "size": 1114,
+      "mtime_ns": 1789106207029603965,
+      "symlink": false,
+      "sha256": "921a84c85ab1c761ccded9b28c69d418b24d2562625533d579150b282f38f7dc"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-accepted-commit.json",
+      "size": 1644,
+      "mtime_ns": 1789172366791798458,
+      "symlink": false,
+      "sha256": "40f5bf2c5795b8335580c050b7f041845a025b327d34cb3e2d856c42dd03dfb0"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-codex-review-round1-hold.json",
+      "size": 1805,
+      "mtime_ns": 1789125997587228551,
+      "symlink": false,
+      "sha256": "a75f7834b548a067f148d7ac0899f9da90230e9420fe134b91209c5e6f926bb2"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-codex-review-round1-start.json",
+      "size": 2963,
+      "mtime_ns": 1789124890744155783,
+      "symlink": false,
+      "sha256": "6af989d5f7ec4b9e46d61a1923d1e17cbf35074368aab2d2f0a854a6649343bf"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-codex-review-round2-start.json",
+      "size": 3443,
+      "mtime_ns": 1789128152518773516,
+      "symlink": false,
+      "sha256": "46fcd33fb0b238c267fa2fc206b895355f46b7aeac8622da5d24fc644be2caee"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-fence-expansion-rebind.json",
+      "size": 1602,
+      "mtime_ns": 1789122691224810410,
+      "symlink": false,
+      "sha256": "705b7fba57b003e13ccfe1f2a3c4df13c088c6448a39a83855fb271f3f185795"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-fence-expansion-receiver-ack.json",
+      "size": 1375,
+      "mtime_ns": 1789125997587228551,
+      "symlink": false,
+      "sha256": "0401eb0e9b49fedb7155c8a2281c1ce646b51d788c6c1e94eaf44bdafe21d0a1"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-fence-expansion-session-manager-test.json",
+      "size": 1885,
+      "mtime_ns": 1789131850059220405,
+      "symlink": false,
+      "sha256": "9033c43923d8dadc0e9b11ef4c18c9867b83db6a01557053a4ff6104e63adcd2"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round1-freeze-reconciliation.json",
+      "size": 1912,
+      "mtime_ns": 1789126364086009186,
+      "symlink": false,
+      "sha256": "f815f067e26901212e64afc3b0557240e88123a0ed1d02694210631a046b308d"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round10-freeze-method-reconciliation.json",
+      "size": 1360,
+      "mtime_ns": 1789168772684490015,
+      "symlink": false,
+      "sha256": "431d5682cc709d8772acaf33deaa7a15b4af7db0cfad8dbfe5e6ecb0f2c870cd"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round10-independent-review-advance.json",
+      "size": 2105,
+      "mtime_ns": 1789172268580875423,
+      "symlink": false,
+      "sha256": "8136481e61fb5d50d026f5f0f76d63252ec9c5387eee506170cddb33e9630c11"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round10-review-attempt1-startup-failed.json",
+      "size": 1532,
+      "mtime_ns": 1789169664613291257,
+      "symlink": false,
+      "sha256": "637c67f4d506079c502e6d1fd429b1f6b3111983c9a2d16ad5984ad7dbf01909"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round10-review-attempt2-evidence-hold.json",
+      "size": 2268,
+      "mtime_ns": 1789171344242770202,
+      "symlink": false,
+      "sha256": "d85c50a8be4e9ad0fea22e3e85aa8fe2c91aef109794097b09509118a2fc0eac"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round10-review-candidate.json",
+      "size": 4278,
+      "mtime_ns": 1789168772684490015,
+      "symlink": false,
+      "sha256": "1b8250e2d13172c91cae5397cc96bdaa4bfbc8eb754c61b03313b478290720ee"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round3-review-hold.json",
+      "size": 1835,
+      "mtime_ns": 1789134795302408064,
+      "symlink": false,
+      "sha256": "7b2a6337a6453a89f79f2b6a4adb1daa99d7c86d05917793bb3415000cc97ad2"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round4-clean-pause-writer-reconciliation.json",
+      "size": 2177,
+      "mtime_ns": 1789137388547379495,
+      "symlink": false,
+      "sha256": "390e12c25ecc0a4293b84e12cf66986cb0342fbf54f7b547601386c697b73019"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round4-resume-single-coder-writer-reconciliation-20260911-01.json",
+      "size": 3173,
+      "mtime_ns": 1789138996852870403,
+      "symlink": false,
+      "sha256": "f400a61874105b6f6c06f7553e7776115db0b0372ef24e7f34a29408cd6d9ee5"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round4-review-candidate.json",
+      "size": 3231,
+      "mtime_ns": 1789139609761767307,
+      "symlink": false,
+      "sha256": "d127a05e5b8e7737298087cf2806e595952bc462b4dcf24d717cabdb91ac5a8c"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round4-review-hold.json",
+      "size": 3585,
+      "mtime_ns": 1789140529841783344,
+      "symlink": false,
+      "sha256": "1ca28c945d9596bbb926cca982e8e3be7616263d7e9e6488f18086fcf703ec74"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round5-review-candidate.json",
+      "size": 4285,
+      "mtime_ns": 1789142956434950513,
+      "symlink": false,
+      "sha256": "1ac15f934068bd24cce2fdd2f3094bca04d2b8e88f3e63853a3afbcd2b7d6fd1"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round5-review-hold.json",
+      "size": 3029,
+      "mtime_ns": 1789144297286731729,
+      "symlink": false,
+      "sha256": "5f2fda4c7bad8a16a6c1acfab88d9ec24193abc174637eabf70bd43b1e6fa520"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round6-clean-pause-quota.json",
+      "size": 3852,
+      "mtime_ns": 1789145907492148043,
+      "symlink": false,
+      "sha256": "41424e3401c9f17798c453b2a6a700fcc792a26ec759aa64b4184e1af85717e2"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round6-freeze-reconciliation.json",
+      "size": 2392,
+      "mtime_ns": 1789144520713477679,
+      "symlink": false,
+      "sha256": "fe71033e01f63c753a483442dafb5f8933398497a33c82053c5f3cbb0868e674"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round6-quota-recovery-reconciliation.json",
+      "size": 2422,
+      "mtime_ns": 1789151585572210527,
+      "symlink": false,
+      "sha256": "180af8696e174dd2878eaf072b7a561453d4f33e7e94628c9b54b9068438f58f"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round6-recovery-review-candidate.json",
+      "size": 3433,
+      "mtime_ns": 1789152388341493615,
+      "symlink": false,
+      "sha256": "1ff3c67e49e6e746c55353874d6c28100e9791068170381c1687697194fad188"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round6-recovery-review-hold.json",
+      "size": 4235,
+      "mtime_ns": 1789154257062071022,
+      "symlink": false,
+      "sha256": "c4d9f8371c77a16fdf0948d75127f2cd6264366237b175196b343fdec7377485"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round7-review-candidate.json",
+      "size": 3674,
+      "mtime_ns": 1789156763117734487,
+      "symlink": false,
+      "sha256": "1c39adc8572e06124a8c8b364b139c1809a515e7b34b168c45dfe80ac849aee4"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round7-review-hold.json",
+      "size": 2270,
+      "mtime_ns": 1789157976723207452,
+      "symlink": false,
+      "sha256": "6910cdab056ec70a2fa7c940cb99b0d428eb8300564615e7107a4d609f453b02"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round8-freeze-method-reconciliation.json",
+      "size": 1384,
+      "mtime_ns": 1789158235581739137,
+      "symlink": false,
+      "sha256": "f58e670b9613891dc94e53984a5882ef8997fee733ba1ff3fb6124dbc626fdd0"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round8-review-candidate.json",
+      "size": 4333,
+      "mtime_ns": 1789161840335376188,
+      "symlink": false,
+      "sha256": "a3e03d16210262747c3ceb5486e1f932c84ecf4ac18f84cd549f7e575f569999"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round8b-review-hold.json",
+      "size": 2065,
+      "mtime_ns": 1789162981760158541,
+      "symlink": false,
+      "sha256": "3c5681fd2c25cb9596617a2305b5ea2b6d832639f9de52559aa5b8f18e96aac2"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round9-review-candidate.json",
+      "size": 3567,
+      "mtime_ns": 1789165051855460766,
+      "symlink": false,
+      "sha256": "db151017bf8820d789ac449818ebced02255e1f3253e75f4ad0c7ef8246e6ebb"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-round9-review-hold.json",
+      "size": 3211,
+      "mtime_ns": 1789166598204509849,
+      "symlink": false,
+      "sha256": "d6e25f31fd5ca87568006293e39f843ba69146ec9024be72d623309241c66dd1"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice53-start.json",
+      "size": 2120,
+      "mtime_ns": 1789121899050499012,
+      "symlink": false,
+      "sha256": "fba89f53a0233046e40e0c99211da41644a824a2228f2fed0851ceaae81da6b5"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task5-slice54-absorption-reconciliation.json",
+      "size": 7374,
+      "mtime_ns": 1789180546923394970,
+      "symlink": false,
+      "sha256": "30b8d4853eea4695aa48c2c23e3f123f49f546a8f1e3bb3276f990a39bd10fcd"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice61-review-hold-round1.json",
+      "size": 1769,
+      "mtime_ns": 1789182070462601334,
+      "symlink": false,
+      "sha256": "cf1d8b00b7c508f60340b736da4c2b21999f9edb297bd4d39f0d447aab804f0e"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice61-review-hold-round2.json",
+      "size": 1999,
+      "mtime_ns": 1789188082765937097,
+      "symlink": false,
+      "sha256": "acf6bdb996eaa7d279c387a388fdec607e90d216a8e3b4d2174961d1fcf495c8"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice61-review-hold-round3.json",
+      "size": 2801,
+      "mtime_ns": 1789192388260238936,
+      "symlink": false,
+      "sha256": "e53e112db9054d426de85f9a6227b2940de3e71fb5ffdb5fa1c947c3cf9f8a79"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice61-review-hold-round4.json",
+      "size": 1871,
+      "mtime_ns": 1789196758609801380,
+      "symlink": false,
+      "sha256": "7f7aaf025b771271ebd6a3fcbbeae15d78ab7e4c1f8dff69ee15cebe7b2c0e32"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice61-review-hold-round5.json",
+      "size": 2281,
+      "mtime_ns": 1789204140958438037,
+      "symlink": false,
+      "sha256": "8e4b35bebc1fb8168c59c37d4ccde189ef7156a53ce86e1faef250e5216e527d"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice61-review-hold-round6.json",
+      "size": 2060,
+      "mtime_ns": 1789207562181982041,
+      "symlink": false,
+      "sha256": "4444f304b75a6c078d0df04709d2eac46b460797b701f3e45160ffd406a2f7f9"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice61-round2-review-candidate.json",
+      "size": 3258,
+      "mtime_ns": 1789186867366178004,
+      "symlink": false,
+      "sha256": "5d27f7acd356d1e7f453568ce34ed81d7c9b8c2793bca2ff245d982502006c27"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice61-round3-review-candidate.json",
+      "size": 3224,
+      "mtime_ns": 1789190556136655724,
+      "symlink": false,
+      "sha256": "f4037fe41f875d7abbec0eafb885b2a4736a2d7c7298c7a03a039ea04cbb428e"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice61-round4-pre-preflight-reconciliation.json",
+      "size": 1354,
+      "mtime_ns": 1789192614073260394,
+      "symlink": false,
+      "sha256": "3c14d4572e1efbc96a4a9d2be2123c1c6535d9b29c0e5abc18cfa0933e0a0eeb"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice61-round4-review-attempt1-startup-failed.json",
+      "size": 1128,
+      "mtime_ns": 1789195310277192743,
+      "symlink": false,
+      "sha256": "081e0750ed5d714d6bdbf5f21f6f2a9a0d8c018bfa9f62b87fb33511c3dc4fd9"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice61-round4-review-candidate.json",
+      "size": 2304,
+      "mtime_ns": 1789194417730329316,
+      "symlink": false,
+      "sha256": "350c7df0ba2e40fd3fb1809a1e9b406d0a6a452f35ed43d112b5eb385d77cd8a"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice61-round5-ccoder-attempt1-startup-failed.json",
+      "size": 905,
+      "mtime_ns": 1789196905108343634,
+      "symlink": false,
+      "sha256": "cceecd930efd0f2153ff4bd2ff8fd38a15ddf26be2980c1c04d0bca51348678d"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice61-round5-review-attempt1-startup-failed.json",
+      "size": 1275,
+      "mtime_ns": 1789202738430972105,
+      "symlink": false,
+      "sha256": "61a51a9f6f83b4abfedcf344c7b164398e344ae46016bc1f961689b4a3a442ed"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice61-round5-review-candidate.json",
+      "size": 2658,
+      "mtime_ns": 1789202097277428319,
+      "symlink": false,
+      "sha256": "153327479126a78285910798aee45e8d59d71016fa62a0d76d37ffc7eeabe169"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice61-round6-review-candidate.json",
+      "size": 2784,
+      "mtime_ns": 1789205977787114803,
+      "symlink": false,
+      "sha256": "864c45ee656eff84b631e724c5e476dced85d4f2c3c2f69332b52ae3f9dfb057"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice61-round7-commit.json",
+      "size": 1747,
+      "mtime_ns": 1789213168463928408,
+      "symlink": false,
+      "sha256": "df143167ed716ebae2e85ac3e0d6f18a3bfd2732461756ca19e88d07542896c6"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice61-round7-review-candidate.json",
+      "size": 2932,
+      "mtime_ns": 1789210747367081464,
+      "symlink": false,
+      "sha256": "d85a96db8272dbf07e08ba471d83ce5bc784a83cc6fc33d7a9ac978f705123f5"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice61-start.json",
+      "size": 2833,
+      "mtime_ns": 1789172456877521702,
+      "symlink": false,
+      "sha256": "275e92d80b5ae8b9b8c131f77a7a57347f0b7305ff262eb97463163eec104f3d"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice62-fence-ruling.json",
+      "size": 967,
+      "mtime_ns": 1789214377377575572,
+      "symlink": false,
+      "sha256": "03eed1055fbc1e7b32cb4115eb1100743712550a176e0c4f7f1edcf10f1d4608"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice62-round1-review-candidate.json",
+      "size": 2435,
+      "mtime_ns": 1789215213632417509,
+      "symlink": false,
+      "sha256": "f30cfa979eb8fd4dd07cf21789ca896c8a2371b50718218c99b24d20508feb6a"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice62-round1-review-hold.json",
+      "size": 1578,
+      "mtime_ns": 1789216658775124281,
+      "symlink": false,
+      "sha256": "922cb500dba7e599ba3d45faac065aadd4fa2f49811e4da92b14571ce30ea81c"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice62-round2-commit.json",
+      "size": 1813,
+      "mtime_ns": 1789225019493849924,
+      "symlink": false,
+      "sha256": "ae4d219aa4e0c7956c2b67e5d67d82aac969482366e16f2d4e5b2665643bb7db"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice62-round2-review-advance.json",
+      "size": 2455,
+      "mtime_ns": 1789223158622829728,
+      "symlink": false,
+      "sha256": "a12f75742eff675f2128be3cca471efaeed428aba8f0ae7dfe1df86aabe2f17f"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice62-round2-review-candidate.json",
+      "size": 3528,
+      "mtime_ns": 1789222206453749443,
+      "symlink": false,
+      "sha256": "0647b3e150316c8b6a0e46591025ac0214c6ca9c90acee7e110adec6940b3b5b"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice62-start.json",
+      "size": 1735,
+      "mtime_ns": 1789213374841716480,
+      "symlink": false,
+      "sha256": "2855c475ff457f201d44f6c0201ae3aa0b43025b49f273d1061702606efb790b"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice63-round1-controller-hold.json",
+      "size": 1553,
+      "mtime_ns": 1789230240437579205,
+      "symlink": false,
+      "sha256": "1e0710a9459064ff6f3e06a889e3c8a252930aee220871f874a6dfd309724d31"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice63-round2-review-candidate.json",
+      "size": 3296,
+      "mtime_ns": 1789233992275180375,
+      "symlink": false,
+      "sha256": "5f1871b71e54b1ab162afe9f3cd74334be6d3b3903ab30f12e210003235e9bca"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice63-round3-review-candidate.json",
+      "size": 3386,
+      "mtime_ns": 1789238689265436973,
+      "symlink": false,
+      "sha256": "456377f4934e10468cbe3643c18e1b02786e2dfbd60d1558601dbb0f17bb3e8d"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice63-round4-review-candidate.json",
+      "size": 2428,
+      "mtime_ns": 1789242215057584132,
+      "symlink": false,
+      "sha256": "e4df218c7c32a4c3c7a82669294f733050c02dd2b3935d2c530454241cd89609"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice63-round5-review-candidate.json",
+      "size": 2508,
+      "mtime_ns": 1789246572212646221,
+      "symlink": false,
+      "sha256": "118eef7c8a1e377e1f850df03e1a11b8ee053a4079f33eb3168783b5b899ee3b"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice63-round6-commit.json",
+      "size": 1209,
+      "mtime_ns": 1789252725609547404,
+      "symlink": false,
+      "sha256": "9803ad67dc0e4c36729c2c063819ebba77fca86cbff9e4a492f30315968ecb1b"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice63-round6-review-advance.json",
+      "size": 1347,
+      "mtime_ns": 1789252558603197641,
+      "symlink": false,
+      "sha256": "5bb5d1cf85ebe6db21acb76be636f6a8eac3ef251a6269f873c9a79285c21f76"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice63-round6-review-candidate.json",
+      "size": 2676,
+      "mtime_ns": 1789250223527173537,
+      "symlink": false,
+      "sha256": "4af81f8e61caf1b82ea0f5dacdc50640d09de0cbc48262e1564c8c8df5487ff9"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task6-slice63-start.json",
+      "size": 2488,
+      "mtime_ns": 1789225019497842930,
+      "symlink": false,
+      "sha256": "525a53f787a1f114160be09544a63ae30401ed7ac7d82e456805d71a920f5ae1"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task7-commit.json",
+      "size": 1016,
+      "mtime_ns": 1789259657684710601,
+      "symlink": false,
+      "sha256": "ef68e7e7de67625eec738db36de633fef81d56d9173ecb4a2cdb2f0526fe8625"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task7-review-candidate.json",
+      "size": 2336,
+      "mtime_ns": 1789255495351552576,
+      "symlink": false,
+      "sha256": "3cba24622436adb48980755c6e828a7db9fe4de99960a44f9242e4fc73196fe3"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task7-round1-review-hold.json",
+      "size": 1774,
+      "mtime_ns": 1789256217025469004,
+      "symlink": false,
+      "sha256": "0ec55d468bc136649fe71fdc4e4b24b5db8931bc60e2b976dd0f569100d9737e"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task7-round2-review-advance.json",
+      "size": 1021,
+      "mtime_ns": 1789259600271904226,
+      "symlink": false,
+      "sha256": "ea1cb051081e7c54ede484da6445fbe18ea829e8f8c1ffd1da7d7ebfc7b19424"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task7-round2-review-candidate.json",
+      "size": 2901,
+      "mtime_ns": 1789257917120801832,
+      "symlink": false,
+      "sha256": "1cc6c8d5564ce51367192b6628fb5f43eb0f0c91ae55ce1eda88a6489cfd9d54"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task7-slices-7.1-7.5-reconciliation.json",
+      "size": 3274,
+      "mtime_ns": 1789261561306843764,
+      "symlink": false,
+      "sha256": "552921d93579a51e8c15320712fe43c09ffebb6f8d49ac3d16afbbadcf52eff1"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task7-start.json",
+      "size": 1216,
+      "mtime_ns": 1789252858515340721,
+      "symlink": false,
+      "sha256": "2ea038dd79809ab52687bf6af75798f7310dd058204b07c7b775ce24ce9e862b"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task8-pre-upstream-preservation.json",
+      "size": 1073,
+      "mtime_ns": 1789261862210946863,
+      "symlink": false,
+      "sha256": "36e219008068c96f51858261afb6a36b8c5b0b6447fa596c2d01815fa0d1bba1"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task8-review-candidate.json",
+      "size": 2071,
+      "mtime_ns": 1789260286381336484,
+      "symlink": false,
+      "sha256": "31467616159c85a742731738ca0bb1cade0097778e72c2d19a007cb09ce7702c"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task8-review-hold-round1.json",
+      "size": 1569,
+      "mtime_ns": 1789261326623620327,
+      "symlink": false,
+      "sha256": "6a8ea7816e578ab98ad79e04f9f6c48422f6d0d68d330074272591b5d827026d"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/task8-start.json",
+      "size": 847,
+      "mtime_ns": 1789259784598448450,
+      "symlink": false,
+      "sha256": "219c262ccce72e7debdd07bbd89407a37b75e013ba9d530896a0c13911fa1524"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/tasks1-9-owner-authorization-telegram-1361.json",
+      "size": 2276,
+      "mtime_ns": 1789252558603197641,
+      "symlink": false,
+      "sha256": "635b499c2ee8127b9ade7ccf4ec20b2b01d4a80d2648e1050939083cb40984bb"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/tasks5-9-dynamic-fence-ledger.json",
+      "size": 2691,
+      "mtime_ns": 1789131850059220405,
+      "symlink": false,
+      "sha256": "c3ad6f645d196b0fe77d2c486a39944c3cb2aa4c3a3a63a1644ef37177afe636"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/tasks5-9-standing-implementation-authorization.json",
+      "size": 2221,
+      "mtime_ns": 1789089815057979065,
+      "symlink": false,
+      "sha256": "d0cb2d2c16615703de76b96498da224bdf2700609485000dc31a00037cf280fd"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/tasks7-9-replacement-amendment-planner-binding-blocked.json",
+      "size": 2824,
+      "mtime_ns": 1789264537027703740,
+      "symlink": false,
+      "sha256": "ef0dbffe1081767449d2bbe51719feb0c6cfa8dbdfae638ff3131ad740706950"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/tasks7-9-upstream-first-amendment.json",
+      "size": 1913,
+      "mtime_ns": 1789261806970214095,
+      "symlink": false,
+      "sha256": "31810f9d6ed0fa08feff66b68b4f4bb3df231d45b52daa9ffef211a5ca3e3c02"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-BOOTSTRAP/checkpoints/upstream-main-merge-resolution.json",
+      "size": 2861,
+      "mtime_ns": 1789264170034657775,
+      "symlink": false,
+      "sha256": "6347936e2452eff7df8029af80bfbfd1c076f1e7a077fc78afa81f372807339c"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R1/chat.jsonl",
+      "size": 5935,
+      "mtime_ns": 1789310850983522496,
+      "symlink": false,
+      "sha256": "3ed3a95849b0ead68d34a917e0a6542a67832628d67f676cf7635d23f959ed02"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R1/checkpoints/council.yaml",
+      "size": 5069,
+      "mtime_ns": 1789265877612718344,
+      "symlink": false,
+      "sha256": "2cb588ce434270b7db9ae24945699f36d1190785555e0d9c7a27d08ab4aa7db5"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R1/checkpoints/instruction-snapshot/RTK.md",
+      "size": 482,
+      "mtime_ns": 1789265877611967752,
+      "symlink": false,
+      "sha256": "49c368c302c6f63d089f4c1085b242fc50fe22ce5bc34dada6478083000e7c6f"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R1/checkpoints/instruction-snapshot/approved-plan.md",
+      "size": 19880,
+      "mtime_ns": 1789265877613395010,
+      "symlink": false,
+      "sha256": "b8446ec85a0a6285db59cf6405583298fb099462a91304ca36302c876a27b328"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R1/checkpoints/instruction-snapshot/global-AGENTS.md",
+      "size": 33672,
+      "mtime_ns": 1789265877611166274,
+      "symlink": false,
+      "sha256": "d493facab0d036ad85f488464ab26a3cf5bc5355b21555664f1f0591054266f4"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R1/checkpoints/owner-excludes-uab-from-active-scope.json",
+      "size": 3370,
+      "mtime_ns": 1789321461345802600,
+      "symlink": false,
+      "sha256": "3c6b95cb449d6892eb58121c897deafa2440841d3e665f36de477649595794fd"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R1/checkpoints/planner-hold-missing-live-bindings.json",
+      "size": 3106,
+      "mtime_ns": 1789310986109499231,
+      "symlink": false,
+      "sha256": "eeee36dbf945d75ae07a7bef4360fe9bb958e725a4789049f3c689967f7cd4ee"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R1/checkpoints/successor-preflight-blocked.json",
+      "size": 5403,
+      "mtime_ns": 1789266038860332102,
+      "symlink": false,
+      "sha256": "fe08c10add34feb88cebfd1a4a93e6ae317c02dbada56a3885d6b94cfe23fd0b"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R1/checkpoints/successor-preflight-resolved.json",
+      "size": 3671,
+      "mtime_ns": 1789309841072744086,
+      "symlink": false,
+      "sha256": "301957ac5031ddb1b122767abbf4db11fb77509db8e2110becea5e6dcab386a4"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R1/checkpoints/task8-clean-pause-successor-resume-surface-unavailable.json",
+      "size": 2968,
+      "mtime_ns": 1789321914964403335,
+      "symlink": false,
+      "sha256": "22e1e126cdf89aba5446b61fa78e6fcab7f845b8b09cfab0612495e2308aced7"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R1/checks/verify-active-plan-scope.mjs",
+      "size": 1414,
+      "mtime_ns": 1789321331675920573,
+      "symlink": false,
+      "sha256": "18363910439c598452b272280d74e450d56184e9be5e9927cf3b6daf61a04f77"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R1/decisions.jsonl",
+      "size": 366,
+      "mtime_ns": 1789328123138804653,
+      "symlink": false,
+      "sha256": "78490ded0d80fd63c97e132ef3055a3f55e1b9d54c1dc9435e15d3eadf367a4f"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/chat.jsonl",
+      "size": 15401,
+      "mtime_ns": 1789329554939732568,
+      "symlink": false,
+      "sha256": "107f0a6f7c5d7d07a1050712cdf61bec4dc065aab1f33ceabd38554dedc83844"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/checkpoints/council.yaml",
+      "size": 4157,
+      "mtime_ns": 1789319019222314723,
+      "symlink": false,
+      "sha256": "3db5dd07744b41ab1b70d3bfd55ba3a9fd565a639f1b9f3db1158108c28add95"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/checkpoints/instruction-snapshot/RTK.md",
+      "size": 482,
+      "mtime_ns": 1788853877721119165,
+      "symlink": false,
+      "sha256": "49c368c302c6f63d089f4c1085b242fc50fe22ce5bc34dada6478083000e7c6f"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/checkpoints/instruction-snapshot/approved-plan.md",
+      "size": 19880,
+      "mtime_ns": 1789265877613395010,
+      "symlink": false,
+      "sha256": "b8446ec85a0a6285db59cf6405583298fb099462a91304ca36302c876a27b328"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/checkpoints/instruction-snapshot/global-AGENTS.md",
+      "size": 35946,
+      "mtime_ns": 1789293775607473895,
+      "symlink": false,
+      "sha256": "374140e764c8133f7baea40547b4a70830a9e6a1ce61b154bad2cdac25b471a7"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/checkpoints/owner-authorizes-r2-four-engine-task8-9.json",
+      "size": 2154,
+      "mtime_ns": 1789323439262554961,
+      "symlink": false,
+      "sha256": "1397af2b634dcd8a95bdb43499390fb1ca0eda5b4d2827cc656752662a7849f3"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/checkpoints/r2-preflight.json",
+      "size": 3266,
+      "mtime_ns": 1789323439262554961,
+      "symlink": false,
+      "sha256": "f1357ced226c4fa0e5477c5bee3798bd913dc44283e380f0b789e768d5a22cce"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/checkpoints/superseded-by-trust-recovery-r1.json",
+      "size": 953,
+      "mtime_ns": 1789346534944156541,
+      "symlink": false,
+      "sha256": "ddd4ea040124e9138870b0a1170666214c436a42b5678b3e87fe99e138661381"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/checkpoints/task8-9-evidence/matrix.json",
+      "size": 152129,
+      "mtime_ns": 1789333559779484906,
+      "symlink": false,
+      "sha256": "e5b32a345f20945d8627af03d606678564b8b1e5ef03ba76f882feb246e0a534"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/checkpoints/task8-9-evidence/task9-coder-report.json",
+      "size": 1630,
+      "mtime_ns": 1789332520532046556,
+      "symlink": false,
+      "sha256": "5c6a282027659255a6e4f4b7a0b614750ea847df77458b1766f1a1aeb0ee1954"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/checkpoints/task8-clean-pause-planner-relay-no-controls.json",
+      "size": 2280,
+      "mtime_ns": 1789324298575025973,
+      "symlink": false,
+      "sha256": "01afabf33d131f9839209ebce516b09f61f7d5968ae03c5d8f2ddd2d9e33e653"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/checkpoints/task9-material-blocker-baseline-tombstone.json",
+      "size": 3209,
+      "mtime_ns": 1789334524484327307,
+      "symlink": false,
+      "sha256": "f146fb1e6b6c9f40f3358f809412b8c7cf1d4c32eb50f20104ec8e398df8fce7"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/checks/verify.mjs",
+      "size": 8937,
+      "mtime_ns": 1789334218981979080,
+      "symlink": false,
+      "sha256": "ee1d9ef09697f552e8381d8479d725f21577424925a74312f184e143babe8004"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/checks/verify.test.mjs",
+      "size": 2010,
+      "mtime_ns": 1789333907159006827,
+      "symlink": false,
+      "sha256": "cf1924337257fb3a56355805400d79b7999f23f052b2ed59bf66951996024fec"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/decisions.jsonl",
+      "size": 1116,
+      "mtime_ns": 1789329546759602135,
+      "symlink": false,
+      "sha256": "9e36c3cf84c2a8abe4e796cdc856a4d3229997983058c50d75281c5bc18d0a8a"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/iter/0/coder_summary.txt",
+      "size": 886,
+      "mtime_ns": 1789329413981668158,
+      "symlink": false,
+      "sha256": "3d264efab759b3ad7a609da5219bb065ae87331f9dc1d379570d1e30b7275e80"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/iter/0/diff.patch",
+      "size": 0,
+      "mtime_ns": 1789329413997668472,
+      "symlink": false,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/iter/0/directive.json",
+      "size": 1612,
+      "mtime_ns": 1789329337524534395,
+      "symlink": false,
+      "sha256": "f0bbf7b0e90074b86b3cf75dd7919c41e565c8cc30218c06f14851265267d3ab"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/iter/0/eval_output.json",
+      "size": 2046,
+      "mtime_ns": 1789329413981668158,
+      "symlink": false,
+      "sha256": "839a2f42f15dfeea3523301f7b6bc968e58d045e78b0fb356728a86c7443816f"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/iter/0/verdict.json",
+      "size": 1279,
+      "mtime_ns": 1789329464606399346,
+      "symlink": false,
+      "sha256": "25d5ee8a69088f8509e53c44f70796169e32a3f0aa9f82ecfbd62dae403f0ddf"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/iter/1/directive.json",
+      "size": 1637,
+      "mtime_ns": 1789329491726777931,
+      "symlink": false,
+      "sha256": "f2ed31386f540c7e3b182ee76b2830276fd09a884aaa8d0130305851f86bfc71"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/iter/1/reviewer-native-advance.json",
+      "size": 781,
+      "mtime_ns": 1789332234734693192,
+      "symlink": false,
+      "sha256": "c941692b5b9f5ca431ac48f972988046e2e1302534b363cdb774f5740875b531"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/iter/1/reviewer-native-hold.json",
+      "size": 2082,
+      "mtime_ns": 1789331896149770797,
+      "symlink": false,
+      "sha256": "df28eaf2212a0f65c5ba1165e8beff7ee701e9d14ba31bd594e1e7ca019dede8"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/planner-brief.md",
+      "size": 4030,
+      "mtime_ns": 1789323439262554961,
+      "symlink": false,
+      "sha256": "4fedb53e829d689f54a2176d2caa6b632e6ab48253f16186aba2a414c111f34d"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/reviewer_sandbox/goal.json",
+      "size": 1804,
+      "mtime_ns": 1789329414041427669,
+      "symlink": false,
+      "sha256": "8b05cc5c09822213da935caa1772ab82e94569b0c98701bb29a48c82542dd079"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/reviewer_sandbox/iter-0/coder_summary.txt",
+      "size": 886,
+      "mtime_ns": 1789329414041305865,
+      "symlink": false,
+      "sha256": "3d264efab759b3ad7a609da5219bb065ae87331f9dc1d379570d1e30b7275e80"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/reviewer_sandbox/iter-0/diff.patch",
+      "size": 0,
+      "mtime_ns": 1789329413997668472,
+      "symlink": false,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/reviewer_sandbox/iter-0/directive.json",
+      "size": 1612,
+      "mtime_ns": 1789329414041362682,
+      "symlink": false,
+      "sha256": "f0bbf7b0e90074b86b3cf75dd7919c41e565c8cc30218c06f14851265267d3ab"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/reviewer_sandbox/iter-0/eval_output.json",
+      "size": 2046,
+      "mtime_ns": 1789329414041379706,
+      "symlink": false,
+      "sha256": "839a2f42f15dfeea3523301f7b6bc968e58d045e78b0fb356728a86c7443816f"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/reviewer_sandbox/plan.md",
+      "size": 18262,
+      "mtime_ns": 1789329414041400054,
+      "symlink": false,
+      "sha256": "b4bc7809c30c83d9815e6f013140f4336922ee5ee2597bf3721babe09f5fa32e"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/reviewer_sandbox/reviewer_memory.md",
+      "size": 331,
+      "mtime_ns": 1789329453955620238,
+      "symlink": false,
+      "sha256": "85b36258e29e708e72196f169b2e06132d6e48b665b83a17d72d105b571615f4"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1/chat.jsonl",
+      "size": 13863,
+      "mtime_ns": 1789350289983471716,
+      "symlink": false,
+      "sha256": "bd6f0ffffebeeedc0560888a143d517ac522ce54f6d25d094f7c04fb5d2fb431"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1/decisions.jsonl",
+      "size": 2150,
+      "mtime_ns": 1789350165657634888,
+      "symlink": false,
+      "sha256": "0caf8f8962cbdcfbb74466f4cd5161348f291aa8bfa1da6247e9c10e8115851d"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1/iter/0/directive.json",
+      "size": 2610,
+      "mtime_ns": 1789350289983471716,
+      "symlink": false,
+      "sha256": "7772fff11647e022ee8d87bba7a28437cc8aad67b2ab4e6fd6bc1be954382f6d"
+    },
+    {
+      "path": "tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1/preflight.json",
+      "size": 2772,
+      "mtime_ns": 1789346534948156599,
+      "symlink": false,
+      "sha256": "a9310afc0bd7d4b465a170c9b9edb5e083acbcc85813394f694385289f66742e"
+    }
+  ],
+  "execution_history": "Coder writes were confined to the four implementation files and this run's .artifacts outputs. No production, tasks/, plan.md or goal.json writes, manual commits or stash restoration occurred in the available Coder command history.",
+  "uncertainty": "Three controller-owned paths changed while new directives were delivered; chat and decisions preserve their old byte prefixes and the directive was replaced. No OS write audit exists to independently attribute those writes or prove historical absence of all earlier writes."
+}

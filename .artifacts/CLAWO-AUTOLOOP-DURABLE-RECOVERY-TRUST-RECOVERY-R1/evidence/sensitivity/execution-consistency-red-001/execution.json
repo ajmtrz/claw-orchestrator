@@ -1,0 +1,22 @@
+{
+  "purpose": "snapshot and execution consistency RED",
+  "argv": [
+    "rtk",
+    "proxy",
+    "node",
+    "--test",
+    "scripts/autoloop-trust-recovery/verify.test.mjs"
+  ],
+  "cwd": "/home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery",
+  "started_at": "2026-09-14T01:39:51.284568+00:00",
+  "ended_at": "2026-09-14T01:39:51.582844+00:00",
+  "exit_code": 1,
+  "artifacts": {
+    "collect.mjs": "79eeddb883994e860518515c56e66d441d44c56f3e7f0e058ec4e203d8d06a0a",
+    "evidence.schema.json": "e71d310524f82e4e633f7eb0ecf040ddd4258b064a074ef295b55055d74ced91",
+    "stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout.txt": "9c84a59fad1d7a45fd3b09c755413935392fee45944b60f827f96e14d9e875a0",
+    "verify.mjs": "d57863a1c60b3d89300900009c5001be33a131b439b522b92ce4baf9a228435e",
+    "verify.test.mjs": "cf64d798b988e20ae283b383e7dbfbe1e5a5f86ff1cf9af05ad275970b246fb0"
+  }
+}
