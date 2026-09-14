@@ -1163,7 +1163,20 @@ export function verifyResumeCase(directory, caseId, sourceHead, readBytes) {
   const eq = (a, b, label) => check(isDeepStrictEqual(a, b), label);
   check(RESUME_CASES.includes(caseId), 'unknown resume scenario');
   const read = readBytes ?? ((name) => fs.readFileSync(containedPath(directory, name)));
-  const parse = (bytes) => bytes.toString().trim().split('\n').filter(Boolean).map(JSON.parse);
+  const parse = (bytes) => {
+    const text = bytes.toString();
+    check(text.endsWith('\n'), 'expected nonempty, line-complete JSONL');
+    const lines = text.slice(0, -1).split('\n');
+    check(
+      lines.every((line) => line.trim().length > 0),
+      'expected nonempty, line-complete JSONL',
+    );
+    try {
+      return lines.map((line) => JSON.parse(line));
+    } catch {
+      check(false, 'expected valid, line-complete JSONL');
+    }
+  };
   const api = JSON.parse(read('api.json'));
   eq(api.schema_version, 1, 'API observation version');
   eq(api.scenario, caseId, 'relabelled API scenario');
@@ -1181,6 +1194,14 @@ export function verifyResumeCase(directory, caseId, sourceHead, readBytes) {
     after = read('decisions.after.jsonl');
   const generations = read('generations.input.jsonl'),
     generationAfter = read('generations.after.jsonl');
+  parse(before);
+  parse(after);
+  // The torn negative scenario certifies rejection, never successful resume.
+  // Its exact malformed bytes are checked against the clean baseline below.
+  if (caseId !== 'trust-timeout-torn') {
+    parse(generations);
+    parse(generationAfter);
+  }
   eq(after, before, 'resume rewrote decision history');
   if (caseId === 'trust-real-uncertain-recovery-claim') {
     eq(api.request.method, 'autoloopRecover', 'wrong recovery API');
@@ -1199,6 +1220,8 @@ export function verifyResumeCase(directory, caseId, sourceHead, readBytes) {
     );
     eq(claim.action_sha256, sha256(canonical(claim.action_snapshot)), 'altered uncertain action');
     const original = read('before.jsonl');
+    parse(original);
+    parse(read('prepared-and-cold-rejected.jsonl'));
     eq(before.subarray(0, original.length), original, 'preparation changed history');
     eq(before, read('prepared-and-cold-rejected.jsonl'), 'uncertain bytes changed');
     eq(api.response.error?.code, 'AUTOLOOP_RECOVERY_INCOMPLETE', 'uncertainty was not blocked');
@@ -1310,6 +1333,10 @@ export function verifyResumeCase(directory, caseId, sourceHead, readBytes) {
       eq(firstApi.response.value?.run_id, runId, 'missing first resume result');
       const firstBefore = read('first-resume/decisions.input.jsonl'),
         firstAfter = read('first-resume/decisions.after.jsonl');
+      parse(firstBefore);
+      parse(firstAfter);
+      parse(read('first-resume/generations.input.jsonl'));
+      parse(read('first-resume/generations.after.jsonl'));
       eq(firstAfter.subarray(0, firstBefore.length), firstBefore, 'first resume rewrote history');
       eq(parse(firstAfter.subarray(firstBefore.length)), [migration], 'wrong persisted first migration');
       eq(before.subarray(0, firstAfter.length), firstAfter, 'cold retry lost first migration');

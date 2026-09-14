@@ -396,6 +396,71 @@ export default {...original,root:${JSON.stringify(project)},cacheDir:${JSON.stri
   }
 });
 
+// Retained real API observations: refresh every file reference after mutation so
+// hash validation cannot mask the JSONL completeness predicate under test.
+const resumeEvidence = path.join(
+  artifactRoot,
+  'evidence/candidate/durability-1789373923054-c3982300-b930-45ab-9e49-9d1057afecf0/cases',
+);
+for (const [label, scenario, names, mutation] of [
+  ['decisions input and after', 'generation-reset', ['decisions.input.jsonl', 'decisions.after.jsonl']],
+  ['generation input with matching after prefix', 'generation-reset', ['generations.input.jsonl'], 'prefix'],
+  ['generation after suffix', 'generation-reset', ['generations.after.jsonl']],
+  ['first decisions input', 'terminated-generation', ['first-resume/decisions.input.jsonl']],
+  ['first decisions after suffix', 'terminated-generation', ['first-resume/decisions.after.jsonl']],
+  ['first generations input', 'terminated-generation', ['first-resume/generations.input.jsonl']],
+  ['first generations after', 'terminated-generation', ['first-resume/generations.after.jsonl']],
+  ['clean generation baseline', 'missing-release', ['generations.before.jsonl']],
+  ['clean decision baseline', 'missing-release', ['decisions.before.jsonl']],
+  ['empty decisions', 'generation-reset', ['decisions.input.jsonl', 'decisions.after.jsonl'], 'empty'],
+  ['blank decisions', 'generation-reset', ['decisions.input.jsonl', 'decisions.after.jsonl'], 'blank'],
+  ['empty generation suffix', 'generation-reset', ['generations.after.jsonl'], 'empty-suffix'],
+]) {
+  test(`resume JSONL rejects ${label} with refreshed artifact references`, () => {
+    const id = `trust-timeout-${scenario}`;
+    const original = path.join(
+      resumeEvidence,
+      fs.readdirSync(resumeEvidence).find((name) => name.startsWith(id + '-')),
+    );
+    const head = '8469e68821acbca313d9e442970cabffb082779a';
+    assert.equal(verifier.verifyResumeCase(original, id, head).case_id, id);
+    const directory = fs.mkdtempSync(path.join(scratch, 'resume-jsonl-'));
+    fs.cpSync(original, directory, { recursive: true });
+    for (const name of names) {
+      const file = path.join(directory, name);
+      const bytes = fs.readFileSync(file);
+      assert.equal(bytes.at(-1), 10);
+      let changed = bytes.subarray(0, bytes.length - 1);
+      if (mutation === 'empty') changed = Buffer.alloc(0);
+      if (mutation === 'blank') changed = Buffer.from('\n');
+      if (mutation === 'empty-suffix') changed = fs.readFileSync(path.join(directory, 'generations.input.jsonl'));
+      fs.writeFileSync(file, changed);
+      if (mutation === 'prefix') {
+        const after = path.join(directory, 'generations.after.jsonl');
+        fs.writeFileSync(after, Buffer.concat([changed, fs.readFileSync(after).subarray(bytes.length)]));
+      }
+    }
+    const files = fs
+      .readdirSync(directory, { recursive: true })
+      .filter((name) => fs.statSync(path.join(directory, name)).isFile())
+      .map((name) => ({ path: name, sha256: digest(fs.readFileSync(path.join(directory, name))) }));
+    fs.writeFileSync(path.join(directory, 'refreshed-references.json'), JSON.stringify(files));
+    const read = collector.durabilityArtifactReader(directory, files);
+    for (const file of files) read(file.path);
+    let error;
+    try {
+      verifier.verifyResumeCase(directory, id, head, read);
+    } catch (caught) {
+      error = caught;
+    }
+    fs.writeFileSync(
+      path.join(directory, 'observed-verdict.json'),
+      JSON.stringify({ accepted: !error, error: error?.message }),
+    );
+    assert.match(error?.message ?? 'accepted torn ledger', /line-complete JSONL/);
+  });
+}
+
 test('durability reference reader distinguishes observed absence from an omitted artifact hash', () => {
   const directory = deliveryCase('target');
   const read = collector.durabilityArtifactReader(directory, []);
