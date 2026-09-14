@@ -1,1 +1,28 @@
-{"scalar":null,"gates":[{"name":"G1_documentation_contract","cmd":"rtk node tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/checks/verify.mjs docs","must":true},{"name":"G2_four_engine_96_cell_matrix","cmd":"rtk node tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/checks/verify.mjs matrix","must":true},{"name":"G3_fixture_reliability_5_and_20","cmd":"rtk node tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/checks/verify.mjs reliability","must":true},{"name":"G4_format","cmd":"rtk npm run format:check","must":true},{"name":"G4_lint","cmd":"rtk npm run lint","must":true},{"name":"G4_upstream_typecheck_no_new_diagnostics","cmd":"rtk node tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/checks/verify.mjs typecheck","must":true},{"name":"G4_build","cmd":"rtk npm run build","must":true},{"name":"G5_full_tests","cmd":"rtk npm test","must":true},{"name":"G5_coverage","cmd":"rtk npm run test:coverage","must":true},{"name":"G5_critical_branch_coverage","cmd":"rtk node tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/checks/verify.mjs coverage","must":true},{"name":"G6_focused_and_repository_regressions","cmd":"rtk node tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/checks/verify.mjs repository","must":true},{"name":"G7_four_live_boundaries","cmd":"rtk node tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/checks/verify.mjs live","must":true},{"name":"G8_scope_freeze_diff_index","cmd":"rtk node tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/checks/verify.mjs freeze","must":true},{"name":"G8_independent_readonly_review","cmd":"rtk node tasks/CLAWO-AUTOLOOP-DURABLE-RECOVERY-POST-UPSTREAM-TASK8-9-R2/checks/verify.mjs review","must":true}],"termination":{"max_iters":100}}
+{
+  "scalar": null,
+  "gates": [
+    {"name":"G1_validator","cmd":"rtk proxy node --test scripts/autoloop-trust-recovery/verify.test.mjs","must":true},
+    {"name":"G2_provenance","cmd":"rtk proxy node scripts/autoloop-trust-recovery/verify.mjs provenance","must":true},
+    {"name":"G3_incidents","cmd":"rtk proxy node scripts/autoloop-trust-recovery/verify.mjs incidents","must":true},
+    {"name":"G4_legacy","cmd":"rtk proxy node scripts/autoloop-trust-recovery/verify.mjs legacy","must":true},
+    {"name":"G5_durability","cmd":"rtk proxy node scripts/autoloop-trust-recovery/verify.mjs durability","must":true},
+    {"name":"G6_controls","cmd":"rtk proxy node scripts/autoloop-trust-recovery/verify.mjs controls","must":true},
+    {"name":"G7_adapters","cmd":"rtk proxy node scripts/autoloop-trust-recovery/verify.mjs adapters","must":true},
+    {"name":"G8_focused","cmd":"rtk proxy node scripts/autoloop-trust-recovery/verify.mjs focused","must":true},
+    {"name":"G9_format","cmd":"rtk proxy node scripts/autoloop-trust-recovery/verify.mjs format","must":true},
+    {"name":"G10_lint","cmd":"rtk proxy node scripts/autoloop-trust-recovery/verify.mjs lint","must":true},
+    {"name":"G11_build","cmd":"rtk proxy node scripts/autoloop-trust-recovery/verify.mjs build","must":true},
+    {"name":"G12_typecheck","cmd":"rtk proxy node scripts/autoloop-trust-recovery/verify.mjs typecheck","must":true},
+    {"name":"G13_full","cmd":"rtk proxy node scripts/autoloop-trust-recovery/verify.mjs full","must":true},
+    {"name":"G14_coverage","cmd":"rtk proxy node scripts/autoloop-trust-recovery/verify.mjs coverage","must":true},
+    {"name":"G15_e2e","cmd":"rtk proxy node scripts/autoloop-trust-recovery/verify.mjs e2e","must":true},
+    {"name":"G16_concurrency","cmd":"rtk proxy node scripts/autoloop-trust-recovery/verify.mjs concurrency","must":true},
+    {"name":"G17_nonregression","cmd":"rtk proxy node scripts/autoloop-trust-recovery/verify.mjs nonregression","must":true},
+    {"name":"G18_live","cmd":"rtk proxy node scripts/autoloop-trust-recovery/verify.mjs live","must":true},
+    {"name":"G19_review","cmd":"rtk proxy node scripts/autoloop-trust-recovery/verify.mjs review","must":true},
+    {"name":"G20_close","cmd":"rtk proxy node scripts/autoloop-trust-recovery/verify.mjs close","must":true}
+  ],
+  "termination": {
+    "max_iters": null
+  }
+}
