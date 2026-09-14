@@ -1165,6 +1165,9 @@ describe('SessionManager', () => {
     });
 
     it('keeps a legacy generation-zero tombstone fenced until release evidence is durable', async () => {
+      // This ordinary legacy fixture must still be inside the seven-day TTL
+      // when release claims its durable generation-zero fence.
+      vi.setSystemTime(new Date('2026-09-05T12:00:00.000Z'));
       const sessionName = 'autoloop-probe-legacy-planner';
       const next = managerGeneration(sessionName);
       const reservations = (
@@ -8488,7 +8491,7 @@ describe('SessionManager', () => {
       });
 
       it.each(['on_phase_error', 'on_decision_needed'] as const)(
-        'repairs a legacy non-fallback $key channel during an allowed partial update',
+        'repairs a legacy non-fallback %s channel during an allowed partial update',
         async (key) => {
           const runId = `planner-critical-policy-defensive-${key}`;
           const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
@@ -8554,7 +8557,7 @@ describe('SessionManager', () => {
       });
 
       it.each(['on_phase_error', 'on_decision_needed'] as const)(
-        'refuses prose plus a silence-only $key attempt without policy or successful-control audit mutation',
+        'refuses prose plus a silence-only %s attempt without policy or successful-control audit mutation',
         async (key) => {
           const runId = `planner-critical-silence-with-text-${key}`;
           const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
@@ -9121,7 +9124,7 @@ describe('SessionManager', () => {
       );
 
       it.each(['absent', 'staged'] as const)(
-        'restores the exact $prior Planner artifact index state after a failed commit',
+        'restores the exact %s Planner artifact index state after a failed commit',
         async (prior) => {
           const runId = `planner-index-restore-${prior}`;
           const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
