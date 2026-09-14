@@ -27,6 +27,65 @@ import type { AnyAutoloopMessage, PhaseErrorPayload } from '../autoloop/messages
 import type { PlannerToolCall } from '../autoloop/planner-tools.js';
 import { recoveryActionDigest } from '../autoloop/recovery.js';
 
+// Observation-only boundary: preserve actual public results and file bytes.
+// No expected decision, ACK, lifecycle event or recovery result is synthesized.
+async function observeTrustApi<T>(
+  output: string | undefined,
+  scenario: string,
+  request: Record<string, unknown>,
+  files: Record<string, string>,
+  inspect: () => Record<string, unknown>,
+  action: () => Promise<T>,
+): Promise<T> {
+  if (!output) return action();
+  const root = path.resolve('.artifacts/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1');
+  if (!path.resolve(output).startsWith(root + path.sep)) throw new Error('Unsafe API evidence path');
+  fs.mkdirSync(output, { recursive: true });
+  const save = (phase: string) => {
+    for (const [name, file] of Object.entries(files)) {
+      fs.writeFileSync(
+        path.join(output, `${name}.${phase}.jsonl`),
+        fs.existsSync(file) ? fs.readFileSync(file) : 'null\n',
+        { flag: 'wx' },
+      );
+    }
+  };
+  save('input');
+  const before = inspect();
+  let response: Record<string, unknown>;
+  try {
+    const value = await action();
+    response = { value };
+    return value;
+  } catch (error) {
+    const observed = error as Error & { code?: string; retryable?: boolean };
+    response = {
+      error: { name: observed.name, message: observed.message, code: observed.code, retryable: observed.retryable },
+    };
+    throw error;
+  } finally {
+    save('after');
+    const source_imports = ['src/session-manager.ts', 'src/__tests__/session-manager.test.ts'].map((file) => ({
+      path: path.resolve(file),
+      sha256: createHash('sha256').update(fs.readFileSync(file)).digest('hex'),
+    }));
+    fs.writeFileSync(
+      path.join(output, 'api.json'),
+      JSON.stringify({
+        schema_version: 1,
+        process_id: process.pid,
+        scenario,
+        request,
+        before,
+        after: inspect(),
+        response: response!,
+        source_imports,
+      }),
+      { flag: 'wx' },
+    );
+  }
+}
+
 // ─── Mock ISession ──────────────────────────────────────────────────────────
 
 class MockSession extends EventEmitter implements ISession {
@@ -6635,19 +6694,37 @@ describe('SessionManager', () => {
           .filter((row) => row.kind === 'agent_generation_started' && row.payload.role === 'planner');
         expect(started.map((row) => row.payload.generation)).toEqual([1, 2]);
         expect(started[0].payload.owner_instance_id).not.toBe(started[1].payload.owner_instance_id);
+        let output: string | undefined;
         if (process.env.CLAWO_TRUST_CASE_ROOT) {
-          const output = fs.mkdtempSync(path.join(process.env.CLAWO_TRUST_CASE_ROOT, `${runId}-`));
+          output = fs.mkdtempSync(path.join(process.env.CLAWO_TRUST_CASE_ROOT, `${runId}-`));
           fs.writeFileSync(path.join(output, 'decisions.before.jsonl'), audit, { flag: 'wx' });
           fs.writeFileSync(path.join(output, 'generations.before.jsonl'), generations, { flag: 'wx' });
         }
-        return { workspace, auditPath, generationPath, audit, generations };
+        return { workspace, auditPath, generationPath, audit, generations, output };
       };
+
+      const observedResume = (
+        runId: string,
+        observed: { output?: string; auditPath: string; generationPath: string },
+        options?: { sendTimeoutMs: number },
+      ) =>
+        observeTrustApi(
+          observed.output,
+          runId === 'CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1' ? 'trust-timeout-missing-legacy' : runId,
+          { method: 'autoloopResume', run_id: runId, options },
+          { decisions: observed.auditPath, generations: observed.generationPath, spec: storedSpecPath(runId) },
+          () => ({
+            handle_present: !!mgr.getAutoloop(runId),
+            effective_timeout_ms: mgr.getAutoloop(runId)?.dispatcher.effectiveSendTimeoutMs,
+          }),
+          () => mgr.autoloopResume(runId, options),
+        );
 
       it('cold-resumes a timeout reset proved by durable generation replacement without rewriting history', async () => {
         const runId = 'trust-timeout-generation-reset';
         const observed = await generationScopedTimeoutHistory(runId);
         const specBefore = fs.readFileSync(storedSpecPath(runId), 'utf8');
-        await expect(mgr.autoloopResume(runId)).resolves.toMatchObject({ run_id: runId });
+        await expect(observedResume(runId, observed)).resolves.toMatchObject({ run_id: runId });
         expect(mgr.getAutoloop(runId)!.dispatcher.effectiveSendTimeoutMs).toBe(1_200_000);
         expect(fs.readFileSync(observed.auditPath, 'utf8')).toBe(observed.audit);
         expect(fs.readFileSync(observed.generationPath, 'utf8').startsWith(observed.generations)).toBe(true);
@@ -6677,7 +6754,14 @@ describe('SessionManager', () => {
         const auditPath = auditPathFor(workspace, runId);
         fs.writeFileSync(auditPath, bytes);
         fs.unlinkSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'));
-        await expect(mgr.autoloopResume(runId)).rejects.toThrow(/timeout.*(chain|generation)/i);
+        const observed = {
+          auditPath,
+          generationPath: path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'),
+          output: process.env.CLAWO_TRUST_CASE_ROOT
+            ? fs.mkdtempSync(path.join(process.env.CLAWO_TRUST_CASE_ROOT, 'trust-timeout-missing-legacy-'))
+            : undefined,
+        };
+        await expect(observedResume(runId, observed)).rejects.toThrow(/timeout.*(chain|generation)/i);
         expect(mgr.getAutoloop(runId)).toBeUndefined();
         expect(fs.readFileSync(auditPath, 'utf8')).toBe(bytes);
       });
@@ -6685,12 +6769,16 @@ describe('SessionManager', () => {
       it('cold-resumes a proved generation reset terminated before its timeout migration', async () => {
         const runId = 'trust-timeout-terminated-generation';
         const observed = await generationScopedTimeoutHistory(runId, false);
-        await mgr.autoloopResume(runId, { sendTimeoutMs: 1_200_000 });
+        await observedResume(
+          runId,
+          { ...observed, output: observed.output && path.join(observed.output, 'first-resume') },
+          { sendTimeoutMs: 1_200_000 },
+        );
         expect(mgr.getAutoloop(runId)!.dispatcher.effectiveSendTimeoutMs).toBe(1_200_000);
         await terminateAndReconstructManager(runId);
         const before = fs.readFileSync(observed.auditPath, 'utf8');
         expect(before.startsWith(observed.audit)).toBe(true);
-        await expect(mgr.autoloopResume(runId)).resolves.toMatchObject({ run_id: runId });
+        await expect(observedResume(runId, observed)).resolves.toMatchObject({ run_id: runId });
         expect(mgr.getAutoloop(runId)!.dispatcher.effectiveSendTimeoutMs).toBe(1_200_000);
         expect(fs.readFileSync(observed.auditPath, 'utf8')).toBe(before);
       });
@@ -6743,7 +6831,7 @@ describe('SessionManager', () => {
           fs.writeFileSync(observed.auditPath, decisions.map((row) => JSON.stringify(row) + '\n').join(''));
         }
         const before = fs.readFileSync(observed.auditPath, 'utf8');
-        await expect(mgr.autoloopResume(runId)).rejects.toThrow(/timeout.*(chain|generation)|malformed/i);
+        await expect(observedResume(runId, observed)).rejects.toThrow(/timeout.*(chain|generation)|malformed/i);
         expect(mgr.getAutoloop(runId)).toBeUndefined();
         expect(fs.readFileSync(observed.auditPath, 'utf8')).toBe(before);
       });
@@ -10467,13 +10555,26 @@ describe('SessionManager', () => {
       mgr = createManager();
       const fresh = await mgr.autoloopRecover(runId);
       const starts = createdConfigs.length;
+      const output = process.env.CLAWO_TRUST_CASE_ROOT
+        ? fs.mkdtempSync(path.join(process.env.CLAWO_TRUST_CASE_ROOT, `${runId}-`))
+        : undefined;
       await expect(
-        mgr.autoloopRecover(runId, { apply: true, recovery_token: fresh.assessment.recovery_token }),
+        observeTrustApi(
+          output,
+          runId,
+          {
+            method: 'autoloopRecover',
+            run_id: runId,
+            options: { apply: true, recovery_token: fresh.assessment.recovery_token },
+          },
+          { decisions: decisionPath, generations: path.join(workspace, 'tasks', runId, 'agent-generations.jsonl') },
+          () => ({ handle_present: !!mgr.getAutoloop(runId), engine_starts: createdConfigs.length }),
+          () => mgr.autoloopRecover(runId, { apply: true, recovery_token: fresh.assessment.recovery_token }),
+        ),
       ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_INCOMPLETE', retryable: false });
       expect(createdConfigs).toHaveLength(starts);
       expect(fs.readFileSync(decisionPath)).toEqual(prepared);
-      if (process.env.CLAWO_TRUST_CASE_ROOT) {
-        const output = fs.mkdtempSync(path.join(process.env.CLAWO_TRUST_CASE_ROOT, `${runId}-`));
+      if (output) {
         fs.writeFileSync(path.join(output, 'before.jsonl'), before, { flag: 'wx' });
         fs.writeFileSync(path.join(output, 'prepared-and-cold-rejected.jsonl'), prepared, { flag: 'wx' });
       }

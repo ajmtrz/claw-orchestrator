@@ -227,6 +227,14 @@ function applyPredicate(assertion, values, observations) {
  * Contract comes from reviewed caller code, never bundle fields. This checks
  * evidence integrity and predicates, not authenticity or independent review.
  */
+export function readInputManifest(directory, reference) {
+  const manifest = JSON.parse(readArtifact(directory, reference));
+  requireThat(validateManifest(manifest), 'Invalid input manifest schema');
+  for (const entries of Object.values(manifest))
+    requireThat(!duplicates(entries.map((e) => e.path)), 'Duplicate manifest path');
+  return manifest;
+}
+
 export function verifyBundle(bundle, directory, contract) {
   requireThat(validateSchema(bundle), `Evidence schema: ${ajv.errorsText(validateSchema.errors)}`);
   requireThat(contract && Array.isArray(contract.assertions), 'A separate fixed contract is required');
@@ -245,10 +253,7 @@ export function verifyBundle(bundle, directory, contract) {
   ])
     same(bundle[key], contract[key], `Wrong ${key}`);
   same(bundle.input_manifest.sha256, contract.input_manifest_sha256, 'Wrong input manifest');
-  const manifest = JSON.parse(readArtifact(directory, bundle.input_manifest));
-  requireThat(validateManifest(manifest), 'Invalid input manifest schema');
-  for (const entries of Object.values(manifest))
-    requireThat(!duplicates(entries.map((e) => e.path)), 'Duplicate manifest path');
+  const manifest = readInputManifest(directory, bundle.input_manifest);
   for (const [field, key] of [
     ['harness_sha256', 'harness'],
     ['dependency_sha256', 'dependencies'],
@@ -761,11 +766,610 @@ export function verifyLegacyCase(directory, candidateHead) {
   return title;
 }
 
+export const DURABILITY_CASES = [
+  'before-send',
+  'after-capture',
+  'after-ack',
+  'target',
+  'torn',
+  'intent-fsync',
+  'digest-mismatch',
+  'review-checkpoint',
+];
+const DELIVERY_SOURCE = 'src/__tests__/autoloop-trust-recovery-delivery.test.ts';
+const DELIVERY_IMPORTS = [
+  'session-manager.ts',
+  'autoloop/dispatcher.ts',
+  'autoloop/runner.ts',
+  'autoloop/messages.ts',
+  'logger.ts',
+  'autoloop/secure-ledger.ts',
+].map((file) => `src/${file}`);
+const gitSource = (head, file) => {
+  if (head === undefined) return fs.readFileSync(path.join(PROJECT, file));
+  requireThat(/^[a-f0-9]{40}$/.test(head), 'durability: invalid source head');
+  return execFileSync('rtk', ['proxy', 'git', 'show', `${head}:${file}`], {
+    cwd: PROJECT,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+};
+const canonical = (value) =>
+  JSON.stringify(value, function (key, item) {
+    return item && typeof item === 'object' && !Array.isArray(item)
+      ? Object.fromEntries(
+          Object.keys(item)
+            .sort()
+            .map((k) => [k, item[k]]),
+        )
+      : item;
+  });
+
+/** Recompute one independently selected scenario from the worker's actual files.
+ * readBytes can enforce an outer hashed inventory; it cannot supply predicates.
+ * A copied scenario may keep its historical absolute paths, but not its identity.
+ */
+export function verifyDurabilityCase(directory, caseId, sourceHead, readBytes) {
+  const check = (value, label) => requireThat(value, `durability ${caseId}: ${label}`);
+  const eq = (a, b, label) => check(isDeepStrictEqual(a, b), label);
+  check(DURABILITY_CASES.includes(caseId), 'unknown scenario');
+  const read = readBytes ?? ((name) => fs.readFileSync(containedPath(directory, name)));
+  const json = (name) => JSON.parse(read(name));
+  const rows = (name) => {
+    const text = read(name).toString();
+    check(text.endsWith('\n'), `torn artifact ${name}`);
+    return text.trim().split('\n').filter(Boolean).map(JSON.parse);
+  };
+  const optionalRows = (name) => {
+    try {
+      return rows(name);
+    } catch (error) {
+      if (error.code === 'ENOENT') return [];
+      throw error;
+    }
+  };
+  const source = gitSource(sourceHead, DELIVERY_SOURCE).toString();
+  const worker = source.match(/const worker = String.raw`([\s\S]*?)`;\n/);
+  check(worker, 'missing committed worker');
+  eq(read('worker.mjs').toString(), worker[1], 'worker differs from committed scenario');
+  const review = caseId === 'review-checkpoint',
+    negative = ['target', 'torn'].includes(caseId);
+  const fault = caseId === 'intent-fsync' ? 'fsync' : caseId === 'digest-mismatch' ? 'digest' : undefined;
+  const boundary = review ? 'after-ack' : negative ? 'before-send' : fault ? 'none' : caseId;
+  const ids = fault ? ['failed'] : ['crashed', 'cold'];
+  const processes = ids.map((id) => {
+    const e = json(`${id}.execution.json`),
+      events = rows(`${id}/events.jsonl`);
+    eq(
+      { id: e.input.id, boundary: e.input.boundary, cold: e.input.cold, fault: e.input.fault, review: e.input.review },
+      { id, boundary: id === 'cold' && (review || negative) ? 'none' : boundary, cold: id === 'cold', fault, review },
+      'scenario descriptor mismatch',
+    );
+    eq(path.resolve(e.input.project), path.resolve(PROJECT), 'wrong source subject');
+    check(!e.timedOut && Date.parse(e.ended_at) >= Date.parse(e.started_at), 'invalid process interval');
+    eq(e.argv.slice(0, 2), ['rtk', 'proxy'], 'unexpected launcher');
+    eq(e.argv.slice(3), ['--import', 'tsx', '--input-type=module', '-'], 'unexpected process command');
+    check(path.basename(e.argv[2]) === 'node', 'unexpected executable');
+    const out = read(`${id}.stdout.txt`),
+      err = read(`${id}.stderr.txt`);
+    eq(sha256(out), e.stdout_sha256, 'stdout hash');
+    eq(sha256(err), e.stderr_sha256, 'stderr hash');
+    check(events.length > 1 && Number.isInteger(events[0].process_id), 'missing process events');
+    events.forEach((event, i) => {
+      eq(event.sequence, i, 'event ordering');
+      eq(event.process_id, events[0].process_id, 'mixed process');
+    });
+    eq(events[0].kind, 'source-imports', 'missing source observations');
+    eq(
+      events[0].value,
+      DELIVERY_IMPORTS.map((file) => ({ path: path.join(PROJECT, file), sha256: sha256(gitSource(sourceHead, file)) })),
+      'fabricated source hashes',
+    );
+    if (id === 'crashed') {
+      eq(e.signal, 'SIGKILL', 'missing witnessed death');
+      eq(e.code, null, 'crash exit');
+      check(
+        out
+          .toString()
+          .split('\n')
+          .some((line) => line === JSON.stringify({ barrier: boundary })),
+        'missing barrier stdout',
+      );
+      eq(events.at(-1).kind, 'barrier', 'missing last barrier');
+      eq(events.at(-1).value, boundary, 'wrong barrier');
+    } else {
+      eq(e.signal, null, 'unexpected process loss');
+      eq(e.code, fault || negative ? 2 : 0, 'hidden process failure');
+      check(out.toString().includes(JSON.stringify({ done: true, exit: e.code })), 'missing process completion');
+      check(
+        events.some((x) => x.kind === (fault || negative ? 'failure' : 'final-state')),
+        'missing API terminal outcome',
+      );
+      if (!fault && !negative)
+        check(!events.some((x) => ['failure', 'runner-error'].includes(x.kind)), 'hidden API failure');
+    }
+    return { id, e, events, pid: events[0].process_id };
+  });
+  if (processes.length === 2) {
+    check(processes[0].pid !== processes[1].pid, 'warm process replay');
+    eq(processes[0].e.input.directory, processes[1].e.input.directory, 'different persisted workspace');
+    check(Date.parse(processes[1].e.started_at) >= Date.parse(processes[0].e.ended_at), 'cold process preceded death');
+  }
+  const message = json('message-A.json');
+  eq(
+    { iter: message.iter, from: message.from, to: message.to, type: message.type },
+    review
+      ? { iter: 1, from: 'runner', to: 'reviewer', type: 'review_request' }
+      : { iter: 0, from: 'planner', to: 'coder', type: 'directive' },
+    'wrong logical message',
+  );
+  if (!review)
+    eq(
+      message.payload,
+      {
+        goal: 'directive A: preserve these exact bytes',
+        constraints: ['immutable A'],
+        success_criteria: ['one logical effect'],
+        max_attempts: 1,
+      },
+      'changed A payload',
+    );
+  const initialName = fault ? 'failed/failure-decisions.jsonl' : `crashed/${boundary}-decisions.jsonl`;
+  const initial = rows(initialName),
+    intents = initial.filter((x) => x.delivery_id && x.kind && !x.record_type);
+  eq(intents.length, 1, 'missing unique intent');
+  const intent = intents[0];
+  eq(intent.schema_version, 1, 'noncanonical intent');
+  eq(intent.target_role, message.to, 'wrong target');
+  eq(intent.target_generation, 1, 'wrong initial generation');
+  eq(intent.kind, review ? 'review_request' : 'coder_directive', 'wrong intent kind');
+  eq(
+    intent.idempotency_key,
+    'dispatch_' +
+      sha256(JSON.stringify(['trust-delivery', message.msg_id, message.iter, message.from, message.to, message.type])),
+    'changed idempotency key',
+  );
+  eq(intent.payload_sha256, sha256(canonical(intent.payload)), 'payload digest mismatch');
+  const envelope = {
+    msg_id: message.msg_id,
+    iter: message.iter,
+    from: message.from,
+    to: message.to,
+    type: message.type,
+    ts: message.ts,
+    payload: message.payload,
+  };
+  eq(intent.payload.logical_message_sha256, sha256(JSON.stringify(envelope)), 'logical envelope digest mismatch');
+  const checkpoint = review ? read('checkpoint.txt').toString().trim() : null;
+  const prompt = review
+    ? `[review_request iter=1]\nArtifacts staged from run source-checkpoint iter 0 at: iter-1/ (directive.json, diff.patch, eval_output.json)\ncheckpoint_sha: ${checkpoint}\nscope: ["durable-delivery"]\nprior_verdict: (none)\nprior_metrics: []\n\nAudit and emit \`review_complete\`.`
+    : '[directive iter=0]\ngoal: directive A: preserve these exact bytes\nconstraints:\n  - immutable A\nsuccess_criteria:\n  - one logical effect\nmax_attempts: 1\nRead plan.md / goal.json, make the change, run the evaluator, then emit `iter_complete`.';
+  eq(intent.payload.prompt, prompt, 'changed rendered payload');
+  const suffix = `\n\n<autoloop_delivery delivery_id="${intent.delivery_id}" payload_sha256="${intent.payload_sha256}">\nEcho both fields unchanged in iter_complete, request_clarification, or review_complete.\n</autoloop_delivery>`;
+  const recipients = optionalRows('recipient.jsonl'),
+    effects = optionalRows('receiver-effects.jsonl');
+  const count = negative || fault === 'fsync' ? 0 : boundary === 'after-capture' ? 2 : 1;
+  eq(recipients.length, count, 'recipient inventory');
+  eq(effects, count ? [recipients[0]] : [], 'duplicate/altered receiver effects');
+  const captures = processes.flatMap((p) =>
+    p.events.filter((x) => x.kind === 'recipient-captured').map((x) => x.value),
+  );
+  eq(captures, recipients, 'recipient event/file disagreement');
+  recipients.forEach((recipient) => {
+    eq(recipient.prompt, prompt + suffix, 'changed recipient payload');
+    eq(recipient.role, message.to, 'changed recipient role');
+    eq(recipient.delivery_id, intent.delivery_id, 'changed delivery id');
+    eq(recipient.payload_sha256, intent.payload_sha256, 'changed recipient digest');
+    const p = processes.find((p) => p.pid === recipient.process_id);
+    check(p, 'unknown recipient process');
+    check(
+      p.events.some(
+        (x) =>
+          x.kind === 'engine-created' &&
+          x.value.session_id === recipient.session_id &&
+          x.value.name.endsWith('-' + message.to),
+      ),
+      'unproved receiver session',
+    );
+  });
+  for (const p of processes) {
+    for (const transport of p.events.filter((x) => x.kind === 'transport-enter')) {
+      const snapshot = rows(`${p.id}/transport-1-decisions.jsonl`);
+      check(
+        snapshot.some((x) => isDeepStrictEqual(x, intent)),
+        'transport before durable complete intent',
+      );
+      const preceding = p.events.slice(0, transport.sequence);
+      const lastMessage = preceding.findLastIndex(
+        (x) => x.kind === 'runner-message' && x.value.msg_id === message.msg_id,
+      );
+      const syncs = preceding.slice(lastMessage + 1).filter((x) => x.kind === 'fsync-return');
+      check(
+        syncs.some((x) => x.value.endsWith('/decisions.jsonl')) &&
+          syncs.some((x) => x.value.endsWith('/tasks/trust-delivery')),
+        'transport before file/directory fsync',
+      );
+    }
+  }
+  if (negative) {
+    const altered = read('altered-input.jsonl');
+    if (caseId === 'torn')
+      eq(altered, Buffer.concat([read(initialName), Buffer.from('{"schema_version":')]), 'wrong torn fault');
+    else {
+      const expected = structuredClone(initial);
+      expected.find((x) => x.kind === 'coder_directive').target_role = 'reviewer';
+      eq(altered.toString(), expected.map((x) => JSON.stringify(x) + '\n').join(''), 'wrong target fault');
+    }
+    eq(read('cold/failure-decisions.jsonl'), altered, 'blocked ledger changed');
+    check(
+      !processes[1].events.some((x) => ['transport-enter', 'ack-consumed'].includes(x.kind)),
+      'blocked case performed effect',
+    );
+    return { case_id: caseId };
+  }
+  if (fault) {
+    eq(
+      initial.filter((x) => x.acknowledged_at),
+      [],
+      'failed delivery was acknowledged',
+    );
+    check(!processes[0].events.some((x) => x.kind === 'ack-consumed'), 'failed phase advanced');
+    const failure = processes[0].events.find((x) => x.kind === 'failure').value;
+    eq(
+      failure.code,
+      fault === 'fsync' ? 'AUTOLOOP_DELIVERY_COMMITTED_OBSERVATION_FAILED' : 'AUTOLOOP_CONTROL_MALFORMED',
+      'wrong fault outcome',
+    );
+    if (fault === 'fsync')
+      check(
+        processes[0].events.some((x) => x.kind === 'injected-fsync-failure'),
+        'missing persistence fault',
+      );
+    return { case_id: caseId };
+  }
+  const finalBytes = read('cold/final-decisions.jsonl'),
+    final = rows('cold/final-decisions.jsonl');
+  eq(finalBytes.subarray(0, read(initialName).length), read(initialName), 'historical prefix rewritten');
+  eq(
+    final.filter((x) => x.delivery_id && x.kind && !x.record_type),
+    [intent],
+    'replayed intent changed',
+  );
+  check(
+    final.slice(initial.length).every((x) => x.schema_version === 1),
+    'noncanonical appended delivery',
+  );
+  const acks = final.filter((x) => x.acknowledged_at);
+  eq(acks.length, 1, 'missing unique durable ACK');
+  eq(acks[0].delivery_id, intent.delivery_id, 'ACK identity');
+  eq(acks[0].payload_sha256, intent.payload_sha256, 'ACK digest');
+  eq(initial.filter((x) => x.acknowledged_at).length, boundary === 'after-ack' ? 1 : 0, 'wrong crash/ACK boundary');
+  const cold = processes[1];
+  const messages = cold.events.filter((x) => x.kind === 'runner-message').map((x) => x.value);
+  check(messages.filter((x) => isDeepStrictEqual(x, message)).length >= 2, 'missing concurrent exact retries');
+  check(
+    cold.events.some((x) => x.kind === 'B-rejected'),
+    'conflicting directive not refused',
+  );
+  const consumed = cold.events.filter((x) => x.kind === 'ack-consumed');
+  if (!review) {
+    check(consumed.length >= 1, 'missing ACK phase consumption');
+    consumed.forEach((x) => eq(x.value.ack_rows, acks, 'phase before matching durable ACK'));
+  }
+  for (const p of processes) {
+    const captured = p.events.find((x) => x.kind === 'recipient-captured');
+    if (captured && !(p.id === 'crashed' && boundary === 'after-capture')) {
+      const end =
+        p.id === 'crashed'
+          ? p.events.length
+          : (p.events.find((x) => x.kind === 'ack-consumed')?.sequence ?? p.events.length);
+      check(
+        p.events
+          .slice(captured.sequence + 1, end)
+          .some((x) => x.kind === 'fsync-return' && x.value.endsWith('/decisions.jsonl')),
+        'ACK before captured receiver or durable fsync',
+      );
+    }
+  }
+  const rebinds = final.filter((x) => x.record_type === 'delivery_generation_rebind');
+  eq(rebinds.length, boundary === 'after-ack' ? 0 : 1, 'wrong rebind count');
+  for (const rebind of rebinds) {
+    for (const key of ['delivery_id', 'idempotency_key', 'kind', 'target_role', 'payload_sha256'])
+      eq(rebind[key], intent[key], 'rebind identity');
+    eq([rebind.from_generation, rebind.to_generation], [1, 2], 'rebind generation');
+    const generations = rows('cold/final-generations.jsonl'),
+      old = rows(`crashed/${boundary}-generations.jsonl`);
+    eq(
+      read('cold/final-generations.jsonl').subarray(0, read(`crashed/${boundary}-generations.jsonl`).length),
+      read(`crashed/${boundary}-generations.jsonl`),
+      'generation history changed',
+    );
+    const live = old.find((x) => x.kind === 'agent_generation_started' && x.payload.role === message.to);
+    check(live, 'missing original owner');
+    const role = generations.filter((x) => x.payload.role === message.to);
+    eq(
+      role.map((x) => x.kind),
+      [
+        'agent_generation_reserved',
+        'agent_generation_started',
+        'agent_generation_orphaned',
+        'agent_generation_released',
+        'agent_generation_reserved',
+        'agent_generation_started',
+      ],
+      'missing release before replacement',
+    );
+    for (const row of role.slice(2, 4))
+      for (const key of ['generation', 'session_id', 'session_name', 'owner_instance_id'])
+        eq(row.payload[key], live.payload[key], 'release ownership mismatch');
+    eq(role[4].payload.generation, 2, 'nonmonotonic successor');
+    check(role[4].payload.owner_instance_id !== live.payload.owner_instance_id, 'same owner replacement');
+    eq(Date.parse(role[4].ts) - Date.parse(live.ts), 300000, 'wrong controlled cold clock');
+    check(Date.parse(role[4].ts) > Date.parse(live.payload.lease_expires_at), 'lease not crossed');
+  }
+  if (review) {
+    check(/^[a-f0-9]{40}$/.test(checkpoint), 'invalid checkpoint');
+    eq(
+      read('source.patch'),
+      execFileSync(
+        'rtk',
+        [
+          'proxy',
+          'git',
+          'show',
+          '--no-ext-diff',
+          '--no-textconv',
+          '--format=',
+          '--unified=3',
+          '--no-renames',
+          checkpoint,
+          '--',
+        ],
+        { cwd: PROJECT, maxBuffer: 16 * 1024 * 1024 },
+      ),
+      'wrong checkpoint patch',
+    );
+    eq(message.payload.checkpoint_sha, checkpoint, 'wrong review subject');
+    const verdict = json('workspace/tasks/trust-delivery/iter/1/verdict.json');
+    eq(verdict.iter, 1, 'wrong review iteration');
+    eq(verdict.decision, 'hold', 'wrong observed verdict');
+    check(
+      !processes.some((p) => p.events.some((x) => x.kind === 'engine-created' && x.value.name.endsWith('-coder'))),
+      'review started Coder',
+    );
+    eq(final.filter((x) => x.kind === 'request_review').length, 1, 'duplicate review request');
+  }
+  return { case_id: caseId };
+}
+
+export const RESUME_CASES = [
+  'generation-reset',
+  'terminated-generation',
+  'missing-legacy',
+  'missing-release',
+  'same-owner',
+  'wrong-session',
+  'wrong-generation',
+  'late-start',
+  'future-created',
+  'torn',
+  'decreasing',
+  'wrong-dispatch',
+]
+  .map((name) => `trust-timeout-${name}`)
+  .concat(['trust-real-uncertain-recovery-claim']);
+
+export function verifyResumeCase(directory, caseId, sourceHead, readBytes) {
+  const check = (value, label) => requireThat(value, `durability ${caseId}: ${label}`);
+  const eq = (a, b, label) => check(isDeepStrictEqual(a, b), label);
+  check(RESUME_CASES.includes(caseId), 'unknown resume scenario');
+  const read = readBytes ?? ((name) => fs.readFileSync(containedPath(directory, name)));
+  const parse = (bytes) => bytes.toString().trim().split('\n').filter(Boolean).map(JSON.parse);
+  const api = JSON.parse(read('api.json'));
+  eq(api.schema_version, 1, 'API observation version');
+  eq(api.scenario, caseId, 'relabelled API scenario');
+  eq(
+    api.source_imports,
+    ['src/session-manager.ts', 'src/__tests__/session-manager.test.ts'].map((file) => ({
+      path: path.join(PROJECT, file),
+      sha256: sha256(gitSource(sourceHead, file)),
+    })),
+    'wrong API source identity',
+  );
+  check(Number.isInteger(api.process_id) && api.process_id > 0, 'missing observer process');
+  eq(api.before.handle_present, false, 'not cold reconstruction');
+  const before = read('decisions.input.jsonl'),
+    after = read('decisions.after.jsonl');
+  const generations = read('generations.input.jsonl'),
+    generationAfter = read('generations.after.jsonl');
+  eq(after, before, 'resume rewrote decision history');
+  if (caseId === 'trust-real-uncertain-recovery-claim') {
+    eq(api.request.method, 'autoloopRecover', 'wrong recovery API');
+    eq(api.request.run_id, caseId, 'wrong recovery run');
+    eq(api.request.options.apply, true, 'not an apply operation');
+    check(/^[a-f0-9]{64}$/.test(api.request.options.recovery_token), 'missing actual recovery token');
+    const receipts = parse(before).filter((x) => x.record_type === 'autoloop_recovery_receipt');
+    eq(receipts.length, 1, 'uncertain claim inventory');
+    const claim = receipts[0];
+    eq(claim.schema_version, 1, 'noncanonical claim');
+    eq(claim.status, 'prepared', 'not uncertain prepared effect');
+    eq(claim.run_id, caseId, 'wrong claim subject');
+    check(
+      claim.claim_id && claim.action_snapshot && claim.action_sha256 && claim.recovery_token,
+      'incomplete prepared claim',
+    );
+    eq(claim.action_sha256, sha256(canonical(claim.action_snapshot)), 'altered uncertain action');
+    const original = read('before.jsonl');
+    eq(before.subarray(0, original.length), original, 'preparation changed history');
+    eq(before, read('prepared-and-cold-rejected.jsonl'), 'uncertain bytes changed');
+    eq(api.response.error?.code, 'AUTOLOOP_RECOVERY_INCOMPLETE', 'uncertainty was not blocked');
+    eq(api.response.error?.retryable, false, 'unsafe retry permitted');
+    eq(api.after, api.before, 'uncertain retry created an effect');
+    eq(generationAfter, generations, 'uncertain retry changed ownership');
+    return { case_id: caseId };
+  }
+  const runId = caseId === 'trust-timeout-missing-legacy' ? RUN_ID : caseId;
+  eq(api.request, { method: 'autoloopResume', run_id: runId }, 'wrong resume request');
+  eq(read('spec.after.jsonl'), read('spec.input.jsonl'), 'immutable configuration rewritten');
+  const success = ['trust-timeout-generation-reset', 'trust-timeout-terminated-generation'].includes(caseId);
+  if (!success) {
+    check(
+      api.response.error &&
+        typeof api.response.error.message === 'string' &&
+        /timeout.*(chain|generation)|malformed/i.test(api.response.error.message),
+      'missing blocking API error',
+    );
+    eq(api.after.handle_present, false, 'blocked resume created a handle');
+    eq(generationAfter, generations, 'blocked resume changed generation ledger');
+    if (caseId === 'trust-timeout-missing-legacy') {
+      eq(
+        sha256(before),
+        'c09281dc6c5bca5f5cc2ddae128b7532c89542506bda026afd3dad5c86d1a55f',
+        'wrong historical incident bytes',
+      );
+      eq(generations.toString(), 'null\n', 'missing generation scenario invented evidence');
+      return { case_id: caseId };
+    }
+    // Independent fault descriptors specify the exact mutation, not an API
+    // status label. The unmodified, actually produced history remains retained.
+    const clean = read('generations.before.jsonl'),
+      cleanDecisions = read('decisions.before.jsonl');
+    let expected = parse(clean);
+    const first = expected.find((x) => x.kind === 'agent_generation_started').payload;
+    const fault = caseId.slice('trust-timeout-'.length);
+    if (fault === 'missing-release')
+      expected = expected.filter((x) => !(x.kind === 'agent_generation_released' && x.payload.generation === 1));
+    if (fault === 'same-owner')
+      expected.forEach((x) => {
+        x.payload.owner_instance_id = first.owner_instance_id;
+      });
+    if (fault === 'wrong-session')
+      expected.find((x) => x.kind === 'agent_generation_released').payload.session_id = 'different-physical-session';
+    if (fault === 'wrong-generation')
+      expected.forEach((x) => {
+        if (x.payload.generation === 2) x.payload.generation = 3;
+      });
+    const actual = fault === 'torn' ? null : parse(generations);
+    if (fault === 'late-start' || fault === 'future-created') {
+      const field = fault === 'late-start' ? 'ts' : 'created_at';
+      const reference = actual.find((x) => x.kind === 'agent_generation_started' && x.payload.generation === 2);
+      const timestamp = field === 'ts' ? reference.ts : reference.payload.created_at;
+      check(
+        Date.parse(timestamp) > Math.max(...parse(cleanDecisions).map((x) => Date.parse(x.ts))),
+        'fault timestamp did not cross timeout',
+      );
+      expected.forEach((x) => {
+        if (x.payload.generation === 2) {
+          if (field === 'created_at') x.payload.created_at = timestamp;
+          else if (x.kind === 'agent_generation_started') x.ts = timestamp;
+        }
+      });
+    }
+    eq(
+      generations.toString(),
+      expected.map((x) => JSON.stringify(x) + '\n').join('') + (fault === 'torn' ? '{' + '"kind":' : ''),
+      'wrong lifecycle fault',
+    );
+    const decisions = parse(cleanDecisions),
+      migration = decisions.filter((x) => x.kind === 'timeout_migration').at(-1);
+    if (fault === 'decreasing') migration.newValue = 599999;
+    if (fault === 'wrong-dispatch') migration.pendingDispatchId = 'unrelated-dispatch';
+    eq(before.toString(), decisions.map((x) => JSON.stringify(x) + '\n').join(''), 'wrong timeout fault');
+    return { case_id: caseId };
+  }
+  check(api.response.value && !api.response.error, 'missing successful public outcome');
+  eq(api.response.value.run_id, runId, 'wrong returned run');
+  eq(api.after.handle_present, true, 'no resumed handle');
+  eq(api.after.effective_timeout_ms, 1200000, 'wrong effective timeout');
+  const decisions = parse(before),
+    migrations = decisions.filter((x) => x.kind === 'timeout_migration');
+  eq(
+    migrations.map((x) => [x.oldValue, x.newValue]),
+    [
+      [600000, 1200000],
+      [1200000, 2400000],
+      [2400000, 3600000],
+      [600000, 1200000],
+    ],
+    'wrong migration chain',
+  );
+  for (const migration of migrations) {
+    eq(migration.schema_version, 1, 'noncanonical migration');
+    eq(migration.runId, runId, 'wrong migration subject');
+    if (caseId === 'trust-timeout-terminated-generation' && migration === migrations.at(-1)) {
+      eq(migration.reason, 'stored_run_resume', 'wrong terminated migration reason');
+      eq(migration.pendingDispatchId, undefined, 'invented terminated pending dispatch');
+      const firstApi = JSON.parse(read('first-resume/api.json'));
+      eq(firstApi.source_imports, api.source_imports, 'first resume source mismatch');
+      eq(
+        firstApi.request,
+        { method: 'autoloopResume', run_id: runId, options: { sendTimeoutMs: 1200000 } },
+        'wrong first resume request',
+      );
+      eq(firstApi.before.handle_present, false, 'first resume was warm');
+      eq(firstApi.after.effective_timeout_ms, 1200000, 'first migration ineffective');
+      eq(firstApi.response.value?.run_id, runId, 'missing first resume result');
+      const firstBefore = read('first-resume/decisions.input.jsonl'),
+        firstAfter = read('first-resume/decisions.after.jsonl');
+      eq(firstAfter.subarray(0, firstBefore.length), firstBefore, 'first resume rewrote history');
+      eq(parse(firstAfter.subarray(firstBefore.length)), [migration], 'wrong persisted first migration');
+      eq(before.subarray(0, firstAfter.length), firstAfter, 'cold retry lost first migration');
+      eq(parse(firstBefore).at(-1).kind, 'terminate', 'reset not terminated');
+      check(
+        parse(firstBefore).some((x) => x.kind === 'send_timeout' && x.payload.timeout_ms === 600000),
+        'missing reset timeout',
+      );
+      continue;
+    }
+    check(
+      decisions.some(
+        (x) =>
+          x.kind === 'send_timeout' &&
+          x.payload.dispatch_id === migration.pendingDispatchId &&
+          x.payload.timeout_ms === migration.oldValue &&
+          Date.parse(x.ts) <= Date.parse(migration.ts),
+      ),
+      'migration has no matching timeout',
+    );
+  }
+  const lifecycle = parse(generations).filter((x) => x.payload.role === 'planner');
+  const started = lifecycle.filter((x) => x.kind === 'agent_generation_started');
+  check(started.length >= 2, 'missing generations');
+  eq(
+    started.slice(0, 2).map((x) => x.payload.generation),
+    [1, 2],
+    'generation gap',
+  );
+  check(started[0].payload.owner_instance_id !== started[1].payload.owner_instance_id, 'generation owner reused');
+  const released = lifecycle.find((x) => x.kind === 'agent_generation_released' && x.payload.generation === 1);
+  check(released, 'missing durable release');
+  for (const key of ['session_id', 'owner_instance_id', 'session_name'])
+    eq(released.payload[key], started[0].payload[key], 'release identity');
+  const reset = decisions.filter((x) => x.kind === 'send_timeout').at(-1);
+  check(
+    Date.parse(released.ts) < Date.parse(started[1].ts) &&
+      Date.parse(started[1].ts) <= Date.parse(reset.ts) &&
+      Date.parse(started[1].payload.created_at) <= Date.parse(reset.ts),
+    'reset lacks preceding lifecycle proof',
+  );
+  eq(generationAfter.subarray(0, generations.length), generations, 'resume changed historical generation prefix');
+  const suffix = parse(generationAfter.subarray(generations.length));
+  check(suffix.length >= 2 && suffix.every((x) => x.schema_version === 1), 'missing canonical replacement events');
+  const successor = suffix.filter((x) => x.kind === 'agent_generation_started' && x.payload.role === 'planner');
+  eq(successor.length, 1, 'duplicate/missing resumed generation');
+  eq(successor[0].payload.generation, Math.max(...started.map((x) => x.payload.generation)) + 1, 'nonmonotonic resume');
+  return { case_id: caseId };
+}
+
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   // Finish module evaluation before loading collect, which imports this API.
   setImmediate(async () => {
     try {
       const [mode, directory, ...extra] = process.argv.slice(2);
+      if (mode === 'durability' && extra.length === 0) {
+        const { verifyDurability } = await import('./collect.mjs');
+        process.stdout.write(JSON.stringify({ ...verifyDurability(directory), verified: true }) + '\n');
+        return;
+      }
       if (mode === 'legacy' && extra.length === 0) {
         const { verifyLegacy } = await import('./collect.mjs');
         const result = verifyLegacy(directory && path.resolve(directory));

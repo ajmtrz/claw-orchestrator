@@ -12,10 +12,15 @@ import {
   containedPath,
   inspectTestReport,
   readArtifact,
+  readInputManifest,
   sha256,
   verifyBundle,
   LEGACY_TITLES,
   verifyLegacyCase,
+  DURABILITY_CASES,
+  RESUME_CASES,
+  verifyDurabilityCase,
+  verifyResumeCase,
 } from './verify.mjs';
 
 export const SOURCE_URL = import.meta.url;
@@ -118,7 +123,7 @@ function redact(text, artifact, redactions) {
  */
 export async function captureExecution({ directory, id, argv, cwd, timeout_ms = 30000, env = {} }) {
   ensure(/^[A-Za-z0-9_-]+$/.test(id), 'Invalid execution identity/path');
-  ensure(Number.isSafeInteger(timeout_ms) && timeout_ms > 0 && timeout_ms <= 60000, 'Invalid bounded timeout');
+  ensure(Number.isSafeInteger(timeout_ms) && timeout_ms > 0 && timeout_ms <= 600000, 'Invalid bounded timeout');
   ensure(Array.isArray(argv) && argv.length > 0 && argv.every((arg) => typeof arg === 'string'), 'Invalid argv');
   directory = outputDirectory(directory);
   const names = [`${id}.stdout.txt`, `${id}.stderr.txt`, `${id}.execution.json`];
@@ -300,6 +305,7 @@ function importObservations(directory, execution) {
 export async function collect(group) {
   ensure(group === 'validator' || LATER_GROUPS.includes(group), 'Unknown collector group');
   if (group === 'legacy') return await collectLegacy();
+  if (group === 'delivery') return await collectDurability();
   // Preparation is the only reviewed execution policy in this iteration. In
   // particular, no final group is allowed to silently run without isolation.
   ensure(
@@ -595,9 +601,9 @@ async function collectLegacy() {
 
 export function verifyLegacy(directory) {
   if (!directory) return verifyLegacyReceipt();
-  const snapshot = legacySnapshot();
   ensure(/^evidence\/candidate\/[^/]+$/.test(path.relative(ARTIFACT_ROOT, directory)), 'Wrong legacy attempt scope');
   const bundle = JSON.parse(fs.readFileSync(containedPath(directory, 'bundle.json')));
+  const snapshot = authenticatedPrecommitSnapshot(legacySnapshot(), directory, bundle);
   const values = verifyBundle(bundle, directory, legacyContract(snapshot, directory));
   return verifyLegacyObservations(values, directory);
 }
@@ -705,9 +711,19 @@ function historicalTools(manifest) {
   });
 }
 
-function committedSnapshot(commit, parent, historicalManifest) {
+// Verification executes in a different process from collection. Preserve the
+// historical executable paths, but authenticate their bytes before using them
+// in the expected contract. All other expected inputs remain source-derived.
+export function authenticatedPrecommitSnapshot(snapshot, directory, bundle) {
+  const manifest = readInputManifest(directory, bundle.input_manifest);
+  const tools = historicalTools(manifest);
+  equal(bundle.tool_sha256, sha256(JSON.stringify(tools)), 'Wrong tool_sha256');
+  return { ...snapshot, manifest: { ...snapshot.manifest, tools } };
+}
+
+function committedSnapshot(commit, parent, historicalManifest, inventoryCommit = commit) {
   const current = legacySnapshot();
-  const names = [...commitTree(commit).keys()].filter(
+  const names = [...commitTree(inventoryCommit).keys()].filter(
     (file) =>
       /^(src|scripts|bin|docs|skills)\//.test(file) ||
       /^(package(?:-lock)?\.json|tsconfig.*\.json|vitest\.config\.ts)$/.test(file),
@@ -732,10 +748,10 @@ function committedSnapshot(commit, parent, historicalManifest) {
   };
 }
 
-function changedCommitFiles(parent, commit) {
+function changedCommitFiles(parent, commit, fence = LEGACY_FILES) {
   const names = git('diff', '--no-renames', '--name-only', parent, commit).trim().split('\n').filter(Boolean);
   ensure(
-    names.length && names.every((file) => LEGACY_FILES.includes(file)),
+    names.length && names.every((file) => fence.includes(file)),
     'Commit changed files outside the legacy source fence',
   );
   return names
@@ -820,8 +836,124 @@ function makeCommitLink(commit, bundleRef) {
   };
 }
 
+// The accepted Slice 1 receipt is an immutable predecessor, not a template
+// to rename for later source candidates. Subsequent links are actual Git objects.
+const SLICE1_HEAD = '21ded46e6d94be1ce11d0eb8336134c4a2dea29d';
+const SLICE2_HEAD = 'e3e235b280a570e1bafef57be13e5fad8f6d7ce2';
+const SLICE1_RECEIPT = {
+  path: 'evidence/candidate/legacy-postcommit-21ded46e6d94be1ce11d0eb8336134c4a2dea29d-3d8841cd-bb98-40f0-8e15-3c7d2ee194aa/receipt.json',
+  sha256: '1c53338fc95b6811859cbebe726e0ae2e06a928534bb2ecdd4bbee676b8cbd79',
+};
+const SLICE2_BUNDLE = {
+  path: 'evidence/candidate/legacy-1789368805539-5f6a9d04-5b17-4327-b1ce-1ff61eb7c012/bundle.json',
+  sha256: '7ccdcc14a115e225a3c0e43a37a79eb0c6dcecbb0b81dbea05156b966efa7f60',
+};
+const SLICE2_FILES = [
+  ...FILES,
+  'src/session-manager.ts',
+  'src/__tests__/session-manager.test.ts',
+  'src/__tests__/autoloop-durable-recovery-e2e.test.ts',
+  'src/__tests__/autoloop-trust-recovery-delivery.test.ts',
+];
+const commitPatch = (parent, head, files = []) =>
+  gitBytes(
+    '-c',
+    'core.abbrev=7',
+    'diff',
+    '--binary',
+    '--no-ext-diff',
+    '--no-textconv',
+    '--no-renames',
+    '--no-color',
+    '--src-prefix=a/',
+    '--dst-prefix=b/',
+    parent,
+    head,
+    '--',
+    ...files,
+  );
+function extensionHeads(head) {
+  const heads = git('rev-list', '--reverse', '--ancestry-path', `${SLICE1_HEAD}..${head}`).trim().split('\n');
+  ensure(heads[0] === SLICE2_HEAD && heads.at(-1) === head, 'Wrong receipt ancestry');
+  let parent = SLICE1_HEAD;
+  for (const commit of heads) {
+    equal(git('show', '-s', '--format=%P', commit).trim(), parent, 'Wrong chain parent');
+    parent = commit;
+  }
+  return heads;
+}
+function extensionLink(commit) {
+  const parent = git('rev-parse', `${commit}^`).trim();
+  const patch = commitPatch(parent, commit);
+  return {
+    parent,
+    commit,
+    tree: git('rev-parse', `${commit}^{tree}`).trim(),
+    patch_base64: patch.toString('base64'),
+    patch_sha256: sha256(patch),
+    files: changedCommitFiles(
+      parent,
+      commit,
+      commit === SLICE2_HEAD ? SLICE2_FILES : [...FILES, 'src/__tests__/session-manager.test.ts'],
+    ),
+  };
+}
+function verifyExtendedReceipt(receipt, head) {
+  equal(receipt.schema_version, 2, 'Wrong receipt schema');
+  equal(receipt.run_id, RUN_ID, 'Wrong receipt run');
+  equal(receipt.kind, 'legacy-postcommit', 'Wrong receipt kind');
+  equal(receipt.commit, head, 'Wrong receipt head');
+  equal(receipt.tree, git('rev-parse', `${head}^{tree}`).trim(), 'Wrong receipt tree');
+  equal(receipt.parent, git('show', '-s', '--format=%P', head).trim(), 'Wrong receipt parent');
+  equal(receipt.base, SLICE1_HEAD, 'Wrong receipt base');
+  equal(receipt.previous, SLICE1_RECEIPT, 'Wrong previous receipt hash/path');
+  verifyReceiptData(JSON.parse(readArtifact(ARTIFACT_ROOT, receipt.previous)), SLICE1_HEAD);
+  const heads = extensionHeads(head);
+  ensure(Array.isArray(receipt.chain) && receipt.chain.length === heads.length, 'Incomplete receipt chain');
+  receipt.chain.forEach((link, i) => {
+    const expected = extensionLink(heads[i]);
+    for (const key of ['parent', 'commit', 'tree', 'patch_base64', 'patch_sha256', 'files'])
+      equal(link[key], expected[key], `Wrong chain ${key}`);
+  });
+  // Retained observations were executed on the Slice 2 bytes. Every later
+  // allowed link changes only the verifier harness; runtime/test evidence is
+  // not silently rebound to different production or scenario implementations.
+  equal(receipt.candidate_bundle, SLICE2_BUNDLE, 'Wrong candidate bundle hash/path');
+  const bundle = JSON.parse(readArtifact(ARTIFACT_ROOT, receipt.candidate_bundle));
+  const directory = path.dirname(containedPath(ARTIFACT_ROOT, receipt.candidate_bundle.path));
+  equal(bundle.head, SLICE1_HEAD, 'Wrong precommit head');
+  equal(bundle.tree, git('rev-parse', `${SLICE1_HEAD}^{tree}`).trim(), 'Wrong precommit tree');
+  const patch = readArtifact(directory, bundle.patch);
+  equal(
+    patchSections(patch),
+    patchSections(commitPatch(SLICE1_HEAD, SLICE2_HEAD, LEGACY_FILES)),
+    'Wrong retained legacy patch',
+  );
+  const manifest = JSON.parse(readArtifact(directory, bundle.input_manifest));
+  const snapshot = committedSnapshot(SLICE2_HEAD, SLICE1_HEAD, manifest, SLICE1_HEAD);
+  for (const key of ['tracked', 'harness', 'dependencies', 'tools']) {
+    const actual = new Map(manifest[key].map((row) => [row.path, row.sha256]));
+    const expected = new Map(snapshot.manifest[key].map((row) => [row.path, row.sha256]));
+    const differing = [...new Set([...actual.keys(), ...expected.keys()])].filter(
+      (file) => actual.get(file) !== expected.get(file),
+    );
+    ensure(!differing.length, `Historical ${key} mismatch: ${differing.join(', ')}`);
+    equal(manifest[key], snapshot.manifest[key], `Historical ${key} inventory order mismatch`);
+  }
+  const contract = legacyContract(snapshot, directory, {
+    patch_sha256: sha256(patch),
+    test_source_sha256s: LEGACY_FILES.map((file) => sha256(commitFile(SLICE2_HEAD, file))),
+  });
+  const result = verifyLegacyObservations(verifyBundle(bundle, directory, contract), directory, SLICE2_HEAD);
+  return { ...result, committed_head: head, committed_tree: receipt.tree, postcommit_verified: true };
+}
+
 function receiptParent(head) {
   ensure(head !== ORIGINAL_COMMIT, 'Corrective controller commit does not exist yet');
+  if (![FIRST_CORRECTION, SLICE1_HEAD].includes(head)) {
+    extensionHeads(head);
+    return git('rev-parse', `${head}^`).trim();
+  }
   const parent = head === FIRST_CORRECTION ? ORIGINAL_COMMIT : FIRST_CORRECTION;
   equal(git('show', '-s', '--format=%P', head).trim(), parent, 'Wrong corrective commit parent');
   return parent;
@@ -836,7 +968,7 @@ function frozenHead() {
   receiptParent(head);
   // Check actual current bytes as well as Git status (which can hide files
   // marked assume-unchanged). A receipt cannot certify an uncommitted module.
-  for (const file of LEGACY_FILES)
+  for (const file of [...commitTree(head).keys()].filter((file) => /^(src|scripts)\//.test(file)))
     equal(
       fs.readFileSync(path.join(PROJECT, file)),
       commitFile(head, file),
@@ -846,6 +978,7 @@ function frozenHead() {
 }
 
 export function verifyReceiptData(receipt, head) {
+  if (receipt.schema_version === 2) return verifyExtendedReceipt(receipt, head);
   equal(receipt.schema_version, 1, 'Wrong receipt schema');
   equal(receipt.run_id, RUN_ID, 'Wrong receipt run');
   equal(receipt.kind, 'legacy-postcommit', 'Wrong receipt kind');
@@ -906,6 +1039,21 @@ export function auditLegacyFinalization(head, directory, bundleSha256, originalS
   const relative = path.relative(ARTIFACT_ROOT, path.resolve(directory));
   ensure(/^evidence\/(candidate|sensitivity)\/[^/]+$/.test(relative), 'Wrong audit bundle scope');
   const bundleRef = { path: `${relative}/bundle.json`, sha256: bundleSha256 };
+  if (![ORIGINAL_COMMIT, FIRST_CORRECTION, SLICE1_HEAD].includes(head)) {
+    const receipt = {
+      schema_version: 2,
+      run_id: RUN_ID,
+      kind: 'legacy-postcommit',
+      base: SLICE1_HEAD,
+      parent: receiptParent(head),
+      commit: head,
+      tree: git('rev-parse', `${head}^{tree}`).trim(),
+      previous: { ...SLICE1_RECEIPT },
+      candidate_bundle: bundleRef,
+      chain: extensionHeads(head).map(extensionLink),
+    };
+    return { receipt, result: verifyReceiptData(receipt, head) };
+  }
   const receipt = {
     schema_version: 1,
     run_id: RUN_ID,
@@ -921,9 +1069,355 @@ export function auditLegacyFinalization(head, directory, bundleSha256, originalS
   return { receipt, result: verifyReceiptData(receipt, head) };
 }
 
+const DELIVERY_MATRIX = [
+  'autoloop-dispatcher',
+  'autoloop-durable-recovery-e2e',
+  'autoloop-outbox',
+  'autoloop-recovery',
+  'autoloop-runner',
+  'autoloop-secure-ledger',
+  'autoloop-trust-recovery-delivery',
+  'autoloop-trust-recovery-legacy',
+  'session-manager-pidfile',
+  'session-manager',
+].map((name) => `src/__tests__/${name}.test.ts`);
+const DELIVERY_FILES = [...FILES, ...DELIVERY_MATRIX, LEGACY_HELPER];
+function durabilitySnapshot() {
+  const snapshot = legacySnapshot();
+  snapshot.manifest.harness = DELIVERY_FILES.toSorted().map((file) => ({
+    path: path.join(PROJECT, file),
+    sha256: sha256(fs.readFileSync(path.join(PROJECT, file))),
+  }));
+  return snapshot;
+}
+function durabilityCommand(directory) {
+  return [
+    'rtk',
+    'proxy',
+    'npm',
+    'test',
+    '--',
+    ...DELIVERY_MATRIX,
+    '--config',
+    path.join(directory, 'vitest.config.mjs'),
+    '--configLoader',
+    'native',
+    '--reporter=verbose',
+    '--reporter=json',
+    `--outputFile=${path.join(directory, 'report.json')}`,
+  ];
+}
+const deliveryConfig = (directory) =>
+  `import original from ${JSON.stringify(path.join(PROJECT, 'vitest.config.ts'))};\nexport default {...original,root:${JSON.stringify(PROJECT)},cacheDir:${JSON.stringify(path.join(directory, 'cache'))},test:{...original.test,pool:'forks',maxWorkers:4,minWorkers:1}};\n`;
+// Preserve real Unix sockets under the long authorized artifact root. An open
+// directory fd shortens only the bind address, not its filesystem destination.
+const SOCKET_PRELOAD = `import fs from 'node:fs';
+import net from 'node:net';
+import path from 'node:path';
+const original=net.Server.prototype.listen;
+net.Server.prototype.listen=function(...args){
+ const socket=args[0],root=${JSON.stringify(ARTIFACT_ROOT)};
+ if(typeof socket!=='string'||!socket.startsWith(root+'/')||Buffer.byteLength(socket)<104)return Reflect.apply(original,this,args);
+ const fd=fs.openSync(path.dirname(socket),fs.constants.O_RDONLY|fs.constants.O_DIRECTORY);
+ let closed=false;const close=()=>{if(!closed){closed=true;fs.closeSync(fd);}};
+ const address='/proc/self/fd/'+fd+'/'+path.basename(socket);
+ if(Buffer.byteLength(address)>=104){close();throw new Error('Isolated socket address still too long');}
+ this.once('close',close);this.once('error',close);args[0]=address;
+ try{return Reflect.apply(original,this,args);}catch(e){close();throw e;}
+};\n`;
+function durabilityContract(snapshot, directory, exactInputs) {
+  const hashList = (key) => sha256(JSON.stringify(snapshot.manifest[key]));
+  return {
+    run_id: RUN_ID,
+    case_id: 'slice2-durability',
+    requirement_ids: ['DURABLE-DELIVERY', 'COLD-RECOVERY', 'GENERATION-RESUME'],
+    subject_kind: 'candidate',
+    base: SLICE2_HEAD,
+    head: snapshot.head,
+    tree: snapshot.tree,
+    frozen: false,
+    patch_sha256: exactInputs?.patch_sha256 ?? sha256(patchBytes(DELIVERY_FILES)),
+    test_source_sha256s:
+      exactInputs?.test_source_sha256s ??
+      DELIVERY_FILES.map((file) => sha256(fs.readFileSync(path.join(PROJECT, file)))),
+    input_manifest_sha256: sha256(JSON.stringify(snapshot.manifest, null, 2) + '\n'),
+    harness_sha256: hashList('harness'),
+    dependency_sha256: hashList('dependencies'),
+    tool_sha256: hashList('tools'),
+    executions: [{ argv: durabilityCommand(directory), cwd: PROJECT, required_test_ids: [] }],
+    assertions: [
+      {
+        id: 'complete-cases',
+        predicate: 'row-count',
+        observations: ['case-index'],
+        expected: DURABILITY_CASES.length + RESUME_CASES.length,
+      },
+    ],
+    required_observations: ['case-index', 'evidence-files'],
+    required_fault_observations: [],
+    required_source_paths: [],
+  };
+}
+export function durabilityArtifactReader(directory, files) {
+  const refs = new Map(files.map((ref) => [ref.path, ref]));
+  equal(refs.size, files.length, 'Duplicate durability artifacts');
+  return (name) => {
+    if (!refs.has(name)) {
+      // The negative scenarios deliberately produce no recipient file. Check
+      // its actual absence; an existing file without a retained hash is an error.
+      containedPath(directory, name);
+      throw new Error(`Missing durability artifact reference: ${name}`);
+    }
+    return readArtifact(directory, refs.get(name));
+  };
+}
+
+function durabilityObservations(bundle, directory, values, head) {
+  const files = values.get('evidence-files'),
+    cases = values.get('case-index');
+  ensure(Array.isArray(files) && Array.isArray(cases), 'Missing durability artifact index');
+  const read = durabilityArtifactReader(directory, files);
+  for (const file of files) read(file.path);
+  equal(
+    cases.map((row) => row.case_id).sort(),
+    [...DURABILITY_CASES, ...RESUME_CASES].sort(),
+    'Wrong durability scenario inventory',
+  );
+  ensure(new Set(cases.map((row) => row.path)).size === cases.length, 'Replayed durability case directory');
+  const results = cases.map((row) => {
+    ensure(/^cases\/[^/]+$/.test(row.path), 'Wrong durability case path');
+    const readCase = (name) => read(`${row.path}/${name}`);
+    if (DURABILITY_CASES.includes(row.case_id))
+      return verifyDurabilityCase(path.join(directory, row.path), row.case_id, head, readCase);
+    return verifyResumeCase(path.join(directory, row.path), row.case_id, head, readCase);
+  });
+  // Full matrix inventory is independently fixed by source filenames. A green
+  // aggregate cannot conceal a missing suite or an unhandled failed assertion.
+  const execution = bundle.executions[0],
+    report = JSON.parse(readArtifact(directory, execution.report));
+  ensure(execution.executed_test_ids.length >= 1376, 'Missing previously passing focused tests');
+  equal(
+    report.testResults.map((row) => row.name).sort(),
+    DELIVERY_MATRIX.map((file) => path.join(PROJECT, file)).sort(),
+    'Incomplete focused matrix',
+  );
+  equal(
+    fs.readFileSync(containedPath(directory, 'vitest.config.mjs')).toString(),
+    deliveryConfig(directory),
+    'Altered test configuration',
+  );
+  equal(
+    fs.readFileSync(containedPath(directory, 'socket-preload.mjs')).toString(),
+    SOCKET_PRELOAD,
+    'Altered isolation preload',
+  );
+  return { scope: 'slice2', cases: results.length, tests: execution.executed_test_ids.length, final_candidate: false };
+}
+export function verifyDurability(directory) {
+  if (!directory) return verifyDurabilityReceipt();
+  directory = path.resolve(directory);
+  const bundle = JSON.parse(fs.readFileSync(containedPath(directory, 'bundle.json')));
+  const contract = durabilityContract(
+    authenticatedPrecommitSnapshot(durabilitySnapshot(), directory, bundle),
+    directory,
+  );
+  return durabilityObservations(bundle, directory, verifyBundle(bundle, directory, contract));
+}
+async function collectDurability() {
+  const snapshot = durabilitySnapshot();
+  const directory = outputDirectory(
+    path.join(ARTIFACT_ROOT, 'evidence', 'candidate', `durability-${Date.now()}-${randomUUID()}`),
+  );
+  outputDirectory(path.join(directory, 'cases'));
+  writeArtifact(directory, 'vitest.config.mjs', deliveryConfig(directory));
+  writeArtifact(directory, 'socket-preload.mjs', SOCKET_PRELOAD);
+  const input_manifest = writeArtifact(directory, 'inputs.json', JSON.stringify(snapshot.manifest, null, 2) + '\n');
+  const patch = writeArtifact(directory, 'inputs.patch', patchBytes(DELIVERY_FILES));
+  const test_sources = DELIVERY_FILES.map((file) =>
+    writeArtifact(directory, path.basename(file), fs.readFileSync(path.join(PROJECT, file))),
+  );
+  const execution = await captureExecution({
+    directory,
+    id: `durability-${randomUUID()}`,
+    argv: durabilityCommand(directory),
+    cwd: PROJECT,
+    timeout_ms: 600000,
+    env: {
+      NODE_OPTIONS: `--import=${path.join(PROJECT, LEGACY_HELPER)} --import=${path.join(directory, 'socket-preload.mjs')}`,
+      CLAWO_TRUST_SCRATCH: path.join(directory, 'scratch'),
+      CLAWO_TRUST_CASE_ROOT: path.join(directory, 'cases'),
+      NPM_CONFIG_CACHE: path.join(directory, 'npm-cache'),
+      NPM_CONFIG_UPDATE_NOTIFIER: 'false',
+    },
+  });
+  const report = { path: 'report.json', sha256: sha256(fs.readFileSync(containedPath(directory, 'report.json'))) };
+  const inventory = inspectTestReport(readArtifact(directory, report), 'vitest-json');
+  Object.assign(execution, {
+    report,
+    report_format: 'vitest-json',
+    discovered_test_ids: inventory.discovered,
+    executed_test_ids: inventory.executed,
+    skipped_test_ids: inventory.skipped,
+  });
+  writeArtifact(directory, 'interpreted-execution.json', JSON.stringify(execution, null, 2) + '\n');
+  const entries = fs.readdirSync(path.join(directory, 'cases'));
+  const cases = [...DURABILITY_CASES, ...RESUME_CASES].map((case_id) => {
+    const found = entries.filter((name) => name.startsWith(case_id + '-'));
+    equal(found.length, 1, `Missing/duplicate observed scenario: ${case_id}`);
+    return { case_id, path: `cases/${found[0]}` };
+  });
+  // Capture only actual relevant process/API files, not the disposable review
+  // checkout's .git objects or symlinks. The semantic reader requires every
+  // consumed file to occur in this independently hashed inventory.
+  const evidenceNames = [];
+  function walk(relative) {
+    for (const entry of fs.readdirSync(containedPath(directory, relative), { withFileTypes: true })) {
+      const file = `${relative}/${entry.name}`;
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) {
+        if (['.git', 'node_modules', 'home'].includes(entry.name)) continue;
+        if (
+          relative.includes('/workspace') &&
+          !['workspace', 'tasks', 'trust-delivery', 'source-checkpoint', 'iter', '0', '1'].includes(entry.name)
+        )
+          continue;
+        walk(file);
+      } else if (entry.isFile() && /\.(jsonl|json|txt|mjs|patch)$/.test(entry.name)) evidenceNames.push(file);
+    }
+  }
+  cases.forEach((row) => walk(row.path));
+  const files = evidenceNames
+    .sort()
+    .map((file) => ({ path: file, sha256: sha256(fs.readFileSync(containedPath(directory, file))) }));
+  const index = [cases, files].map((value, sequence) => ({
+    sequence,
+    process_id: process.pid,
+    observer_id: 'durability-collector',
+    value,
+  }));
+  const ref = writeArtifact(directory, 'observed-files.json', JSON.stringify(index, null, 2) + '\n');
+  const observations = index.map((event, i) => ({
+    id: i ? 'evidence-files' : 'case-index',
+    artifact: ref,
+    pointer: `/${i}`,
+    ...event,
+    execution_id: execution.id,
+  }));
+  const contract = durabilityContract(snapshot, directory);
+  const bundle = {
+    schema_version: 1,
+    run_id: RUN_ID,
+    case_id: contract.case_id,
+    requirement_ids: contract.requirement_ids,
+    subject_kind: 'candidate',
+    base: SLICE2_HEAD,
+    head: snapshot.head,
+    tree: snapshot.tree,
+    frozen: false,
+    input_manifest,
+    harness_sha256: contract.harness_sha256,
+    dependency_sha256: contract.dependency_sha256,
+    tool_sha256: contract.tool_sha256,
+    patch,
+    test_sources,
+    source_imports: [],
+    executions: [execution],
+    observations,
+    assertions: contract.assertions,
+  };
+  writeArtifact(directory, 'bundle.json', JSON.stringify(bundle, null, 2) + '\n');
+  equal(durabilitySnapshot(), snapshot, 'Source changed during durability collection');
+  verifyDurability(directory);
+  return { directory, bundle_sha256: sha256(fs.readFileSync(path.join(directory, 'bundle.json'))), execution };
+}
+
+export function auditDurabilityFinalization(head, directory, bundleSha256) {
+  const parent = git('rev-parse', `${head}^`).trim();
+  ensure(head !== SLICE2_HEAD, 'Durability corrective commit does not exist yet');
+  const chain = extensionHeads(head).map(extensionLink);
+  const relative = path.relative(ARTIFACT_ROOT, path.resolve(directory));
+  ensure(/^evidence\/candidate\/[^/]+$/.test(relative), 'Wrong durability bundle scope');
+  const receipt = {
+    schema_version: 1,
+    kind: 'durability-postcommit',
+    run_id: RUN_ID,
+    base: SLICE2_HEAD,
+    parent,
+    commit: head,
+    tree: git('rev-parse', `${head}^{tree}`).trim(),
+    bundle: { path: `${relative}/bundle.json`, sha256: bundleSha256 },
+    chain,
+  };
+  return { receipt, result: verifyDurabilityReceiptData(receipt, head) };
+}
+export function verifyDurabilityReceiptData(receipt, head) {
+  equal(receipt.schema_version, 1, 'Wrong durability receipt schema');
+  equal(receipt.kind, 'durability-postcommit', 'Wrong durability receipt kind');
+  equal(receipt.run_id, RUN_ID, 'Wrong durability run');
+  equal(receipt.base, SLICE2_HEAD, 'Wrong durability base');
+  equal(receipt.commit, head, 'Wrong durability head');
+  equal(receipt.tree, git('rev-parse', `${head}^{tree}`).trim(), 'Wrong durability tree');
+  equal(receipt.parent, git('show', '-s', '--format=%P', head).trim(), 'Wrong durability parent');
+  equal(receipt.chain, extensionHeads(head).map(extensionLink), 'Wrong durability ancestry/patch/files');
+  const directory = path.dirname(containedPath(ARTIFACT_ROOT, receipt.bundle.path));
+  const bundle = JSON.parse(readArtifact(ARTIFACT_ROOT, receipt.bundle));
+  equal(bundle.head, receipt.parent, 'Wrong durability precommit head');
+  equal(bundle.base, SLICE2_HEAD, 'Wrong durability bundle base');
+  const manifest = JSON.parse(readArtifact(directory, bundle.input_manifest));
+  const snapshot = committedSnapshot(head, receipt.parent, manifest, receipt.parent);
+  snapshot.manifest.harness = DELIVERY_FILES.toSorted().map((file) => ({
+    path: path.join(PROJECT, file),
+    sha256: sha256(commitFile(head, file)),
+  }));
+  const patch = readArtifact(directory, bundle.patch);
+  equal(patchSections(patch), patchSections(commitPatch(receipt.parent, head)), 'Wrong durability complete patch');
+  const contract = durabilityContract(snapshot, directory, {
+    patch_sha256: sha256(patch),
+    test_source_sha256s: DELIVERY_FILES.map((file) => sha256(commitFile(head, file))),
+  });
+  return {
+    ...durabilityObservations(bundle, directory, verifyBundle(bundle, directory, contract), head),
+    committed_head: head,
+    committed_tree: receipt.tree,
+    postcommit_verified: true,
+  };
+}
+export function verifyDurabilityReceipt() {
+  const head = frozenHead();
+  const pointer = JSON.parse(
+    fs.readFileSync(containedPath(ARTIFACT_ROOT, `reports/durability-committed-${head}.json`)),
+  );
+  return {
+    ...verifyDurabilityReceiptData(JSON.parse(readArtifact(ARTIFACT_ROOT, pointer.receipt)), head),
+    receipt: pointer.receipt,
+  };
+}
+export function finalizeDurability(directory, bundleSha256) {
+  const head = frozenHead();
+  // G4's committed chain must be verified before G5 can be finalized.
+  verifyLegacyReceipt();
+  const { receipt } = auditDurabilityFinalization(head, directory, bundleSha256);
+  const pointer = path.join(ARTIFACT_ROOT, 'reports', `durability-committed-${head}.json`);
+  if (fs.existsSync(pointer)) {
+    const existing = verifyDurabilityReceipt();
+    equal(JSON.parse(readArtifact(ARTIFACT_ROOT, existing.receipt)), receipt, 'Immutable durability receipt differs');
+    return existing;
+  }
+  const directoryOut = outputDirectory(
+    path.join(ARTIFACT_ROOT, 'evidence', 'candidate', `durability-postcommit-${head}-${randomUUID()}`),
+  );
+  const ref = writeArtifact(directoryOut, 'receipt.json', JSON.stringify(receipt, null, 2) + '\n');
+  ref.path = path.relative(ARTIFACT_ROOT, path.join(directoryOut, ref.path));
+  writeArtifact(path.dirname(pointer), path.basename(pointer), JSON.stringify({ receipt: ref }) + '\n');
+  return verifyDurabilityReceipt();
+}
+
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    if (process.argv[2] === 'finalize-legacy') {
+    if (process.argv[2] === 'finalize-durability') {
+      ensure(process.argv.length === 5, 'Usage: collect.mjs finalize-durability <attempt> <bundle-sha256>');
+      process.stdout.write(JSON.stringify(finalizeDurability(...process.argv.slice(3))) + '\n');
+    } else if (process.argv[2] === 'finalize-legacy') {
       ensure(
         process.argv.length === 6,
         'Usage: collect.mjs finalize-legacy <candidate-attempt> <bundle-sha256> <original-bundle-sha256>',

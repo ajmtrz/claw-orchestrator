@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { verifyBundle, verifySeries, verifyLegacyCase, LEGACY_TITLES, SOURCE_URL as verifySource } from './verify.mjs';
 import { captureExecution, collect, SOURCE_URL as collectorSource } from './collect.mjs';
 import * as collector from './collect.mjs';
+import * as verifier from './verify.mjs';
 
 // These deliberately synthetic documents test the validator, never recovery.
 // A missing hash/identity/predicate/report check must make a negative test fail.
@@ -30,6 +31,476 @@ const firstCorrectionDirectory = path.join(
   'evidence/candidate/legacy-1789359636920-7c9e02d9-4e71-4c01-a83b-087501a6396d',
 );
 const firstCorrectionDigest = '8f28667ee4ee9db372d767ea08178bbd0823ac87763fff849381f907cf240c99';
+
+const slice2Commit = 'e3e235b280a570e1bafef57be13e5fad8f6d7ce2';
+const slice2Directory = path.join(
+  artifactRoot,
+  'evidence/candidate/legacy-1789368805539-5f6a9d04-5b17-4327-b1ce-1ff61eb7c012',
+);
+const slice2Digest = '7ccdcc14a115e225a3c0e43a37a79eb0c6dcecbb0b81dbea05156b966efa7f60';
+const slice2Audit = () =>
+  collector.auditLegacyFinalization(
+    slice2Commit,
+    slice2Directory,
+    slice2Digest,
+    'a89dc369113aaeaefb469625f4c4532d83e481a85dccde392e4f4f6967836f3d',
+  );
+
+test('extends the immutable receipt chain through the actual Slice 2 commit', () => {
+  const before = fs.readFileSync(path.join(slice2Directory, 'bundle.json'));
+  const audit = slice2Audit();
+  assert.equal(audit.result.committed_head, slice2Commit);
+  assert.equal(audit.result.committed_tree, '64a2450d65b29e0eb71e5c6729bb4958c099df2f');
+  assert.equal(audit.result.cases, 25);
+  assert.deepEqual(fs.readFileSync(path.join(slice2Directory, 'bundle.json')), before);
+  assert.equal(audit.receipt.chain[0].parent, '21ded46e6d94be1ce11d0eb8336134c4a2dea29d');
+  assert.equal(audit.receipt.chain[0].files.length, 6);
+});
+
+for (const [name, mutate, pattern] of [
+  [
+    'head',
+    (r) => {
+      r.commit = firstCorrection;
+    },
+    /head/i,
+  ],
+  [
+    'tree',
+    (r) => {
+      r.tree = '0'.repeat(40);
+    },
+    /tree/i,
+  ],
+  [
+    'parent',
+    (r) => {
+      r.parent = firstCorrection;
+    },
+    /parent/i,
+  ],
+  [
+    'base',
+    (r) => {
+      r.base = firstCorrection;
+    },
+    /base/i,
+  ],
+  [
+    'prior receipt',
+    (r) => {
+      r.previous.sha256 = '0'.repeat(64);
+    },
+    /prior|previous/i,
+  ],
+  [
+    'bundle',
+    (r) => {
+      r.candidate_bundle.sha256 = '0'.repeat(64);
+    },
+    /hash/i,
+  ],
+  [
+    'missing ancestry',
+    (r) => {
+      r.chain = [];
+    },
+    /chain|ancestry/i,
+  ],
+  [
+    'link parent',
+    (r) => {
+      r.chain[0].parent = firstCorrection;
+    },
+    /parent/i,
+  ],
+  [
+    'patch',
+    (r) => {
+      r.chain[0].patch_base64 = Buffer.from('fake patch').toString('base64');
+    },
+    /patch/i,
+  ],
+  [
+    'file bytes',
+    (r) => {
+      r.chain[0].files[0].sha256 = '0'.repeat(64);
+    },
+    /file/i,
+  ],
+]) {
+  test(`rejects Slice 2 receipt ${name} substitution`, () => {
+    const { receipt } = slice2Audit();
+    mutate(receipt);
+    assert.throws(() => collector.verifyReceiptData(receipt, slice2Commit), pattern);
+  });
+}
+
+const retainedDelivery = path.join(artifactRoot, 'evidence/candidate/slice2-combined-final-correction-001/cases');
+function deliveryCase(id) {
+  return path.join(
+    retainedDelivery,
+    fs.readdirSync(retainedDelivery).find((name) => name.startsWith(id + '-')),
+  );
+}
+for (const id of [
+  'before-send',
+  'after-capture',
+  'after-ack',
+  'target',
+  'torn',
+  'intent-fsync',
+  'digest-mismatch',
+  'review-checkpoint',
+]) {
+  test(`recomputes retained ${id} durability observations from real process files`, () => {
+    assert.equal(verifier.verifyDurabilityCase(deliveryCase(id), id, slice2Commit).case_id, id);
+  });
+}
+for (const [name, id, change] of [
+  ['relabeled crash', 'before-send', (d) => {}],
+  [
+    'payload bytes',
+    'before-send',
+    (d) => {
+      const f = path.join(d, 'cold/final-decisions.jsonl');
+      fs.writeFileSync(
+        f,
+        fs.readFileSync(f, 'utf8').replace('directive A: preserve these exact bytes', 'substituted payload'),
+      );
+    },
+  ],
+  [
+    'missing durable ACK',
+    'before-send',
+    (d) => {
+      const f = path.join(d, 'cold/final-decisions.jsonl');
+      fs.writeFileSync(
+        f,
+        fs
+          .readFileSync(f, 'utf8')
+          .split('\n')
+          .filter((l) => !l.includes('acknowledged_at'))
+          .join('\n'),
+      );
+    },
+  ],
+  [
+    'changed recipient',
+    'after-capture',
+    (d) => {
+      const f = path.join(d, 'recipient.jsonl');
+      fs.writeFileSync(f, fs.readFileSync(f, 'utf8').replace('immutable A', 'mutated B'));
+    },
+  ],
+  [
+    'duplicate logical effect',
+    'after-capture',
+    (d) => {
+      const f = path.join(d, 'receiver-effects.jsonl');
+      fs.appendFileSync(f, fs.readFileSync(f));
+    },
+  ],
+  [
+    'missing death',
+    'after-ack',
+    (d) => {
+      const f = path.join(d, 'crashed.execution.json');
+      const v = JSON.parse(fs.readFileSync(f));
+      v.signal = null;
+      fs.writeFileSync(f, JSON.stringify(v));
+    },
+  ],
+  [
+    'missing release',
+    'before-send',
+    (d) => {
+      const f = path.join(d, 'cold/final-generations.jsonl');
+      fs.writeFileSync(
+        f,
+        fs
+          .readFileSync(f, 'utf8')
+          .split('\n')
+          .filter((l) => !l.includes('agent_generation_released'))
+          .join('\n'),
+      );
+    },
+  ],
+  [
+    'fabricated source',
+    'before-send',
+    (d) => {
+      const f = path.join(d, 'cold/events.jsonl');
+      const rows = fs.readFileSync(f, 'utf8').trim().split('\n').map(JSON.parse);
+      rows[0].value[0].sha256 = '0'.repeat(64);
+      fs.writeFileSync(f, rows.map((r) => JSON.stringify(r) + '\n').join(''));
+    },
+  ],
+  [
+    'hidden failure',
+    'before-send',
+    (d) => {
+      const f = path.join(d, 'cold.execution.json');
+      const v = JSON.parse(fs.readFileSync(f));
+      v.code = 2;
+      fs.writeFileSync(f, JSON.stringify(v));
+    },
+  ],
+  ['missing artifact', 'before-send', (d) => fs.unlinkSync(path.join(d, 'message-A.json'))],
+  [
+    'rebind target',
+    'before-send',
+    (d) => {
+      const f = path.join(d, 'cold/final-decisions.jsonl');
+      const rows = fs.readFileSync(f, 'utf8').trim().split('\n').map(JSON.parse);
+      rows.find((x) => x.record_type === 'delivery_generation_rebind').to_generation = 3;
+      fs.writeFileSync(f, rows.map((x) => JSON.stringify(x) + '\n').join(''));
+    },
+  ],
+  [
+    'ACK digest',
+    'after-ack',
+    (d) => {
+      const f = path.join(d, 'cold/final-decisions.jsonl');
+      const rows = fs.readFileSync(f, 'utf8').trim().split('\n').map(JSON.parse);
+      rows.find((x) => x.acknowledged_at).payload_sha256 = '0'.repeat(64);
+      fs.writeFileSync(f, rows.map((x) => JSON.stringify(x) + '\n').join(''));
+    },
+  ],
+  [
+    'missing sync',
+    'before-send',
+    (d) => {
+      const f = path.join(d, 'cold/events.jsonl');
+      const rows = fs
+        .readFileSync(f, 'utf8')
+        .trim()
+        .split('\n')
+        .map(JSON.parse)
+        .filter((x) => x.kind !== 'fsync-return');
+      fs.writeFileSync(f, rows.map((x, sequence) => JSON.stringify({ ...x, sequence }) + '\n').join(''));
+    },
+  ],
+]) {
+  test(`rejects durability ${name} even with internally refreshed references`, () => {
+    fs.mkdirSync(scratch, { recursive: true });
+    const d = fs.mkdtempSync(path.join(scratch, 'durability-tamper-'));
+    fs.cpSync(deliveryCase(id), d, { recursive: true });
+    change(d);
+    assert.throws(
+      () => verifier.verifyDurabilityCase(d, name === 'relabeled crash' ? 'after-capture' : id, slice2Commit),
+      /durability|artifact|ENOENT/i,
+    );
+  });
+}
+
+test('retained delivery cannot certify a stale source subject', () => {
+  assert.throws(
+    () => verifier.verifyDurabilityCase(deliveryCase('before-send'), 'before-send', originalCommit),
+    /durability|not in/i,
+  );
+});
+
+test('the actual resume regression retains API outcomes and before/after files for G5', async () => {
+  const directory = fs.mkdtempSync(path.join(scratch, 'resume-observer-'));
+  fs.mkdirSync(path.join(directory, 'cases'));
+  fs.writeFileSync(
+    path.join(directory, 'vitest.config.mjs'),
+    `import original from ${JSON.stringify(path.join(project, 'vitest.config.ts'))};
+export default {...original,root:${JSON.stringify(project)},cacheDir:${JSON.stringify(path.join(directory, 'cache'))},test:{...original.test,pool:'forks',maxWorkers:1,minWorkers:1}};`,
+  );
+  const execution = await captureExecution({
+    directory,
+    id: 'resume',
+    cwd: project,
+    timeout_ms: 60000,
+    argv: [
+      'rtk',
+      'proxy',
+      'npm',
+      'test',
+      '--',
+      'src/__tests__/session-manager.test.ts',
+      '-t',
+      'cold-resumes a timeout reset proved',
+      '--config',
+      path.join(directory, 'vitest.config.mjs'),
+      '--configLoader',
+      'native',
+    ],
+    env: {
+      NODE_OPTIONS: `--import=${path.join(project, 'src/__tests__/helpers/autoloop-trust-recovery.ts')}`,
+      CLAWO_TRUST_SCRATCH: path.join(directory, 'scratch'),
+      CLAWO_TRUST_CASE_ROOT: path.join(directory, 'cases'),
+    },
+  });
+  assert.equal(execution.exit_code, 0);
+  const found = fs
+    .readdirSync(path.join(directory, 'cases'))
+    .filter((name) => name.startsWith('trust-timeout-generation-reset-'));
+  assert.equal(found.length, 1);
+  const observation = path.join(directory, 'cases', found[0]);
+  assert.ok(fs.existsSync(path.join(observation, 'api.json')), 'G5 lacks actual resume API outcome');
+  assert.ok(fs.existsSync(path.join(observation, 'decisions.after.jsonl')), 'G5 lacks post-resume durable bytes');
+  assert.equal(
+    verifier.verifyResumeCase(observation, 'trust-timeout-generation-reset').case_id,
+    'trust-timeout-generation-reset',
+  );
+  for (const [name, change] of [
+    [
+      'API failure',
+      (d) => {
+        const f = path.join(d, 'api.json'),
+          v = JSON.parse(fs.readFileSync(f));
+        v.response = { error: { message: 'failure' } };
+        fs.writeFileSync(f, JSON.stringify(v));
+      },
+    ],
+    [
+      'forged source',
+      (d) => {
+        const f = path.join(d, 'api.json'),
+          v = JSON.parse(fs.readFileSync(f));
+        v.source_imports[0].sha256 = '0'.repeat(64);
+        fs.writeFileSync(f, JSON.stringify(v));
+      },
+    ],
+    [
+      'no replacement',
+      (d) =>
+        fs.writeFileSync(
+          path.join(d, 'generations.after.jsonl'),
+          fs.readFileSync(path.join(d, 'generations.input.jsonl')),
+        ),
+    ],
+    ['rewrite history', (d) => fs.appendFileSync(path.join(d, 'decisions.after.jsonl'), '{}\n')],
+    [
+      'missing release',
+      (d) => {
+        const f = path.join(d, 'generations.input.jsonl');
+        fs.writeFileSync(
+          f,
+          fs
+            .readFileSync(f, 'utf8')
+            .split('\n')
+            .filter((x) => !x.includes('agent_generation_released'))
+            .join('\n'),
+        );
+      },
+    ],
+  ]) {
+    const copy = fs.mkdtempSync(path.join(scratch, 'resume-tamper-'));
+    fs.cpSync(observation, copy, { recursive: true });
+    change(copy);
+    assert.throws(() => verifier.verifyResumeCase(copy, 'trust-timeout-generation-reset'), /durability/i, name);
+  }
+});
+
+test('durability reference reader distinguishes observed absence from an omitted artifact hash', () => {
+  const directory = deliveryCase('target');
+  const read = collector.durabilityArtifactReader(directory, []);
+  assert.throws(
+    () => read('recipient.jsonl'),
+    (error) => error.code === 'ENOENT',
+  );
+  assert.throws(() => read('message-A.json'), /Missing durability artifact reference/);
+  const wrong = collector.durabilityArtifactReader(directory, [{ path: 'message-A.json', sha256: '0'.repeat(64) }]);
+  assert.throws(() => wrong('message-A.json'), /hash/i);
+});
+
+test('durability CLI resolves its evidence mode and fails closed on missing bytes', async () => {
+  const directory = fs.mkdtempSync(path.join(scratch, 'durability-cli-'));
+  const execution = await captureExecution({
+    directory,
+    id: 'missing',
+    cwd: project,
+    timeout_ms: 3000,
+    argv: [
+      'rtk',
+      'proxy',
+      'node',
+      'scripts/autoloop-trust-recovery/verify.mjs',
+      'durability',
+      path.join(directory, 'absent'),
+    ],
+  });
+  assert.equal(execution.exit_code, 1);
+  const error = JSON.parse(fs.readFileSync(path.join(directory, execution.stderr.path))).error;
+  assert.match(error, /ENOENT/);
+});
+
+const relocationBundles = {
+  legacy: 'legacy-1789372963181-b79dd8e3-885f-43dc-86d3-fac75cbdbf27',
+  durability: 'durability-1789372963192-2d24f5a3-e1c0-4c60-a7f2-68f219efcad9',
+};
+for (const [mode, attempt] of Object.entries(relocationBundles)) {
+  for (const node of [
+    '/home/openclaw/.nvm/versions/node/v26.7.0/bin/node',
+    '/home/openclaw/.openclaw/tools/node-v26.7.0/bin/node',
+  ]) {
+    test(`${mode} precommit tool contract retains authenticated paths under ${node}`, () => {
+      const directory = path.join(artifactRoot, 'evidence/candidate', attempt);
+      const code = `import assert from 'node:assert/strict';import fs from 'node:fs';
+        import {authenticatedPrecommitSnapshot} from ${JSON.stringify(collectorSource)};
+        const directory=${JSON.stringify(directory)};
+        const bundle=JSON.parse(fs.readFileSync(directory+'/bundle.json'));
+        const manifest=JSON.parse(fs.readFileSync(directory+'/inputs.json'));
+        const before={head:bundle.head,tree:bundle.tree,manifest:structuredClone(manifest)};
+        before.manifest.tools[0].path=process.execPath;
+        const actual=authenticatedPrecommitSnapshot(before,directory,bundle);
+        assert.deepEqual(actual.manifest.tools,manifest.tools);
+        for(const key of ['tracked','harness','dependencies']) assert.deepEqual(actual.manifest[key],before.manifest[key]);
+        assert.equal(actual.head,before.head);assert.equal(actual.tree,before.tree);
+        console.log(JSON.stringify({mode:${JSON.stringify(mode)},runtime:process.execPath,tools:actual.manifest.tools}));`;
+      const output = fs.mkdtempSync(path.join(scratch, 'precommit-relocation-'));
+      const argv = ['rtk', 'proxy', node, '--input-type=module', '-'];
+      const result = spawnSync(argv[0], argv.slice(1), { input: code, cwd: project, encoding: 'utf8' });
+      fs.writeFileSync(path.join(output, 'stdout.txt'), result.stdout);
+      fs.writeFileSync(path.join(output, 'stderr.txt'), result.stderr);
+      fs.writeFileSync(path.join(output, 'execution.json'), JSON.stringify({ argv, exit_code: result.status }));
+      assert.equal(result.status, 0, result.stderr);
+    });
+  }
+}
+for (const fault of [
+  'digest',
+  'manifest-reference',
+  'tool-digest',
+  'relative-path',
+  'wrong-name',
+  'missing-path',
+  'non-file',
+  'changed-path-bytes',
+  'schema',
+]) {
+  test(`precommit historical tool validation rejects ${fault}`, () => {
+    const original = path.join(artifactRoot, 'evidence/candidate', relocationBundles.legacy);
+    const directory = fs.mkdtempSync(path.join(scratch, 'precommit-tool-tamper-'));
+    const bundle = JSON.parse(fs.readFileSync(path.join(original, 'bundle.json')));
+    const manifest = JSON.parse(fs.readFileSync(path.join(original, 'inputs.json')));
+    const snapshot = { head: bundle.head, tree: bundle.tree, manifest: structuredClone(manifest) };
+    if (fault === 'digest') manifest.tools[0].sha256 = '0'.repeat(64);
+    if (fault === 'relative-path') manifest.tools[0].path = 'node';
+    if (fault === 'wrong-name') manifest.tools[0].path = path.join(directory, 'pretend-node');
+    if (['missing-path', 'non-file', 'changed-path-bytes'].includes(fault)) {
+      manifest.tools[0].path = path.join(directory, 'node');
+      if (fault === 'non-file') fs.mkdirSync(manifest.tools[0].path);
+      if (fault === 'changed-path-bytes') fs.writeFileSync(manifest.tools[0].path, 'different executable bytes');
+    }
+    if (fault === 'schema') manifest.tools[0].extra = 'unapproved';
+    const bytes = JSON.stringify(manifest, null, 2) + '\n';
+    fs.writeFileSync(path.join(directory, 'inputs.json'), bytes);
+    bundle.input_manifest = {
+      path: 'inputs.json',
+      sha256: fault === 'manifest-reference' ? '0'.repeat(64) : digest(bytes),
+    };
+    bundle.tool_sha256 = fault === 'tool-digest' ? '0'.repeat(64) : digest(JSON.stringify(manifest.tools));
+    assert.throws(
+      () => collector.authenticatedPrecommitSnapshot(snapshot, directory, bundle),
+      /hash|tool|schema|ENOENT/i,
+    );
+  });
+}
 
 test('audits controller commit then receipt verification under the controller Node path', () => {
   fs.mkdirSync(scratch, { recursive: true });
