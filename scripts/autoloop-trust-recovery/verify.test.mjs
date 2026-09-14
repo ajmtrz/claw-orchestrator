@@ -809,15 +809,16 @@ test('rejects a rewritten historical bundle identity even with a refreshed bundl
   assert.throws(() => collector.verifyLegacyCommitLink(link, originalCommit), /head/i);
 });
 
-test('cannot finalize a receipt before the corrective controller commit exists', () => {
+test('rejects the original Slice 1 bundle as a Slice 2 candidate', () => {
   assert.throws(
     () =>
-      collector.finalizeLegacy(
+      collector.auditLegacyFinalization(
+        slice2Commit,
         path.join(artifactRoot, path.dirname(originalBundle)),
         'a89dc369113aaeaefb469625f4c4532d83e481a85dccde392e4f4f6967836f3d',
         'a89dc369113aaeaefb469625f4c4532d83e481a85dccde392e4f4f6967836f3d',
       ),
-    /commit|frozen|clean/i,
+    { message: 'Wrong candidate bundle hash/path' },
   );
 });
 
