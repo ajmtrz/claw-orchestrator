@@ -1,1 +1,0 @@
-{"verified":false,"error":"ENOENT: no such file or directory, lstat '/home/openclaw/workspace/projects/claw-orchestrator-autoloop-durable-recovery/.artifacts/CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1/evidence/candidate/validator-fixture-f9QytY'"}
