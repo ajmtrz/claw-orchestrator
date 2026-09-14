@@ -4,8 +4,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { verifyBundle, verifySeries, SOURCE_URL as verifySource } from './verify.mjs';
+import { verifyBundle, verifySeries, verifyLegacyCase, LEGACY_TITLES, SOURCE_URL as verifySource } from './verify.mjs';
 import { captureExecution, collect, SOURCE_URL as collectorSource } from './collect.mjs';
+import * as collector from './collect.mjs';
 
 // These deliberately synthetic documents test the validator, never recovery.
 // A missing hash/identity/predicate/report check must make a negative test fail.
@@ -16,6 +17,265 @@ const digest = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const sha = 'a'.repeat(40);
 const tap =
   'TAP version 13\n# Subtest: fixture command\nok 1 - fixture command\n1..1\n# tests 1\n# suites 0\n# pass 1\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n';
+
+// This immutable, real Git commit and its retained precommit evidence are the
+// historical anchor approved for this run. Tests never create Git commits.
+const originalCommit = '1559595d688fd91e2d9d9073c395f66d222afd83';
+const originalBundle = 'evidence/candidate/legacy-1789355466078-105035dd-ce89-4fb4-a876-56d398fb81d4/bundle.json';
+const artifactRoot = path.join(project, '.artifacts', run);
+function originalCommitLink() {
+  const files = JSON.parse(
+    fs.readFileSync(path.join(artifactRoot, 'evidence/candidate/slice1-finish-002/candidate-files.json')),
+  );
+  return {
+    base: '2694c0babcf16030278e58d829a7c71bcaa0f7a2',
+    parent: '1af92f4e1a8d6f82bfe8e1175310f672606c5e55',
+    commit: originalCommit,
+    tree: '10dc9a4a7c1c23795cd8cb998beb4b35fc9b13e2',
+    bundle: { path: originalBundle, sha256: 'a89dc369113aaeaefb469625f4c4532d83e481a85dccde392e4f4f6967836f3d' },
+    patch: {
+      path: originalBundle.replace('bundle.json', 'inputs.patch'),
+      sha256: '9f31883089e7488c25e15f7cab13e1f9ae975471f4ad46706ac2f49628c85e36',
+    },
+    files: files.sort((a, b) => a.path.localeCompare(b.path)),
+  };
+}
+
+test('binds preserved precommit evidence to the actual immutable Slice 1 Git commit', () => {
+  const before = fs.readFileSync(path.join(artifactRoot, originalBundle));
+  assert.equal(collector.verifyLegacyCommitLink(originalCommitLink(), originalCommit).cases, 25);
+  assert.deepEqual(fs.readFileSync(path.join(artifactRoot, originalBundle)), before);
+});
+
+for (const [name, change, expected] of [
+  [
+    'head',
+    (x) => {
+      x.commit = '2694c0babcf16030278e58d829a7c71bcaa0f7a2';
+    },
+    /head/i,
+  ],
+  [
+    'tree',
+    (x) => {
+      x.tree = '4b7b5561919457ad1193467b3caa7e709d53db0f';
+    },
+    /tree/i,
+  ],
+  [
+    'parent',
+    (x) => {
+      x.parent = x.base;
+    },
+    /parent/i,
+  ],
+  [
+    'base',
+    (x) => {
+      x.base = x.parent;
+    },
+    /base/i,
+  ],
+  [
+    'patch hash',
+    (x) => {
+      x.patch.sha256 = '0'.repeat(64);
+    },
+    /hash|patch/i,
+  ],
+  [
+    'file bytes',
+    (x) => {
+      x.files[0].sha256 = '0'.repeat(64);
+    },
+    /file|bytes/i,
+  ],
+  [
+    'file Git object',
+    (x) => {
+      x.files[0].git_blob_sha1 = '0'.repeat(40);
+    },
+    /file|object/i,
+  ],
+  [
+    'omitted changed file',
+    (x) => {
+      x.files.pop();
+    },
+    /file/i,
+  ],
+  [
+    'bundle hash',
+    (x) => {
+      x.bundle.sha256 = '0'.repeat(64);
+    },
+    /hash|bundle/i,
+  ],
+]) {
+  test(`rejects a committed evidence link with wrong ${name}`, () => {
+    const link = originalCommitLink();
+    change(link);
+    assert.throws(() => collector.verifyLegacyCommitLink(link, originalCommit), expected);
+  });
+}
+
+test('rejects changed patch bytes even when the supplied patch hash is refreshed', () => {
+  const link = originalCommitLink();
+  fs.mkdirSync(scratch, { recursive: true });
+  const dir = fs.mkdtempSync(path.join(scratch, 'postcommit-patch-'));
+  const bytes = fs
+    .readFileSync(path.join(artifactRoot, link.patch.path), 'utf8')
+    .replace('@@ -13,6 +13,8 @@', '@@ -14,6 +14,8 @@');
+  const file = path.join(dir, 'changed.patch');
+  fs.writeFileSync(file, bytes);
+  link.patch = { path: path.relative(artifactRoot, file), sha256: digest(bytes) };
+  assert.throws(() => collector.verifyLegacyCommitLink(link, originalCommit), /patch/i);
+});
+
+test('rejects a rewritten historical bundle identity even with a refreshed bundle hash', () => {
+  const link = originalCommitLink();
+  fs.mkdirSync(scratch, { recursive: true });
+  const dir = fs.mkdtempSync(path.join(scratch, 'postcommit-bundle-'));
+  const b = JSON.parse(fs.readFileSync(path.join(artifactRoot, link.bundle.path)));
+  b.head = link.base;
+  const bytes = JSON.stringify(b);
+  const file = path.join(dir, 'bundle.json');
+  fs.writeFileSync(file, bytes);
+  link.bundle = { path: path.relative(artifactRoot, file), sha256: digest(bytes) };
+  assert.throws(() => collector.verifyLegacyCommitLink(link, originalCommit), /head/i);
+});
+
+test('cannot finalize a receipt before the corrective controller commit exists', () => {
+  assert.throws(
+    () =>
+      collector.finalizeLegacy(
+        path.join(artifactRoot, path.dirname(originalBundle)),
+        'a89dc369113aaeaefb469625f4c4532d83e481a85dccde392e4f4f6967836f3d',
+        'a89dc369113aaeaefb469625f4c4532d83e481a85dccde392e4f4f6967836f3d',
+      ),
+    /commit|frozen|clean/i,
+  );
+});
+
+// Synthetic validator inputs, not runtime evidence. Expectations intentionally
+// do not import the verifier's scenario builder or derive clocks from titles.
+function legacyLabelFixture(change = () => {}) {
+  fs.mkdirSync(scratch, { recursive: true });
+  const directory = fs.mkdtempSync(path.join(scratch, 'legacy-label-unit-'));
+  const title =
+    'trust recovery legacy persisted state candidate: reads ordinary legacy metadata at TTL -1 ms from real registry bytes';
+  const action = {
+    action: 'load',
+    subject: project,
+    now: 1789207199999,
+    seed: [
+      {
+        name: 'autoloop-legacy-probe-planner',
+        claudeSessionId: 'legacy-session-id',
+        cwd: project,
+        originalCreated: '2026-09-05T10:00:00.000Z',
+        lastResumed: '2026-09-05T10:00:00.000Z',
+        lastActivity: 1788602400000,
+      },
+    ],
+  };
+  change(action);
+  const input = { runId: 'legacy-probe', sessionName: 'autoloop-legacy-probe-planner', ...action };
+  const seedBytes = JSON.stringify(action.seed);
+  fs.writeFileSync(path.join(directory, 'seed.json'), seedBytes);
+  const snapshot = { registry: { path: path.join(directory, 'seed.json'), sha256: digest(seedBytes) } };
+  fs.mkdirSync(path.join(directory, 'process-42'));
+  const source = path.join(action.subject, 'src/session-manager.ts');
+  const values = [
+    { kind: 'invocation', data: input },
+    { path: source, sha256: digest(fs.readFileSync(source)) },
+  ];
+  fs.writeFileSync(
+    path.join(directory, 'process-42/observations.jsonl'),
+    values
+      .map((value, sequence) => JSON.stringify({ sequence, process_id: 42, observer_id: 'unit-worker', value }) + '\n')
+      .join(''),
+  );
+  fs.writeFileSync(
+    path.join(directory, 'parent.jsonl'),
+    JSON.stringify({
+      sequence: 0,
+      process_id: 43,
+      observer_id: 'unit-parent',
+      value: { kind: 'execution', pid: 42, action, status: 0, signal: null },
+    }) + '\n',
+  );
+  fs.writeFileSync(
+    path.join(directory, 'worker-42-stdout.txt'),
+    JSON.stringify({
+      process_id: 42,
+      loaded: action.seed,
+      apis: { reserve: true, release: true },
+      snapshots: { seed: snapshot, final: snapshot },
+    }),
+  );
+  fs.writeFileSync(path.join(directory, 'case.json'), JSON.stringify({ title }));
+  return { directory, title };
+}
+
+test('accepts independently specified below-TTL validator inputs', () => {
+  const f = legacyLabelFixture();
+  assert.equal(verifyLegacyCase(f.directory), f.title);
+});
+
+for (const [name, replacement] of [
+  [
+    'TTL-plus-1 relabel',
+    'trust recovery legacy persisted state candidate: reads ordinary legacy metadata at TTL +1 ms from real registry bytes',
+  ],
+  [
+    'TTL-boundary replay',
+    'trust recovery legacy persisted state candidate: reads ordinary legacy metadata at TTL +0 ms from real registry bytes',
+  ],
+  [
+    'starting-subject relabel',
+    'trust recovery legacy persisted state start: reads ordinary legacy metadata at TTL -1 ms from real registry bytes',
+  ],
+]) {
+  test(`rejects ${name} even with the complete required title inventory`, () => {
+    const f = legacyLabelFixture();
+    assert.equal(verifyLegacyCase(f.directory), f.title);
+    // A correct-looking supplied descriptor cannot substitute for fixed code.
+    fs.writeFileSync(
+      path.join(f.directory, 'case.json'),
+      JSON.stringify({ title: replacement, descriptor: { title: replacement, delta: 1, subject: 'candidate' } }),
+    );
+    const titles = LEGACY_TITLES.map((t) => (t === replacement ? replacement : t));
+    assert.deepEqual(titles, LEGACY_TITLES);
+    assert.throws(() => verifyLegacyCase(f.directory), /scenario|descriptor/i);
+  });
+}
+
+for (const [name, change] of [
+  [
+    'seed name',
+    (a) => {
+      a.seed[0].name = 'another-legacy-session';
+    },
+  ],
+  [
+    'seed clock',
+    (a) => {
+      a.seed[0].lastActivity -= 1;
+    },
+  ],
+  [
+    'extra precondition',
+    (a) => {
+      a.seed[0].agentGeneration = 0;
+    },
+  ],
+]) {
+  test(`rejects self-consistent legacy evidence with a wrong ${name}`, () => {
+    const f = legacyLabelFixture(change);
+    assert.throws(() => verifyLegacyCase(f.directory), /scenario|descriptor/i);
+  });
+}
 
 // Actual worker import receipts. Unit-test fixture events below are separate.
 if (process.env.CLAWO_TRUST_CAPTURE_ID) {

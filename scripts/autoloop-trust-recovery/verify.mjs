@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
@@ -359,8 +360,104 @@ export const LEGACY_TITLES = [
   'does not let shutdown publish a stale legacy snapshot over the successor fence',
 ].map((title) => `trust recovery legacy persisted state ${title}`);
 
+// Independent scenario definitions: neither labels nor supplied descriptors
+// select arbitrary clocks, seeds, subjects, barriers or invocation sequences.
+function legacyScenario(title) {
+  const created = 1788602400000;
+  const legacy = {
+    name: 'autoloop-legacy-probe-planner',
+    claudeSessionId: 'legacy-session-id',
+    cwd: PROJECT,
+    originalCreated: '2026-09-05T10:00:00.000Z',
+    lastResumed: '2026-09-05T10:00:00.000Z',
+    lastActivity: created,
+  };
+  const pending = {
+    ...legacy,
+    agentGeneration: 0,
+    agentOwnerInstanceId: 'legacy-registry',
+    agentReleasePending: true,
+    agentReleaseOwnerInstanceId: 'unclassifiable-old-owner',
+  };
+  const step = (action, rest = {}) => ({ action, ...rest });
+  const seeded = (action, rest = {}) => step(action, { seed: [legacy], ...rest });
+  const definitions = [
+    { outcome: 'isolation', steps: [] },
+    ...['upstream', 'start', 'candidate'].flatMap((subjectKind) =>
+      [-1, 0, 1].map((delta) => ({
+        outcome: 'ordinary',
+        subjectKind,
+        delta,
+        steps: [
+          seeded('load', {
+            subject:
+              subjectKind === 'candidate' ? PROJECT : path.join(PROJECT, '.worktrees/trust-recovery-r1', subjectKind),
+            now: created + 604800000 + delta,
+          }),
+        ],
+      })),
+    ),
+    ...[-1, 0, 1].map((delta) => ({
+      outcome: 'fences',
+      delta,
+      steps: [
+        step('load', {
+          seed: [
+            pending,
+            { ...legacy, name: 'released-legacy', agentReleasedGeneration: 0 },
+            { ...legacy, name: 'ordinary' },
+          ],
+          now: created + 604800000 + delta,
+        }),
+      ],
+    })),
+    ...[-1, 0, 1].map((delta) => ({
+      outcome: 'release-ttl',
+      delta,
+      steps: [seeded('release', { now: created + 604800000 + delta })],
+    })),
+    {
+      outcome: 'competition',
+      steps: [
+        seeded('release', { barrier: 'before-file-fsync' }),
+        step('reserve'),
+        step('prepare'),
+        step('release'),
+        step('prepare'),
+        step('reserve'),
+      ],
+    },
+    ...['before-release-write', 'before-file-fsync', 'after-durable-release'].map((barrier) => ({
+      outcome: 'crash',
+      steps: [seeded('prepare', { barrier }), step('reserve'), step('prepare'), step('reserve')],
+    })),
+    {
+      outcome: 'unknown',
+      steps: [
+        step('prepare', { seed: [pending] }),
+        ...[{ generation: 1 }, { owner: 'wrong-owner' }, { session: 'wrong-session' }, { omitSession: true }].map(
+          (options) => step('release-options', { options }),
+        ),
+      ],
+    },
+    { outcome: 'sync', steps: [seeded('prepare', { fault: 'release-fsync' }), step('prepare')] },
+    {
+      outcome: 'partial',
+      steps: [seeded('prepare', { fault: 'release-short-write' }), step('prepare'), step('reserve')],
+    },
+    {
+      outcome: 'shutdown',
+      steps: [seeded('shutdown', { barrier: 'after-durable-release' }), step('reserve'), step('prepare')],
+    },
+    { outcome: 'stale', steps: [seeded('load', { barrier: 'loaded' }), step('prepare')] },
+  ];
+  const index = LEGACY_TITLES.indexOf(title);
+  requireThat(index >= 0 && definitions.length === LEGACY_TITLES.length, 'Unknown legacy scenario identity');
+  return { title: LEGACY_TITLES[index], subjectKind: 'candidate', ...definitions[index] };
+}
+
 /** Slice-specific predicates over actual files; API booleans alone never suffice. */
-export function verifyLegacyCase(directory) {
+export function verifyLegacyCase(directory, candidateHead) {
   const read = (relative) => fs.readFileSync(containedPath(directory, relative), 'utf8');
   const lines = (relative) =>
     read(relative)
@@ -368,13 +465,13 @@ export function verifyLegacyCase(directory) {
       .filter(Boolean)
       .map((line) => JSON.parse(line));
   const title = JSON.parse(read('case.json')).title;
-  requireThat(LEGACY_TITLES.includes(title), 'Unknown legacy case identity');
+  const scenario = legacyScenario(title);
   const journal = lines('parent.jsonl');
   journal.forEach((event, i) =>
     requireThat(event.sequence === i && event.process_id > 0, 'Invalid parent observation order'),
   );
   const events = journal.map((event) => event.value);
-  if (title === LEGACY_TITLES[0]) {
+  if (scenario.outcome === 'isolation') {
     const [event] = events;
     requireThat(
       events.length === 1 && event.kind === 'isolation' && event.status === 0 && event.signal === null,
@@ -387,7 +484,7 @@ export function verifyLegacyCase(directory) {
   }
   const runs = events
     .filter((event) => ['execution', 'spawn'].includes(event.kind))
-    .map((event) => {
+    .map((event, index) => {
       const exit = event.kind === 'execution' ? event : events.find((e) => e.kind === 'exit' && e.pid === event.pid);
       requireThat(exit && !exit.error, 'Missing/failed worker exit observation');
       const trace = lines(`process-${event.pid}/observations.jsonl`);
@@ -397,25 +494,58 @@ export function verifyLegacyCase(directory) {
       const values = trace.map((entry) => entry.value);
       const input = values.find((entry) => entry.kind === 'invocation')?.data;
       requireThat(input, 'Missing worker invocation');
-      for (const [key, value] of Object.entries(event.action))
-        same(input[key], value, 'Invocation differs from parent command');
-      const subject = path.resolve(input.subject ?? PROJECT);
-      requireThat(
-        [
-          PROJECT,
-          path.join(PROJECT, '.worktrees/trust-recovery-r1/upstream'),
-          path.join(PROJECT, '.worktrees/trust-recovery-r1/start'),
-        ]
-          .map((p) => path.resolve(p))
-          .includes(subject),
-        'Wrong legacy subject',
+      const expected = scenario.steps[index];
+      same(event.action, expected, 'Legacy scenario descriptor: parent action, clock, seed or barrier mismatch');
+      same(
+        input,
+        { runId: 'legacy-probe', sessionName: 'autoloop-legacy-probe-planner', now: 1788602401000, ...expected },
+        'Legacy scenario descriptor: worker invocation mismatch',
       );
+      const subject = path.resolve(input.subject ?? PROJECT);
+      const expectedSubject =
+        scenario.subjectKind === 'candidate'
+          ? PROJECT
+          : path.join(PROJECT, '.worktrees/trust-recovery-r1', scenario.subjectKind);
+      same(subject, path.resolve(expectedSubject), 'Legacy scenario descriptor: wrong subject');
+      const head =
+        scenario.subjectKind === 'upstream'
+          ? '3e09b032a2f95fa520648f959f4ac9cdc7393350'
+          : scenario.subjectKind === 'start'
+            ? '2694c0babcf16030278e58d829a7c71bcaa0f7a2'
+            : (candidateHead ??
+              execFileSync('rtk', ['proxy', 'git', '-C', PROJECT, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim());
+      requireThat(/^[a-f0-9]{40}$/.test(head), 'Legacy scenario descriptor: invalid subject head');
       const source = values.find((entry) => entry.path === path.join(subject, 'src/session-manager.ts'));
-      requireThat(source?.sha256 === sha256(fs.readFileSync(source.path)), 'Missing/stale imported subject');
+      const expectedSource = execFileSync('rtk', [
+        'proxy',
+        'git',
+        '-C',
+        PROJECT,
+        'cat-file',
+        'blob',
+        `${head}:src/session-manager.ts`,
+      ]);
+      requireThat(
+        source?.sha256 === sha256(expectedSource) && source.sha256 === sha256(fs.readFileSync(source.path)),
+        'Legacy scenario descriptor: missing/stale imported subject head',
+      );
+      if (expected.seed) {
+        const seed = values.find((entry) => entry.kind === 'snapshot' && entry.data?.label === 'seed')?.data.registry;
+        // Original worker captures also expose this reference in stdout.
+        const stdoutSeed =
+          exit.signal === null && JSON.parse(read(`worker-${event.pid}-stdout.txt`)).snapshots?.seed?.registry;
+        const reference = seed ?? stdoutSeed;
+        requireThat(reference, 'Legacy scenario descriptor: missing persisted seed');
+        same(
+          JSON.parse(readArtifact(directory, { ...reference, path: path.relative(directory, reference.path) })),
+          expected.seed,
+          'Legacy scenario descriptor: persisted seed mismatch',
+        );
+      }
       const barrier = values.find((entry) => entry.kind === 'barrier-reached')?.data;
       if (exit.signal === 'SIGKILL') {
         requireThat(
-          title.includes('witnessed process loss') && barrier?.stage === input.barrier,
+          scenario.outcome === 'crash' && barrier?.stage === expected.barrier,
           'Unwitnessed or unexpected process loss',
         );
         const receipt = events.find((e) => e.kind === 'barrier' && e.pid === event.pid);
@@ -428,7 +558,10 @@ export function verifyLegacyCase(directory) {
       requireThat(result.process_id === event.pid, 'Wrong result process');
       return { event, exit, values, input, barrier, result };
     });
-  requireThat(runs.length > 0, 'No legacy executions');
+  requireThat(
+    runs.length > 0 && runs.length === scenario.steps.length,
+    'Legacy scenario descriptor: wrong execution count',
+  );
   const raw = (ref) => readArtifact(directory, { ...ref, path: path.relative(directory, ref.path) });
   const registry = (snap) => JSON.parse(raw(snap.registry));
   const ledger = (snap) => (snap.ledger ? raw(snap.ledger) : Buffer.alloc(0));
@@ -499,19 +632,18 @@ export function verifyLegacyCase(directory) {
       'Missing real ledger fsync return',
     );
   const [first] = runs;
-  if (title.includes('ordinary legacy metadata at TTL')) {
+  if (scenario.outcome === 'ordinary') {
     requireThat(runs.length === 1 && first.input.action === 'load', 'Wrong TTL execution');
-    const delta = first.input.now - Date.parse('2026-09-05T10:00:00.000Z') - 604800000;
-    requireThat([-1, 0, 1].includes(delta), 'Uncontrolled TTL boundary');
+    const delta = scenario.delta;
     same(first.result.loaded, delta < 0 ? first.input.seed : [], 'Ordinary metadata TTL postcondition');
     same(registry(first.result.snapshots.seed), first.input.seed, 'Seed differs from persisted bytes');
     same(
       first.result.apis,
-      { reserve: !title.includes('upstream:'), release: !title.includes('upstream:') },
+      { reserve: scenario.subjectKind !== 'upstream', release: scenario.subjectKind !== 'upstream' },
       'Missing baseline API cannot be a release PASS',
     );
-  } else if (title.includes('distinguishes durable pending')) {
-    const delta = first.input.now - Date.parse('2026-09-05T10:00:00.000Z') - 604800000;
+  } else if (scenario.outcome === 'fences') {
+    const delta = scenario.delta;
     same(
       first.result.loaded,
       delta < 0 ? first.input.seed : first.input.seed.slice(0, 2),
@@ -522,8 +654,8 @@ export function verifyLegacyCase(directory) {
         registry(final(first)).some((entry) => entry.agentReleasedGeneration === 0),
       'Lost durable TTL fences',
     );
-  } else if (title.includes('traces the legacy release hooks')) {
-    const young = first.input.now - Date.parse('2026-09-05T10:00:00.000Z') < 604800000;
+  } else if (scenario.outcome === 'release-ttl') {
+    const young = scenario.delta < 0;
     same(first.result.responses, [young], 'Wrong observed legacy release response');
     if (young) {
       released(final(first));
@@ -533,7 +665,7 @@ export function verifyLegacyCase(directory) {
       same(rows(final(first)), [], 'Expired fixture reached evidence hooks');
       same(registry(final(first)), [], 'Expired ordinary fixture retained');
     }
-  } else if (title.includes('refuses a competing process')) {
+  } else if (scenario.outcome === 'competition') {
     requireThat(
       runs.length === 6 && first.barrier?.stage === 'before-file-fsync',
       'Incomplete competing reservation interval',
@@ -552,7 +684,7 @@ export function verifyLegacyCase(directory) {
     prefix(first.barrier.snapshot, final(runs[4]));
     requireThat(runs[5].result.value === false, 'Duplicate successor accepted');
     unchanged(final(runs[4]), final(runs[5]));
-  } else if (title.includes('witnessed process loss')) {
+  } else if (scenario.outcome === 'crash') {
     requireThat(runs.length === 4 && first.exit.signal === 'SIGKILL', 'Missing crash/cold execution');
     pending(first.barrier.snapshot);
     refused(runs[1]);
@@ -564,7 +696,7 @@ export function verifyLegacyCase(directory) {
       runs[2].result.owner !== first.barrier.owner && !runs[2].result.failure && runs[3].result.value === false,
       'Cold owner/single successor postcondition',
     );
-  } else if (title.includes('unknown legacy release ownership')) {
+  } else if (scenario.outcome === 'unknown') {
     requireThat(
       runs.length === 5 && first.result.failure?.code === 'AUTOLOOP_AGENT_GENERATION_CONFLICT',
       'Unknown ownership was not BLOCKED',
@@ -578,7 +710,7 @@ export function verifyLegacyCase(directory) {
       runs.slice(1).every((run) => run.result.value === false),
       'Mismatched tuple accepted',
     );
-  } else if (title.includes('real file-sync failure')) {
+  } else if (scenario.outcome === 'sync') {
     requireThat(
       runs.length === 2 &&
         first.result.failure?.code === 'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE' &&
@@ -590,7 +722,7 @@ export function verifyLegacyCase(directory) {
     history(final(runs[1]), true);
     flushed(runs[1]);
     prefix(final(first), final(runs[1]));
-  } else if (title.includes('partially written release row')) {
+  } else if (scenario.outcome === 'partial') {
     requireThat(
       runs.length === 3 &&
         first.values.some((v) => v.kind === 'short-write' && v.data.written > 0 && v.data.written < v.data.requested) &&
@@ -604,7 +736,7 @@ export function verifyLegacyCase(directory) {
     );
     same(ledger(final(first)), ledger(final(runs[1])), 'Partial history rewritten');
     refused(runs[2]);
-  } else if (title.includes('during shutdown')) {
+  } else if (scenario.outcome === 'shutdown') {
     requireThat(
       runs.length === 3 &&
         first.barrier?.stage === 'after-durable-release' &&
@@ -622,7 +754,7 @@ export function verifyLegacyCase(directory) {
     released(final(first));
     flushed(first);
     history(final(runs.at(-1)), true);
-  } else if (title.includes('stale legacy snapshot')) {
+  } else if (scenario.outcome === 'stale') {
     requireThat(runs.length === 2 && first.barrier?.stage === 'loaded', 'Missing stale snapshot barrier');
     history(final(runs[1]), true);
     unchanged(final(first), final(runs[1]));
