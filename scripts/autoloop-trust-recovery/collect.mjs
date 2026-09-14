@@ -586,7 +586,8 @@ async function collectLegacy() {
   writeArtifact(directory, 'bundle.json', JSON.stringify(bundle, null, 2) + '\n');
   ensure(JSON.stringify(legacySnapshot()) === JSON.stringify(snapshot), 'Legacy inputs changed during collection');
   verifyLegacy(directory);
-  const pointer = path.join(ARTIFACT_ROOT, 'reports', `legacy-${snapshot.head}-${contract.patch_sha256}.json`);
+  // Repeated collection on the same source must preserve each attempt's report.
+  const pointer = path.join(ARTIFACT_ROOT, 'reports', `legacy-${snapshot.head}-${contract.patch_sha256}-${id}.json`);
   const bundle_sha256 = sha256(fs.readFileSync(path.join(directory, 'bundle.json')));
   fs.writeFileSync(pointer, JSON.stringify({ directory, bundle_sha256 }) + '\n', { flag: 'wx', mode: 0o600 });
   return { directory, bundle_sha256, execution };
@@ -598,7 +599,7 @@ export function verifyLegacy(directory) {
   ensure(/^evidence\/candidate\/[^/]+$/.test(path.relative(ARTIFACT_ROOT, directory)), 'Wrong legacy attempt scope');
   const bundle = JSON.parse(fs.readFileSync(containedPath(directory, 'bundle.json')));
   const values = verifyBundle(bundle, directory, legacyContract(snapshot, directory));
-  return verifyLegacyObservations(values, directory, snapshot.head);
+  return verifyLegacyObservations(values, directory);
 }
 
 function verifyLegacyObservations(values, directory, candidateHead) {

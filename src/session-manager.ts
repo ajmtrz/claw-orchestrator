@@ -554,6 +554,7 @@ type CodexAppSession = ISession & {
 type AutoloopRoleName = 'planner' | 'coder' | 'reviewer';
 
 interface SendTimeoutMigrationAuditRecord {
+  schema_version?: 1;
   ts: string;
   kind: 'timeout_migration';
   actor: 'operator';
@@ -1060,6 +1061,112 @@ function isSendTimeoutPayload(value: unknown): value is SendTimeoutPayload {
   );
 }
 
+interface StoredTimeoutObservation {
+  ts: string;
+  payload: SendTimeoutPayload;
+}
+
+/** Legacy timeout rows have no owner tuple. Only an unambiguous, durable
+ * release/start interval can prove that a later baseline timeout belongs to a
+ * replacement owner. A timestamp or a reset request alone is not authority.
+ */
+function provesTimeoutGenerationReset(
+  ledger: SecureAutoloopLedger,
+  runId: string,
+  previous: StoredTimeoutObservation | undefined,
+  next: StoredTimeoutObservation,
+): boolean {
+  if (!previous) return false;
+  const earlier = Date.parse(previous.ts),
+    later = Date.parse(next.ts);
+  if (!Number.isFinite(earlier) || !Number.isFinite(later) || earlier >= later) return false;
+  const sameIdentity = (a: PhysicalAgentGeneration, b: PhysicalAgentGeneration) =>
+    a.role === b.role &&
+    a.generation === b.generation &&
+    a.session_name === b.session_name &&
+    a.owner_instance_id === b.owner_instance_id &&
+    a.session_id === b.session_id &&
+    a.created_at === b.created_at;
+  const history: Array<{ ts: number; kind: string; generation: PhysicalAgentGeneration }> = [];
+  const current = new Map<string, (typeof history)[number]>();
+  let lastTime = -Infinity;
+  for (const line of (ledger.readFlatFile('agent-generations.jsonl') ?? '').split('\n')) {
+    if (!line.trim()) continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      return false;
+    }
+    const g = row?.payload as PhysicalAgentGeneration | undefined;
+    const ts = Date.parse(row?.ts);
+    if (
+      row?.schema_version !== 1 ||
+      !g ||
+      !['planner', 'coder', 'reviewer'].includes(g.role) ||
+      !Number.isSafeInteger(g.generation) ||
+      g.generation < 1 ||
+      g.session_name !== `autoloop-${runId}-${g.role}` ||
+      !isRecoverableAgentOwnerInstanceId(g.owner_instance_id) ||
+      typeof g.session_id !== 'string' ||
+      !g.session_id ||
+      !Number.isFinite(Date.parse(g.created_at)) ||
+      !Number.isFinite(ts) ||
+      Date.parse(g.created_at) > ts ||
+      ts < lastTime
+    )
+      return false;
+    const prior = current.get(g.role);
+    const kind = row.kind;
+    if (kind === 'agent_generation_reserved') {
+      if (
+        g.state !== 'stale' ||
+        (prior
+          ? prior.kind !== 'agent_generation_released' ||
+            g.generation !== prior.generation.generation + 1 ||
+            g.session_id === prior.generation.session_id
+          : g.generation !== 1)
+      )
+        return false;
+    } else {
+      if (!prior || !sameIdentity(prior.generation, g)) return false;
+      if (kind === 'agent_generation_started') {
+        if (prior.kind !== 'agent_generation_reserved' || g.state !== 'live') return false;
+      } else if (kind === 'agent_generation_lease_renewed') {
+        if (!['agent_generation_started', 'agent_generation_lease_renewed'].includes(prior.kind) || g.state !== 'live')
+          return false;
+      } else if (kind === 'agent_generation_orphaned') {
+        if (prior.kind === 'agent_generation_released' || g.state !== 'orphaned') return false;
+      } else if (kind === 'agent_generation_released') {
+        if (g.state !== 'released') return false;
+      } else return false;
+    }
+    const event = { ts, kind, generation: g };
+    history.push(event);
+    current.set(g.role, event);
+    lastTime = ts;
+  }
+  const activeAt = (role: string, at: number) => {
+    const event = history.filter((entry) => entry.generation.role === role && entry.ts <= at).at(-1);
+    // Equal cross-ledger timestamps cannot prove which event came first.
+    return event && event.ts < at && event.generation.state === 'live' ? event.generation : undefined;
+  };
+  const oldOwner = activeAt(previous.payload.agent, earlier);
+  const newOwner = activeAt(next.payload.agent, later);
+  return Boolean(
+    oldOwner &&
+    newOwner &&
+    oldOwner.owner_instance_id !== newOwner.owner_instance_id &&
+    history.some(
+      (event) =>
+        event.kind === 'agent_generation_released' &&
+        sameIdentity(event.generation, oldOwner) &&
+        event.ts > earlier &&
+        event.ts < Date.parse(newOwner.created_at),
+    ),
+  );
+}
+
 /**
  * Replay only timeout-resume audit rows. The original run spec remains the
  * immutable starting point; each coherent append advances the effective value.
@@ -1074,6 +1181,9 @@ function readStoredAutoloopResumeContext(
   validateAutoloopTimeoutConfig({ sendTimeoutMs: originalSendTimeoutMs as number | undefined });
   let effectiveSendTimeoutMs = (originalSendTimeoutMs as number | undefined) ?? DEFAULT_SEND_TIMEOUT_MS;
   let pendingDispatch: SendTimeoutPayload | null = null;
+  let pendingObservation: StoredTimeoutObservation | undefined;
+  let previousMigratedTimeout: StoredTimeoutObservation | undefined;
+  let generationReset = false;
   const auditContents = ledger.readFlatFile('decisions.jsonl') ?? '';
 
   const lines = auditContents.split('\n');
@@ -1086,11 +1196,25 @@ function readStoredAutoloopResumeContext(
       throw new Error(`Cannot safely resume Autoloop '${runId}': decisions.jsonl contains malformed JSON`);
     }
     if (row.kind === 'send_timeout' && isSendTimeoutPayload(row.payload)) {
+      const observation = { ts: String(row.ts), payload: row.payload };
+      if (row.payload.timeout_ms < effectiveSendTimeoutMs) {
+        if (
+          row.payload.timeout_ms !== (originalSendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS) ||
+          !provesTimeoutGenerationReset(ledger, runId, previousMigratedTimeout, observation)
+        ) {
+          throw new Error(`Cannot safely resume Autoloop '${runId}': timeout generation reset lacks durable proof`);
+        }
+        effectiveSendTimeoutMs = row.payload.timeout_ms;
+        generationReset = true;
+      }
       pendingDispatch = row.payload;
+      pendingObservation = observation;
       continue;
     }
     if (row.kind === 'terminate') {
       pendingDispatch = null;
+      pendingObservation = undefined;
+      generationReset = false;
       continue;
     }
     if (row.kind !== 'timeout_migration' || row.runId !== runId || row.field !== 'sendTimeoutMs') continue;
@@ -1102,11 +1226,23 @@ function readStoredAutoloopResumeContext(
     } catch {
       throw new Error(`Cannot safely resume Autoloop '${runId}': timeout migration audit is invalid`);
     }
-    if (oldValue !== effectiveSendTimeoutMs || (newValue as number) <= (oldValue as number)) {
+    if (
+      oldValue !== effectiveSendTimeoutMs ||
+      (newValue as number) <= (oldValue as number) ||
+      (generationReset &&
+        (!pendingDispatch ||
+          row.pendingDispatchId !== pendingDispatch.dispatch_id ||
+          pendingDispatch.timeout_ms !== oldValue))
+    ) {
       throw new Error(`Cannot safely resume Autoloop '${runId}': timeout migration audit chain is inconsistent`);
     }
     effectiveSendTimeoutMs = newValue as number;
-    if (row.pendingDispatchId === pendingDispatch?.dispatch_id) pendingDispatch = null;
+    if (pendingDispatch && row.pendingDispatchId === pendingDispatch.dispatch_id) {
+      previousMigratedTimeout = pendingObservation;
+      pendingDispatch = null;
+      pendingObservation = undefined;
+    }
+    generationReset = false;
   }
   return { effectiveSendTimeoutMs, pendingDispatch };
 }
@@ -1123,6 +1259,7 @@ function encodeSendTimeoutMigration(
 ): string {
   const timestamp = new Date().toISOString();
   const record: SendTimeoutMigrationAuditRecord = {
+    schema_version: 1,
     ts: timestamp,
     kind: 'timeout_migration',
     actor: 'operator',

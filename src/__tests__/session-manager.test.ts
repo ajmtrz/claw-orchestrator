@@ -6585,6 +6585,169 @@ describe('SessionManager', () => {
         mgr = createManager();
       };
 
+      const generationScopedTimeoutHistory = async (runId: string, migrateReplacement = true) => {
+        const workspace = workspaceFor(runId);
+        await mgr.autoloopStart({ runId, workspace, sendTimeoutMs: 600_000 });
+        const timeoutAndIncrease = async (next?: number) => {
+          vi.setSystemTime(Date.now() + 10);
+          lastMock().sendImplementation = async () => {
+            throw new Error('Timeout waiting for response');
+          };
+          await expect(mgr.autoloopChat(runId, `timeout before ${next}`)).rejects.toMatchObject({
+            code: 'AUTOLOOP_SEND_TIMEOUT',
+          });
+          const pending = mgr.getAutoloop(runId)!.runner.state.pending_dispatch!;
+          if (next !== undefined)
+            await mgr.autoloopResume(runId, { sendTimeoutMs: next, pendingDispatchId: pending.dispatch_id });
+        };
+        for (const next of [1_200_000, 2_400_000, 3_600_000]) await timeoutAndIncrease(next);
+        vi.setSystemTime(Date.now() + 10);
+        await terminateAndReconstructManager(runId);
+        // Reproduce the old controller's physical restart with the immutable
+        // starting configuration. Kernel, dispatcher, generations and all
+        // timeout/migration persistence remain real; only the engine is fake.
+        vi.setSystemTime(Date.now() + 10);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await (mgr as any)._resumeAutoloopRun(runId, { runId, workspace, sendTimeoutMs: 600_000 });
+        await timeoutAndIncrease(migrateReplacement ? 1_200_000 : undefined);
+        vi.setSystemTime(Date.now() + 10);
+        await terminateAndReconstructManager(runId);
+        const auditPath = auditPathFor(workspace, runId);
+        const generationPath = path.join(workspace, 'tasks', runId, 'agent-generations.jsonl');
+        const audit = fs.readFileSync(auditPath, 'utf8');
+        const generations = fs.readFileSync(generationPath, 'utf8');
+        const rows = audit
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line));
+        expect(
+          rows.filter((row) => row.kind === 'timeout_migration').map((row) => [row.oldValue, row.newValue]),
+        ).toEqual([
+          [600_000, 1_200_000],
+          [1_200_000, 2_400_000],
+          [2_400_000, 3_600_000],
+          ...(migrateReplacement ? [[600_000, 1_200_000]] : []),
+        ]);
+        const started = generations
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line))
+          .filter((row) => row.kind === 'agent_generation_started' && row.payload.role === 'planner');
+        expect(started.map((row) => row.payload.generation)).toEqual([1, 2]);
+        expect(started[0].payload.owner_instance_id).not.toBe(started[1].payload.owner_instance_id);
+        if (process.env.CLAWO_TRUST_CASE_ROOT) {
+          const output = fs.mkdtempSync(path.join(process.env.CLAWO_TRUST_CASE_ROOT, `${runId}-`));
+          fs.writeFileSync(path.join(output, 'decisions.before.jsonl'), audit, { flag: 'wx' });
+          fs.writeFileSync(path.join(output, 'generations.before.jsonl'), generations, { flag: 'wx' });
+        }
+        return { workspace, auditPath, generationPath, audit, generations };
+      };
+
+      it('cold-resumes a timeout reset proved by durable generation replacement without rewriting history', async () => {
+        const runId = 'trust-timeout-generation-reset';
+        const observed = await generationScopedTimeoutHistory(runId);
+        const specBefore = fs.readFileSync(storedSpecPath(runId), 'utf8');
+        await expect(mgr.autoloopResume(runId)).resolves.toMatchObject({ run_id: runId });
+        expect(mgr.getAutoloop(runId)!.dispatcher.effectiveSendTimeoutMs).toBe(1_200_000);
+        expect(fs.readFileSync(observed.auditPath, 'utf8')).toBe(observed.audit);
+        expect(fs.readFileSync(observed.generationPath, 'utf8').startsWith(observed.generations)).toBe(true);
+        expect(fs.readFileSync(storedSpecPath(runId), 'utf8')).toBe(specBefore);
+        const migrations = observed.audit
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line))
+          .filter((row) => row.kind === 'timeout_migration');
+        expect(migrations.every((row) => row.schema_version === 1)).toBe(true);
+      });
+
+      it('keeps the retained trust-recovery timeout reset blocked without durable generation evidence', async () => {
+        const runId = 'CLAWO-AUTOLOOP-DURABLE-RECOVERY-TRUST-RECOVERY-R1';
+        const workspace = workspaceFor(runId);
+        await mgr.autoloopStart({ runId, workspace, sendTimeoutMs: 600_000 });
+        await terminateAndReconstructManager(runId);
+        const retained = path.resolve(
+          '.artifacts',
+          runId,
+          'evidence/candidate/slice2-start-001/legacy-decisions.jsonl',
+        );
+        const bytes = fs.readFileSync(retained, 'utf8');
+        expect(createHash('sha256').update(bytes).digest('hex')).toBe(
+          'c09281dc6c5bca5f5cc2ddae128b7532c89542506bda026afd3dad5c86d1a55f',
+        );
+        const auditPath = auditPathFor(workspace, runId);
+        fs.writeFileSync(auditPath, bytes);
+        fs.unlinkSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'));
+        await expect(mgr.autoloopResume(runId)).rejects.toThrow(/timeout.*(chain|generation)/i);
+        expect(mgr.getAutoloop(runId)).toBeUndefined();
+        expect(fs.readFileSync(auditPath, 'utf8')).toBe(bytes);
+      });
+
+      it('cold-resumes a proved generation reset terminated before its timeout migration', async () => {
+        const runId = 'trust-timeout-terminated-generation';
+        const observed = await generationScopedTimeoutHistory(runId, false);
+        await mgr.autoloopResume(runId, { sendTimeoutMs: 1_200_000 });
+        expect(mgr.getAutoloop(runId)!.dispatcher.effectiveSendTimeoutMs).toBe(1_200_000);
+        await terminateAndReconstructManager(runId);
+        const before = fs.readFileSync(observed.auditPath, 'utf8');
+        expect(before.startsWith(observed.audit)).toBe(true);
+        await expect(mgr.autoloopResume(runId)).resolves.toMatchObject({ run_id: runId });
+        expect(mgr.getAutoloop(runId)!.dispatcher.effectiveSendTimeoutMs).toBe(1_200_000);
+        expect(fs.readFileSync(observed.auditPath, 'utf8')).toBe(before);
+      });
+
+      it.each([
+        'missing-release',
+        'same-owner',
+        'wrong-session',
+        'wrong-generation',
+        'late-start',
+        'future-created',
+        'torn',
+        'decreasing',
+        'wrong-dispatch',
+      ])('blocks a timeout generation reset with %s evidence without changing the ledger', async (fault) => {
+        const runId = `trust-timeout-${fault}`;
+        const observed = await generationScopedTimeoutHistory(runId);
+        let rows = observed.generations
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line));
+        const first = rows.find((row) => row.kind === 'agent_generation_started').payload;
+        if (fault === 'missing-release')
+          rows = rows.filter((row) => !(row.kind === 'agent_generation_released' && row.payload.generation === 1));
+        if (fault === 'same-owner') for (const row of rows) row.payload.owner_instance_id = first.owner_instance_id;
+        if (fault === 'wrong-session')
+          rows.find((row) => row.kind === 'agent_generation_released').payload.session_id =
+            'different-physical-session';
+        if (fault === 'wrong-generation')
+          for (const row of rows) if (row.payload.generation === 2) row.payload.generation = 3;
+        if (fault === 'late-start')
+          rows.find((row) => row.kind === 'agent_generation_started' && row.payload.generation === 2).ts = new Date(
+            Date.now() + 1000,
+          ).toISOString();
+        if (fault === 'future-created')
+          for (const row of rows)
+            if (row.payload.generation === 2) row.payload.created_at = new Date(Date.now() + 1000).toISOString();
+        fs.writeFileSync(
+          observed.generationPath,
+          rows.map((row) => JSON.stringify(row) + '\n').join('') + (fault === 'torn' ? '{"kind":' : ''),
+        );
+        if (fault === 'decreasing' || fault === 'wrong-dispatch') {
+          const decisions = observed.audit
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line));
+          const migration = decisions.filter((row) => row.kind === 'timeout_migration').at(-1)!;
+          if (fault === 'decreasing') migration.newValue = 599_999;
+          else migration.pendingDispatchId = 'unrelated-dispatch';
+          fs.writeFileSync(observed.auditPath, decisions.map((row) => JSON.stringify(row) + '\n').join(''));
+        }
+        const before = fs.readFileSync(observed.auditPath, 'utf8');
+        await expect(mgr.autoloopResume(runId)).rejects.toThrow(/timeout.*(chain|generation)|malformed/i);
+        expect(mgr.getAutoloop(runId)).toBeUndefined();
+        expect(fs.readFileSync(observed.auditPath, 'utf8')).toBe(before);
+      });
+
       it('increases a live recoverable timeout through the matching dispatch without replaying it', async () => {
         const runId = 'resume-timeout-live';
         const workspace = workspaceFor(runId);
@@ -10261,6 +10424,59 @@ describe('SessionManager', () => {
       expect(createdConfigs.map((config) => config.name).filter((name) => name.endsWith('-coder'))).toEqual([]);
       expect(createdConfigs.map((config) => config.name).filter((name) => name.endsWith('-reviewer'))).toHaveLength(1);
       await expect(mgr.autoloopRecover(runId)).resolves.toHaveProperty('assessment');
+    });
+
+    it('blocks cold retry after a real prepared recovery claim loses its effect boundary', async () => {
+      const runId = 'trust-real-uncertain-recovery-claim';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      seedExactReviewArtifacts(workspace, runId, 0);
+      const handle = mgr.getAutoloop(runId)!;
+      await handle.runner.config.persistReviewEnvelope!(
+        AutoloopMsg.reviewRequest(0, { iter: 0, ledger_path: handle.runner.state.ledger_dir, prior_metrics: [] }),
+      );
+      await reconstructManager(runId);
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const before = fs.readFileSync(decisionPath);
+      const inspection = await mgr.autoloopRecover(runId);
+      // Interrupt the effect only after the real locked transaction has
+      // durably appended its prepared receipt. The fixture never writes it.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const effect = vi.spyOn(mgr as any, '_resumeAutoloopRun').mockRejectedValue(new Error('lost effect boundary'));
+      await expect(
+        mgr.autoloopRecover(runId, { apply: true, recovery_token: inspection.assessment.recovery_token }),
+      ).rejects.toThrow('lost effect boundary');
+      expect(effect).toHaveBeenCalledTimes(1);
+      const prepared = fs.readFileSync(decisionPath);
+      expect(prepared.subarray(0, before.length)).toEqual(before);
+      const receipts = prepared
+        .toString()
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line))
+        .filter((row) => row.record_type === 'autoloop_recovery_receipt');
+      expect(receipts).toEqual([
+        expect.objectContaining({
+          schema_version: 1,
+          status: 'prepared',
+          recovery_token: inspection.assessment.recovery_token,
+        }),
+      ]);
+      effect.mockRestore();
+      await mgr.shutdown();
+      mgr = createManager();
+      const fresh = await mgr.autoloopRecover(runId);
+      const starts = createdConfigs.length;
+      await expect(
+        mgr.autoloopRecover(runId, { apply: true, recovery_token: fresh.assessment.recovery_token }),
+      ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_INCOMPLETE', retryable: false });
+      expect(createdConfigs).toHaveLength(starts);
+      expect(fs.readFileSync(decisionPath)).toEqual(prepared);
+      if (process.env.CLAWO_TRUST_CASE_ROOT) {
+        const output = fs.mkdtempSync(path.join(process.env.CLAWO_TRUST_CASE_ROOT, `${runId}-`));
+        fs.writeFileSync(path.join(output, 'before.jsonl'), before, { flag: 'wx' });
+        fs.writeFileSync(path.join(output, 'prepared-and-cold-rejected.jsonl'), prepared, { flag: 'wx' });
+      }
     });
 
     it('fails closed on a crash-window prepared receipt instead of replaying an unproven effect', async () => {

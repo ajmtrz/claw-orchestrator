@@ -80,12 +80,17 @@ async function persistThenCrash(
   const sessionManagerUrl = pathToFileURL(path.resolve('src/session-manager.ts')).href;
   const script = `
     import fs from 'node:fs';
+    import os from 'node:os';
+    import path from 'node:path';
     import { ClaudeAgentDispatcher } from ${JSON.stringify(dispatcherUrl)};
     import { nullLogger } from ${JSON.stringify(loggerUrl)};
     import { SessionManager } from ${JSON.stringify(sessionManagerUrl)};
     const manager = new SessionManager({ maxConcurrentSessions: 3 }, nullLogger);
     manager.sendMessage = async () => {
-      fs.writeFileSync(${JSON.stringify(barrierPath)}, 'persisted-before-delivery');
+      fs.writeFileSync(${JSON.stringify(barrierPath)}, JSON.stringify({
+        phase: 'persisted-before-delivery',
+        registry_path: path.join(os.homedir(), '.openclaw', 'claude-sessions.json'),
+      }));
       throw new Error('simulated child crash before delivery');
     };
     const dispatcher = new ClaudeAgentDispatcher({
@@ -102,6 +107,9 @@ async function persistThenCrash(
   const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', script], {
     cwd: process.cwd(),
     stdio: 'ignore',
+    // This child continues the parent's run and must reopen its registry. The
+    // isolation preload otherwise assigns each process a different home.
+    env: { ...process.env, CLAWO_TRUST_SHARED_HOME: os.homedir() },
   });
   const [code] = await once(child, 'exit');
   expect(code).toBe(23);
@@ -292,10 +300,30 @@ describe.sequential('Autoloop durable recovery real-process E2E', () => {
       fs.writeFileSync(metadataPath, metadataBeforeOriginalShutdown);
 
       await persistThenCrash(workspace, runId, message, barrierPath);
-      expect(fs.readFileSync(barrierPath, 'utf8')).toBe('persisted-before-delivery');
+      const registryPath = path.join(os.homedir(), '.openclaw', 'claude-sessions.json');
+      expect(JSON.parse(fs.readFileSync(barrierPath, 'utf8'))).toEqual({
+        phase: 'persisted-before-delivery',
+        registry_path: registryPath,
+      });
       const ledger = SecureAutoloopLedger.open(workspace, runId);
       const intent = lookupByIdempotencyKey(ledger, idempotencyKey);
       expect(intent).toMatchObject({ idempotency_key: idempotencyKey, target_role: 'coder' });
+      const lastCoderEvent = ledger
+        .readFlatFile('agent-generations.jsonl')!
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line))
+        .filter((row) => row.payload.role === 'coder')
+        .at(-1);
+      expect(lastCoderEvent.kind).toBe('agent_generation_released');
+      expect(JSON.parse(fs.readFileSync(registryPath, 'utf8'))).toContainEqual(
+        expect.objectContaining({
+          name: lastCoderEvent.payload.session_name,
+          agentReleasedGeneration: lastCoderEvent.payload.generation,
+          agentReleasedOwnerInstanceId: lastCoderEvent.payload.owner_instance_id,
+          agentReleasedSessionId: lastCoderEvent.payload.session_id,
+        }),
+      );
 
       recovered = new SessionManager({ maxConcurrentSessions: 3 }, nullLogger);
       process.env.AUTOLOOP_E2E_AGY_MODE = 'planner_control';

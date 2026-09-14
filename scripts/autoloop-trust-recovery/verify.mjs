@@ -516,17 +516,15 @@ export function verifyLegacyCase(directory, candidateHead) {
               execFileSync('rtk', ['proxy', 'git', '-C', PROJECT, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim());
       requireThat(/^[a-f0-9]{40}$/.test(head), 'Legacy scenario descriptor: invalid subject head');
       const source = values.find((entry) => entry.path === path.join(subject, 'src/session-manager.ts'));
-      const expectedSource = execFileSync('rtk', [
-        'proxy',
-        'git',
-        '-C',
-        PROJECT,
-        'cat-file',
-        'blob',
-        `${head}:src/session-manager.ts`,
-      ]);
+      // Historical receipt verification uses its independently checked Git
+      // object. Fresh collection binds the worktree through the input manifest
+      // and complete patch; later worktree edits cannot invalidate old receipts.
+      const expectedSource =
+        scenario.subjectKind === 'candidate' && candidateHead === undefined
+          ? fs.readFileSync(path.join(subject, 'src/session-manager.ts'))
+          : execFileSync('rtk', ['proxy', 'git', '-C', PROJECT, 'cat-file', 'blob', `${head}:src/session-manager.ts`]);
       requireThat(
-        source?.sha256 === sha256(expectedSource) && source.sha256 === sha256(fs.readFileSync(source.path)),
+        source?.sha256 === sha256(expectedSource),
         'Legacy scenario descriptor: missing/stale imported subject head',
       );
       if (expected.seed) {
