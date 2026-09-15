@@ -261,7 +261,7 @@
           "$ref": "#/definitions/artifact"
         },
         "report_format": {
-          "enum": ["node-tap", "vitest-json"]
+          "enum": ["node-tap", "vitest-json", "vitest-json-indexed"]
         },
         "discovered_test_ids": {
           "type": "array",

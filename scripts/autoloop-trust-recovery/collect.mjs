@@ -21,6 +21,7 @@ import {
   RESUME_CASES,
   verifyDurabilityCase,
   verifyResumeCase,
+  verifySlice3RawCase,
 } from './verify.mjs';
 
 export const SOURCE_URL = import.meta.url;
@@ -303,6 +304,7 @@ function importObservations(directory, execution) {
 }
 
 export async function collect(group) {
+  if (group === 'controls' || group === 'adapters') return await collectSlice3(group);
   ensure(group === 'validator' || LATER_GROUPS.includes(group), 'Unknown collector group');
   if (group === 'legacy') return await collectLegacy();
   if (group === 'delivery') return await collectDurability();
@@ -907,7 +909,6 @@ function verifyExtendedReceipt(receipt, head) {
   equal(receipt.parent, git('show', '-s', '--format=%P', head).trim(), 'Wrong receipt parent');
   equal(receipt.base, SLICE1_HEAD, 'Wrong receipt base');
   equal(receipt.previous, SLICE1_RECEIPT, 'Wrong previous receipt hash/path');
-  verifyReceiptData(JSON.parse(readArtifact(ARTIFACT_ROOT, receipt.previous)), SLICE1_HEAD);
   const heads = extensionHeads(head);
   ensure(Array.isArray(receipt.chain) && receipt.chain.length === heads.length, 'Incomplete receipt chain');
   receipt.chain.forEach((link, i) => {
@@ -919,6 +920,10 @@ function verifyExtendedReceipt(receipt, head) {
   // allowed link changes only the verifier harness; runtime/test evidence is
   // not silently rebound to different production or scenario implementations.
   equal(receipt.candidate_bundle, SLICE2_BUNDLE, 'Wrong candidate bundle hash/path');
+  // Validate the supplied structure before traversing historical executable
+  // dependencies. Tool drift must not mask a malformed receipt; it still
+  // rejects an otherwise valid receipt through the unchanged authentication.
+  verifyReceiptData(JSON.parse(readArtifact(ARTIFACT_ROOT, receipt.previous)), SLICE1_HEAD);
   const bundle = JSON.parse(readArtifact(ARTIFACT_ROOT, receipt.candidate_bundle));
   const directory = path.dirname(containedPath(ARTIFACT_ROOT, receipt.candidate_bundle.path));
   equal(bundle.head, SLICE1_HEAD, 'Wrong precommit head');
@@ -987,15 +992,15 @@ export function verifyReceiptData(receipt, head) {
   equal(receipt.base, BASE, 'Wrong receipt base');
   equal(receipt.tree, git('rev-parse', `${head}^{tree}`).trim(), 'Wrong receipt tree');
   equal(receipt.original.bundle, ORIGINAL_BUNDLE, 'Wrong original bundle hash or path');
-  verifyLegacyCommitLink(receipt.original, ORIGINAL_COMMIT);
   const extended = head !== FIRST_CORRECTION;
   ensure(Array.isArray(receipt.history) && receipt.history.length === (extended ? 1 : 0), 'Wrong receipt history');
   if (extended) {
     equal(receipt.history[0].bundle, FIRST_CORRECTION_BUNDLE, 'Wrong first correction bundle hash or path');
     equal(receipt.history[0].parent, ORIGINAL_COMMIT, 'Wrong first correction parent');
-    verifyLegacyCommitLink(receipt.history[0], FIRST_CORRECTION);
   }
   const result = verifyLegacyCommitLink(receipt.candidate, head);
+  verifyLegacyCommitLink(receipt.original, ORIGINAL_COMMIT);
+  if (extended) verifyLegacyCommitLink(receipt.history[0], FIRST_CORRECTION);
   return { ...result, committed_head: head, committed_tree: receipt.tree, postcommit_verified: true };
 }
 
@@ -1081,6 +1086,382 @@ const DELIVERY_MATRIX = [
   'session-manager-pidfile',
   'session-manager',
 ].map((name) => `src/__tests__/${name}.test.ts`);
+
+const SLICE3_BASE = 'c79c0991f28955fe7731fb643472cd7a4dff1f9e';
+const SLICE3_MATRIX = {
+  controls: [
+    'autoloop-trust-recovery-boundaries',
+    'autoloop-trust-recovery-adapters',
+    'autoloop-planner-tools',
+    'autoloop-agent-tools',
+    'agy-planner-e2e',
+    'tool-registration',
+    'embedded-server-launcher',
+    'autoloop-documentation-contract',
+  ],
+  adapters: [
+    'autoloop-trust-recovery-adapters',
+    'persistent-session',
+    'codex-session',
+    'agy-session',
+    'cursor-session',
+  ],
+};
+const slice3Files = (group) => [
+  ...FILES,
+  ...['planner', 'coder', 'reviewer'].map((role) => `configs/autoloop-${role}-prompt.md`),
+  ...SLICE3_MATRIX[group].map((n) => `src/__tests__/${n}.test.ts`),
+  'src/__tests__/helpers/autoloop-trust-recovery.ts',
+  ...['codex', 'claude', 'agy', 'cursor'].map((n) => `src/__tests__/fixtures/autoloop-trust-recovery/${n}.mjs`),
+];
+function slice3Snapshot(group) {
+  const snapshot = inputSnapshot(slice3Files(group));
+  for (const dependency of ['vitest', 'vite', 'tsx', 'esbuild'])
+    for (const file of [require.resolve(dependency), require.resolve(`${dependency}/package.json`)])
+      snapshot.manifest.dependencies.push({ path: file, sha256: sha256(fs.readFileSync(file)) });
+  snapshot.manifest.dependencies = [...new Map(snapshot.manifest.dependencies.map((x) => [x.path, x])).values()].sort(
+    (a, b) => a.path.localeCompare(b.path),
+  );
+  return snapshot;
+}
+const slice3Config = (directory) =>
+  `import original from ${JSON.stringify(path.join(PROJECT, 'vitest.config.ts'))};\nexport default {...original,root:${JSON.stringify(PROJECT)},cacheDir:${JSON.stringify(path.join(directory, 'cache'))},test:{...original.test,pool:'forks',maxWorkers:1,minWorkers:1}};\n`;
+const slice3Shards = (group) =>
+  group === 'controls' ? SLICE3_MATRIX[group].map((name) => [name]) : [SLICE3_MATRIX[group]];
+export function verifySlice3ShardInventory(group, reports) {
+  equal(
+    reports.map((report) => report.testResults.map((row) => row.name).sort()),
+    slice3Shards(group).map((names) => names.map((name) => path.join(PROJECT, `src/__tests__/${name}.test.ts`)).sort()),
+    'Wrong Slice3 shard inventory',
+  );
+  return true;
+}
+export const slice3Command = (group, directory, shard) => [
+  'rtk',
+  'proxy',
+  process.execPath,
+  path.join(PROJECT, 'node_modules/vitest/vitest.mjs'),
+  'run',
+  ...slice3Shards(group)[shard].map((n) => `src/__tests__/${n}.test.ts`),
+  '--config',
+  path.join(directory, 'vitest.config.mjs'),
+  '--configLoader',
+  'native',
+  '--reporter=verbose',
+  '--reporter=json',
+  `--outputFile=${path.join(directory, `report-${shard}.json`)}`,
+];
+function slice3Contract(group, snapshot, directory) {
+  return {
+    run_id: RUN_ID,
+    case_id: `slice3-${group}`,
+    requirement_ids:
+      group === 'controls'
+        ? ['PUBLIC-TERMINAL', 'RESET-POSTCONDITION', 'INDEPENDENT-REVIEW']
+        : ['NATIVE-PROTOCOL', 'NATIVE-MODEL', 'NATIVE-RECOVERY'],
+    subject_kind: 'candidate',
+    base: SLICE3_BASE,
+    head: snapshot.head,
+    tree: snapshot.tree,
+    frozen: false,
+    patch_sha256: sha256(patchBytes(slice3Files(group))),
+    test_source_sha256s: slice3Files(group).map((file) => sha256(fs.readFileSync(path.join(PROJECT, file)))),
+    input_manifest_sha256: sha256(JSON.stringify(snapshot.manifest, null, 2) + '\n'),
+    harness_sha256: sha256(JSON.stringify(snapshot.manifest.harness)),
+    dependency_sha256: sha256(JSON.stringify(snapshot.manifest.dependencies)),
+    tool_sha256: sha256(JSON.stringify(snapshot.manifest.tools)),
+    executions: slice3Shards(group).map((_, shard) => ({
+      argv: slice3Command(group, directory, shard),
+      cwd: PROJECT,
+      required_test_ids: [],
+    })),
+    assertions: [],
+    required_observations: ['case-index', 'evidence-files'],
+    required_fault_observations: [],
+    required_source_paths: [],
+  };
+}
+const publicKeys = [
+  'manager:reset',
+  ...['source_run_id', 'source_iter', 'scope', 'idempotency_key'].map((x) => 'manager:' + x),
+  ...['manager', 'mcp', 'http'].flatMap((s) => ['empty', 'denied', 'persistence'].map((x) => `${s}:${x}`)),
+  'mcp:conversation',
+  'manager:partial-batch',
+];
+const nativeKeys = ['codex', 'claude', 'agy', 'cursor']
+  .flatMap((e) => [
+    `${e}:reset`,
+    `${e}:success:control`,
+    `${e}:success,success:reply`,
+    `${e}:denied,success:reply`,
+    ...['review', 'delivery'].flatMap((s) => ['before-send', 'after-capture'].map((b) => `${e}:${s}:${b}`)),
+    ...['empty', 'partial', 'protocol', 'process', 'denied'].map((m) => `${e}:${m}:control`),
+  ])
+  .concat(['agy:denied-empty,success:reply', 'codex:partial:control']);
+function slice3Observations(group, bundle, directory, values, snapshot) {
+  const cases = values.get('case-index'),
+    files = values.get('evidence-files');
+  ensure(Array.isArray(cases) && Array.isArray(files), 'Missing Slice3 raw inventory');
+  const read = durabilityArtifactReader(directory, files);
+  for (const file of files) read(file.path);
+  const before = JSON.parse(read('git-before.json')),
+    after = JSON.parse(read('git-after.json'));
+  equal(before, after, 'Slice3 repository changed during tests');
+  equal(before.head, snapshot.head, 'Wrong Slice3 repository HEAD');
+  equal(before.index, '', 'Slice3 staged candidate');
+  const sourceHashes = new Map(
+    [...snapshot.manifest.tracked, ...snapshot.manifest.harness].map((x) => [x.path, x.sha256]),
+  );
+  const nodeTools = snapshot.manifest.tools.filter((entry) => path.basename(entry.path) === 'node');
+  ensure(nodeTools.length === 1, 'Slice3 manifest requires exactly one authenticated Node executable');
+  const nodeTool = nodeTools[0];
+  ensure(
+    path.isAbsolute(nodeTool.path) && sha256(fs.readFileSync(nodeTool.path)) === nodeTool.sha256,
+    'Slice3 Node tool differs from authenticated manifest bytes',
+  );
+  const observed = [];
+  for (const row of cases) {
+    ensure(/^cases\/[^/]+$/.test(row.path) && ['controls', 'adapters'].includes(row.kind), 'Wrong Slice3 case path');
+    const requiredSources = (
+      row.kind === 'controls'
+        ? ['session-manager', 'index', 'embedded-server'].map((n) => `src/${n}.ts`)
+        : ['src/session-manager.ts', 'src/autoloop/dispatcher.ts', 'src/autoloop/runner.ts']
+    ).map((p) => path.join(PROJECT, p));
+    try {
+      observed.push(
+        [
+          row.kind,
+          verifySlice3RawCase(row.kind, (n) => read(`${row.path}/${n}`), {
+            head: snapshot.head,
+            sourceHashes,
+            requiredSources,
+            nodeTool,
+          }),
+        ].join('/'),
+      );
+    } catch (error) {
+      throw new Error(`${row.path}: ${error.message}`, { cause: error });
+    }
+  }
+  // Duplicate codex partial cases are intentional: the specialized retry-ID
+  // regression and the generic failure matrix independently execute it.
+  equal(
+    observed.sort(),
+    [
+      ...(group === 'controls' ? publicKeys.map((x) => 'controls/' + x) : []),
+      ...nativeKeys.map((x) => 'adapters/' + x),
+    ].sort(),
+    'Wrong Slice3 case inventory',
+  );
+  ensure(new Set(cases.map((x) => x.path)).size === cases.length, 'Reused Slice3 case directory');
+  verifySlice3ShardInventory(
+    group,
+    bundle.executions.map((execution) => JSON.parse(readArtifact(directory, execution.report))),
+  );
+  const executed = bundle.executions.flatMap((execution) => execution.executed_test_ids);
+  ensure(executed.length === (group === 'controls' ? 418 : 206), 'Changed Slice3 test inventory');
+  equal(
+    fs.readFileSync(containedPath(directory, 'vitest.config.mjs')).toString(),
+    slice3Config(directory),
+    'Changed Slice3 test configuration',
+  );
+  return {
+    scope: `slice3-${group}`,
+    cases: cases.length,
+    tests: executed.length,
+    final_candidate: false,
+  };
+}
+export function verifySlice3(group, directory) {
+  ensure(Object.hasOwn(SLICE3_MATRIX, group), 'Wrong Slice3 group');
+  const snapshot = slice3Snapshot(group);
+  if (!directory) {
+    const pointers = fs
+      .readdirSync(path.join(ARTIFACT_ROOT, 'reports'))
+      .filter((n) => n.startsWith(`slice3-${group}-${snapshot.head}-`) && n.endsWith('.json'))
+      .sort();
+    ensure(pointers.length > 0, 'Missing Slice3 receipt');
+    // Only receipts with the current exact tracked/harness manifest may match.
+    const hash = sha256(JSON.stringify(snapshot.manifest, null, 2) + '\n');
+    const matches = pointers
+      .map((n) => JSON.parse(fs.readFileSync(containedPath(ARTIFACT_ROOT, 'reports/' + n))))
+      .filter((x) => x.input_manifest_sha256 === hash);
+    ensure(matches.length > 0, 'No current Slice3 input receipt');
+    const selected = matches.at(-1);
+    directory = containedPath(ARTIFACT_ROOT, selected.directory);
+    ensure(
+      sha256(fs.readFileSync(containedPath(directory, 'bundle.json'))) === selected.bundle_sha256,
+      'Changed Slice3 bundle',
+    );
+  }
+  directory = path.resolve(directory);
+  ensure(/^evidence\/candidate\/[^/]+$/.test(path.relative(ARTIFACT_ROOT, directory)), 'Wrong Slice3 attempt scope');
+  const bundle = JSON.parse(fs.readFileSync(containedPath(directory, 'bundle.json')));
+  return slice3Observations(
+    group,
+    bundle,
+    directory,
+    verifyBundle(bundle, directory, slice3Contract(group, snapshot, directory)),
+    snapshot,
+  );
+}
+async function collectSlice3(group) {
+  const snapshot = slice3Snapshot(group);
+  const gitState = () => ({
+    head: git('rev-parse', 'HEAD').trim(),
+    index: git('diff', '--cached', '--binary', '--full-index'),
+    status: git('status', '--porcelain=v1', '--untracked-files=all'),
+  });
+  const before = gitState();
+  ensure(snapshot.head === SLICE3_BASE, 'Slice3 collection requires accepted immutable product commit');
+  const directory = outputDirectory(
+    path.join(ARTIFACT_ROOT, 'evidence', 'candidate', `${group}-${Date.now()}-${randomUUID()}`),
+  );
+  outputDirectory(path.join(directory, 'cases'));
+  writeArtifact(directory, 'vitest.config.mjs', slice3Config(directory));
+  const input_manifest = writeArtifact(directory, 'inputs.json', JSON.stringify(snapshot.manifest, null, 2) + '\n');
+  writeArtifact(directory, 'git-before.json', JSON.stringify(before, null, 2) + '\n');
+  const patch = writeArtifact(directory, 'inputs.patch', patchBytes(slice3Files(group)));
+  const test_sources = slice3Files(group).map((file, i) =>
+    writeArtifact(directory, `source-${i}.txt`, fs.readFileSync(path.join(PROJECT, file))),
+  );
+  const roots = [...(group === 'controls' ? ['slice3-public'] : []), 'slice3-native'];
+  const prior = new Map(
+    roots.map((name) => {
+      const root = path.join(ARTIFACT_ROOT, 'evidence/candidate', name);
+      return [name, new Set(fs.existsSync(root) ? fs.readdirSync(root) : [])];
+    }),
+  );
+  const executions = [];
+  for (const [shard] of slice3Shards(group).entries()) {
+    const execution = await captureExecution({
+      directory,
+      id: `${group}-${randomUUID()}`,
+      argv: slice3Command(group, directory, shard),
+      cwd: PROJECT,
+      timeout_ms: 600000,
+      env: { NPM_CONFIG_CACHE: path.join(directory, 'npm-cache'), NPM_CONFIG_UPDATE_NOTIFIER: 'false' },
+    });
+    const report = {
+      path: `report-${shard}.json`,
+      sha256: sha256(fs.readFileSync(containedPath(directory, `report-${shard}.json`))),
+    };
+    const inventory = inspectTestReport(readArtifact(directory, report), 'vitest-json-indexed');
+    Object.assign(execution, {
+      report,
+      report_format: 'vitest-json-indexed',
+      discovered_test_ids: inventory.discovered,
+      executed_test_ids: inventory.executed,
+      skipped_test_ids: inventory.skipped,
+    });
+    writeArtifact(directory, `interpreted-execution-${shard}.json`, JSON.stringify(execution, null, 2) + '\n');
+    executions.push(execution);
+  }
+  const cases = [],
+    files = [];
+  for (const rootName of roots) {
+    const root = path.join(ARTIFACT_ROOT, 'evidence/candidate', rootName);
+    for (const name of fs.readdirSync(root).filter((n) => !prior.get(rootName).has(n))) {
+      const source = path.join(root, name);
+      if (!fs.existsSync(path.join(source, 'execution.json'))) continue; // standalone permission fixture is report-bound
+      const relative = `cases/${rootName}-${name}`;
+      outputDirectory(path.join(directory, relative));
+      const copy = (from, rel) => {
+        for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
+          if (
+            entry.isSymbolicLink() ||
+            ['.git', 'node_modules', 'home', 'shared-home', 'reviewer_sandbox'].includes(entry.name)
+          )
+            continue;
+          const target = path.join(directory, rel, entry.name);
+          if (entry.isDirectory()) {
+            if (rel === relative && entry.name !== 'tasks') continue;
+            if (
+              rel.includes('/tasks/') &&
+              !['native-boundary', 'public-boundary', 'source-checkpoint', 'iter', '0', '1', '2'].includes(entry.name)
+            )
+              continue;
+            outputDirectory(target);
+            copy(path.join(from, entry.name), rel + '/' + entry.name);
+          } else if (entry.isFile() && /\.(jsonl|json|txt|mjs|patch|md)$/.test(entry.name)) {
+            const bytes = fs.readFileSync(path.join(from, entry.name));
+            writeArtifact(path.dirname(target), entry.name, bytes);
+            files.push({ path: rel + '/' + entry.name, sha256: sha256(bytes) });
+          }
+        }
+      };
+      copy(source, relative);
+      cases.push({ kind: rootName === 'slice3-public' ? 'controls' : 'adapters', path: relative });
+      const input = JSON.parse(fs.readFileSync(path.join(source, 'execution.json'))).input;
+      if (input.scenario === 'review') {
+        const repo = {
+          head: git('-C', source, 'rev-parse', 'HEAD').trim(),
+          tracked_status: git('-C', source, 'status', '--porcelain=v1', '--untracked-files=no'),
+        };
+        const bytes = JSON.stringify(repo, null, 2) + '\n';
+        writeArtifact(path.join(directory, relative), 'collector-repo-state.json', bytes);
+        files.push({ path: relative + '/collector-repo-state.json', sha256: sha256(bytes) });
+      }
+    }
+  }
+  const after = gitState();
+  writeArtifact(directory, 'git-after.json', JSON.stringify(after, null, 2) + '\n');
+  equal(after, before, 'Slice3 repository/index changed during collection');
+  for (const name of ['git-before.json', 'git-after.json'])
+    files.push({ path: name, sha256: sha256(fs.readFileSync(path.join(directory, name))) });
+  const index = [cases, files.sort((a, b) => a.path.localeCompare(b.path))].map((value, sequence) => ({
+    value,
+    sequence,
+    process_id: process.pid,
+    observer_id: 'slice3-collector',
+  }));
+  const ref = writeArtifact(directory, 'observed-files.json', JSON.stringify(index, null, 2) + '\n');
+  const observations = index.map((event, i) => ({
+    ...event,
+    id: i ? 'evidence-files' : 'case-index',
+    artifact: ref,
+    pointer: `/${i}`,
+    execution_id: executions[0].id,
+  }));
+  const contract = slice3Contract(group, snapshot, directory);
+  const bundle = {
+    schema_version: 1,
+    run_id: RUN_ID,
+    case_id: contract.case_id,
+    requirement_ids: contract.requirement_ids,
+    subject_kind: 'candidate',
+    base: SLICE3_BASE,
+    head: snapshot.head,
+    tree: snapshot.tree,
+    frozen: false,
+    input_manifest,
+    harness_sha256: contract.harness_sha256,
+    dependency_sha256: contract.dependency_sha256,
+    tool_sha256: contract.tool_sha256,
+    patch,
+    test_sources,
+    source_imports: [],
+    executions,
+    observations,
+    assertions: [],
+  };
+  const bytes = JSON.stringify(bundle, null, 2) + '\n';
+  writeArtifact(directory, 'bundle.json', bytes);
+  equal(slice3Snapshot(group), snapshot, 'Slice3 source changed during collection');
+  const result = verifySlice3(group, directory);
+  const receipt = {
+    directory: path.relative(ARTIFACT_ROOT, directory),
+    bundle_sha256: sha256(bytes),
+    input_manifest_sha256: input_manifest.sha256,
+    ...result,
+  };
+  writeArtifact(
+    path.join(ARTIFACT_ROOT, 'reports'),
+    `slice3-${group}-${snapshot.head}-${Date.now()}-${randomUUID()}.json`,
+    JSON.stringify(receipt, null, 2) + '\n',
+  );
+  return { ...receipt, execution: executions.at(-1), executions };
+}
 const DELIVERY_FILES = [...FILES, ...DELIVERY_MATRIX, LEGACY_HELPER];
 function durabilitySnapshot() {
   const snapshot = legacySnapshot();

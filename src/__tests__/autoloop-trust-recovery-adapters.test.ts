@@ -14,16 +14,39 @@ const worker = String.raw`
 import fs from 'node:fs';
 import path from 'node:path';
 const input=JSON.parse(process.env.CLAWO_TRUST_NATIVE_CONFIG_INPUT);
-const now=Date.parse('2026-09-14T12:00:00Z')+(input.cold?300000:0);
-Date.now=()=>now;
+fs.writeFileSync(path.join(input.directory,(input.cold?'cold-':'')+'worker-process.json'),JSON.stringify({pid:process.pid}),{flag:'wx'});
+const childProcess=await import('node:child_process');
+const {syncBuiltinESMExports}=await import('node:module');
+const originalSpawn=childProcess.default.spawn;
+const observedChildren=[];
+let shutdownStarted=false;
+childProcess.default.spawn=function(command,args,options){
+ const child=originalSpawn.call(this,command,args,options);
+ if(command===input.fixture){
+  const fd=fs.openSync(path.join(input.directory,'native-spawns.jsonl'),'a');
+  try{fs.writeSync(fd,JSON.stringify({phase:input.cold?'cold':'warm',worker_pid:process.pid,engine:input.engine,pid:child.pid,argv:args})+'\n');fs.fsyncSync(fd);}finally{fs.closeSync(fd);}
+  const closed=new Promise(resolve=>child.once('close',(code,signal)=>{
+   const exitFd=fs.openSync(path.join(input.directory,'native-exits.jsonl'),'a');
+   try{fs.writeSync(exitFd,JSON.stringify({engine:input.engine,pid:child.pid,argv:args,code,signal,shutdown:shutdownStarted})+'\n');fs.fsyncSync(exitFd);}finally{fs.closeSync(exitFd);}
+   resolve();
+  }));observedChildren.push(closed);
+ }
+ return child;
+};syncBuiltinESMExports();
+// Keep lock ages in the real filesystem epoch and deadlines advancing.
+// Cold reconstruction still advances exactly five minutes relative to wall time.
+const WallDate=Date;
+globalThis.Date=class extends WallDate {
+ constructor(...args){super(...(args.length?args:[WallDate.now()+(input.cold?300000:0)]));}
+ static now(){return WallDate.now()+(input.cold?300000:0);}
+};
 const {SessionManager}=await import(input.project+'/src/session-manager.ts');
 const {ClaudeAgentDispatcher}=await import(input.project+'/src/autoloop/dispatcher.ts');
 const {Msg}=await import(input.project+'/src/autoloop/messages.ts');
 const {AutoloopRunner}=await import(input.project+'/src/autoloop/runner.ts');
-const {syncBuiltinESMExports}=await import('node:module');
 const {nullLogger}=await import(input.project+'/src/logger.ts');
 const manager=new SessionManager({maxConcurrentSessions:3,claudeBin:input.fixture},nullLogger);
-const dispatcher=new ClaudeAgentDispatcher({manager,workspace:input.directory,runId:'native-boundary',plannerEngine:input.engine,plannerModel:input.model,coderEngine:input.engine,coderModel:input.model,reviewerEngine:input.engine,reviewerModel:input.model,agentLeaseMs:1000,now:()=>new Date(now),logger:nullLogger});
+const dispatcher=new ClaudeAgentDispatcher({manager,workspace:input.directory,runId:'native-boundary',plannerEngine:input.engine,plannerModel:input.model,coderEngine:input.engine,coderModel:input.model,reviewerEngine:input.engine,reviewerModel:input.model,agentLeaseMs:1000,now:()=>new Date(Date.now()),logger:nullLogger});
 const replies=[];dispatcher.on('planner_reply',reply=>replies.push(reply));
 const outcomes=[];
 let runner;
@@ -84,7 +107,7 @@ try {
  }
  fs.writeFileSync(path.join(input.directory,'outcome.json'),JSON.stringify({outcomes,replies,stats:manager.getStatus(dispatcher.sessionNames.planner).stats,plan:fs.existsSync(path.join(input.directory,'plan.md'))?fs.readFileSync(path.join(input.directory,'plan.md'),'utf8'):null}));
  }
-} finally {runner?.stop();await dispatcher.shutdown('native-fixture-end',{purge:!input.scenario});await manager.shutdown();}
+} finally {shutdownStarted=true;runner?.stop();await dispatcher.shutdown('native-fixture-end',{purge:!input.scenario});await manager.shutdown();await Promise.all(observedChildren);}
 `;
 
 async function native(
@@ -212,7 +235,9 @@ async function native(
         .filter(Boolean)
         .map((line) => JSON.parse(line).pid),
     );
-    for (const pid of pids) {
+    const cleanupPids = pids;
+    for (const pid of cleanupPids) {
+      if (!pids.has(pid)) throw new Error(`Cleanup barrier PID ${pid} was not a captured fixture invocation`);
       let argv: string[];
       try {
         argv = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0');
@@ -244,6 +269,7 @@ async function native(
       }
     }
   }
+  const workerPid = JSON.parse(fs.readFileSync(path.join(directory, prefix + 'worker-process.json'), 'utf8')).pid;
   fs.writeFileSync(path.join(directory, prefix + 'stdout.txt'), Buffer.concat(stdout), { flag: 'wx' });
   fs.writeFileSync(path.join(directory, prefix + 'stderr.txt'), Buffer.concat(stderr), { flag: 'wx' });
   fs.writeFileSync(
@@ -254,6 +280,7 @@ async function native(
       started,
       ended: new Date().toISOString(),
       ...result,
+      worker_pid: workerPid,
       timeout,
       witnessed,
       cleaned_fixture_pids: cleaned,
@@ -288,7 +315,7 @@ async function native(
         fs.readFileSync(path.join(directory, 'tasks/native-boundary', name)),
         { flag: 'wx' },
       );
-    return { directory, witnessed };
+    return { directory, witnessed, cleaned_fixture_pids: cleaned };
   }
   expect(result.code, Buffer.concat(stderr).toString() + directory).toBe(0);
   return {
@@ -487,6 +514,15 @@ describe('Slice 3 authentic native protocol boundaries', () => {
           .trim()
           .split('\n')
           .map((line) => JSON.parse(line));
+        const successor = generations.find(
+          (row) =>
+            row.payload.role === 'reviewer' && row.payload.generation === 2 && row.kind === 'agent_generation_started',
+        );
+        const rebind = rows.find((row: { record_type?: string }) => row.record_type === 'delivery_generation_rebind');
+        expect(
+          Date.parse(successor.ts),
+          'outbox and generation timestamps must share the cold clock',
+        ).toBeLessThanOrEqual(Date.parse(rebind.rebound_at));
         expect(generations.filter((row) => row.payload.role === 'coder')).toHaveLength(0);
         expect(
           generations.filter((row) => row.payload.role === 'reviewer' && row.kind === 'agent_generation_started')
@@ -562,6 +598,21 @@ describe('Slice 3 authentic native protocol boundaries', () => {
           '```autoloop\n{"tool":"send_directive","args":{"goal":"directive A exact bytes","constraints":["preserve A"],"success_criteria":["one effect"],"max_attempts":1}}\n```';
         const first = await native(engine, model, [], reply, { scenario: 'delivery', boundary });
         expect(first.witnessed).toBe(true);
+        if (engine === 'claude' && boundary === 'after-capture') {
+          const barrier = JSON.parse(fs.readFileSync(path.join(first.directory, 'barrier.json'), 'utf8'));
+          const warmPids = fs
+            .readFileSync(path.join(first.directory, 'native-spawns.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line))
+            .filter((row) => row.phase === 'warm')
+            .map((row) => row.pid);
+          // The worker-group crash cannot reach Claude's detached children.
+          // Every captured warm child is therefore cleaned by exact PID after
+          // its live argv is re-authenticated, including the barrier PID.
+          expect(first.cleaned_fixture_pids).toEqual(warmPids);
+          expect(first.cleaned_fixture_pids).toContain(barrier.pid);
+        }
         const before = fs.readFileSync(path.join(first.directory, 'tasks/native-boundary/decisions.jsonl'));
         const final = await native(engine, model, [], reply, {
           scenario: 'delivery',
