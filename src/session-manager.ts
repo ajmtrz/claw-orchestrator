@@ -9,7 +9,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { execFile, execFileSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -40,6 +40,12 @@ function getPluginVersion(): string {
 
 const PERSIST_DIR = path.join(os.homedir(), '.openclaw');
 const PERSIST_FILE = path.join(PERSIST_DIR, 'claude-sessions.json');
+const PERSIST_LOCK_FILE = `${PERSIST_FILE}.lock`;
+const MAX_RELEASED_REVIEW_IDENTITIES_PER_RUN = 64;
+/** A recovery envelope is written before queue acceptance and may be replayed once by a crash retry. */
+const MAX_RECOVERY_REVIEW_ENVELOPE_DUPLICATES = 2;
+/** Bound untrusted decision-ledger indexing during cold recovery. */
+const MAX_RECOVERY_REVIEW_ENVELOPE_INDEX_ROWS = 128;
 // PERSIST_DISK_TTL_MS imported from ./constants.js
 
 interface PersistedSession {
@@ -52,80 +58,262 @@ interface PersistedSession {
   originalCreated: string;
   lastResumed: string;
   lastActivity: number;
+  /** Generation fence for an Autoloop-owned physical session name. */
+  agentGeneration?: number;
+  agentOwnerInstanceId?: string;
+  agentSessionId?: string;
+  /** Exact generation remains unavailable while its release evidence is persisted. */
+  agentReleasePending?: boolean;
+  /** Runtime owner that won the durable compare-and-release fence. */
+  agentReleaseOwnerInstanceId?: string;
+  /** Retained after release so a stale caller cannot reuse an older generation. */
+  agentReleasedGeneration?: number;
+  agentReleasedOwnerInstanceId?: string;
+  agentReleasedSessionId?: string;
+}
+
+const AGENT_FENCE_FIELDS = [
+  'agentGeneration',
+  'agentOwnerInstanceId',
+  'agentSessionId',
+  'agentReleasePending',
+  'agentReleaseOwnerInstanceId',
+  'agentReleasedGeneration',
+  'agentReleasedOwnerInstanceId',
+  'agentReleasedSessionId',
+] as const satisfies ReadonlyArray<keyof PersistedSession>;
+
+function hasAgentFence(session: PersistedSession): boolean {
+  return AGENT_FENCE_FIELDS.some((field) => session[field] !== undefined);
+}
+
+function sameAgentFence(left: PersistedSession, right: PersistedSession): boolean {
+  return AGENT_FENCE_FIELDS.every((field) => left[field] === right[field]);
+}
+
+/**
+ * Merge an ordinary registry snapshot without letting a stale manager publish
+ * or erase Autoloop fencing state. Agent transitions use the locked CAS path;
+ * lifecycle persistence may update only a fence that is still authoritative.
+ */
+function mergeRegistrySnapshot(
+  authoritative: Map<string, PersistedSession>,
+  desired: Map<string, PersistedSession>,
+): Map<string, PersistedSession> {
+  const merged = new Map(desired);
+
+  for (const [name, authoritativeSession] of authoritative) {
+    const desiredSession = desired.get(name);
+    if (!hasAgentFence(authoritativeSession)) {
+      if (desiredSession && hasAgentFence(desiredSession)) merged.set(name, authoritativeSession);
+      continue;
+    }
+    if (!desiredSession || !sameAgentFence(authoritativeSession, desiredSession)) {
+      merged.set(name, authoritativeSession);
+      continue;
+    }
+
+    const withAuthoritativeFence: PersistedSession = { ...desiredSession };
+    const mutableFence = withAuthoritativeFence as unknown as Record<string, unknown>;
+    for (const field of AGENT_FENCE_FIELDS) {
+      const value = authoritativeSession[field];
+      if (value === undefined) delete mutableFence[field];
+      else mutableFence[field] = value;
+    }
+    merged.set(name, withAuthoritativeFence);
+  }
+
+  for (const [name, desiredSession] of desired) {
+    if (!authoritative.has(name) && hasAgentFence(desiredSession)) merged.delete(name);
+  }
+  return merged;
+}
+
+/**
+ * Refresh the local registry from disk without discarding metadata whose
+ * debounced write is still pending. Local metadata is reusable only while the
+ * exact authoritative fence is unchanged; a successor fence or authoritative
+ * deletion always wins.
+ */
+function mergeRegistryView(
+  authoritative: Map<string, PersistedSession>,
+  local: Map<string, PersistedSession>,
+): Map<string, PersistedSession> {
+  const merged = new Map(authoritative);
+  for (const [name, localSession] of local) {
+    const authoritativeSession = authoritative.get(name);
+    if (!authoritativeSession) {
+      if (!hasAgentFence(localSession)) merged.set(name, localSession);
+      continue;
+    }
+    if (!sameAgentFence(authoritativeSession, localSession)) continue;
+
+    const withLocalMetadata: PersistedSession = { ...authoritativeSession, ...localSession };
+    const mutableFence = withLocalMetadata as unknown as Record<string, unknown>;
+    for (const field of AGENT_FENCE_FIELDS) {
+      const value = authoritativeSession[field];
+      if (value === undefined) delete mutableFence[field];
+      else mutableFence[field] = value;
+    }
+    merged.set(name, withLocalMetadata);
+  }
+  return merged;
+}
+
+export type AutoloopAgentRegistryErrorCode =
+  | 'AUTOLOOP_AGENT_REGISTRY_CORRUPT'
+  | 'AUTOLOOP_AGENT_REGISTRY_READ_FAILED'
+  | 'AUTOLOOP_AGENT_REGISTRY_LOCK_CLEANUP_FAILED'
+  | 'AUTOLOOP_AGENT_REGISTRY_LOCK_CONTENDED'
+  | 'AUTOLOOP_AGENT_REGISTRY_PERSIST_FAILED';
+
+export class AutoloopAgentRegistryError extends Error {
+  readonly code: AutoloopAgentRegistryErrorCode;
+  readonly retryable: boolean;
+
+  constructor(code: AutoloopAgentRegistryErrorCode, message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'AutoloopAgentRegistryError';
+    this.code = code;
+    this.retryable =
+      code !== 'AUTOLOOP_AGENT_REGISTRY_CORRUPT' && code !== 'AUTOLOOP_AGENT_REGISTRY_LOCK_CLEANUP_FAILED';
+  }
 }
 
 function loadPersistedSessions(): Map<string, PersistedSession> {
+  if (!fs.existsSync(PERSIST_FILE)) return new Map();
+
+  let raw: string;
   try {
-    if (!fs.existsSync(PERSIST_FILE)) return new Map();
-    const raw = fs.readFileSync(PERSIST_FILE, 'utf8');
-    const arr: PersistedSession[] = JSON.parse(raw);
-    const now = Date.now();
-    // Filter out entries older than disk TTL
-    const valid = arr.filter((s) => now - s.lastActivity < PERSIST_DISK_TTL_MS);
-    return new Map(valid.map((s) => [s.name, s]));
-  } catch {
-    return new Map();
+    raw = fs.readFileSync(PERSIST_FILE, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return new Map();
+    throw new AutoloopAgentRegistryError(
+      'AUTOLOOP_AGENT_REGISTRY_READ_FAILED',
+      `Failed to read the shared session registry: ${(err as Error).message}`,
+      { cause: err },
+    );
   }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new AutoloopAgentRegistryError(
+      'AUTOLOOP_AGENT_REGISTRY_CORRUPT',
+      `The shared session registry contains malformed JSON: ${(err as Error).message}`,
+      { cause: err },
+    );
+  }
+  if (!Array.isArray(parsed)) {
+    throw new AutoloopAgentRegistryError(
+      'AUTOLOOP_AGENT_REGISTRY_CORRUPT',
+      'The shared session registry root must be an array',
+    );
+  }
+  if (
+    parsed.some(
+      (entry) =>
+        !entry ||
+        typeof entry !== 'object' ||
+        typeof (entry as Partial<PersistedSession>).name !== 'string' ||
+        typeof (entry as Partial<PersistedSession>).lastActivity !== 'number',
+    )
+  ) {
+    throw new AutoloopAgentRegistryError(
+      'AUTOLOOP_AGENT_REGISTRY_CORRUPT',
+      'The shared session registry contains an invalid session entry',
+    );
+  }
+
+  const arr = parsed as PersistedSession[];
+  const now = Date.now();
+  // A durable generation fence cannot expire merely because its ordinary
+  // resumable-session metadata is old. Recovery must explicitly release it.
+  const valid = arr.filter((session) => hasAgentFence(session) || now - session.lastActivity < PERSIST_DISK_TTL_MS);
+  return new Map(valid.map((session) => [session.name, session]));
 }
 
-// Atomic write: write to .tmp then rename to avoid corrupt reads on crash
-function savePersistedSessions(sessions: Map<string, PersistedSession>, logger?: Logger): void {
+// Atomic write used only while PERSIST_LOCK_FILE is held.
+function savePersistedSessions(
+  sessions: Map<string, PersistedSession>,
+  logger?: Logger,
+): { ok: true } | { ok: false; error: AutoloopAgentRegistryError } {
+  const tmp = PERSIST_FILE + '.tmp';
   try {
     fs.mkdirSync(PERSIST_DIR, { recursive: true });
     const arr = Array.from(sessions.values());
-    const tmp = PERSIST_FILE + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(arr, null, 2));
+    const fileFd = fs.openSync(tmp, 'r+');
+    try {
+      fs.fsyncSync(fileFd);
+    } finally {
+      fs.closeSync(fileFd);
+    }
     fs.renameSync(tmp, PERSIST_FILE);
+    if (process.platform === 'win32') {
+      (logger || createConsoleLogger('SessionManager')).warn(
+        'Shared session registry was replaced, but parent-directory fsync is unavailable on win32',
+      );
+    } else {
+      const directoryFd = fs.openSync(PERSIST_DIR, 'r');
+      try {
+        fs.fsyncSync(directoryFd);
+      } finally {
+        fs.closeSync(directoryFd);
+      }
+    }
+    return { ok: true };
   } catch (err) {
+    try {
+      if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    } catch {
+      // Preserve the primary persistence error. A later locked write will
+      // replace the fixed-name temp file before attempting another rename.
+    }
     (logger || createConsoleLogger('SessionManager')).warn('Failed to persist sessions:', (err as Error).message);
+    return {
+      ok: false,
+      error: new AutoloopAgentRegistryError(
+        'AUTOLOOP_AGENT_REGISTRY_PERSIST_FAILED',
+        `Failed to persist the shared session registry: ${(err as Error).message}`,
+        { cause: err },
+      ),
+    };
   }
 }
 
-// Async version for hot-path (sendMessage, TTL cleanup)
-function savePersistedSessionsAsync(sessions: Map<string, PersistedSession>, logger?: Logger): void {
-  const log = logger || createConsoleLogger('SessionManager');
-  const arr = Array.from(sessions.values());
-  const tmp = PERSIST_FILE + '.tmp';
-  fs.mkdir(PERSIST_DIR, { recursive: true }, (mkdirErr) => {
-    if (mkdirErr) {
-      log.error('Failed to create persist dir:', mkdirErr.message);
-      return;
-    }
-    fs.writeFile(tmp, JSON.stringify(arr, null, 2), (writeErr) => {
-      if (writeErr) {
-        log.error('Failed to write session file:', writeErr.message);
-        return;
-      }
-      fs.rename(tmp, PERSIST_FILE, (renameErr) => {
-        if (renameErr) {
-          log.error('Failed to rename session file:', renameErr.message);
-          // Clean up orphan tmp file
-          fs.unlink(tmp, () => {});
-        }
-      });
-    });
-  });
+interface DebouncedCallback {
+  (): void;
+  cancel(): void;
 }
 
 // Debounce helper — coalesces rapid writes into one
-function makeDebounced(fn: () => void, ms: number): () => void {
+function makeDebounced(fn: () => void, ms: number): DebouncedCallback {
   let timer: ReturnType<typeof setTimeout> | null = null;
-  return () => {
+  const debounced = (() => {
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => {
       timer = null;
       fn();
     }, ms);
+  }) as DebouncedCallback;
+  debounced.cancel = () => {
+    if (!timer) return;
+    clearTimeout(timer);
+    timer = null;
   };
+  return debounced;
 }
 
 import { type Logger, createConsoleLogger } from './logger.js';
 import { CircuitBreaker } from './circuit-breaker.js';
 import { detectRepoLang } from './kernel/repo.js';
+import { isFileLockReleaseError, withFileLock } from './kernel/file-lock.js';
 import { RunKernel, runDir as kernelRunDir } from './kernel/engine.js';
 import { registerDefaultExecutors } from './kernel/nodes/index.js';
 import { autoloopStateFromRecord, makeAutoloopExecutor, type AutoloopHandle } from './kernel/nodes/autoloop.js';
-import { loadRun, readNodeOutput, type RunSummary } from './kernel/store.js';
+import { leaseIsStale, loadRun, readLease, readNodeOutput, type RunSummary } from './kernel/store.js';
 import {
   LEGACY_NODE,
   joinFindings,
@@ -209,11 +397,72 @@ import { isAgyConversationId } from './agy-conversation.js';
 import { Council } from './council.js';
 import { Fanout, type FanoutConfig, type FanoutSession, type FanoutAgentSpec } from './fanout.js';
 import { AutoloopRunner } from './autoloop/runner.js';
-import { ClaudeAgentDispatcher, type ClaudeAgentDispatcherConfig } from './autoloop/dispatcher.js';
-import type { AutoloopState, PushPolicy } from './autoloop/types.js';
-import { DEFAULT_PUSH_POLICY, DEFAULT_SEND_TIMEOUT_MS, validateAutoloopTimeoutConfig } from './autoloop/types.js';
-import { Msg as AutoloopMsg, type PushChannel, type PushLevel, type SendTimeoutPayload } from './autoloop/messages.js';
+import {
+  AutoloopOperationError,
+  ClaudeAgentDispatcher,
+  type AutoloopResetResult,
+  type ClaudeAgentDispatcherConfig,
+} from './autoloop/dispatcher.js';
+import type {
+  AgentReservationReleaseOptions,
+  AgentRuntimeLiveness,
+  AgentRuntimeProbe,
+  AutoloopChatStateCode,
+  AutoloopRecoveryErrorCode,
+  AutoloopState,
+  RecoveryAgentEvidence,
+  RecoveryActionSnapshot,
+  RecoveryAssessment,
+  RecoveryDeliveryEvidence,
+  RecoveryIterationEvidence,
+  RecoveryReceipt,
+  RecoveryReviewEnvelope,
+  RecoveryResult,
+  PhysicalAgentGeneration,
+  PublicAutoloopFailure,
+  PublicAutoloopFailureCode,
+  PushPolicy,
+} from './autoloop/types.js';
+import {
+  AutoloopRecoveryError,
+  AutoloopAgentReleaseOwnerError,
+  DEFAULT_PUSH_POLICY,
+  DEFAULT_SEND_TIMEOUT_MS,
+  isRecoverableAgentOwnerInstanceId,
+  validateAutoloopTimeoutConfig,
+} from './autoloop/types.js';
+import {
+  assessRecovery,
+  blockRecoveryAssessment,
+  parseRecoveryReceipt,
+  parseRecoveryReviewEnvelope,
+  rebindRecoveryAction,
+  recoveryActionDispatchId,
+  recoveryActionDigest,
+  recoveryLogicalMessageSha256,
+} from './autoloop/recovery.js';
+import {
+  parseOutboxDecisionLedgerRow,
+  validateOutboxDecisionLedgerGraph,
+  type DeliveryLedgerRow,
+} from './autoloop/outbox.js';
+import {
+  Msg as AutoloopMsg,
+  canonicalizeRequestReviewArgs,
+  type AutoloopMessageType,
+  type AutoloopOperationErrorCode,
+  type PushChannel,
+  type PushLevel,
+  type RequestReviewArgs,
+  type SendTimeoutPayload,
+} from './autoloop/messages.js';
 import { appendPushLog, notifyUserFallbackChain } from './autoloop/notify.js';
+import {
+  isCommittedSecureLedgerError,
+  SecureAutoloopLedger,
+  type SecureAutoloopLedgerCommitError,
+  type SecureAutoloopPreparedAppend,
+} from './autoloop/secure-ledger.js';
 import { UltraappManager } from './ultraapp/manager.js';
 import { UltraappStore, defaultStoreRoot } from './ultraapp/store.js';
 import type { UltraappRouter } from './ultraapp/router.js';
@@ -312,6 +561,7 @@ type CodexAppSession = ISession & {
 type AutoloopRoleName = 'planner' | 'coder' | 'reviewer';
 
 interface SendTimeoutMigrationAuditRecord {
+  schema_version?: 1;
   ts: string;
   kind: 'timeout_migration';
   actor: 'operator';
@@ -329,9 +579,477 @@ interface StoredAutoloopResumeContext {
   pendingDispatch: SendTimeoutPayload | null;
 }
 
+/** Resume-only custom configurations must never enter a recovery receipt. */
+interface RecoveryBootOverrides {
+  plannerCustomEngine?: CustomEngineConfig;
+  coderCustomEngine?: CustomEngineConfig;
+  reviewerCustomEngine?: CustomEngineConfig;
+  sendTimeoutMs?: number;
+}
+
 interface PreparedSendTimeoutMigrationAppend {
-  fd: number;
-  line: string;
+  append: SecureAutoloopPreparedAppend;
+  expectedTail: string;
+}
+
+class AutoloopChatStateError extends Error {
+  constructor(
+    readonly code: AutoloopChatStateCode,
+    message: string,
+    readonly retryable: boolean,
+    readonly pending_dispatch?: SendTimeoutPayload,
+    readonly status_reason?: string | null,
+  ) {
+    super(message);
+    this.name = 'AutoloopChatStateError';
+  }
+}
+
+export type { PublicAutoloopFailure, PublicAutoloopFailureCode };
+
+export interface PublicAutoloopUnknownFailure {
+  readonly message: string;
+}
+
+interface DetachedAutoloopPhaseFailure {
+  readonly agent: 'planner';
+  readonly phase: 'planner_turn';
+  readonly code?: PublicAutoloopFailureCode;
+  readonly committed?: true;
+  readonly retryable?: boolean;
+  readonly pending_dispatch?: Readonly<SendTimeoutPayload>;
+  readonly status_reason?: string | null;
+  readonly error: string;
+}
+
+interface DurableDetachedAutoloopPhaseFailure extends DetachedAutoloopPhaseFailure {
+  readonly detached_failure_id?: string;
+}
+
+interface DurableDetachedAutoloopFailureRow {
+  readonly ts: string;
+  readonly payload: Readonly<DurableDetachedAutoloopPhaseFailure>;
+  readonly startByteOffset: number;
+}
+
+interface DetachedFailureLedgerCursor {
+  readonly version: 1;
+  readonly byteOffset: number;
+  readonly prefixSha256: string;
+}
+
+interface AutoloopChatFailureBinding {
+  readonly logicalId: string;
+  readonly preaudited?: DurableDetachedAutoloopFailureRow;
+  readonly runnerProjection?: AutoloopState['recent_phase_errors'][number];
+}
+
+const DETACHED_AUTOLOOP_FAILURE_ID = Symbol('detachedAutoloopFailureId');
+
+const AUTOLOOP_OPERATION_ERROR_RETRYABILITY = Object.freeze({
+  AUTOLOOP_EMPTY_REPLY: true,
+  AUTOLOOP_SESSION_NOT_CREATED: true,
+  AUTOLOOP_ENGINE_FAILURE: true,
+  AUTOLOOP_REQUIRED_TOOL_DENIED: true,
+  AUTOLOOP_CONTROL_MALFORMED: false,
+  AUTOLOOP_CONTROL_APPLICATION_FAILED: false,
+  AUTOLOOP_CONTROL_NOT_PERSISTED: true,
+  AUTOLOOP_RESET_POSTCONDITION_FAILED: false,
+  AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE: false,
+  AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE: false,
+  AUTOLOOP_LEDGER_DESCRIPTOR_CLOSE_INCOMPLETE: false,
+  AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID: false,
+} as const satisfies Record<AutoloopOperationErrorCode, boolean>);
+
+const AUTOLOOP_CHAT_STATE_RETRYABILITY = Object.freeze({
+  AUTOLOOP_SEND_TIMEOUT: true,
+  AUTOLOOP_RUN_PAUSED: false,
+  AUTOLOOP_RUN_TERMINAL: false,
+} as const satisfies Record<AutoloopChatStateCode, boolean>);
+
+const AUTOLOOP_RECOVERY_ERROR_RETRYABILITY = Object.freeze({
+  AUTOLOOP_RECOVERY_TOKEN_REQUIRED: false,
+  AUTOLOOP_RECOVERY_TOKEN_STALE: false,
+  AUTOLOOP_RECOVERY_MANUAL_RESOLUTION_REQUIRED: false,
+  AUTOLOOP_RECOVERY_INCOMPLETE: false,
+} as const satisfies Record<AutoloopRecoveryErrorCode, boolean>);
+
+const COMMITTED_AUTOLOOP_LEDGER_ERROR_CODES = new Set<PublicAutoloopFailureCode>([
+  'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+  'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+  'AUTOLOOP_LEDGER_DESCRIPTOR_CLOSE_INCOMPLETE',
+  'AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID',
+]);
+
+function isAutoloopChatStateCode(value: unknown): value is AutoloopChatStateCode {
+  return typeof value === 'string' && Object.hasOwn(AUTOLOOP_CHAT_STATE_RETRYABILITY, value);
+}
+
+function isAutoloopRecoveryErrorCode(value: unknown): value is AutoloopRecoveryErrorCode {
+  return typeof value === 'string' && Object.hasOwn(AUTOLOOP_RECOVERY_ERROR_RETRYABILITY, value);
+}
+
+function isPublicAutoloopFailureCode(value: unknown): value is PublicAutoloopFailureCode {
+  return isAutoloopOperationErrorCode(value) || isAutoloopChatStateCode(value) || isAutoloopRecoveryErrorCode(value);
+}
+
+function publicAutoloopFailureRetryable(code: PublicAutoloopFailureCode): boolean {
+  if (isAutoloopOperationErrorCode(code)) return AUTOLOOP_OPERATION_ERROR_RETRYABILITY[code];
+  if (isAutoloopChatStateCode(code)) return AUTOLOOP_CHAT_STATE_RETRYABILITY[code];
+  return AUTOLOOP_RECOVERY_ERROR_RETRYABILITY[code];
+}
+
+function isCommittedAutoloopLedgerErrorCode(code: PublicAutoloopFailureCode): boolean {
+  return COMMITTED_AUTOLOOP_LEDGER_ERROR_CODES.has(code);
+}
+
+function isAutoloopOperationErrorCode(value: unknown): value is AutoloopOperationErrorCode {
+  return typeof value === 'string' && Object.hasOwn(AUTOLOOP_OPERATION_ERROR_RETRYABILITY, value);
+}
+
+function ownDataValue(value: object, key: PropertyKey): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor && Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined;
+}
+
+function safeOwnErrorMessage(error: unknown): string {
+  if (typeof error === 'string') return error;
+  if ((typeof error !== 'object' || error === null) && typeof error !== 'function') return 'unknown error';
+  try {
+    const message = ownDataValue(error, 'message');
+    return typeof message === 'string' ? message : 'unknown error';
+  } catch {
+    return 'unknown error';
+  }
+}
+
+function publicData<T extends object>(fields: T): Readonly<T> {
+  return Object.freeze(Object.assign(Object.create(null) as T, fields));
+}
+
+function snapshotPendingDispatch(value: unknown): Readonly<SendTimeoutPayload> | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const status = ownDataValue(value, 'status');
+  const dispatchId = ownDataValue(value, 'dispatch_id');
+  const agent = ownDataValue(value, 'agent');
+  const messageId = ownDataValue(value, 'message_id');
+  const messageType = ownDataValue(value, 'message_type');
+  const iter = ownDataValue(value, 'iter');
+  const timeoutMs = ownDataValue(value, 'timeout_ms');
+  const pendingError = ownDataValue(value, 'error');
+  if (
+    status !== 'awaiting_resume' ||
+    typeof dispatchId !== 'string' ||
+    dispatchId.length === 0 ||
+    (agent !== 'planner' && agent !== 'coder' && agent !== 'reviewer') ||
+    typeof messageId !== 'string' ||
+    typeof messageType !== 'string' ||
+    !new Set<AutoloopMessageType>([
+      'chat',
+      'directive',
+      'directive_ack',
+      'iter_artifacts',
+      'review_request',
+      'review_verdict',
+      'iter_done',
+      'push_user',
+      'pause',
+      'resume',
+      'terminate',
+      'phase_error',
+      'send_timeout',
+    ]).has(messageType as AutoloopMessageType) ||
+    typeof iter !== 'number' ||
+    typeof timeoutMs !== 'number' ||
+    typeof pendingError !== 'string'
+  ) {
+    return undefined;
+  }
+  return publicData({
+    status,
+    dispatch_id: dispatchId,
+    agent,
+    message_id: messageId,
+    message_type: messageType as AutoloopMessageType,
+    iter,
+    timeout_ms: timeoutMs,
+    error: pendingError,
+  });
+}
+
+/**
+ * Convert only recognized typed Autoloop failures. Unknown errors intentionally
+ * return undefined so adapters retain their existing generic failure path.
+ */
+export function toPublicAutoloopFailure(error: unknown): Readonly<PublicAutoloopFailure> | undefined {
+  const committedLedgerError = isCommittedSecureLedgerError(error);
+  if (error instanceof AutoloopOperationError || committedLedgerError) {
+    const code = ownDataValue(error, 'code');
+    const messageValue = ownDataValue(error, 'message');
+    if (!isAutoloopOperationErrorCode(code)) return undefined;
+    const committed = committedLedgerError && isCommittedAutoloopLedgerErrorCode(code);
+    if (!committed && typeof messageValue !== 'string') return undefined;
+    return publicData({
+      code,
+      message: typeof messageValue === 'string' ? messageValue : 'unknown error',
+      ...(committed ? { committed: true as const } : {}),
+      retryable: AUTOLOOP_OPERATION_ERROR_RETRYABILITY[code],
+    });
+  }
+
+  if (error instanceof AutoloopRecoveryError) {
+    const code = ownDataValue(error, 'code');
+    const message = ownDataValue(error, 'message');
+    if (!isAutoloopRecoveryErrorCode(code) || typeof message !== 'string') return undefined;
+    return publicData({ code, message, retryable: AUTOLOOP_RECOVERY_ERROR_RETRYABILITY[code] });
+  }
+
+  if (error instanceof Error && ownDataValue(error, 'name') === 'AutoloopChatStateError') {
+    const codeValue = ownDataValue(error, 'code');
+    if (typeof codeValue !== 'string' || !Object.hasOwn(AUTOLOOP_CHAT_STATE_RETRYABILITY, codeValue)) {
+      return undefined;
+    }
+    const code = codeValue as AutoloopChatStateCode;
+    const message = ownDataValue(error, 'message');
+    if (typeof message !== 'string') return undefined;
+    const pending = snapshotPendingDispatch(ownDataValue(error, 'pending_dispatch'));
+    const rawStatusReason = ownDataValue(error, 'status_reason');
+    const statusReason = typeof rawStatusReason === 'string' || rawStatusReason === null ? rawStatusReason : undefined;
+    return publicData({
+      code,
+      message,
+      retryable: AUTOLOOP_CHAT_STATE_RETRYABILITY[code],
+      ...(pending ? { pending_dispatch: pending } : {}),
+      ...(statusReason !== undefined ? { status_reason: statusReason } : {}),
+    });
+  }
+
+  if (
+    typeof error === 'object' &&
+    error !== null &&
+    ownDataValue(error, 'ok') === false &&
+    ownDataValue(error, 'code') === 'AUTOLOOP_RESET_POSTCONDITION_FAILED' &&
+    typeof ownDataValue(error, 'message') === 'string' &&
+    ownDataValue(error, 'retryable') === false
+  ) {
+    return publicData({
+      code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+      message: ownDataValue(error, 'message') as string,
+      retryable: false,
+    });
+  }
+
+  return undefined;
+}
+
+function detachedPhaseFailure(
+  failure: Readonly<PublicAutoloopFailure | PublicAutoloopUnknownFailure>,
+  detachedFailureId?: string,
+): Readonly<DurableDetachedAutoloopPhaseFailure> {
+  if ('code' in failure) {
+    return publicData({
+      agent: 'planner' as const,
+      phase: 'planner_turn' as const,
+      code: failure.code,
+      ...(failure.committed === true && isCommittedAutoloopLedgerErrorCode(failure.code)
+        ? { committed: true as const }
+        : {}),
+      retryable: publicAutoloopFailureRetryable(failure.code),
+      ...(failure.pending_dispatch ? { pending_dispatch: failure.pending_dispatch } : {}),
+      ...(failure.status_reason !== undefined ? { status_reason: failure.status_reason } : {}),
+      error: failure.message,
+      ...(detachedFailureId ? { detached_failure_id: detachedFailureId } : {}),
+    });
+  }
+  return publicData({
+    agent: 'planner' as const,
+    phase: 'planner_turn' as const,
+    error: failure.message,
+    ...(detachedFailureId ? { detached_failure_id: detachedFailureId } : {}),
+  });
+}
+
+function snapshotDurableDetachedPhaseFailure(
+  value: unknown,
+): Readonly<DurableDetachedAutoloopPhaseFailure> | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  if (
+    ownDataValue(value, 'agent') !== 'planner' ||
+    ownDataValue(value, 'phase') !== 'planner_turn' ||
+    typeof ownDataValue(value, 'error') !== 'string'
+  ) {
+    return undefined;
+  }
+  const error = ownDataValue(value, 'error') as string;
+  const codeValue = ownDataValue(value, 'code');
+  const detachedFailureIdValue = ownDataValue(value, 'detached_failure_id');
+  const detachedFailureId =
+    typeof detachedFailureIdValue === 'string' && detachedFailureIdValue.length > 0
+      ? detachedFailureIdValue
+      : undefined;
+  if (codeValue === undefined) {
+    return publicData({
+      agent: 'planner' as const,
+      phase: 'planner_turn' as const,
+      error,
+      ...(detachedFailureId ? { detached_failure_id: detachedFailureId } : {}),
+    });
+  }
+  if (!isPublicAutoloopFailureCode(codeValue)) return undefined;
+  const committed = ownDataValue(value, 'committed') === true && isCommittedAutoloopLedgerErrorCode(codeValue);
+  const pending = snapshotPendingDispatch(ownDataValue(value, 'pending_dispatch'));
+  const statusReasonValue = ownDataValue(value, 'status_reason');
+  const statusReason =
+    typeof statusReasonValue === 'string' || statusReasonValue === null ? statusReasonValue : undefined;
+  return publicData({
+    agent: 'planner' as const,
+    phase: 'planner_turn' as const,
+    code: codeValue,
+    ...(committed ? { committed: true as const } : {}),
+    retryable: publicAutoloopFailureRetryable(codeValue),
+    ...(pending ? { pending_dispatch: pending } : {}),
+    ...(statusReason !== undefined ? { status_reason: statusReason } : {}),
+    error,
+    ...(detachedFailureId ? { detached_failure_id: detachedFailureId } : {}),
+  });
+}
+
+function readDurableDetachedFailureRows(contents: string): DurableDetachedAutoloopFailureRow[] {
+  const rows: DurableDetachedAutoloopFailureRow[] = [];
+  let byteOffset = 0;
+  const lines = contents.split('\n');
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const startByteOffset = byteOffset;
+    const lineByteLength = Buffer.byteLength(line, 'utf8');
+    byteOffset = startByteOffset + lineByteLength + (index < lines.length - 1 ? 1 : 0);
+    if (!line.trim()) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line) as unknown;
+    } catch {
+      continue;
+    }
+    if (typeof parsed !== 'object' || parsed === null) continue;
+    const row = parsed as Record<string, unknown>;
+    if (ownDataValue(row, 'kind') !== 'phase_error' || ownDataValue(row, 'actor') !== 'dispatcher') continue;
+    const payload = snapshotDurableDetachedPhaseFailure(ownDataValue(row, 'payload'));
+    if (!payload) continue;
+    const tsValue = ownDataValue(row, 'ts');
+    rows.push(
+      publicData({
+        ts: typeof tsValue === 'string' ? tsValue : '',
+        payload,
+        startByteOffset,
+      }),
+    );
+  }
+  return rows;
+}
+
+function detachedFailureLedgerCursor(contents: string): Readonly<DetachedFailureLedgerCursor> {
+  return publicData({
+    version: 1 as const,
+    byteOffset: Buffer.byteLength(contents, 'utf8'),
+    prefixSha256: createHash('sha256').update(contents, 'utf8').digest('hex'),
+  });
+}
+
+function snapshotDetachedFailureLedgerCursor(value: unknown): Readonly<DetachedFailureLedgerCursor> | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const version = ownDataValue(value, 'version');
+  const byteOffset = ownDataValue(value, 'byteOffset');
+  const prefixSha256 = ownDataValue(value, 'prefixSha256');
+  if (
+    version !== 1 ||
+    typeof byteOffset !== 'number' ||
+    !Number.isSafeInteger(byteOffset) ||
+    byteOffset < 0 ||
+    typeof prefixSha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(prefixSha256)
+  ) {
+    return undefined;
+  }
+  return publicData({ version, byteOffset, prefixSha256 });
+}
+
+function validatedDetachedFailureCursorOffset(contents: string, cursor: Readonly<DetachedFailureLedgerCursor>): number {
+  const bytes = Buffer.from(contents, 'utf8');
+  if (cursor.byteOffset > bytes.length || (cursor.byteOffset > 0 && bytes[cursor.byteOffset - 1] !== 0x0a)) {
+    throw new Error('decisions.jsonl no longer contains the checkpointed detached-failure prefix boundary');
+  }
+  const prefixSha256 = createHash('sha256').update(bytes.subarray(0, cursor.byteOffset)).digest('hex');
+  if (prefixSha256 !== cursor.prefixSha256) {
+    throw new Error('decisions.jsonl no longer matches the checkpointed detached-failure prefix');
+  }
+  return cursor.byteOffset;
+}
+
+function detachedPhaseFailureKey(value: DetachedAutoloopPhaseFailure): string {
+  return JSON.stringify(
+    publicData({
+      code: value.code ?? null,
+      committed: value.code && value.committed === true && isCommittedAutoloopLedgerErrorCode(value.code) ? true : null,
+      retryable: value.code ? publicAutoloopFailureRetryable(value.code) : null,
+      pending_dispatch: value.pending_dispatch ?? null,
+      status_reason: value.status_reason ?? null,
+      error: value.error,
+    }),
+  );
+}
+
+function sameDetachedPhaseFailure(left: DetachedAutoloopPhaseFailure, right: DetachedAutoloopPhaseFailure): boolean {
+  return detachedPhaseFailureKey(left) === detachedPhaseFailureKey(right);
+}
+
+function newlyAppendedDispatcherPreaudit(
+  before: string,
+  after: string,
+  expected: DetachedAutoloopPhaseFailure,
+): DurableDetachedAutoloopFailureRow | undefined {
+  if (!after.startsWith(before)) return undefined;
+  const appendedLines = after
+    .slice(before.length)
+    .split('\n')
+    .filter((line) => line.trim().length > 0);
+  const lastLine = appendedLines.at(-1);
+  if (!lastLine) return undefined;
+  const rows = readDurableDetachedFailureRows(`${lastLine}\n`);
+  if (rows.length !== 1) return undefined;
+  const row = rows[0];
+  if (row.payload.detached_failure_id !== undefined || !sameDetachedPhaseFailure(row.payload, expected)) {
+    return undefined;
+  }
+  return row;
+}
+
+function rowIsAfterCheckpoint(rowTimestamp: string, checkpointTimestamp: string): boolean {
+  const rowTime = Date.parse(rowTimestamp);
+  const checkpointTime = Date.parse(checkpointTimestamp);
+  return Number.isFinite(rowTime) && Number.isFinite(checkpointTime) && rowTime > checkpointTime;
+}
+
+function detachedStateEntry(
+  ts: string,
+  payload: Readonly<DurableDetachedAutoloopPhaseFailure>,
+  detachedFailureId?: string,
+): AutoloopState['recent_phase_errors'][number] {
+  const entry = Object.assign(Object.create(null), {
+    ts,
+    agent: payload.agent,
+    phase: payload.phase,
+    ...(payload.code ? { code: payload.code, retryable: publicAutoloopFailureRetryable(payload.code) } : {}),
+    ...(payload.code && payload.committed === true && isCommittedAutoloopLedgerErrorCode(payload.code)
+      ? { committed: true as const }
+      : {}),
+    ...(payload.pending_dispatch ? { pending_dispatch: payload.pending_dispatch } : {}),
+    ...(payload.status_reason !== undefined ? { status_reason: payload.status_reason } : {}),
+    error: payload.error,
+  }) as AutoloopState['recent_phase_errors'][number];
+  if (detachedFailureId) {
+    Object.defineProperty(entry, DETACHED_AUTOLOOP_FAILURE_ID, { value: detachedFailureId });
+  }
+  return Object.freeze(entry);
 }
 
 function isSendTimeoutPayload(value: unknown): value is SendTimeoutPayload {
@@ -350,6 +1068,112 @@ function isSendTimeoutPayload(value: unknown): value is SendTimeoutPayload {
   );
 }
 
+interface StoredTimeoutObservation {
+  ts: string;
+  payload: SendTimeoutPayload;
+}
+
+/** Legacy timeout rows have no owner tuple. Only an unambiguous, durable
+ * release/start interval can prove that a later baseline timeout belongs to a
+ * replacement owner. A timestamp or a reset request alone is not authority.
+ */
+function provesTimeoutGenerationReset(
+  ledger: SecureAutoloopLedger,
+  runId: string,
+  previous: StoredTimeoutObservation | undefined,
+  next: StoredTimeoutObservation,
+): boolean {
+  if (!previous) return false;
+  const earlier = Date.parse(previous.ts),
+    later = Date.parse(next.ts);
+  if (!Number.isFinite(earlier) || !Number.isFinite(later) || earlier >= later) return false;
+  const sameIdentity = (a: PhysicalAgentGeneration, b: PhysicalAgentGeneration) =>
+    a.role === b.role &&
+    a.generation === b.generation &&
+    a.session_name === b.session_name &&
+    a.owner_instance_id === b.owner_instance_id &&
+    a.session_id === b.session_id &&
+    a.created_at === b.created_at;
+  const history: Array<{ ts: number; kind: string; generation: PhysicalAgentGeneration }> = [];
+  const current = new Map<string, (typeof history)[number]>();
+  let lastTime = -Infinity;
+  for (const line of (ledger.readFlatFile('agent-generations.jsonl') ?? '').split('\n')) {
+    if (!line.trim()) continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      return false;
+    }
+    const g = row?.payload as PhysicalAgentGeneration | undefined;
+    const ts = Date.parse(row?.ts);
+    if (
+      row?.schema_version !== 1 ||
+      !g ||
+      !['planner', 'coder', 'reviewer'].includes(g.role) ||
+      !Number.isSafeInteger(g.generation) ||
+      g.generation < 1 ||
+      g.session_name !== `autoloop-${runId}-${g.role}` ||
+      !isRecoverableAgentOwnerInstanceId(g.owner_instance_id) ||
+      typeof g.session_id !== 'string' ||
+      !g.session_id ||
+      !Number.isFinite(Date.parse(g.created_at)) ||
+      !Number.isFinite(ts) ||
+      Date.parse(g.created_at) > ts ||
+      ts < lastTime
+    )
+      return false;
+    const prior = current.get(g.role);
+    const kind = row.kind;
+    if (kind === 'agent_generation_reserved') {
+      if (
+        g.state !== 'stale' ||
+        (prior
+          ? prior.kind !== 'agent_generation_released' ||
+            g.generation !== prior.generation.generation + 1 ||
+            g.session_id === prior.generation.session_id
+          : g.generation !== 1)
+      )
+        return false;
+    } else {
+      if (!prior || !sameIdentity(prior.generation, g)) return false;
+      if (kind === 'agent_generation_started') {
+        if (prior.kind !== 'agent_generation_reserved' || g.state !== 'live') return false;
+      } else if (kind === 'agent_generation_lease_renewed') {
+        if (!['agent_generation_started', 'agent_generation_lease_renewed'].includes(prior.kind) || g.state !== 'live')
+          return false;
+      } else if (kind === 'agent_generation_orphaned') {
+        if (prior.kind === 'agent_generation_released' || g.state !== 'orphaned') return false;
+      } else if (kind === 'agent_generation_released') {
+        if (g.state !== 'released') return false;
+      } else return false;
+    }
+    const event = { ts, kind, generation: g };
+    history.push(event);
+    current.set(g.role, event);
+    lastTime = ts;
+  }
+  const activeAt = (role: string, at: number) => {
+    const event = history.filter((entry) => entry.generation.role === role && entry.ts <= at).at(-1);
+    // Equal cross-ledger timestamps cannot prove which event came first.
+    return event && event.ts < at && event.generation.state === 'live' ? event.generation : undefined;
+  };
+  const oldOwner = activeAt(previous.payload.agent, earlier);
+  const newOwner = activeAt(next.payload.agent, later);
+  return Boolean(
+    oldOwner &&
+    newOwner &&
+    oldOwner.owner_instance_id !== newOwner.owner_instance_id &&
+    history.some(
+      (event) =>
+        event.kind === 'agent_generation_released' &&
+        sameIdentity(event.generation, oldOwner) &&
+        event.ts > earlier &&
+        event.ts < Date.parse(newOwner.created_at),
+    ),
+  );
+}
+
 /**
  * Replay only timeout-resume audit rows. The original run spec remains the
  * immutable starting point; each coherent append advances the effective value.
@@ -357,17 +1181,19 @@ function isSendTimeoutPayload(value: unknown): value is SendTimeoutPayload {
  * accidentally authorizing a timeout decrease after process reconstruction.
  */
 function readStoredAutoloopResumeContext(
-  workspace: string,
+  ledger: SecureAutoloopLedger,
   runId: string,
   originalSendTimeoutMs: unknown,
 ): StoredAutoloopResumeContext {
   validateAutoloopTimeoutConfig({ sendTimeoutMs: originalSendTimeoutMs as number | undefined });
   let effectiveSendTimeoutMs = (originalSendTimeoutMs as number | undefined) ?? DEFAULT_SEND_TIMEOUT_MS;
   let pendingDispatch: SendTimeoutPayload | null = null;
-  const auditPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
-  if (!fs.existsSync(auditPath)) return { effectiveSendTimeoutMs, pendingDispatch };
+  let pendingObservation: StoredTimeoutObservation | undefined;
+  let previousMigratedTimeout: StoredTimeoutObservation | undefined;
+  let generationReset = false;
+  const auditContents = ledger.readFlatFile('decisions.jsonl') ?? '';
 
-  const lines = fs.readFileSync(auditPath, 'utf8').split('\n');
+  const lines = auditContents.split('\n');
   for (const line of lines) {
     if (!line.trim()) continue;
     let row: Record<string, unknown>;
@@ -377,11 +1203,25 @@ function readStoredAutoloopResumeContext(
       throw new Error(`Cannot safely resume Autoloop '${runId}': decisions.jsonl contains malformed JSON`);
     }
     if (row.kind === 'send_timeout' && isSendTimeoutPayload(row.payload)) {
+      const observation = { ts: String(row.ts), payload: row.payload };
+      if (row.payload.timeout_ms < effectiveSendTimeoutMs) {
+        if (
+          row.payload.timeout_ms !== (originalSendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS) ||
+          !provesTimeoutGenerationReset(ledger, runId, previousMigratedTimeout, observation)
+        ) {
+          throw new Error(`Cannot safely resume Autoloop '${runId}': timeout generation reset lacks durable proof`);
+        }
+        effectiveSendTimeoutMs = row.payload.timeout_ms;
+        generationReset = true;
+      }
       pendingDispatch = row.payload;
+      pendingObservation = observation;
       continue;
     }
     if (row.kind === 'terminate') {
       pendingDispatch = null;
+      pendingObservation = undefined;
+      generationReset = false;
       continue;
     }
     if (row.kind !== 'timeout_migration' || row.runId !== runId || row.field !== 'sendTimeoutMs') continue;
@@ -393,11 +1233,23 @@ function readStoredAutoloopResumeContext(
     } catch {
       throw new Error(`Cannot safely resume Autoloop '${runId}': timeout migration audit is invalid`);
     }
-    if (oldValue !== effectiveSendTimeoutMs || (newValue as number) <= (oldValue as number)) {
+    if (
+      oldValue !== effectiveSendTimeoutMs ||
+      (newValue as number) <= (oldValue as number) ||
+      (generationReset &&
+        (!pendingDispatch ||
+          row.pendingDispatchId !== pendingDispatch.dispatch_id ||
+          pendingDispatch.timeout_ms !== oldValue))
+    ) {
       throw new Error(`Cannot safely resume Autoloop '${runId}': timeout migration audit chain is inconsistent`);
     }
     effectiveSendTimeoutMs = newValue as number;
-    if (row.pendingDispatchId === pendingDispatch?.dispatch_id) pendingDispatch = null;
+    if (pendingDispatch && row.pendingDispatchId === pendingDispatch.dispatch_id) {
+      previousMigratedTimeout = pendingObservation;
+      pendingDispatch = null;
+      pendingObservation = undefined;
+    }
+    generationReset = false;
   }
   return { effectiveSendTimeoutMs, pendingDispatch };
 }
@@ -414,6 +1266,7 @@ function encodeSendTimeoutMigration(
 ): string {
   const timestamp = new Date().toISOString();
   const record: SendTimeoutMigrationAuditRecord = {
+    schema_version: 1,
     ts: timestamp,
     kind: 'timeout_migration',
     actor: 'operator',
@@ -424,12 +1277,15 @@ function encodeSendTimeoutMigration(
 }
 
 function appendSendTimeoutMigration(
-  workspace: string,
+  ledger: SecureAutoloopLedger,
   migration: Omit<SendTimeoutMigrationAuditRecord, 'ts' | 'timestamp' | 'kind' | 'actor'>,
-): void {
-  const ledgerDir = path.join(workspace, 'tasks', migration.runId);
-  fs.mkdirSync(ledgerDir, { recursive: true });
-  fs.appendFileSync(path.join(ledgerDir, 'decisions.jsonl'), encodeSendTimeoutMigration(migration));
+): SecureAutoloopLedgerCommitError | undefined {
+  const prepared = prepareSendTimeoutMigrationAppend(ledger, migration);
+  try {
+    return commitPreparedSendTimeoutMigration(prepared);
+  } finally {
+    prepared.append.close();
+  }
 }
 
 /**
@@ -440,23 +1296,42 @@ function appendSendTimeoutMigration(
  * redirected by a path replacement.
  */
 function prepareSendTimeoutMigrationAppend(
-  workspace: string,
+  ledger: SecureAutoloopLedger,
   migration: Omit<SendTimeoutMigrationAuditRecord, 'ts' | 'timestamp' | 'kind' | 'actor'>,
 ): PreparedSendTimeoutMigrationAppend {
-  const ledgerDir = path.join(workspace, 'tasks', migration.runId);
-  fs.mkdirSync(ledgerDir, { recursive: true });
+  const encoded = encodeSendTimeoutMigration(migration);
   return {
-    fd: fs.openSync(path.join(ledgerDir, 'decisions.jsonl'), 'a'),
-    line: encodeSendTimeoutMigration(migration),
+    append: ledger.prepareFlatFileAppend('decisions.jsonl', encoded),
+    expectedTail: encoded.slice(0, -1),
   };
 }
 
-function commitPreparedSendTimeoutMigration(prepared: PreparedSendTimeoutMigrationAppend): void {
-  const expectedBytes = Buffer.byteLength(prepared.line);
-  const writtenBytes = fs.writeSync(prepared.fd, prepared.line, null, 'utf8');
-  if (writtenBytes !== expectedBytes) {
-    throw new Error(`Could not append the complete sendTimeoutMs migration audit record`);
+function assertPreparedSendTimeoutMigrationTail(prepared: PreparedSendTimeoutMigrationAppend): void {
+  if (prepared.append.readLastNonEmptyLine() !== prepared.expectedTail) {
+    throw new Error('Committed timeout migration does not match the pinned decisions.jsonl tail');
   }
+}
+
+function commitPreparedSendTimeoutMigration(
+  prepared: PreparedSendTimeoutMigrationAppend,
+): SecureAutoloopLedgerCommitError | undefined {
+  try {
+    prepared.append.commitDurable();
+  } catch (error) {
+    if (!isCommittedSecureLedgerError(error) || !prepared.append.committed) throw error;
+    assertPreparedSendTimeoutMigrationTail(prepared);
+    try {
+      // Resume only the incomplete barrier. The prepared capability remembers
+      // that its bytes are already present, so this can never append twice.
+      prepared.append.commitDurable();
+    } catch (retryError) {
+      if (!isCommittedSecureLedgerError(retryError) || !prepared.append.committed) throw retryError;
+      assertPreparedSendTimeoutMigrationTail(prepared);
+      return retryError;
+    }
+  }
+  assertPreparedSendTimeoutMigrationTail(prepared);
+  return undefined;
 }
 
 function isStringRecord(value: unknown): value is Record<string, string> {
@@ -559,9 +1434,11 @@ function readPermissionDenials(evt: Record<string, unknown> | undefined): Permis
   return out;
 }
 
-export class SessionManager {
+export class SessionManager implements AgentRuntimeProbe {
+  private static liveAutoloopOwnerInstanceIds = new Set<string>();
   private sessions = new Map<string, ManagedSession>();
   private _pendingSessions = new Map<string, Promise<SessionInfo>>();
+  readonly autoloopOwnerInstanceId = `session-manager:${process.pid}:${randomUUID()}`;
   /**
    * Starts that passed the capacity check and are not in `sessions` yet. The
    * check runs before the first await and a session enters the map only after
@@ -572,12 +1449,19 @@ export class SessionManager {
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
   private pluginConfig: PluginConfig;
   private persistedSessions: Map<string, PersistedSession>;
-  private _debouncedSave: () => void;
+  private _debouncedSave: DebouncedCallback;
   private _proxyServer: http.Server | null = null;
   private _proxyPort: number | null = null;
   /** In-flight proxy startup, so concurrent callers share one server. */
   private _proxyStartPromise: Promise<number | null> | null = null;
   private _activePids = new Map<string, number>();
+  private _agentReleasesInFlight = 0;
+  private _agentReleaseWaiters: Array<() => void> = [];
+  private _agentReleaseOperations = new Map<string, Promise<boolean>>();
+  private _agentReleaseFenceClosed = false;
+  private _shutdownPromise: Promise<void> | null = null;
+  private _completedBeforeReleaseHooks = new Set<string>();
+  private _completedReleaseEvidenceHooks = new Set<string>();
   private _circuitBreaker = new CircuitBreaker();
   private _inbox = new InboxManager();
   /** cwd → detected language, so the manifest probe runs once per directory. */
@@ -605,13 +1489,13 @@ export class SessionManager {
 
     // Load persisted session registry from disk
     this.persistedSessions = loadPersistedSessions();
+    SessionManager.liveAutoloopOwnerInstanceIds.add(this.autoloopOwnerInstanceId);
     // Clean up orphaned child processes from a previous unclean exit
     this._cleanupOrphanedPids();
-    // Debounced async writer — at most one write per 5 seconds on hot paths
-    this._debouncedSave = makeDebounced(
-      () => savePersistedSessionsAsync(this.persistedSessions, this.logger),
-      DEBOUNCED_SAVE_MS,
-    );
+    // Debounced writer — at most one write per 5 seconds on hot paths. The
+    // eventual write still enters the shared registry lock so it cannot race a
+    // generation transition from another process.
+    this._debouncedSave = makeDebounced(() => this._persistRegistrySnapshot(), DEBOUNCED_SAVE_MS);
 
     // Start TTL cleanup timer
     this.cleanupTimer = setInterval(() => this._cleanupIdleSessions(), CLEANUP_INTERVAL_MS);
@@ -668,8 +1552,527 @@ export class SessionManager {
 
   // ─── Session Lifecycle ─────────────────────────────────────────────────
 
-  async startSession(config: Partial<SessionConfig> & { name?: string }): Promise<SessionInfo> {
+  private _syncPersistedSessions(authoritative: Map<string, PersistedSession>): void {
+    this.persistedSessions.clear();
+    for (const [name, session] of authoritative) this.persistedSessions.set(name, session);
+  }
+
+  private _withAgentRegistryLock<T>(
+    operation: (authoritative: Map<string, PersistedSession>) => {
+      value: T;
+      updatedSessions?: Map<string, PersistedSession>;
+    },
+  ): { ok: true; value: T } | { ok: false; error: AutoloopAgentRegistryError } {
+    const localBefore = new Map(this.persistedSessions);
+    let visibleSessions: Map<string, PersistedSession> | undefined;
+    let locked: ReturnType<typeof withFileLock<{ persistError?: AutoloopAgentRegistryError; value: T }>>;
+    try {
+      locked = withFileLock(
+        PERSIST_LOCK_FILE,
+        () => {
+          const authoritative = loadPersistedSessions();
+          const result = operation(authoritative);
+          const updated = result.updatedSessions;
+          if (updated) {
+            const persisted = savePersistedSessions(updated, this.logger);
+            if (!persisted.ok) {
+              visibleSessions = authoritative;
+              return { persistError: persisted.error, value: result.value };
+            }
+          }
+          visibleSessions = updated ?? authoritative;
+          return { value: result.value };
+        },
+        { createParent: true },
+      );
+    } catch (err) {
+      if (err instanceof AutoloopAgentRegistryError) return { ok: false, error: err };
+      if (isFileLockReleaseError(err)) {
+        return {
+          ok: false,
+          error: new AutoloopAgentRegistryError(
+            'AUTOLOOP_AGENT_REGISTRY_LOCK_CLEANUP_FAILED',
+            `The session registry write may have committed, but its lock could not be safely released: ${err.message}`,
+            { cause: err },
+          ),
+        };
+      }
+      throw err;
+    }
+    if (!locked.ok) {
+      if (locked.reason === 'cleanup_failed') {
+        return {
+          ok: false,
+          error: new AutoloopAgentRegistryError(
+            'AUTOLOOP_AGENT_REGISTRY_LOCK_CLEANUP_FAILED',
+            `Could not safely clean up the shared session registry lock: ${locked.error}`,
+            { cause: locked.cause },
+          ),
+        };
+      }
+      return {
+        ok: false,
+        error: new AutoloopAgentRegistryError(
+          'AUTOLOOP_AGENT_REGISTRY_LOCK_CONTENDED',
+          `Could not enter the shared session registry lock: ${locked.error}`,
+        ),
+      };
+    }
+    this._syncPersistedSessions(mergeRegistryView(visibleSessions!, localBefore));
+    if (locked.value.persistError) return { ok: false, error: locked.value.persistError };
+    return { ok: true, value: locked.value.value };
+  }
+
+  private _persistRegistrySnapshot(): boolean {
+    const desired = new Map(this.persistedSessions);
+    const transaction = this._withAgentRegistryLock((authoritative) => ({
+      value: true,
+      updatedSessions: mergeRegistrySnapshot(authoritative, desired),
+    }));
+    if (!transaction.ok) {
+      this.logger.warn('Failed to persist sessions:', transaction.error.message);
+      return false;
+    }
+    return transaction.value;
+  }
+
+  private _finishAgentRelease(): void {
+    this._agentReleasesInFlight -= 1;
+    if (this._agentReleasesInFlight !== 0) return;
+    const waiters = this._agentReleaseWaiters.splice(0);
+    for (const resolve of waiters) resolve();
+  }
+
+  private async _waitForAgentReleases(): Promise<void> {
+    if (this._agentReleasesInFlight === 0) return;
+    await new Promise<void>((resolve) => this._agentReleaseWaiters.push(resolve));
+  }
+
+  private _agentReleaseOperationKey(
+    sessionName: string,
+    expectedGeneration: number,
+    options: Exclude<AgentReservationReleaseOptions, { rollbackUncommittedReservation: true }>,
+  ): string {
+    return [
+      sessionName,
+      expectedGeneration,
+      options.expectedOwnerInstanceId,
+      options.expectedSessionId ?? '',
+      options.releaseOwnerInstanceId,
+    ].join('\0');
+  }
+
+  /**
+   * Atomically reserve an Autoloop physical name for one durable generation.
+   * The existing session registry is the reservation store; no parallel
+   * database is introduced.
+   */
+  reserveAgentGeneration(generation: PhysicalAgentGeneration, cwd: string): boolean {
+    if (
+      !Number.isInteger(generation.generation) ||
+      generation.generation < 1 ||
+      generation.session_name.length === 0 ||
+      generation.owner_instance_id.length === 0 ||
+      !generation.session_id
+    ) {
+      return false;
+    }
+
+    const transaction = this._withAgentRegistryLock((authoritative) => {
+      const existing = authoritative.get(generation.session_name);
+      if (existing?.agentReleasePending) return { value: false };
+      if (existing?.agentGeneration !== undefined) {
+        return {
+          value:
+            existing.agentGeneration === generation.generation &&
+            existing.agentOwnerInstanceId === generation.owner_instance_id &&
+            existing.agentSessionId === generation.session_id,
+        };
+      }
+      if (existing && existing.agentReleasedGeneration === undefined) {
+        // Legacy registry-only entries must be explicitly released as
+        // generation zero before they can become a fenced reservation.
+        return { value: false };
+      }
+      if (
+        existing?.agentReleasedGeneration !== undefined &&
+        generation.generation !== existing.agentReleasedGeneration + 1
+      ) {
+        return { value: false };
+      }
+
+      const observedAt = Date.parse(generation.last_activity_at);
+      const updatedSessions = new Map(authoritative);
+      updatedSessions.set(generation.session_name, {
+        name: generation.session_name,
+        claudeSessionId: existing?.claudeSessionId ?? '',
+        cwd: existing?.cwd ?? cwd,
+        model: existing?.model,
+        engine: existing?.engine,
+        sandboxMode: existing?.sandboxMode,
+        originalCreated: existing?.originalCreated ?? generation.created_at,
+        lastResumed: existing?.lastResumed ?? generation.created_at,
+        lastActivity: Number.isNaN(observedAt) ? Date.now() : observedAt,
+        agentGeneration: generation.generation,
+        agentOwnerInstanceId: generation.owner_instance_id,
+        agentSessionId: generation.session_id,
+        agentReleasePending: undefined,
+        agentReleaseOwnerInstanceId: undefined,
+        agentReleasedGeneration: existing?.agentReleasedGeneration,
+        agentReleasedOwnerInstanceId: existing?.agentReleasedOwnerInstanceId,
+        agentReleasedSessionId: existing?.agentReleasedSessionId,
+      });
+      return { value: true, updatedSessions };
+    });
+    if (!transaction.ok) throw transaction.error;
+    return transaction.value;
+  }
+
+  /**
+   * Atomically prove that a physical name is reusable without reserving it.
+   * This is the same authoritative predicate `reserveAgentGeneration` uses,
+   * but it performs no registry write, so a failed probe cannot strand a new
+   * occupied reservation or a rollback-pending fence.
+   */
+  probeAgentNameReusable(sessionName: string, released?: PhysicalAgentGeneration): boolean {
+    if (this.sessions.has(sessionName) || this._pendingSessions.has(sessionName)) return false;
+    const transaction = this._withAgentRegistryLock((authoritative) => {
+      const reservation = authoritative.get(sessionName);
+      if (!released) {
+        return {
+          value:
+            reservation === undefined ||
+            (reservation.agentGeneration === undefined &&
+              reservation.agentReleasePending !== true &&
+              reservation.agentReleasedGeneration !== undefined),
+        };
+      }
+      return {
+        value: Boolean(
+          reservation &&
+          reservation.agentGeneration === undefined &&
+          reservation.agentReleasePending !== true &&
+          reservation.agentReleasedGeneration === released.generation &&
+          reservation.agentReleasedOwnerInstanceId === released.owner_instance_id &&
+          reservation.agentReleasedSessionId === released.session_id,
+        ),
+      };
+    });
+    if (!transaction.ok) throw transaction.error;
+    return transaction.value;
+  }
+
+  /** Backward-compatible exact-tombstone predicate. */
+  isAgentGenerationReleased(generation: PhysicalAgentGeneration): boolean {
+    return this.probeAgentNameReusable(generation.session_name, generation);
+  }
+
+  /** Inspect only runtime/session-registry facts for one physical name. */
+  async inspect(sessionName: string, sessionId?: string): Promise<AgentRuntimeLiveness> {
+    if (this.sessions.has(sessionName)) return 'live';
+    if (this._pendingSessions.has(sessionName)) return 'unknown';
+
+    const reservation = this.persistedSessions.get(sessionName);
+    if (reservation?.agentSessionId && sessionId && reservation.agentSessionId !== sessionId) {
+      return 'unknown';
+    }
+    return this._inspectSharedPidEvidence(sessionName) ?? 'absent';
+  }
+
+  private _inspectSharedPidEvidence(sessionName: string): AgentRuntimeLiveness | undefined {
+    if (!fs.existsSync(SessionManager.PID_FILE)) return undefined;
+
+    let entries: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(SessionManager.PID_FILE, 'utf8')) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return 'unknown';
+      entries = parsed as Record<string, unknown>;
+    } catch {
+      return 'unknown';
+    }
+    if (!Object.prototype.hasOwnProperty.call(entries, sessionName)) return undefined;
+
+    const raw = entries[sessionName];
+    if (typeof raw === 'number') return 'unknown';
+    if (!raw || typeof raw !== 'object') return 'unknown';
+    const entry = raw as { pid?: unknown; ownerPid?: unknown };
+    if (
+      typeof entry.pid !== 'number' ||
+      !Number.isInteger(entry.pid) ||
+      entry.pid <= 0 ||
+      typeof entry.ownerPid !== 'number' ||
+      !Number.isInteger(entry.ownerPid) ||
+      entry.ownerPid <= 0
+    ) {
+      return 'unknown';
+    }
+
+    if (entry.ownerPid === process.pid) {
+      const locallyOwnedPid = this._activePids.get(sessionName);
+      if (locallyOwnedPid !== undefined) {
+        if (locallyOwnedPid !== entry.pid) return 'unknown';
+        return this._probePidLiveness(entry.pid);
+      }
+      // A host-shared file can retain an entry written by an earlier manager
+      // instance in this same process. The process being alive is not proof
+      // that this manager still owns the child.
+      return this._probePidLiveness(entry.pid) === 'absent' ? 'absent' : 'unknown';
+    }
+
+    const ownerLiveness = this._probePidLiveness(entry.ownerPid);
+    if (ownerLiveness === 'live') return 'live';
+    if (ownerLiveness === 'unknown') return 'unknown';
+    return this._probePidLiveness(entry.pid) === 'absent' ? 'absent' : 'unknown';
+  }
+
+  private _probePidLiveness(pid: number): AgentRuntimeLiveness {
+    try {
+      process.kill(pid, 0);
+      return 'live';
+    } catch (err) {
+      return (err as { code?: string }).code === 'ESRCH' ? 'absent' : 'unknown';
+    }
+  }
+
+  private _inspectReleaseOwner(ownerInstanceId: string): AgentRuntimeLiveness {
+    if (SessionManager.liveAutoloopOwnerInstanceIds.has(ownerInstanceId)) return 'live';
+    const match = /^session-manager:(\d+):[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.exec(ownerInstanceId);
+    if (!match) return 'unknown';
+    const ownerPid = Number(match[1]);
+    if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) return 'unknown';
+    // A same-process owner absent from the local live-owner set completed
+    // shutdown. Merely probing our own process would otherwise make the stale
+    // owner look live forever.
+    if (ownerPid === process.pid) return 'absent';
+    return this._probePidLiveness(ownerPid);
+  }
+
+  /**
+   * Compare-and-release a name reservation. Active or in-flight sessions are
+   * never released, and a stale generation cannot release its replacement.
+   */
+  async releaseReservation(
+    sessionName: string,
+    expectedGeneration: number,
+    options: AgentReservationReleaseOptions,
+  ): Promise<boolean> {
+    if (!options.rollbackUncommittedReservation && !isRecoverableAgentOwnerInstanceId(options.releaseOwnerInstanceId)) {
+      throw new AutoloopAgentReleaseOwnerError(options.releaseOwnerInstanceId);
+    }
+    if (this.sessions.has(sessionName) || this._pendingSessions.has(sessionName)) return false;
+
+    if (options.rollbackUncommittedReservation) {
+      if (this._agentReleaseFenceClosed) return false;
+      const rollback = this._withAgentRegistryLock((authoritative) => {
+        const existing = authoritative.get(sessionName);
+        if (
+          !existing ||
+          existing.agentReleasePending ||
+          existing.agentGeneration !== expectedGeneration ||
+          options.expectedOwnerInstanceId === undefined ||
+          existing.agentOwnerInstanceId !== options.expectedOwnerInstanceId ||
+          options.expectedSessionId === undefined ||
+          existing.agentSessionId !== options.expectedSessionId
+        ) {
+          return { value: false };
+        }
+        const updatedSessions = new Map(authoritative);
+        if (existing.agentReleasedGeneration === undefined) {
+          updatedSessions.delete(sessionName);
+        } else {
+          updatedSessions.set(sessionName, {
+            ...existing,
+            agentGeneration: undefined,
+            agentOwnerInstanceId: undefined,
+            agentSessionId: undefined,
+            agentReleasePending: undefined,
+            agentReleaseOwnerInstanceId: undefined,
+          });
+        }
+        return { value: true, updatedSessions };
+      });
+      if (!rollback.ok) throw rollback.error;
+      return rollback.value;
+    }
+
+    const releaseOperationKey = this._agentReleaseOperationKey(sessionName, expectedGeneration, options);
+    const activeRelease = this._agentReleaseOperations.get(releaseOperationKey);
+    if (activeRelease) return await activeRelease;
+    if (this._agentReleaseFenceClosed) return false;
+
+    const activeTupleMatches = (reservation: PersistedSession): boolean =>
+      reservation.agentGeneration === expectedGeneration &&
+      reservation.agentOwnerInstanceId === options.expectedOwnerInstanceId &&
+      reservation.agentSessionId === options.expectedSessionId;
+    const claim = this._withAgentRegistryLock((authoritative) => {
+      const existing = authoritative.get(sessionName);
+      if (!existing) return { value: 'rejected' as const };
+
+      if (
+        existing.agentGeneration === undefined &&
+        existing.agentReleasePending !== true &&
+        existing.agentReleasedGeneration !== undefined
+      ) {
+        if (existing.agentReleasedGeneration !== expectedGeneration) {
+          return { value: 'rejected' as const };
+        }
+        if (
+          (existing.agentReleasedOwnerInstanceId !== undefined &&
+            existing.agentReleasedOwnerInstanceId !== options.expectedOwnerInstanceId) ||
+          (existing.agentReleasedSessionId !== undefined &&
+            existing.agentReleasedSessionId !== options.expectedSessionId)
+        ) {
+          return { value: 'rejected' as const };
+        }
+        return { value: 'idempotent' as const };
+      }
+
+      if (existing.agentReleasePending) {
+        if (!activeTupleMatches(existing) || !options.releaseOwnerInstanceId) {
+          return { value: 'rejected' as const };
+        }
+        const priorReleaseOwner = existing.agentReleaseOwnerInstanceId;
+        if (priorReleaseOwner === options.releaseOwnerInstanceId) return { value: 'claimed' as const };
+        if (priorReleaseOwner !== undefined && this._inspectReleaseOwner(priorReleaseOwner) !== 'absent') {
+          return { value: 'rejected' as const };
+        }
+        const updatedSessions = new Map(authoritative);
+        updatedSessions.set(sessionName, {
+          ...existing,
+          agentReleaseOwnerInstanceId: options.releaseOwnerInstanceId,
+        });
+        return { value: 'claimed' as const, updatedSessions };
+      }
+
+      if (existing.agentGeneration !== undefined) {
+        if (!activeTupleMatches(existing) || !options.releaseOwnerInstanceId) {
+          return { value: 'rejected' as const };
+        }
+        const updatedSessions = new Map(authoritative);
+        updatedSessions.set(sessionName, {
+          ...existing,
+          agentReleasePending: true,
+          agentReleaseOwnerInstanceId: options.releaseOwnerInstanceId,
+        });
+        return { value: 'claimed' as const, updatedSessions };
+      }
+
+      // A pre-generation registry entry is fenced as generation zero instead
+      // of being deleted, so a crash cannot expose its name between evidence
+      // writes.
+      if (
+        expectedGeneration !== 0 ||
+        options.expectedOwnerInstanceId !== 'legacy-registry' ||
+        !Object.prototype.hasOwnProperty.call(options, 'expectedSessionId') ||
+        !options.releaseOwnerInstanceId
+      ) {
+        return { value: 'rejected' as const };
+      }
+      const updatedSessions = new Map(authoritative);
+      updatedSessions.set(sessionName, {
+        ...existing,
+        agentGeneration: 0,
+        agentOwnerInstanceId: options.expectedOwnerInstanceId,
+        agentSessionId: options.expectedSessionId,
+        agentReleasePending: true,
+        agentReleaseOwnerInstanceId: options.releaseOwnerInstanceId,
+      });
+      return { value: 'claimed' as const, updatedSessions };
+    });
+    if (!claim.ok) throw claim.error;
+    if (claim.value === 'rejected') return false;
+    if (claim.value === 'idempotent') return true;
+
+    this._agentReleasesInFlight += 1;
+    let releaseOperation: Promise<boolean>;
+    try {
+      releaseOperation = Promise.resolve().then(() => {
+        try {
+          if (options.beforeRelease && !this._completedBeforeReleaseHooks.has(releaseOperationKey)) {
+            options.beforeRelease();
+            this._completedBeforeReleaseHooks.add(releaseOperationKey);
+          }
+
+          // Returning false without this hook deliberately leaves the durable
+          // tombstone in place. A caller may retry with the evidence writer, but may
+          // not make the physical name reusable without it.
+          if (!options.persistReleaseEvidence) return false;
+          if (!this._completedReleaseEvidenceHooks.has(releaseOperationKey)) {
+            options.persistReleaseEvidence();
+            this._completedReleaseEvidenceHooks.add(releaseOperationKey);
+          }
+
+          const completion = this._withAgentRegistryLock((authoritative) => {
+            const stillPending = authoritative.get(sessionName);
+            if (
+              !stillPending?.agentReleasePending ||
+              !activeTupleMatches(stillPending) ||
+              stillPending.agentReleaseOwnerInstanceId !== options.releaseOwnerInstanceId
+            ) {
+              return { value: false };
+            }
+            const updatedSessions = new Map(authoritative);
+            updatedSessions.set(sessionName, {
+              ...stillPending,
+              agentGeneration: undefined,
+              agentOwnerInstanceId: undefined,
+              agentSessionId: undefined,
+              agentReleasePending: undefined,
+              agentReleaseOwnerInstanceId: undefined,
+              agentReleasedGeneration: expectedGeneration,
+              agentReleasedOwnerInstanceId: stillPending.agentOwnerInstanceId,
+              agentReleasedSessionId: stillPending.agentSessionId,
+            });
+            return { value: true, updatedSessions };
+          });
+          if (!completion.ok) throw completion.error;
+          if (completion.value) {
+            this._completedBeforeReleaseHooks.delete(releaseOperationKey);
+            this._completedReleaseEvidenceHooks.delete(releaseOperationKey);
+          }
+          return completion.value;
+        } finally {
+          this._finishAgentRelease();
+        }
+      });
+    } catch (err) {
+      this._finishAgentRelease();
+      throw err;
+    }
+    this._agentReleaseOperations.set(releaseOperationKey, releaseOperation);
+    try {
+      return await releaseOperation;
+    } finally {
+      if (this._agentReleaseOperations.get(releaseOperationKey) === releaseOperation) {
+        this._agentReleaseOperations.delete(releaseOperationKey);
+      }
+    }
+  }
+
+  async startSession(
+    config: Partial<SessionConfig> & { name?: string },
+    agentGeneration?: PhysicalAgentGeneration,
+  ): Promise<SessionInfo> {
     const name = config.name || `session-${Date.now()}`;
+
+    const reservation = this.persistedSessions.get(name);
+    const reservationMatches =
+      agentGeneration !== undefined &&
+      reservation?.agentReleasePending !== true &&
+      reservation?.agentGeneration === agentGeneration.generation &&
+      reservation.agentOwnerInstanceId === agentGeneration.owner_instance_id &&
+      reservation.agentSessionId === agentGeneration.session_id;
+    if (
+      (reservation?.agentGeneration !== undefined ||
+        reservation?.agentReleasePending === true ||
+        reservation?.agentReleasedGeneration !== undefined ||
+        agentGeneration !== undefined) &&
+      !reservationMatches
+    ) {
+      throw Object.assign(new Error(`Autoloop session name '${name}' has a conflicting generation reservation`), {
+        code: 'AUTOLOOP_AGENT_GENERATION_CONFLICT',
+      });
+    }
 
     // Check pending first — a concurrent caller may have already started creation
     const pending = this._pendingSessions.get(name);
@@ -1279,7 +2682,16 @@ export class SessionManager {
           unregisterPublisher: (runId) => this._autoloopPublishers.delete(runId),
           extra: (runId) => {
             const roleSelection = this._autoloopSelection.get(runId);
-            return roleSelection ? { roleSelection } : {};
+            const handle = kernel.handle<AutoloopHandle & { dispatcher: ClaudeAgentDispatcher }>(runId, LEGACY_NODE);
+            if (!handle) throw new Error(`Autoloop run '${runId}' has no live ledger while publishing its checkpoint`);
+            const decisionLog = handle.dispatcher.secureLedgerCapability.readFlatFile('decisions.jsonl') ?? '';
+            return {
+              ...(roleSelection ? { roleSelection } : {}),
+              // Internal recovery metadata, intentionally outside AutoloopState:
+              // the hash proves the saved byte boundary is still a prefix, and
+              // the byte offset supplies append causality without trusting time.
+              detachedFailureLedgerCursor: detachedFailureLedgerCursor(decisionLog),
+            };
           },
         }),
       );
@@ -1340,6 +2752,24 @@ export class SessionManager {
    * because they were never written down.
    */
   async workflowResume(runId: string, opts: { secrets?: Record<string, unknown> } = {}): Promise<RunRecord> {
+    const stored = loadRun(runId);
+    if (stored?.workflow === 'autoloop') {
+      const supplied = opts.secrets ?? {};
+      const named =
+        supplied.agentCustomEngines &&
+        typeof supplied.agentCustomEngines === 'object' &&
+        !Array.isArray(supplied.agentCustomEngines)
+          ? (supplied.agentCustomEngines as Record<string, unknown>)
+          : {};
+      await this.autoloopResume(runId, {
+        plannerCustomEngine: (named.planner ?? supplied.plannerCustomEngine) as CustomEngineConfig | undefined,
+        coderCustomEngine: (named.coder ?? supplied.coderCustomEngine) as CustomEngineConfig | undefined,
+        reviewerCustomEngine: (named.reviewer ?? supplied.reviewerCustomEngine) as CustomEngineConfig | undefined,
+      });
+      const resumed = loadRun(runId);
+      if (!resumed) throw new Error(`Workflow run '${runId}' not found after Autoloop recovery`);
+      return resumed;
+    }
     return this.kernel.resume(runId, { secrets: opts.secrets });
   }
 
@@ -1411,8 +2841,15 @@ export class SessionManager {
       // Callers that want the session resumable (autoloop terminate that
       // should still allow /autoloop/<id>/resume to reattach the Planner's
       // Claude conversation) pass keepPersisted: true.
-      this.persistedSessions.delete(name);
-      savePersistedSessions(this.persistedSessions, this.logger);
+      const persisted = this.persistedSessions.get(name);
+      if (persisted?.agentGeneration !== undefined) {
+        // Keep the generation fence until the dispatcher has durably appended
+        // its release evidence and performs compare-and-release.
+        this.persistedSessions.set(name, { ...persisted, claudeSessionId: '' });
+      } else {
+        this.persistedSessions.delete(name);
+      }
+      this._persistRegistrySnapshot();
     }
   }
 
@@ -1844,7 +3281,19 @@ export class SessionManager {
    *
    * After shutdown(), no new sessions can be started. Idempotent.
    */
-  async shutdown(): Promise<void> {
+  shutdown(): Promise<void> {
+    if (this._shutdownPromise) return this._shutdownPromise;
+    let resolveShutdown!: () => void;
+    let rejectShutdown!: (reason?: unknown) => void;
+    this._shutdownPromise = new Promise<void>((resolve, reject) => {
+      resolveShutdown = resolve;
+      rejectShutdown = reject;
+    });
+    void this._performShutdown().then(resolveShutdown, rejectShutdown);
+    return this._shutdownPromise;
+  }
+
+  private async _performShutdown(): Promise<void> {
     if (this.cleanupTimer) {
       clearInterval(this.cleanupTimer);
       this.cleanupTimer = null;
@@ -1875,8 +3324,15 @@ export class SessionManager {
       this._proxyServer = null;
       this._proxyPort = null;
     }
+    // Kernel teardown may legitimately release Autoloop agents. Once it has
+    // finished initiating those releases, close the fence before observing
+    // the registered-operation count so no later claim can escape the wait.
+    this._agentReleaseFenceClosed = true;
+    await this._waitForAgentReleases();
+    this._debouncedSave.cancel();
     // Persist final state (TTL-expired sessions already removed by cleanup)
-    savePersistedSessions(this.persistedSessions, this.logger);
+    this._persistRegistrySnapshot();
+    SessionManager.liveAutoloopOwnerInstanceIds.delete(this.autoloopOwnerInstanceId);
   }
 
   // ─── Codex /goal helpers (codex-app engine only) ─────────────────────
@@ -2388,14 +3844,18 @@ export class SessionManager {
 
   private _persistSession(name: string, managed: ManagedSession): void {
     const resumeSessionId = this._managedResumeId(managed);
+    const existing = this.persistedSessions.get(name);
     if (!resumeSessionId) {
-      if (managed.config.engine === 'agy' && this.persistedSessions.delete(name)) {
+      if (
+        managed.config.engine === 'agy' &&
+        existing?.agentGeneration === undefined &&
+        this.persistedSessions.delete(name)
+      ) {
         this._debouncedSave();
       }
       return;
     }
     managed.claudeSessionId = resumeSessionId;
-    const existing = this.persistedSessions.get(name);
     this.persistedSessions.set(name, {
       name,
       claudeSessionId: resumeSessionId,
@@ -2406,6 +3866,14 @@ export class SessionManager {
       originalCreated: existing?.originalCreated || managed.created,
       lastResumed: new Date().toISOString(),
       lastActivity: managed.lastActivity,
+      agentGeneration: existing?.agentGeneration,
+      agentOwnerInstanceId: existing?.agentOwnerInstanceId,
+      agentSessionId: existing?.agentSessionId,
+      agentReleasePending: existing?.agentReleasePending,
+      agentReleaseOwnerInstanceId: existing?.agentReleaseOwnerInstanceId,
+      agentReleasedGeneration: existing?.agentReleasedGeneration,
+      agentReleasedOwnerInstanceId: existing?.agentReleasedOwnerInstanceId,
+      agentReleasedSessionId: existing?.agentReleasedSessionId,
     });
     this._debouncedSave();
   }
@@ -2918,6 +4386,31 @@ export class SessionManager {
   private _autoloopSelection = new Map<string, unknown>();
   /** Per-run checkpoint refreshers, registered by the autoloop node executor. */
   private _autoloopPublishers = new Map<string, () => void>();
+  /**
+   * Per-run Planner-chat transaction tails. Dispatcher reply/phase-error events
+   * are run-scoped rather than message-scoped, so only one listener pair may
+   * own a run at a time.
+   */
+  private _autoloopChatTransactions = new Map<string, Promise<void>>();
+  private _autoloopReviewTransactions = new Map<string, Promise<void>>();
+  /** One in-process recovery transaction per logical run and token; durable receipts fence restarts. */
+  private _autoloopRecoveryTransactions = new Map<string, Promise<RecoveryResult>>();
+  /** One in-process receipt-free stored resume per logical run boundary. */
+  private _autoloopStoredResumeTransactions = new Map<string, Promise<AutoloopState>>();
+  private _autoloopReleasedReviewIterations = new Map<string, Map<string, number>>();
+  private _autoloopReviewDeleting = new Set<string>();
+  private _autoloopReviewDeleteCounts = new Map<string, number>();
+  /** Logical Planner chat identity and any causally observed Dispatcher audit. */
+  private _autoloopFailureBindings = new WeakMap<object, Readonly<AutoloopChatFailureBinding>>();
+  /** Successfully published logical bindings, including projections that later roll out of state. */
+  private _completedAutoloopFailureBindings = new WeakSet<object>();
+  /** Stable retry id for direct callers whose failure has no Planner chat id. */
+  private _detachedAutoloopFailureIds = new WeakMap<object, string>();
+  /** In-flight logical recordings; settled entries are always removed. */
+  private _detachedAutoloopFailureRecordings = new Map<
+    string,
+    Promise<Readonly<PublicAutoloopFailure | PublicAutoloopUnknownFailure>>
+  >();
 
   async ultraplanStart(
     task: string,
@@ -3204,24 +4697,45 @@ export class SessionManager {
         on(event: string, fn: () => void): void;
         off(event: string, fn: () => void): void;
         stop(): void;
+        waitForTermination(): Promise<void>;
       };
       const done = (): boolean => runner.state.status === 'terminated' || runner.state.status === 'crashed';
-      if (done()) return resolve();
-      const check = (): void => {
-        if (done() || signal.aborted) {
-          runner.off('state', check);
-          clearInterval(poll);
-          if (signal.aborted) {
-            // Cancelling a run has to tear the loop down the way a stop does.
-            // Without this the three persistent agents keep running and their
-            // session names stay claimed, so the run cannot be restarted — the
-            // failure looks like "session name already in use" a long way from
-            // its cause.
-            runner.stop();
-            void handle.dispatcher.shutdown('cancelled').catch(() => undefined);
-          }
+      const finishNaturalExit = (): void => {
+        if (runner.state.status === 'crashed') {
           resolve();
+          return;
         }
+        // `terminated` is published when teardown starts. Keep the kernel node
+        // live until the runner's dispatcher shutdown has actually settled so
+        // SessionManager shutdown cannot close release admission too early.
+        void runner.waitForTermination().then(resolve, resolve);
+      };
+      if (done()) {
+        finishNaturalExit();
+        return;
+      }
+      let settling = false;
+      const check = (): void => {
+        if ((!done() && !signal.aborted) || settling) return;
+        settling = true;
+        runner.off('state', check);
+        clearInterval(poll);
+        if (!signal.aborted) {
+          finishNaturalExit();
+          return;
+        }
+        // Cancelling a run has to tear the loop down the way a stop does.
+        // Without this the three persistent agents keep running and their
+        // session names stay claimed, so the run cannot be restarted — the
+        // failure looks like "session name already in use" a long way from
+        // its cause. The kernel exit remains pending through that teardown so
+        // SessionManager shutdown cannot close its release-admission fence
+        // while the dispatcher is still releasing physical generations.
+        runner.stop();
+        void handle.dispatcher
+          .shutdown('cancelled')
+          .catch(() => undefined)
+          .then(() => resolve());
       };
       runner.on('state', check);
       // The runner emits on state changes, but a cancel arrives out of band and
@@ -3255,6 +4769,8 @@ export class SessionManager {
     _resumeTimeoutMigration?: boolean;
     /** In-memory commit barrier for a prepared append-only migration record. */
     _commitTimeoutMigration?: () => void;
+    /** Run-scoped capability pinned before a stored resume transaction starts. */
+    _secureLedger?: SecureAutoloopLedger;
   }): Promise<{
     runner: AutoloopRunner;
     dispatcher: ClaudeAgentDispatcher;
@@ -3273,10 +4789,18 @@ export class SessionManager {
         throw new Error(`Autoloop session name '${sessionName}' is already in use`);
       }
     }
-    const ledgerDir = path.join(opts.workspace, 'tasks', opts.runId);
-    if (!fs.existsSync(ledgerDir)) {
-      fs.mkdirSync(ledgerDir, { recursive: true });
-    }
+    const secureLedger =
+      opts._secureLedger ??
+      SecureAutoloopLedger.open(opts.workspace, opts.runId, {
+        create: true,
+        logger: this.logger,
+      });
+    // A resume may carry a capability opened before the runtime was booted.
+    // Revalidate its pinned path and every existing flat ledger before any
+    // physical agent session can start.
+    secureLedger.assertIdentity();
+    secureLedger.validateExistingFlatFiles();
+    const ledgerDir = secureLedger.directory;
     // Per-run policy object — mutable so Planner's update_push_policy is visible
     // to the runner without re-wiring.
     const pushPolicy: PushPolicy = JSON.parse(JSON.stringify(DEFAULT_PUSH_POLICY)) as PushPolicy;
@@ -3301,14 +4825,18 @@ export class SessionManager {
       reviewerEffort: opts.reviewerEffort,
       reviewerCustomEngine: opts.reviewerCustomEngine,
       sendTimeoutMs: opts.sendTimeoutMs,
+      agentLeaseMs: opts.activityLeaseMs,
+      runtimeProbe: this,
+      ownerInstanceId: this.autoloopOwnerInstanceId,
       suppressFailedStartAudit: opts._resumeTimeoutMigration,
+      secureLedger,
       logger: this.logger,
       pushPolicyRef: pushPolicy,
       onSpawnSubagents: async (args) => {
         this.logger.info?.(`[autoloop/${runId}] spawn_subagents starting Coder + Reviewer sessions`);
         await dispatcherRef?.spawnSubagents(args);
-        runnerRef?.markSubagentsSpawned();
       },
+      onSpawnSubagentsCommitted: () => runnerRef?.markSubagentsSpawned(),
       onRoleSelectionChanged: async (selection) => {
         // Used to write a row into a private append-only registry file. The run
         // record is the registry now, so this just refreshes the published
@@ -3332,19 +4860,26 @@ export class SessionManager {
           channel,
           logger: this.logger,
         });
-        appendPushLog(ledgerDir, {
-          ts: new Date().toISOString(),
-          level,
-          summary,
-          detail,
-          channel_requested: channel,
-          channel_used: result.channel_used,
-        });
+        appendPushLog(
+          secureLedger,
+          {
+            ts: new Date().toISOString(),
+            level,
+            summary,
+            detail,
+            channel_requested: channel,
+            channel_used: result.channel_used,
+          },
+          this.logger,
+        );
         this.logger.info?.(
           `[autoloop/${runId}] push level=${level} channel=${channel}→${result.channel_used} summary="${summary.slice(0, 80)}"`,
         );
       },
       dispatcher,
+      persistReviewEnvelope: async (envelope) => {
+        this._appendRecoveryReviewEnvelope(secureLedger, runId, envelope);
+      },
       sendTimeoutMs: opts.sendTimeoutMs,
       activityLeaseMs: opts.activityLeaseMs,
       autoloopHardTimeoutMs: opts.autoloopHardTimeoutMs,
@@ -3474,19 +5009,376 @@ export class SessionManager {
    * natural-language reply.
    */
   async autoloopChat(runId: string, text: string): Promise<{ reply: string }> {
+    const predecessor = this._autoloopChatTransactions.get(runId) ?? Promise.resolve();
+    let release!: () => void;
+    const transaction = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = predecessor.then(() => transaction);
+    this._autoloopChatTransactions.set(runId, tail);
+    await predecessor;
+    try {
+      return await this._autoloopChatTransaction(runId, text);
+    } finally {
+      release();
+      if (this._autoloopChatTransactions.get(runId) === tail) {
+        this._autoloopChatTransactions.delete(runId);
+      }
+    }
+  }
+
+  private _bindAutoloopChatFailure(
+    error: unknown,
+    logicalId: string,
+    ledger: SecureAutoloopLedger,
+    decisionLogBefore: string | undefined,
+    runnerEntriesBefore: ReadonlySet<object>,
+    recentRunnerEntries: readonly AutoloopState['recent_phase_errors'][number][],
+    relatedError?: unknown,
+  ): unknown {
+    let preaudited: DurableDetachedAutoloopFailureRow | undefined;
+    let runnerProjection: AutoloopState['recent_phase_errors'][number] | undefined;
+    const typed = toPublicAutoloopFailure(error);
+    if (typed && decisionLogBefore !== undefined) {
+      try {
+        const decisionLogAfter = ledger.readFlatFile('decisions.jsonl') ?? '';
+        preaudited = newlyAppendedDispatcherPreaudit(decisionLogBefore, decisionLogAfter, detachedPhaseFailure(typed));
+      } catch {
+        // No exact ledger proof means no preaudit suppression. The detached
+        // adapter will append its own identified row instead.
+      }
+    }
+    if (typed) {
+      const targetKey = detachedPhaseFailureKey(detachedPhaseFailure(typed));
+      for (let index = recentRunnerEntries.length - 1; index >= 0; index -= 1) {
+        const entry = recentRunnerEntries[index];
+        if (
+          !runnerEntriesBefore.has(entry as object) &&
+          ownDataValue(entry as object, DETACHED_AUTOLOOP_FAILURE_ID) === undefined &&
+          detachedPhaseFailureKey(entry as DetachedAutoloopPhaseFailure) === targetKey
+        ) {
+          runnerProjection = entry;
+          break;
+        }
+      }
+    }
+    const binding = publicData({
+      logicalId,
+      ...(preaudited ? { preaudited } : {}),
+      ...(runnerProjection ? { runnerProjection } : {}),
+    });
+    const pending = [error, relatedError];
+    const seen = new Set<object>();
+    while (pending.length > 0) {
+      const candidate = pending.pop();
+      if (!((typeof candidate === 'object' && candidate !== null) || typeof candidate === 'function')) continue;
+      const reference = candidate as object;
+      if (seen.has(reference)) continue;
+      seen.add(reference);
+      this._autoloopFailureBindings.set(reference, binding);
+      try {
+        pending.push(ownDataValue(reference, 'cause'));
+      } catch {
+        // A hostile cause descriptor cannot invalidate binding the surfaced
+        // error itself.
+      }
+    }
+    return error;
+  }
+
+  private async _autoloopChatTransaction(runId: string, text: string): Promise<{ reply: string }> {
     const ctx = this._liveAutoloop(runId);
+    const chatEnvelope = AutoloopMsg.chat(ctx.runner.state.iter, { text });
+    const runnerEntriesBefore = new Set<object>(ctx.runner.state.recent_phase_errors.map((entry) => entry as object));
+    let decisionLogBefore: string | undefined;
+    try {
+      decisionLogBefore = ctx.dispatcher.secureLedgerCapability.readFlatFile('decisions.jsonl') ?? '';
+    } catch {
+      // Failure to establish an exact pre-send prefix only disables reuse of a
+      // Dispatcher row; it must not block the Planner chat itself.
+    }
     let reply = '';
     const onReply = (...args: unknown[]) => {
       const t = args[0];
-      if (typeof t === 'string') reply = t;
+      const identity = args[1] as { message_id?: unknown } | undefined;
+      if (typeof t === 'string' && identity?.message_id === chatEnvelope.msg_id) reply = t;
     };
     ctx.dispatcher.on('planner_reply', onReply);
     try {
-      await ctx.runner.send(AutoloopMsg.chat(ctx.runner.state.iter, { text }));
+      try {
+        await ctx.runner.send(chatEnvelope);
+      } catch (error) {
+        let cause: unknown;
+        if ((typeof error === 'object' && error !== null) || typeof error === 'function') {
+          try {
+            cause = ownDataValue(error, 'cause');
+          } catch {
+            // An inaccessible descriptor is not safe evidence of a committed
+            // secure-ledger cause. Bind and surface the original rejection.
+          }
+        }
+        const surfaced = isCommittedSecureLedgerError(cause) ? cause : error;
+        throw this._bindAutoloopChatFailure(
+          surfaced,
+          chatEnvelope.msg_id,
+          ctx.dispatcher.secureLedgerCapability,
+          decisionLogBefore,
+          runnerEntriesBefore,
+          ctx.runner.state.recent_phase_errors,
+          error,
+        );
+      }
     } finally {
       ctx.dispatcher.off('planner_reply', onReply);
     }
+    const pending = ctx.runner.state.pending_dispatch;
+    if (!reply.trim() && pending?.agent === 'planner' && pending.message_id === chatEnvelope.msg_id) {
+      throw this._bindAutoloopChatFailure(
+        new AutoloopChatStateError(
+          'AUTOLOOP_SEND_TIMEOUT',
+          `Planner send '${pending.dispatch_id}' reached its deadline and is awaiting explicit resume`,
+          true,
+          { ...pending },
+          ctx.runner.state.status_reason,
+        ),
+        chatEnvelope.msg_id,
+        ctx.dispatcher.secureLedgerCapability,
+        decisionLogBefore,
+        runnerEntriesBefore,
+        ctx.runner.state.recent_phase_errors,
+      );
+    }
+    if (!reply.trim() && (ctx.runner.state.status === 'terminated' || ctx.runner.state.status === 'crashed')) {
+      throw this._bindAutoloopChatFailure(
+        new AutoloopChatStateError(
+          'AUTOLOOP_RUN_TERMINAL',
+          `Autoloop run '${runId}' became ${ctx.runner.state.status} before Planner produced a reply`,
+          false,
+          undefined,
+          ctx.runner.state.status_reason,
+        ),
+        chatEnvelope.msg_id,
+        ctx.dispatcher.secureLedgerCapability,
+        decisionLogBefore,
+        runnerEntriesBefore,
+        ctx.runner.state.recent_phase_errors,
+      );
+    }
+    if (!reply.trim() && ctx.runner.state.status === 'paused') {
+      throw this._bindAutoloopChatFailure(
+        new AutoloopChatStateError(
+          'AUTOLOOP_RUN_PAUSED',
+          `Autoloop run '${runId}' is paused; Planner chat '${chatEnvelope.msg_id}' remains parked`,
+          false,
+          undefined,
+          ctx.runner.state.status_reason,
+        ),
+        chatEnvelope.msg_id,
+        ctx.dispatcher.secureLedgerCapability,
+        decisionLogBefore,
+        runnerEntriesBefore,
+        ctx.runner.state.recent_phase_errors,
+      );
+    }
+    if (!reply.trim()) {
+      throw this._bindAutoloopChatFailure(
+        new AutoloopOperationError(
+          'AUTOLOOP_EMPTY_REPLY',
+          'Planner transport completed without a non-empty logical reply',
+        ),
+        chatEnvelope.msg_id,
+        ctx.dispatcher.secureLedgerCapability,
+        decisionLogBefore,
+        runnerEntriesBefore,
+        ctx.runner.state.recent_phase_errors,
+      );
+    }
     return { reply };
+  }
+
+  /**
+   * Complete the fire-and-forget HTTP boundary after its accepted chat rejects.
+   * Runner-originated operation failures are already durable; adapter-originated
+   * typed failures are recorded once without replaying the original chat.
+   */
+  async recordDetachedAutoloopChatFailure(
+    runId: string,
+    error: unknown,
+  ): Promise<Readonly<PublicAutoloopFailure | PublicAutoloopUnknownFailure>> {
+    const typedFailure = toPublicAutoloopFailure(error);
+    const unknownMessage =
+      error instanceof Error && typeof ownDataValue(error, 'message') === 'string'
+        ? (ownDataValue(error, 'message') as string)
+        : 'Autoloop chat failed after the request was accepted';
+    const failure = typedFailure ?? publicData({ message: unknownMessage });
+    const reference = (typeof error === 'object' && error !== null) || typeof error === 'function' ? error : undefined;
+    const binding = reference ? this._autoloopFailureBindings.get(reference) : undefined;
+    if (binding && this._completedAutoloopFailureBindings.has(binding)) return failure;
+    const transactionLogicalId = binding?.logicalId;
+    const phaseFailure = detachedPhaseFailure(failure);
+    const reservationKey = transactionLogicalId
+      ? `${runId}:logical:${transactionLogicalId}`
+      : `${runId}:fallback:${detachedPhaseFailureKey(phaseFailure)}`;
+    const existing = this._detachedAutoloopFailureRecordings.get(reservationKey);
+    if (existing) return await existing;
+    let detachedFailureId = transactionLogicalId;
+    if (!detachedFailureId && reference) detachedFailureId = this._detachedAutoloopFailureIds.get(reference);
+    if (!detachedFailureId) {
+      detachedFailureId = randomUUID();
+      if (reference) this._detachedAutoloopFailureIds.set(reference, detachedFailureId);
+    }
+
+    // Schedule after reservation publication. A synchronous append seam can
+    // re-enter this API, so invoking the recorder before Map.set would leave a
+    // check-then-write window even though appendFlatFile itself is synchronous.
+    const recording = Promise.resolve().then(() =>
+      this._recordDetachedAutoloopChatFailure(
+        runId,
+        failure,
+        detachedFailureId!,
+        binding?.preaudited,
+        binding?.runnerProjection,
+      ),
+    );
+    const settled = recording.then(
+      (value) => {
+        if (binding) this._completedAutoloopFailureBindings.add(binding);
+        if (this._detachedAutoloopFailureRecordings.get(reservationKey) === settled) {
+          this._detachedAutoloopFailureRecordings.delete(reservationKey);
+        }
+        return value;
+      },
+      (recordError: unknown) => {
+        if (this._detachedAutoloopFailureRecordings.get(reservationKey) === settled) {
+          this._detachedAutoloopFailureRecordings.delete(reservationKey);
+        }
+        throw recordError;
+      },
+    );
+    this._detachedAutoloopFailureRecordings.set(reservationKey, settled);
+    return await settled;
+  }
+
+  private _recordDetachedAutoloopChatFailure(
+    runId: string,
+    failure: Readonly<PublicAutoloopFailure | PublicAutoloopUnknownFailure>,
+    detachedFailureId: string,
+    preaudited: DurableDetachedAutoloopFailureRow | undefined,
+    boundRunnerProjection: AutoloopState['recent_phase_errors'][number] | undefined,
+  ): Readonly<PublicAutoloopFailure | PublicAutoloopUnknownFailure> {
+    const ctx = this.getAutoloop(runId);
+    const storedRecord = ctx ? undefined : loadRun(runId);
+    let ledger = ctx?.dispatcher.secureLedgerCapability;
+    if (!ledger && storedRecord?.workflow === 'autoloop') {
+      ledger = SecureAutoloopLedger.open(storedRecord.cwd, runId, {
+        validateExistingFlatFiles: ['decisions.jsonl'],
+      });
+    }
+    if (!ledger) throw new Error(`Autoloop run '${runId}' has no durable ledger for detached failure recording`);
+
+    const phasePayload = detachedPhaseFailure(failure, detachedFailureId);
+    const rows = readDurableDetachedFailureRows(ledger.readFlatFile('decisions.jsonl') ?? '');
+    const targetKey = detachedPhaseFailureKey(phasePayload);
+    const identifiedRow = [...rows]
+      .reverse()
+      .find(
+        (row) =>
+          row.payload.detached_failure_id === detachedFailureId && detachedPhaseFailureKey(row.payload) === targetKey,
+      );
+    const provenPreaudit =
+      preaudited &&
+      preaudited.payload.detached_failure_id === undefined &&
+      detachedPhaseFailureKey(preaudited.payload) === targetKey &&
+      rows.some(
+        (row) =>
+          row.ts === preaudited.ts &&
+          row.payload.detached_failure_id === undefined &&
+          detachedPhaseFailureKey(row.payload) === targetKey,
+      )
+        ? preaudited
+        : undefined;
+    const durableRow = identifiedRow ?? (ctx ? provenPreaudit : undefined);
+    const alreadyDurable = durableRow !== undefined;
+    const recordedAt = durableRow?.ts || provenPreaudit?.ts || new Date().toISOString();
+
+    if (!alreadyDurable) {
+      const envelope = publicData({
+        ts: recordedAt,
+        kind: 'phase_error' as const,
+        actor: 'dispatcher' as const,
+        payload: phasePayload,
+      });
+      ledger.appendFlatFile('decisions.jsonl', `${JSON.stringify(envelope)}\n`);
+    }
+
+    if (ctx) {
+      const recent = ctx.runner.state.recent_phase_errors as Array<
+        AutoloopState['recent_phase_errors'][number] & {
+          readonly code?: PublicAutoloopFailureCode;
+          readonly committed?: true;
+          readonly retryable?: boolean;
+          readonly pending_dispatch?: Readonly<SendTimeoutPayload>;
+          readonly status_reason?: string | null;
+          readonly [DETACHED_AUTOLOOP_FAILURE_ID]?: string;
+        }
+      >;
+      const alreadyInState = recent.some((entry) => entry[DETACHED_AUTOLOOP_FAILURE_ID] === detachedFailureId);
+      if (!alreadyInState) {
+        const runnerProjectionIndex = boundRunnerProjection ? recent.indexOf(boundRunnerProjection) : -1;
+        const runnerProjectionFailureId =
+          runnerProjectionIndex >= 0 ? recent[runnerProjectionIndex][DETACHED_AUTOLOOP_FAILURE_ID] : undefined;
+        const runnerProjectionHasForeignId =
+          runnerProjectionFailureId !== undefined && runnerProjectionFailureId !== detachedFailureId;
+
+        const observablePhasePayload = detachedPhaseFailure(failure);
+        if (runnerProjectionIndex >= 0 && recent[runnerProjectionIndex][DETACHED_AUTOLOOP_FAILURE_ID] === undefined) {
+          const runnerProjection = recent[runnerProjectionIndex];
+          recent[runnerProjectionIndex] = detachedStateEntry(runnerProjection.ts, phasePayload, detachedFailureId);
+          try {
+            ctx.runner.emit('state', ctx.runner.state);
+          } catch (publishError) {
+            try {
+              this.logger.warn?.(
+                `[autoloop/${runId}] detached failure listener threw: ${safeOwnErrorMessage(publishError)}`,
+              );
+            } catch {
+              // Durable append/state effects cannot be retried safely merely
+              // because diagnostic extraction or the warning sink failed.
+            }
+          }
+        } else if (boundRunnerProjection === undefined || runnerProjectionHasForeignId) {
+          ctx.runner.state.consecutive_phase_errors += 1;
+          recent.push(detachedStateEntry(recordedAt, phasePayload, detachedFailureId));
+          if (recent.length > 5) recent.splice(0, recent.length - 5);
+          try {
+            ctx.runner.emit('state', ctx.runner.state);
+            ctx.runner.emit('phase_error', observablePhasePayload);
+          } catch (publishError) {
+            try {
+              this.logger.warn?.(
+                `[autoloop/${runId}] detached failure listener threw: ${safeOwnErrorMessage(publishError)}`,
+              );
+            } catch {
+              // Durable append/state effects cannot be retried safely merely
+              // because diagnostic extraction or the warning sink failed.
+            }
+          }
+        }
+        try {
+          ctx.runner.emit('autoloop_failure', failure);
+        } catch (publishError) {
+          try {
+            this.logger.warn?.(
+              `[autoloop/${runId}] detached failure publication threw: ${safeOwnErrorMessage(publishError)}`,
+            );
+          } catch {
+            // Durable append/state effects cannot be retried safely merely
+            // because diagnostic extraction or the warning sink failed.
+          }
+        }
+      }
+    }
+    return failure;
   }
 
   /**
@@ -3495,7 +5387,10 @@ export class SessionManager {
    * Chatting with a Planner needs the live dispatcher; a run that finished or
    * belongs to another process has a readable record and no one to talk to.
    */
-  private _liveAutoloop(runId: string): AutoloopHandle & {
+  private _liveAutoloop(
+    runId: string,
+    activity = 'chatting',
+  ): AutoloopHandle & {
     runner: AutoloopRunner;
     dispatcher: ClaudeAgentDispatcher;
   } {
@@ -3507,7 +5402,7 @@ export class SessionManager {
     const record = loadRun(runId);
     if (!record || record.workflow !== 'autoloop') throw new Error(`Autoloop run '${runId}' not found`);
     throw new Error(
-      `Autoloop run '${runId}' is ${record.state} and not running in this process — resume it before chatting`,
+      `Autoloop run '${runId}' is ${record.state} and not running in this process — resume it before ${activity}`,
     );
   }
 
@@ -3519,7 +5414,1313 @@ export class SessionManager {
     // workspace instead of the all-zero stub the registry fallback produced.
     const record = loadRun(runId);
     if (!record || record.workflow !== 'autoloop') return undefined;
-    return autoloopStateFromRecord(record);
+    const state = autoloopStateFromRecord(record);
+    if (!state) return undefined;
+    // A detached HTTP rejection can arrive after the live node has published
+    // its terminal checkpoint and unregistered its handle. Recover those
+    // post-202 rows from the durable ledger so later status/SSE snapshots do
+    // not erase the failure merely because no runner remains in memory.
+    try {
+      const ledger = SecureAutoloopLedger.open(record.cwd, runId, {
+        validateExistingFlatFiles: ['decisions.jsonl'],
+      });
+      const decisionLog = ledger.readFlatFile('decisions.jsonl') ?? '';
+      const nodeData = record.nodes[LEGACY_NODE]?.data;
+      let checkpointCursorOffset: number | undefined;
+      if (typeof nodeData === 'object' && nodeData !== null && Object.hasOwn(nodeData, 'detachedFailureLedgerCursor')) {
+        const cursor = snapshotDetachedFailureLedgerCursor(ownDataValue(nodeData, 'detachedFailureLedgerCursor'));
+        if (!cursor) throw new Error('Autoloop checkpoint contains a malformed detached-failure ledger cursor');
+        checkpointCursorOffset = validatedDetachedFailureCursorOffset(decisionLog, cursor);
+      }
+      const recovered = readDurableDetachedFailureRows(decisionLog);
+      const checkpointPrefixEnd = checkpointCursorOffset ?? 0;
+      const hasAuthenticatedCheckpointPrefix = checkpointPrefixEnd > 0;
+      const checkpointCounts = new Map<string, number>();
+      for (const current of state.recent_phase_errors) {
+        const key = detachedPhaseFailureKey(current as DetachedAutoloopPhaseFailure);
+        checkpointCounts.set(key, (checkpointCounts.get(key) ?? 0) + 1);
+      }
+      const seenDetachedIds = new Set<string>();
+      let added = 0;
+      for (const row of recovered) {
+        const detachedFailureId = row.payload.detached_failure_id;
+        const key = detachedPhaseFailureKey(row.payload);
+
+        if (hasAuthenticatedCheckpointPrefix && row.startByteOffset < checkpointPrefixEnd) {
+          const checkpointCount = checkpointCounts.get(key) ?? 0;
+          if (checkpointCount > 0) checkpointCounts.set(key, checkpointCount - 1);
+          if (detachedFailureId) seenDetachedIds.add(detachedFailureId);
+          continue;
+        }
+
+        if (!detachedFailureId || seenDetachedIds.has(detachedFailureId)) continue;
+        seenDetachedIds.add(detachedFailureId);
+        if (!hasAuthenticatedCheckpointPrefix) {
+          const checkpointCount = checkpointCounts.get(key) ?? 0;
+          if (checkpointCount > 0) {
+            checkpointCounts.set(key, checkpointCount - 1);
+            continue;
+          }
+        }
+        const isAfterCheckpoint =
+          checkpointCursorOffset === undefined
+            ? rowIsAfterCheckpoint(row.ts, record.updatedAt)
+            : row.startByteOffset >= checkpointCursorOffset;
+        if (!isAfterCheckpoint) continue;
+        state.recent_phase_errors.push(detachedStateEntry(row.ts, row.payload, detachedFailureId));
+        added += 1;
+      }
+      state.consecutive_phase_errors += added;
+      if (state.recent_phase_errors.length > 5)
+        state.recent_phase_errors.splice(0, state.recent_phase_errors.length - 5);
+    } catch (error) {
+      this.logger.warn?.(
+        `[autoloop/${runId}] failed to recover detached failure status: ${safeOwnErrorMessage(error)}`,
+      );
+    }
+    return state;
+  }
+
+  private _recoveryReceiptRows(ledger: SecureAutoloopLedger, runId: string): RecoveryReceipt[] {
+    const rows: RecoveryReceipt[] = [];
+    const contents = ledger.readFlatFile('decisions.jsonl') ?? '';
+    for (const [index, line] of contents.split('\n').entries()) {
+      if (!line) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line) as unknown;
+      } catch {
+        throw new Error(`Autoloop recovery ledger contains malformed JSON at decisions row ${index + 1}`);
+      }
+      const isReceiptRow =
+        typeof parsed === 'object' &&
+        parsed !== null &&
+        (parsed as { record_type?: unknown }).record_type === 'autoloop_recovery_receipt';
+      const receipt = parseRecoveryReceipt(parsed);
+      if (isReceiptRow && !receipt) {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' has malformed recovery receipt at decisions row ${index + 1}`,
+        );
+      }
+      if (!receipt) continue;
+      if (receipt.run_id !== runId) {
+        throw new Error(`Autoloop recovery receipt at decisions row ${index + 1} belongs to another run`);
+      }
+      rows.push(receipt);
+    }
+    const byToken = new Map<string, Array<{ receipt: RecoveryReceipt; index: number }>>();
+    for (const [index, receipt] of rows.entries()) {
+      const matching = byToken.get(receipt.recovery_token) ?? [];
+      matching.push({ receipt, index });
+      byToken.set(receipt.recovery_token, matching);
+    }
+    for (const [token, matching] of byToken) {
+      const prepared = matching.filter(({ receipt }) => receipt.status === 'prepared');
+      const applied = matching.filter(({ receipt }) => receipt.status === 'applied');
+      if (
+        prepared.length !== 1 ||
+        applied.length > 1 ||
+        (applied.length === 1 && applied[0].index < prepared[0].index)
+      ) {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' has an invalid recovery receipt graph for token '${token}'`,
+        );
+      }
+      if (
+        applied[0] &&
+        (applied[0].receipt.action_sha256 !== prepared[0].receipt.action_sha256 ||
+          JSON.stringify(applied[0].receipt.action_snapshot) !== JSON.stringify(prepared[0].receipt.action_snapshot) ||
+          applied[0].receipt.claim_id !== prepared[0].receipt.claim_id ||
+          applied[0].receipt.phase !== prepared[0].receipt.phase ||
+          applied[0].receipt.next_safe_action !== prepared[0].receipt.next_safe_action)
+      ) {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' has conflicting recovery receipt evidence for token '${token}'`,
+        );
+      }
+    }
+    return rows;
+  }
+
+  private _appendRecoveryReceipt(
+    ledger: SecureAutoloopLedger,
+    receipt: RecoveryReceipt,
+    validatePrepared?: (prepared: RecoveryReceipt) => void,
+  ): { receipt: RecoveryReceipt; appended: boolean } {
+    const canonicalReceipt = parseRecoveryReceipt(receipt);
+    if (!canonicalReceipt) {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${receipt.run_id}' recovery receipt is malformed`,
+      );
+    }
+    receipt = canonicalReceipt;
+    const lock = withFileLock(
+      path.join(ledger.directory, '.autoloop-recovery.lock'),
+      () => {
+        // The caller's asynchronous inspection is necessarily outside this
+        // synchronous cross-process lock. Re-read the exact durable action
+        // while holding the lock before its prepared receipt can fence it.
+        // This deliberately cannot await: recovery-envelope persistence uses
+        // this same lock.
+        if (receipt.status === 'prepared') validatePrepared?.(receipt);
+        const rows = this._recoveryReceiptRows(ledger, receipt.run_id);
+        const matching = rows.filter((row) => row.recovery_token === receipt.recovery_token);
+        const existingPrepared = matching.filter((row) => row.status === 'prepared');
+        const existingApplied = matching.filter((row) => row.status === 'applied');
+        if (
+          existingPrepared.length > 1 ||
+          existingApplied.length > 1 ||
+          (existingApplied.length > 0 && existingPrepared.length === 0)
+        ) {
+          throw new AutoloopRecoveryError(
+            'AUTOLOOP_RECOVERY_INCOMPLETE',
+            `Autoloop run '${receipt.run_id}' has ambiguous recovery receipts for the supplied token`,
+          );
+        }
+        if (existingApplied[0]) return { receipt: existingApplied[0], appended: false };
+        if (receipt.status === 'prepared' && existingPrepared[0])
+          return { receipt: existingPrepared[0], appended: false };
+        if (receipt.status === 'prepared') {
+          const appliedTokens = new Set(
+            rows.filter((row) => row.status === 'applied').map((row) => row.recovery_token),
+          );
+          const unresolvedPrepared = rows.find(
+            (row) => row.status === 'prepared' && !appliedTokens.has(row.recovery_token),
+          );
+          if (unresolvedPrepared) {
+            throw new AutoloopRecoveryError(
+              'AUTOLOOP_RECOVERY_INCOMPLETE',
+              `Autoloop run '${receipt.run_id}' has an unresolved prepared recovery receipt`,
+            );
+          }
+        }
+        ledger.appendFlatFile('decisions.jsonl', `${JSON.stringify(receipt)}\n`, true);
+        const observed = this._recoveryReceiptRows(ledger, receipt.run_id).filter(
+          (row) => row.recovery_token === receipt.recovery_token,
+        );
+        const observedStatus = observed.filter((row) => row.status === receipt.status);
+        if (observedStatus.length !== 1) {
+          throw new AutoloopRecoveryError(
+            'AUTOLOOP_RECOVERY_INCOMPLETE',
+            `Autoloop run '${receipt.run_id}' recovery receipt was not durably observed`,
+          );
+        }
+        return { receipt: observedStatus[0], appended: true };
+      },
+      { waitMs: 500 },
+    );
+    if (!lock.ok) {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${receipt.run_id}' recovery receipt lock is ${lock.reason}`,
+      );
+    }
+    return lock.value;
+  }
+
+  /**
+   * Validate the exact action bytes that bind an inspected token immediately
+   * before a prepared receipt is durably appended. This is synchronous because
+   * it executes while `.autoloop-recovery.lock` is owned.
+   */
+  private _validatePreparedRecoveryAction(
+    ledger: SecureAutoloopLedger,
+    receipt: RecoveryReceipt,
+    recovered: {
+      assessment: RecoveryAssessment;
+      state: AutoloopState;
+      directive?: { iter: number; envelope: ReturnType<typeof AutoloopMsg.directive> };
+      review?: RecoveryReviewEnvelope;
+    },
+    expectedEvidenceDigest: string,
+  ): void {
+    const stale = (): never => {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_TOKEN_STALE',
+        `recovery_token is stale for Autoloop run '${receipt.run_id}'`,
+      );
+    };
+    if (
+      receipt.recovery_token !== recovered.assessment.recovery_token ||
+      receipt.action_sha256 !== recovered.assessment.action_sha256 ||
+      this._recoveryClaimEvidenceDigest(ledger, this._recoveryClaimCurrentState(receipt.run_id)) !==
+        expectedEvidenceDigest
+    ) {
+      return stale();
+    }
+    const local = this.kernel.handle(receipt.run_id, LEGACY_NODE);
+    const lease = readLease(receipt.run_id);
+    if (lease && !local && lease.ownerId !== this.kernel.ownerId && !leaseIsStale(lease)) {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${receipt.run_id}' is still owned by another live workflow kernel`,
+      );
+    }
+
+    let exactAction: RecoveryActionSnapshot;
+    if (receipt.next_safe_action === 'request_review') {
+      if (!recovered.review) return stale();
+      const matches: RecoveryReviewEnvelope[] = [];
+      for (const line of (ledger.readFlatFile('decisions.jsonl') ?? '').split('\n')) {
+        if (!line) continue;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line) as unknown;
+        } catch {
+          return stale();
+        }
+        const review = parseRecoveryReviewEnvelope(parsed);
+        if (review?.run_id === receipt.run_id && review.envelope.msg_id === recovered.review.envelope.msg_id) {
+          matches.push(review);
+        }
+      }
+      if (matches.length !== 1) return stale();
+      exactAction = matches[0].envelope;
+    } else if (receipt.next_safe_action === 'dispatch_coder') {
+      if (!recovered.directive) return stale();
+      const bytes = ledger.readIterationArtifact(recovered.directive.iter, 'directive.json');
+      if (!bytes) return stale();
+      let candidate: Partial<{
+        iter: unknown;
+        message_id: unknown;
+        ts: unknown;
+        goal: unknown;
+        constraints: unknown;
+        success_criteria: unknown;
+        max_attempts: unknown;
+      }>;
+      try {
+        candidate = JSON.parse(bytes.toString('utf8')) as typeof candidate;
+      } catch {
+        return stale();
+      }
+      if (
+        candidate.iter !== recovered.directive.iter ||
+        typeof candidate.message_id !== 'string' ||
+        typeof candidate.ts !== 'string' ||
+        typeof candidate.goal !== 'string' ||
+        !Array.isArray(candidate.constraints) ||
+        !candidate.constraints.every((value) => typeof value === 'string') ||
+        !Array.isArray(candidate.success_criteria) ||
+        !candidate.success_criteria.every((value) => typeof value === 'string') ||
+        !Number.isSafeInteger(candidate.max_attempts)
+      ) {
+        return stale();
+      }
+      exactAction = {
+        msg_id: candidate.message_id,
+        iter: candidate.iter as number,
+        from: 'planner',
+        to: 'coder',
+        type: 'directive',
+        ts: candidate.ts,
+        payload: {
+          goal: candidate.goal,
+          constraints: candidate.constraints,
+          success_criteria: candidate.success_criteria,
+          max_attempts: candidate.max_attempts as number,
+        },
+      };
+    } else {
+      if (receipt.next_safe_action !== 'none' && receipt.next_safe_action !== 'resume_planner') return stale();
+      const currentState = this._recoveryClaimCurrentState(receipt.run_id);
+      if (currentState.iter !== recovered.state.iter) return stale();
+      // The remaining actions have no envelope bytes. Their exact action is
+      // reconstructed from the current live-or-durable boundary so a cold
+      // Planner can reach the disk-boot path without weakening the byte fence.
+      exactAction = {
+        type: receipt.next_safe_action,
+        run_id: receipt.run_id,
+        iter: currentState.iter,
+        phase: receipt.phase,
+      };
+    }
+    if (
+      recoveryActionDigest(exactAction) !== receipt.action_sha256 ||
+      JSON.stringify(exactAction) !== JSON.stringify(receipt.action_snapshot)
+    ) {
+      return stale();
+    }
+  }
+
+  private _recoveryActionSnapshot(recovered: {
+    assessment: RecoveryAssessment;
+    state: AutoloopState;
+    directive?: { iter: number; envelope: ReturnType<typeof AutoloopMsg.directive> };
+    review?: RecoveryReviewEnvelope;
+  }): RecoveryActionSnapshot {
+    if (recovered.assessment.next_safe_action === 'dispatch_coder' && recovered.directive) {
+      return structuredClone(recovered.directive.envelope);
+    }
+    if (recovered.assessment.next_safe_action === 'request_review' && recovered.review) {
+      return structuredClone(recovered.review.envelope);
+    }
+    if (
+      recovered.assessment.next_safe_action === 'none' ||
+      recovered.assessment.next_safe_action === 'resume_planner'
+    ) {
+      return {
+        type: recovered.assessment.next_safe_action,
+        run_id: recovered.assessment.run_id,
+        iter: recovered.state.iter,
+        phase: recovered.assessment.phase,
+      };
+    }
+    throw new AutoloopRecoveryError(
+      'AUTOLOOP_RECOVERY_INCOMPLETE',
+      `Autoloop run '${recovered.assessment.run_id}' lacks an exact recovery action snapshot`,
+    );
+  }
+
+  /** Bind recovery authority to the exact kernel ownership generation. */
+  private _recoveryLeaseEvidence(runId: string): string {
+    const lease = readLease(runId);
+    if (!lease) return 'kernel:lease:none';
+    const identity = createHash('sha256')
+      .update(
+        JSON.stringify({
+          runId: lease.runId,
+          incarnationId: lease.incarnationId,
+          ownerId: lease.ownerId,
+          acquisitionId: lease.acquisitionId,
+          fence: lease.fence,
+          pid: lease.pid,
+          host: lease.host,
+          acquiredAt: lease.acquiredAt,
+        }),
+        'utf8',
+      )
+      .digest('hex');
+    // renewedAt is deliberately excluded: heartbeats preserve ownership,
+    // while every new acquisition changes at least acquisitionId and fence.
+    return `kernel:lease:${identity}`;
+  }
+
+  /** Byte-fence every durable input used to reconstruct a recovery assessment. */
+  private _recoveryClaimEvidenceDigest(ledger: SecureAutoloopLedger, state: AutoloopState): string {
+    const digest = createHash('sha256');
+    const add = (name: string, bytes: Buffer | string | undefined): void => {
+      digest.update(name, 'utf8');
+      digest.update('\0', 'utf8');
+      digest.update(bytes ?? '');
+      digest.update('\0', 'utf8');
+    };
+    add(
+      'state',
+      JSON.stringify({
+        status: state.status,
+        iter: state.iter,
+        subagents_spawned: state.subagents_spawned,
+        status_reason: state.status_reason,
+        pending_dispatch: state.pending_dispatch ?? null,
+      }),
+    );
+    add('kernel-lease', this._recoveryLeaseEvidence(state.run_id));
+    add('decisions.jsonl', ledger.readFlatFile('decisions.jsonl'));
+    add('agent-generations.jsonl', ledger.readFlatFile('agent-generations.jsonl'));
+    for (let iter = 0; iter <= state.iter; iter += 1) {
+      for (const name of [
+        'directive.json',
+        'coder_summary.txt',
+        'eval_output.json',
+        'diff.patch',
+        'verdict.json',
+      ] as const) {
+        add(`iter/${iter}/${name}`, ledger.readIterationArtifact(iter, name));
+      }
+    }
+    return digest.digest('hex');
+  }
+
+  private _recoveryClaimCurrentState(runId: string): AutoloopState {
+    const live = this.kernel.handle<AutoloopHandle & { runner: AutoloopRunner }>(runId, LEGACY_NODE);
+    if (live) return live.runner.state;
+    const record = loadRun(runId);
+    const state = record?.workflow === 'autoloop' ? autoloopStateFromRecord(record) : undefined;
+    if (!state) throw new AutoloopRecoveryError('AUTOLOOP_RECOVERY_TOKEN_STALE', `Autoloop run '${runId}' changed`);
+    return state;
+  }
+
+  /**
+   * Persist one fully canonical Reviewer message at the SessionManager/ledger
+   * boundary. The Runner can only enqueue after this returns, which keeps the
+   * envelope identity independent of transient runner/dispatcher memory.
+   */
+  private _appendRecoveryReviewEnvelope(
+    ledger: SecureAutoloopLedger,
+    runId: string,
+    envelope: Extract<import('./autoloop/messages.js').AnyAutoloopMessage, { type: 'review_request' }>,
+  ): RecoveryReviewEnvelope {
+    const candidate: RecoveryReviewEnvelope = {
+      schema_version: 1,
+      record_type: 'autoloop_recovery_review_envelope',
+      kind: 'autoloop_recovery_review_envelope',
+      run_id: runId,
+      envelope,
+    };
+    const serialized = JSON.stringify(candidate);
+    const rows = (): RecoveryReviewEnvelope[] => {
+      const found: RecoveryReviewEnvelope[] = [];
+      for (const [index, line] of (ledger.readFlatFile('decisions.jsonl') ?? '').split('\n').entries()) {
+        if (!line) continue;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line) as unknown;
+        } catch {
+          throw new AutoloopRecoveryError(
+            'AUTOLOOP_RECOVERY_INCOMPLETE',
+            `Autoloop run '${runId}' has malformed decisions evidence at row ${index + 1}`,
+          );
+        }
+        const isEnvelopeRow =
+          typeof parsed === 'object' &&
+          parsed !== null &&
+          (parsed as { record_type?: unknown }).record_type === 'autoloop_recovery_review_envelope';
+        const row = parseRecoveryReviewEnvelope(parsed);
+        if (isEnvelopeRow && !row) {
+          throw new AutoloopRecoveryError(
+            'AUTOLOOP_RECOVERY_INCOMPLETE',
+            `Autoloop run '${runId}' has malformed Reviewer recovery envelope at row ${index + 1}`,
+          );
+        }
+        if (!row) continue;
+        if (row.run_id !== runId) {
+          throw new AutoloopRecoveryError(
+            'AUTOLOOP_RECOVERY_INCOMPLETE',
+            `Autoloop Reviewer recovery envelope at row ${index + 1} belongs to another run`,
+          );
+        }
+        found.push(row);
+      }
+      return found;
+    };
+    const lock = withFileLock(
+      path.join(ledger.directory, '.autoloop-recovery.lock'),
+      () => {
+        const matching = rows().filter((row) => row.envelope.msg_id === envelope.msg_id);
+        if (matching.length > 2 || matching.some((row) => JSON.stringify(row) !== serialized)) {
+          throw new AutoloopRecoveryError(
+            'AUTOLOOP_RECOVERY_INCOMPLETE',
+            `Autoloop run '${runId}' has conflicting Reviewer recovery envelopes for '${envelope.msg_id}'`,
+          );
+        }
+        if (matching.length > 0) return matching[0];
+        ledger.appendFlatFile('decisions.jsonl', `${serialized}\n`, true);
+        const observed = rows().filter((row) => row.envelope.msg_id === envelope.msg_id);
+        if (observed.length !== 1 || JSON.stringify(observed[0]) !== serialized) {
+          throw new AutoloopRecoveryError(
+            'AUTOLOOP_RECOVERY_INCOMPLETE',
+            `Autoloop run '${runId}' Reviewer recovery envelope was not durably observed`,
+          );
+        }
+        return observed[0];
+      },
+      { waitMs: 500 },
+    );
+    if (!lock.ok) {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${runId}' Reviewer recovery envelope lock is ${lock.reason}`,
+      );
+    }
+    return lock.value;
+  }
+
+  private async _recoveryInput(
+    runId: string,
+    options: { readOnly?: boolean } = {},
+  ): Promise<{
+    assessment: RecoveryAssessment;
+    ledger: SecureAutoloopLedger;
+    state: AutoloopState;
+    deliveries: RecoveryDeliveryEvidence[];
+    directive?: { iter: number; envelope: ReturnType<typeof AutoloopMsg.directive> };
+    review?: RecoveryReviewEnvelope;
+  }> {
+    const live = this.kernel.handle<AutoloopHandle & { runner: AutoloopRunner }>(runId, LEGACY_NODE);
+    const record = loadRun(runId);
+    if (!live && (!record || record.workflow !== 'autoloop')) throw new Error(`Autoloop run '${runId}' not found`);
+    const state = live?.runner.state ?? (record ? autoloopStateFromRecord(record) : undefined);
+    if (!state) throw new Error(`Autoloop run '${runId}' has no durable state checkpoint`);
+    const workspace = live?.runner.config.workspace ?? record!.cwd;
+    const ledgerOptions = {
+      validateExistingFlatFiles: ['decisions.jsonl', 'agent-generations.jsonl'] as const,
+      logger: this.logger,
+    };
+    const ledger = options.readOnly
+      ? SecureAutoloopLedger.openReadOnly(workspace, runId, ledgerOptions)
+      : SecureAutoloopLedger.open(workspace, runId, ledgerOptions);
+    // Validate the complete receipt relation during inspection as well as
+    // apply. A malformed or orphaned receipt is never safe to derive from.
+    this._recoveryReceiptRows(ledger, runId);
+
+    const iterations: RecoveryIterationEvidence[] = [];
+    let directive: { iter: number; envelope: ReturnType<typeof AutoloopMsg.directive> } | undefined;
+    let directiveEvidenceProblem: string | undefined;
+    const noteDirectiveEvidenceProblem = (reason: string): void => {
+      directiveEvidenceProblem ??= reason;
+    };
+    const dispatchIter = new Map<string, number>();
+    const directivesByDispatchIdentity = new Map<string, ReturnType<typeof AutoloopMsg.directive>>();
+    for (let iter = 0; iter <= state.iter; iter += 1) {
+      const names: Array<[string, RecoveryIterationEvidence['artifacts'][number]]> = [
+        ['directive.json', 'directive'],
+        ['coder_summary.txt', 'coder_summary'],
+        ['eval_output.json', 'eval_output'],
+        ['diff.patch', 'diff'],
+      ];
+      const artifacts: RecoveryIterationEvidence['artifacts'][number][] = [];
+      for (const [file, artifact] of names) {
+        if (
+          ledger.readIterationArtifact(
+            iter,
+            file as 'directive.json' | 'coder_summary.txt' | 'eval_output.json' | 'diff.patch',
+          )
+        ) {
+          artifacts.push(artifact);
+        }
+      }
+      let verdict: RecoveryIterationEvidence['verdict'];
+      const verdictBytes = ledger.readIterationArtifact(iter, 'verdict.json');
+      if (verdictBytes) {
+        let persistedVerdict: unknown;
+        try {
+          persistedVerdict = JSON.parse(verdictBytes.toString('utf8')) as unknown;
+        } catch {
+          throw new Error(`Autoloop run '${runId}' has malformed verdict evidence for iteration ${iter}`);
+        }
+        const decision =
+          typeof persistedVerdict === 'object' && persistedVerdict !== null
+            ? (persistedVerdict as { decision?: unknown }).decision
+            : undefined;
+        if (decision !== 'advance' && decision !== 'hold' && decision !== 'rollback') {
+          throw new Error(`Autoloop run '${runId}' has ambiguous verdict evidence for iteration ${iter}`);
+        }
+        verdict = decision;
+      }
+      if (artifacts.length > 0 || verdict) iterations.push({ iter, artifacts, ...(verdict ? { verdict } : {}) });
+
+      const directiveBytes = ledger.readIterationArtifact(iter, 'directive.json');
+      if (directiveBytes) {
+        let persisted: unknown;
+        try {
+          persisted = JSON.parse(directiveBytes.toString('utf8')) as unknown;
+        } catch {
+          noteDirectiveEvidenceProblem('malformed_exact_directive');
+          continue;
+        }
+        const candidate = persisted as Partial<{
+          iter: unknown;
+          message_id: unknown;
+          ts: unknown;
+          dispatch_id: unknown;
+          goal: unknown;
+          constraints: unknown;
+          success_criteria: unknown;
+          max_attempts: unknown;
+        }>;
+        if (
+          candidate.iter !== iter ||
+          typeof candidate.message_id !== 'string' ||
+          typeof candidate.ts !== 'string' ||
+          typeof candidate.dispatch_id !== 'string' ||
+          typeof candidate.goal !== 'string' ||
+          !Array.isArray(candidate.constraints) ||
+          !candidate.constraints.every((value) => typeof value === 'string') ||
+          !Array.isArray(candidate.success_criteria) ||
+          !candidate.success_criteria.every((value) => typeof value === 'string') ||
+          !Number.isSafeInteger(candidate.max_attempts)
+        ) {
+          noteDirectiveEvidenceProblem('malformed_exact_directive');
+          continue;
+        }
+        const exactDirective: { iter: number; envelope: ReturnType<typeof AutoloopMsg.directive> } = {
+          iter,
+          envelope: {
+            msg_id: candidate.message_id,
+            iter,
+            from: 'planner',
+            to: 'coder',
+            type: 'directive',
+            ts: candidate.ts,
+            payload: {
+              goal: candidate.goal,
+              constraints: candidate.constraints,
+              success_criteria: candidate.success_criteria,
+              max_attempts: candidate.max_attempts as number,
+            },
+          },
+        };
+        dispatchIter.set(candidate.dispatch_id, iter);
+        directivesByDispatchIdentity.set(candidate.dispatch_id, exactDirective.envelope);
+        directive = exactDirective;
+      }
+    }
+
+    const acknowledged = new Map<string, string>();
+    const reviewEnvelopes: RecoveryReviewEnvelope[] = [];
+    let reviewEvidenceProblem: string | undefined;
+    const noteReviewEvidenceProblem = (reason: string): void => {
+      reviewEvidenceProblem ??= reason;
+    };
+    const intents: Array<{
+      delivery_id: string;
+      idempotency_key: string;
+      kind: 'coder_directive' | 'review_request';
+      target_role: 'coder' | 'reviewer';
+      payload_sha256: string;
+      logical_message_sha256: string;
+    }> = [];
+    const deliveryRows: DeliveryLedgerRow[] = [];
+    for (const [index, line] of (ledger.readFlatFile('decisions.jsonl') ?? '').split('\n').entries()) {
+      if (!line) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line) as unknown;
+      } catch {
+        throw new Error(`Autoloop run '${runId}' has malformed decisions evidence at row ${index + 1}`);
+      }
+      // Recovery receipts share the append-only decision ledger but are not
+      // outbox records. Classify them first so the outbox validator remains
+      // strict for every row it owns.
+      const isReceiptRow =
+        typeof parsed === 'object' &&
+        parsed !== null &&
+        (parsed as { record_type?: unknown }).record_type === 'autoloop_recovery_receipt';
+      const receipt = parseRecoveryReceipt(parsed);
+      if (isReceiptRow && !receipt) {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' has malformed recovery receipt at decisions row ${index + 1}`,
+        );
+      }
+      if (receipt) continue;
+      const isReviewEnvelopeRow =
+        typeof parsed === 'object' &&
+        parsed !== null &&
+        (parsed as { record_type?: unknown }).record_type === 'autoloop_recovery_review_envelope';
+      const reviewEnvelope = parseRecoveryReviewEnvelope(parsed);
+      if (isReviewEnvelopeRow && !reviewEnvelope) {
+        noteReviewEvidenceProblem('malformed_exact_envelope');
+        continue;
+      }
+      if (reviewEnvelope) {
+        if (reviewEnvelope.run_id !== runId) {
+          noteReviewEvidenceProblem('foreign_exact_envelope');
+          continue;
+        }
+        reviewEnvelopes.push(reviewEnvelope);
+        if (reviewEnvelopes.length > MAX_RECOVERY_REVIEW_ENVELOPE_INDEX_ROWS) {
+          noteReviewEvidenceProblem('envelope_index_cap_exceeded');
+        }
+        continue;
+      }
+      const row = parseOutboxDecisionLedgerRow(parsed, index + 1);
+      if (!row) continue;
+      deliveryRows.push(row);
+      if (row.kind === 'acknowledgement') {
+        const existing = acknowledged.get(row.acknowledgement.delivery_id);
+        if (existing !== undefined && existing !== row.acknowledgement.payload_sha256) {
+          throw new Error(`Autoloop run '${runId}' has conflicting acknowledgement provenance`);
+        }
+        acknowledged.set(row.acknowledgement.delivery_id, row.acknowledgement.payload_sha256);
+      }
+      if (row.kind === 'intent') {
+        const payload = row.intent.payload;
+        const payloadKeys =
+          typeof payload === 'object' && payload !== null && !Array.isArray(payload) ? Reflect.ownKeys(payload) : [];
+        const promptDescriptor =
+          typeof payload === 'object' && payload !== null && !Array.isArray(payload)
+            ? Object.getOwnPropertyDescriptor(payload, 'prompt')
+            : undefined;
+        const logicalDigestDescriptor =
+          typeof payload === 'object' && payload !== null && !Array.isArray(payload)
+            ? Object.getOwnPropertyDescriptor(payload, 'logical_message_sha256')
+            : undefined;
+        const logicalMessageDigest =
+          payloadKeys.length === 2 &&
+          payloadKeys.includes('prompt') &&
+          payloadKeys.includes('logical_message_sha256') &&
+          promptDescriptor?.enumerable === true &&
+          Object.hasOwn(promptDescriptor, 'value') &&
+          typeof promptDescriptor.value === 'string' &&
+          logicalDigestDescriptor?.enumerable === true &&
+          Object.hasOwn(logicalDigestDescriptor, 'value') &&
+          typeof logicalDigestDescriptor.value === 'string' &&
+          /^[a-f0-9]{64}$/.test(logicalDigestDescriptor.value)
+            ? logicalDigestDescriptor.value
+            : undefined;
+        if (!logicalMessageDigest) {
+          if (row.intent.kind === 'coder_directive') noteDirectiveEvidenceProblem('malformed_intent_payload');
+          else noteReviewEvidenceProblem('malformed_intent_payload');
+          continue;
+        }
+        intents.push({
+          delivery_id: row.intent.delivery_id,
+          idempotency_key: row.intent.idempotency_key,
+          kind: row.intent.kind,
+          target_role: row.intent.target_role,
+          payload_sha256: row.intent.payload_sha256,
+          logical_message_sha256: logicalMessageDigest,
+        });
+      }
+    }
+    // Do not derive a recovery action from a subset of delivery rows. The
+    // outbox graph is append ordered and an orphan/conflict makes every later
+    // recovery effect ambiguous.
+    validateOutboxDecisionLedgerGraph(deliveryRows);
+
+    const generations = new Map<string, PhysicalAgentGeneration>();
+    for (const [index, line] of (ledger.readFlatFile('agent-generations.jsonl') ?? '').split('\n').entries()) {
+      if (!line) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line) as { kind?: unknown; payload?: unknown };
+      } catch {
+        throw new Error(`Autoloop run '${runId}' has malformed generation evidence at row ${index + 1}`);
+      }
+      const entry = parsed as { kind?: unknown; payload?: unknown };
+      if (
+        entry.kind !== 'agent_generation_reserved' &&
+        entry.kind !== 'agent_generation_started' &&
+        entry.kind !== 'agent_generation_lease_renewed' &&
+        entry.kind !== 'agent_generation_orphaned' &&
+        entry.kind !== 'agent_generation_released'
+      ) {
+        continue;
+      }
+      const generation = entry.payload as Partial<PhysicalAgentGeneration>;
+      if (
+        !generation ||
+        (generation.role !== 'planner' && generation.role !== 'coder' && generation.role !== 'reviewer') ||
+        !Number.isSafeInteger(generation.generation) ||
+        typeof generation.session_name !== 'string' ||
+        typeof generation.owner_instance_id !== 'string' ||
+        typeof generation.created_at !== 'string' ||
+        typeof generation.last_activity_at !== 'string' ||
+        typeof generation.lease_expires_at !== 'string' ||
+        (generation.state !== 'live' &&
+          generation.state !== 'stale' &&
+          generation.state !== 'orphaned' &&
+          generation.state !== 'released')
+      ) {
+        throw new Error(`Autoloop run '${runId}' has ambiguous generation evidence at row ${index + 1}`);
+      }
+      const key = generation.role;
+      const current = generations.get(key);
+      if (!current || (generation.generation as number) >= current.generation)
+        generations.set(key, generation as PhysicalAgentGeneration);
+    }
+    const agents: RecoveryAgentEvidence[] = [];
+    for (const generation of generations.values()) {
+      agents.push({
+        generation: { ...generation },
+        matching_runtime: await this.inspect(generation.session_name, generation.session_id),
+      });
+    }
+    const reviewForCurrentIteration = reviewEnvelopes.filter((row) => row.envelope.iter === state.iter);
+    const reviewIdentities = new Map<string, RecoveryReviewEnvelope[]>();
+    for (const row of reviewForCurrentIteration) {
+      const matching = reviewIdentities.get(row.envelope.msg_id) ?? [];
+      matching.push(row);
+      reviewIdentities.set(row.envelope.msg_id, matching);
+    }
+    if (
+      reviewIdentities.size > 1 ||
+      [...reviewIdentities.values()].some(
+        (rows) =>
+          rows.length > MAX_RECOVERY_REVIEW_ENVELOPE_DUPLICATES ||
+          rows.some((row) => JSON.stringify(row) !== JSON.stringify(rows[0])),
+      )
+    ) {
+      noteReviewEvidenceProblem('conflicting_current_identity');
+    }
+    const review = reviewIdentities.values().next().value?.[0] as RecoveryReviewEnvelope | undefined;
+    const reviewsByDispatchIdentity = new Map<string, RecoveryReviewEnvelope>();
+    for (const row of reviewEnvelopes) {
+      const dispatchIdentity = `dispatch_${createHash('sha256')
+        .update(
+          JSON.stringify([
+            runId,
+            row.envelope.msg_id,
+            row.envelope.iter,
+            row.envelope.from,
+            row.envelope.to,
+            row.envelope.type,
+          ]),
+          'utf8',
+        )
+        .digest('hex')}`;
+      const existing = reviewsByDispatchIdentity.get(dispatchIdentity);
+      if (existing && JSON.stringify(existing) !== JSON.stringify(row)) {
+        noteReviewEvidenceProblem('conflicting_dispatch_identity');
+        continue;
+      }
+      reviewsByDispatchIdentity.set(dispatchIdentity, row);
+    }
+    const deliveries: RecoveryDeliveryEvidence[] = [];
+    for (const intent of intents) {
+      const acknowledgement = acknowledged.get(intent.delivery_id);
+      if (acknowledgement !== undefined && acknowledgement !== intent.payload_sha256) {
+        if (intent.kind === 'coder_directive') noteDirectiveEvidenceProblem('conflicting_acknowledgement');
+        else noteReviewEvidenceProblem('conflicting_acknowledgement');
+        continue;
+      }
+      if (intent.kind === 'coder_directive') {
+        const iter = dispatchIter.get(intent.idempotency_key);
+        const envelope = directivesByDispatchIdentity.get(intent.idempotency_key);
+        if (intent.target_role !== 'coder' || iter === undefined || !envelope) {
+          noteDirectiveEvidenceProblem('missing_exact_directive');
+          continue;
+        }
+        if (recoveryLogicalMessageSha256(envelope) !== intent.logical_message_sha256) {
+          noteDirectiveEvidenceProblem('intent_digest_mismatch');
+          continue;
+        }
+        deliveries.push({
+          delivery_id: intent.delivery_id,
+          idempotency_key: intent.idempotency_key,
+          iter,
+          kind: intent.kind,
+          acknowledged: acknowledgement !== undefined,
+        });
+        continue;
+      }
+      const envelope = reviewsByDispatchIdentity.get(intent.idempotency_key);
+      if (
+        intent.target_role !== 'reviewer' ||
+        !envelope ||
+        envelope.envelope.from !== 'runner' ||
+        envelope.envelope.to !== 'reviewer' ||
+        envelope.envelope.type !== 'review_request'
+      ) {
+        noteReviewEvidenceProblem('missing_exact_envelope');
+        continue;
+      }
+      if (recoveryLogicalMessageSha256(envelope.envelope) !== intent.logical_message_sha256) {
+        noteReviewEvidenceProblem('intent_digest_mismatch');
+        continue;
+      }
+      deliveries.push({
+        delivery_id: intent.delivery_id,
+        idempotency_key: intent.idempotency_key,
+        iter: envelope.envelope.iter,
+        kind: intent.kind,
+        acknowledged: acknowledgement !== undefined,
+      });
+    }
+    let assessment = assessRecovery({
+      run_id: runId,
+      observed_at: new Date().toISOString(),
+      legacy_state: state,
+      iterations,
+      deliveries,
+      agents,
+      completed: state.status === 'terminated' && state.status_reason === 'completed',
+    });
+    const actionEvidenceProblem =
+      assessment.next_safe_action === 'dispatch_coder'
+        ? (directiveEvidenceProblem ??
+          (!directive || directive.iter !== state.iter ? 'missing_exact_directive' : undefined))
+        : assessment.next_safe_action === 'request_review'
+          ? (reviewEvidenceProblem ??
+            (!review || review.envelope.iter !== state.iter ? 'missing_exact_envelope' : undefined))
+          : undefined;
+    if (actionEvidenceProblem) {
+      const role = assessment.next_safe_action === 'dispatch_coder' ? 'coder' : 'review';
+      assessment = blockRecoveryAssessment(assessment, `ambiguity:recovery:${role}:${actionEvidenceProblem}`);
+    } else {
+      const exactAction =
+        assessment.next_safe_action === 'dispatch_coder'
+          ? directive!.envelope
+          : assessment.next_safe_action === 'request_review'
+            ? review!.envelope
+            : {
+                type: assessment.next_safe_action,
+                run_id: runId,
+                iter: state.iter,
+                phase: assessment.phase,
+              };
+      assessment = assessRecovery({
+        run_id: runId,
+        observed_at: new Date().toISOString(),
+        legacy_state: state,
+        iterations,
+        deliveries,
+        agents,
+        completed: state.status === 'terminated' && state.status_reason === 'completed',
+        action_sha256: recoveryActionDigest(exactAction),
+      });
+      if (
+        assessment.next_safe_action === 'resume_planner' &&
+        (live?.runner.state.status === 'planning' || live?.runner.state.status === 'running')
+      ) {
+        assessment = rebindRecoveryAction(
+          assessment,
+          'none',
+          recoveryActionDigest({ type: 'none', run_id: runId, iter: state.iter, phase: assessment.phase }),
+          'recovery:planner:already_satisfied',
+        );
+      } else if (
+        (assessment.next_safe_action === 'dispatch_coder' || assessment.next_safe_action === 'request_review') &&
+        live &&
+        (live.runner.state.status === 'paused' ||
+          live.runner.state.status === 'terminated' ||
+          live.runner.state.status === 'crashed')
+      ) {
+        assessment = blockRecoveryAssessment(assessment, `ambiguity:recovery:runner:${live.runner.state.status}`);
+      }
+    }
+    assessment = rebindRecoveryAction(
+      assessment,
+      assessment.next_safe_action,
+      assessment.action_sha256,
+      this._recoveryLeaseEvidence(runId),
+    );
+    return {
+      assessment,
+      ledger,
+      state,
+      deliveries,
+      directive,
+      review,
+    };
+  }
+
+  /** Internal token-fenced inspection/apply core. Public MCP/HTTP wiring is deliberately deferred. */
+  async autoloopRecover(
+    runId: string,
+    options: { apply?: boolean; recovery_token?: string } = {},
+  ): Promise<RecoveryResult> {
+    return await this._autoloopRecover(runId, options);
+  }
+
+  private async _autoloopRecover(
+    runId: string,
+    options: { apply?: boolean; recovery_token?: string } = {},
+    bootOverrides: RecoveryBootOverrides = {},
+  ): Promise<RecoveryResult> {
+    if (!options.apply) {
+      const { assessment } = await this._recoveryInput(runId, { readOnly: true });
+      return { assessment };
+    }
+    if (!options.recovery_token) {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_TOKEN_REQUIRED',
+        'recovery_token is required when apply is true',
+      );
+    }
+    const transactionKey = `${runId}\u0000${options.recovery_token}`;
+    const existing = this._autoloopRecoveryTransactions.get(transactionKey);
+    if (existing) return await existing;
+    const operation = this._autoloopRecoverApply(runId, options.recovery_token, bootOverrides);
+    this._autoloopRecoveryTransactions.set(transactionKey, operation);
+    try {
+      return await operation;
+    } finally {
+      if (this._autoloopRecoveryTransactions.get(transactionKey) === operation) {
+        this._autoloopRecoveryTransactions.delete(transactionKey);
+      }
+    }
+  }
+
+  private async _autoloopRecoverApply(
+    runId: string,
+    token: string,
+    bootOverrides: RecoveryBootOverrides,
+  ): Promise<RecoveryResult> {
+    const inspected = await this._recoveryInput(runId, { readOnly: true });
+    const inspectedAllReceipts = this._recoveryReceiptRows(inspected.ledger, runId);
+    const inspectedReceipts = inspectedAllReceipts.filter((row) => row.recovery_token === token);
+    const inspectedApplied = inspectedReceipts.find((row) => row.status === 'applied');
+    if (inspectedApplied) {
+      // A durable applied pair is the authority for exact replay even when its
+      // effect advanced the live state and therefore changed the current token.
+      return { assessment: inspected.assessment, receipt: inspectedApplied };
+    }
+    const inspectedAppliedTokens = new Set(
+      inspectedAllReceipts.filter((row) => row.status === 'applied').map((row) => row.recovery_token),
+    );
+    if (
+      inspectedAllReceipts.some((row) => row.status === 'prepared' && !inspectedAppliedTokens.has(row.recovery_token))
+    ) {
+      // A durable prepared claim outranks later state/token drift: its physical
+      // effect may already have happened, so no newer boundary is safe to run.
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${runId}' has an unresolved prepared recovery receipt`,
+      );
+    }
+    if (token !== inspected.assessment.recovery_token) {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_TOKEN_STALE',
+        `recovery_token is stale for Autoloop run '${runId}'`,
+      );
+    }
+    // Applying may harden mutable ledger state, but only after the current
+    // token and exact action digest have been reconstructed through the
+    // read-only boundary. Re-open and compare once more immediately before
+    // claiming the durable effect.
+    const recovered = await this._recoveryInput(runId);
+    const { assessment, ledger } = recovered;
+    if (token !== assessment.recovery_token) {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_TOKEN_STALE',
+        `recovery_token is stale for Autoloop run '${runId}'`,
+      );
+    }
+    const allReceipts = this._recoveryReceiptRows(ledger, runId);
+    const existingReceipts = allReceipts.filter((row) => row.recovery_token === token);
+    if (existingReceipts.some((row) => row.status === 'applied')) {
+      const applied = existingReceipts.filter((row) => row.status === 'applied');
+      if (applied.length !== 1 || existingReceipts.filter((row) => row.status === 'prepared').length !== 1) {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' has ambiguous applied recovery receipts`,
+        );
+      }
+      return { assessment, receipt: applied[0] };
+    }
+    const appliedTokens = new Set(
+      allReceipts.filter((row) => row.status === 'applied').map((row) => row.recovery_token),
+    );
+    const unresolvedPrepared = allReceipts.find(
+      (row) => row.status === 'prepared' && !appliedTokens.has(row.recovery_token),
+    );
+    if (unresolvedPrepared) {
+      // Any prior durable claim may already have executed its external effect.
+      // A changed assessment/token cannot make that unknown outcome safe to
+      // supersede, so fail closed until the original claim is resolved.
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${runId}' has an unresolved prepared recovery receipt`,
+      );
+    }
+    if (existingReceipts.length > 0) {
+      // A process can die after fencing this token but before (or during) the
+      // external effect. Replaying it would turn an unknown outcome into a
+      // duplicate effect, so preserve the evidence and require resolution.
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${runId}' has an unresolved prepared recovery receipt`,
+      );
+    }
+    if (assessment.next_safe_action === 'manual_resolution') {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_MANUAL_RESOLUTION_REQUIRED',
+        `Autoloop run '${runId}' has ambiguous recovery evidence`,
+      );
+    }
+    const claimState = structuredClone(recovered.state);
+    const claimEvidenceDigest = this._recoveryClaimEvidenceDigest(ledger, claimState);
+    const actionSnapshot = this._recoveryActionSnapshot({ ...recovered, state: claimState });
+    if (recoveryActionDigest(actionSnapshot) !== assessment.action_sha256) {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_TOKEN_STALE',
+        `recovery_token is stale for Autoloop run '${runId}'`,
+      );
+    }
+    const preparedClaim = this._appendRecoveryReceipt(
+      ledger,
+      {
+        schema_version: 1,
+        record_type: 'autoloop_recovery_receipt',
+        kind: 'autoloop_recovery_receipt',
+        run_id: runId,
+        recovery_token: token,
+        action_sha256: assessment.action_sha256,
+        action_snapshot: actionSnapshot,
+        claim_id: randomUUID(),
+        phase: assessment.phase,
+        next_safe_action: assessment.next_safe_action,
+        status: 'prepared',
+        recorded_at: new Date().toISOString(),
+      },
+      (preparedReceipt) =>
+        this._validatePreparedRecoveryAction(
+          ledger,
+          preparedReceipt,
+          { ...recovered, state: claimState },
+          claimEvidenceDigest,
+        ),
+    );
+    const prepared = preparedClaim.receipt;
+    if (!preparedClaim.appended) {
+      // Another process owns an unresolved durable claim. The effect outcome
+      // cannot be inferred, so this caller must not replay it.
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${runId}' recovery effect is claimed by another process`,
+      );
+    }
+    if (prepared.status !== 'prepared') {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${runId}' recovery receipt is invalid`,
+      );
+    }
+    const prior = this._recoveryReceiptRows(ledger, runId).filter((row) => row.recovery_token === token);
+    if (prior.length !== 1 || prior[0].status !== 'prepared') {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${runId}' recovery effect is unresolved`,
+      );
+    }
+
+    const live = this.getAutoloop(runId);
+    const recoveryBootConfig = (config: Record<string, unknown>): Parameters<SessionManager['_bootAutoloop']>[0] =>
+      ({
+        ...config,
+        // These caller-supplied configs are process-local recovery inputs. In
+        // particular they must not be copied into a receipt or durable spec.
+        plannerCustomEngine: bootOverrides.plannerCustomEngine,
+        coderCustomEngine: bootOverrides.coderCustomEngine,
+        reviewerCustomEngine: bootOverrides.reviewerCustomEngine,
+        sendTimeoutMs: bootOverrides.sendTimeoutMs ?? config.sendTimeoutMs,
+        _secureLedger: ledger,
+      }) as Parameters<SessionManager['_bootAutoloop']>[0];
+    let plannerTransitionProven = false;
+    if (assessment.next_safe_action === 'resume_planner') {
+      if (live) {
+        if (live.runner.state.status === 'paused' && !live.runner.state.pending_dispatch) {
+          await live.runner.send(AutoloopMsg.resume(live.runner.state.iter));
+          const postResumeStatus = live.runner.state.status as AutoloopState['status'];
+          plannerTransitionProven =
+            (postResumeStatus === 'planning' || postResumeStatus === 'running') && !live.runner.state.pending_dispatch;
+        }
+      } else {
+        const record = loadRun(runId);
+        const config = (
+          record?.spec.nodes.find((node) => node.id === LEGACY_NODE) as { config?: Record<string, unknown> } | undefined
+        )?.config;
+        if (!record || record.workflow !== 'autoloop' || !config) {
+          throw new AutoloopRecoveryError(
+            'AUTOLOOP_RECOVERY_INCOMPLETE',
+            `Autoloop run '${runId}' cannot resume from disk`,
+          );
+        }
+        await this._resumeAutoloopRun(runId, recoveryBootConfig(config));
+        const resumed = this.getAutoloop(runId);
+        plannerTransitionProven =
+          !!resumed &&
+          (resumed.runner.state.status === 'planning' || resumed.runner.state.status === 'running') &&
+          !resumed.runner.state.pending_dispatch;
+      }
+    } else if (assessment.next_safe_action === 'dispatch_coder') {
+      let handle = live ?? this.getAutoloop(runId);
+      if (!handle) {
+        const record = loadRun(runId);
+        const config = (
+          record?.spec.nodes.find((node) => node.id === LEGACY_NODE) as { config?: Record<string, unknown> } | undefined
+        )?.config;
+        if (!record || record.workflow !== 'autoloop' || !config) {
+          throw new AutoloopRecoveryError(
+            'AUTOLOOP_RECOVERY_INCOMPLETE',
+            `Autoloop run '${runId}' cannot resume from disk`,
+          );
+        }
+        await this._resumeAutoloopRun(runId, recoveryBootConfig(config));
+        handle = this.getAutoloop(runId);
+      }
+      if (!handle || prepared.action_snapshot.type !== 'directive') {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' lacks an exact Coder delivery to recover`,
+        );
+      }
+      try {
+        await handle.runner.send(prepared.action_snapshot, { requireRootDelivery: true });
+      } catch {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' Coder recovery did not reach the agent dispatcher`,
+        );
+      }
+    } else if (assessment.next_safe_action === 'request_review') {
+      let handle = live ?? this.getAutoloop(runId);
+      if (!handle) {
+        const record = loadRun(runId);
+        const config = (
+          record?.spec.nodes.find((node) => node.id === LEGACY_NODE) as { config?: Record<string, unknown> } | undefined
+        )?.config;
+        if (!record || record.workflow !== 'autoloop' || !config) {
+          throw new AutoloopRecoveryError(
+            'AUTOLOOP_RECOVERY_INCOMPLETE',
+            `Autoloop run '${runId}' cannot resume Reviewer recovery from disk`,
+          );
+        }
+        await this._resumeAutoloopRun(runId, recoveryBootConfig(config));
+        handle = this.getAutoloop(runId);
+      }
+      if (!handle || prepared.action_snapshot.type !== 'review_request') {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' lacks an exact durable Reviewer request to recover`,
+        );
+      }
+      try {
+        await handle.runner.send(prepared.action_snapshot, { requireRootDelivery: true });
+      } catch {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' Reviewer recovery did not reach the agent dispatcher`,
+        );
+      }
+    }
+    if (assessment.next_safe_action === 'resume_planner') {
+      const resumed = this.getAutoloop(runId);
+      if (
+        !plannerTransitionProven ||
+        !resumed ||
+        (resumed.runner.state.status !== 'planning' && resumed.runner.state.status !== 'running') ||
+        resumed.runner.state.pending_dispatch
+      ) {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' Planner recovery has no proven live postcondition`,
+        );
+      }
+    } else if (assessment.next_safe_action === 'dispatch_coder' || assessment.next_safe_action === 'request_review') {
+      const observed = await this._recoveryInput(runId, { readOnly: true });
+      const kind = assessment.next_safe_action === 'dispatch_coder' ? 'coder_directive' : 'review_request';
+      const actionSnapshot = prepared.action_snapshot;
+      if (actionSnapshot.type !== 'directive' && actionSnapshot.type !== 'review_request') {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' recovery action has no agent delivery identity`,
+        );
+      }
+      const acknowledged = observed.deliveries.some(
+        (delivery) =>
+          delivery.kind === kind &&
+          delivery.iter === actionSnapshot.iter &&
+          delivery.idempotency_key === recoveryActionDispatchId(runId, actionSnapshot) &&
+          delivery.acknowledged,
+      );
+      if (!acknowledged) {
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' ${kind} recovery has no durable acknowledgement`,
+        );
+      }
+    }
+    const appliedClaim = this._appendRecoveryReceipt(ledger, {
+      ...prepared,
+      status: 'applied',
+      recorded_at: new Date().toISOString(),
+    });
+    const receipt = appliedClaim.receipt;
+    if (receipt.status !== 'applied') {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${runId}' recovery effect remains unresolved`,
+      );
+    }
+    return { assessment, receipt };
   }
 
   autoloopList(): AutoloopState[] {
@@ -3534,20 +6735,263 @@ export class SessionManager {
     agent: 'planner' | 'coder' | 'reviewer',
     opts: { force?: boolean; eagerRestart?: boolean } = {},
   ): Promise<boolean> {
+    const result = await this.autoloopResetAgentResult(runId, agent, opts);
+    return result?.ok ?? false;
+  }
+
+  async autoloopResetAgentResult(
+    runId: string,
+    agent: 'planner' | 'coder' | 'reviewer',
+    opts: { force?: boolean; eagerRestart?: boolean } = {},
+  ): Promise<AutoloopResetResult | undefined> {
     const ctx = this.kernel.handle<AutoloopHandle & { dispatcher: ClaudeAgentDispatcher }>(runId, LEGACY_NODE);
-    if (!ctx) return false;
-    await ctx.dispatcher.resetAgent(agent, opts);
-    return true;
+    if (!ctx) return undefined;
+    return await ctx.dispatcher.resetAgent(agent, opts);
+  }
+
+  /** Serialize internal single-role recovery primitives with reviewer-only transitions. */
+  private async _withAutoloopRoleMutation<T>(runId: string, operation: () => Promise<T>): Promise<T> {
+    if (this._autoloopReviewDeleting.has(runId)) throw new Error(`Autoloop run '${runId}' is being deleted`);
+    const predecessor = this._autoloopReviewTransactions.get(runId) ?? Promise.resolve();
+    let release!: () => void;
+    const transaction = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = predecessor.then(() => transaction);
+    this._autoloopReviewTransactions.set(runId, tail);
+    await predecessor;
+    try {
+      if (this._autoloopReviewDeleting.has(runId)) throw new Error(`Autoloop run '${runId}' is being deleted`);
+      const result = await operation();
+      return result;
+    } finally {
+      release();
+      if (this._autoloopReviewTransactions.get(runId) === tail) this._autoloopReviewTransactions.delete(runId);
+    }
+  }
+
+  async autoloopSpawnCoder(
+    runId: string,
+    args: { coder_engine?: EngineType; coder_model?: string } = {},
+  ): Promise<PhysicalAgentGeneration> {
+    if (
+      typeof args !== 'object' ||
+      args === null ||
+      (Object.getPrototypeOf(args) !== Object.prototype && Object.getPrototypeOf(args) !== null)
+    ) {
+      throw new Error('autoloop_spawn_coder arguments must not contain inherited data');
+    }
+    if (
+      Reflect.ownKeys(args).some(
+        (key) => typeof key !== 'string' || (key !== 'coder_engine' && key !== 'coder_model' && key !== 'run_id'),
+      )
+    ) {
+      throw new Error('autoloop_spawn_coder arguments contain an unknown field');
+    }
+    const own = Object.create(null) as { coder_engine?: EngineType; coder_model?: string };
+    const engineDescriptor = Object.getOwnPropertyDescriptor(args, 'coder_engine');
+    const modelDescriptor = Object.getOwnPropertyDescriptor(args, 'coder_model');
+    if (engineDescriptor && !Object.hasOwn(engineDescriptor, 'value'))
+      throw new Error('autoloop_spawn_coder coder_engine must be an own data property');
+    if (modelDescriptor && !Object.hasOwn(modelDescriptor, 'value'))
+      throw new Error('autoloop_spawn_coder coder_model must be an own data property');
+    const engine = engineDescriptor?.value;
+    const model = modelDescriptor?.value;
+    if (
+      engine !== undefined &&
+      (typeof engine !== 'string' || engine === 'custom' || !ENGINE_TYPES.includes(engine as EngineType))
+    )
+      throw new Error(`Coder engine '${String(engine)}' is not supported`);
+    if (model !== undefined && (typeof model !== 'string' || model.length === 0 || model.length > 512))
+      throw new Error('autoloop_spawn_coder coder_model must be a non-empty string of at most 512 characters');
+    if (engine !== undefined) own.coder_engine = engine as EngineType;
+    if (model !== undefined) own.coder_model = model;
+    return await this._withAutoloopRoleMutation(runId, async () => {
+      const ctx = this._liveAutoloop(runId);
+      return await ctx.dispatcher.spawnCoder(own);
+    });
+  }
+
+  /** Internal Reviewer-only boundary: start exactly one Reviewer generation for a live run. */
+  async autoloopSpawnReviewer(
+    runId: string,
+    args: { reviewer_engine?: EngineType; reviewer_model?: string } = {},
+  ): Promise<PhysicalAgentGeneration> {
+    if (
+      typeof args !== 'object' ||
+      args === null ||
+      (Object.getPrototypeOf(args) !== Object.prototype && Object.getPrototypeOf(args) !== null)
+    ) {
+      throw new Error('autoloop_spawn_reviewer arguments must not contain inherited data');
+    }
+    if (
+      Reflect.ownKeys(args).some(
+        (key) => typeof key !== 'string' || (key !== 'reviewer_engine' && key !== 'reviewer_model' && key !== 'run_id'),
+      )
+    ) {
+      throw new Error('autoloop_spawn_reviewer arguments contain an unknown field');
+    }
+    const own = Object.create(null) as { reviewer_engine?: EngineType; reviewer_model?: string };
+    const engineDescriptor = Object.getOwnPropertyDescriptor(args, 'reviewer_engine');
+    const modelDescriptor = Object.getOwnPropertyDescriptor(args, 'reviewer_model');
+    if (engineDescriptor && !Object.hasOwn(engineDescriptor, 'value'))
+      throw new Error('autoloop_spawn_reviewer reviewer_engine must be an own data property');
+    if (modelDescriptor && !Object.hasOwn(modelDescriptor, 'value'))
+      throw new Error('autoloop_spawn_reviewer reviewer_model must be an own data property');
+    const engine = engineDescriptor?.value;
+    const model = modelDescriptor?.value;
+    if (
+      engine !== undefined &&
+      (typeof engine !== 'string' || engine === 'custom' || !ENGINE_TYPES.includes(engine as EngineType))
+    )
+      throw new Error(`Reviewer engine '${String(engine)}' is not supported`);
+    if (model !== undefined && (typeof model !== 'string' || model.length === 0 || model.length > 512))
+      throw new Error('autoloop_spawn_reviewer reviewer_model must be a non-empty string of at most 512 characters');
+    if (engine !== undefined) own.reviewer_engine = engine as EngineType;
+    if (model !== undefined) own.reviewer_model = model;
+    return await this._withAutoloopRoleMutation(runId, async () => {
+      const ctx = this._liveAutoloop(runId);
+      return await ctx.dispatcher.spawnReviewer(own);
+    });
+  }
+
+  /**
+   * Persist and enqueue one checkpoint-bound Reviewer-only request.
+   * Preparation is durable before Runner acceptance; duplicates enqueue nothing.
+   */
+  async autoloopRequestReview(
+    runId: string,
+    input: RequestReviewArgs,
+  ): Promise<{
+    status: 'prepared' | 'duplicate';
+    target: 'reviewer';
+    idempotency_key: string;
+  }> {
+    const request = canonicalizeRequestReviewArgs(input);
+    if (this._autoloopReviewDeleting.has(runId)) {
+      throw new Error(`Autoloop run '${runId}' is being deleted`);
+    }
+    const predecessor = this._autoloopReviewTransactions.get(runId) ?? Promise.resolve();
+    let release!: () => void;
+    const transaction = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = predecessor.then(() => transaction);
+    this._autoloopReviewTransactions.set(runId, tail);
+    await predecessor;
+    try {
+      if (this._autoloopReviewDeleting.has(runId)) {
+        throw new Error(`Autoloop run '${runId}' is being deleted`);
+      }
+      return await this._autoloopRequestReviewTransaction(runId, request);
+    } finally {
+      release();
+      if (this._autoloopReviewTransactions.get(runId) === tail) {
+        this._autoloopReviewTransactions.delete(runId);
+      }
+    }
+  }
+
+  private async _autoloopRequestReviewTransaction(
+    runId: string,
+    input: RequestReviewArgs,
+  ): Promise<{
+    status: 'prepared' | 'duplicate';
+    target: 'reviewer';
+    idempotency_key: string;
+  }> {
+    const request = canonicalizeRequestReviewArgs(input);
+    const ctx = this._liveAutoloop(runId, 'requesting review');
+    if (ctx.runner.state.status === 'paused') {
+      throw new AutoloopChatStateError(
+        'AUTOLOOP_RUN_PAUSED',
+        `Autoloop run '${runId}' is paused; resume it before requesting review`,
+        false,
+        undefined,
+        ctx.runner.state.status_reason,
+      );
+    }
+    if (ctx.runner.state.status === 'terminated' || ctx.runner.state.status === 'crashed') {
+      throw new AutoloopChatStateError(
+        'AUTOLOOP_RUN_TERMINAL',
+        `Autoloop run '${runId}' is terminal and cannot accept a review request`,
+        false,
+        undefined,
+        ctx.runner.state.status_reason,
+      );
+    }
+    const releasedIterations = this._autoloopReleasedReviewIterations.get(runId);
+    if (
+      !releasedIterations?.has(request.idempotency_key) &&
+      (releasedIterations?.size ?? 0) >= MAX_RELEASED_REVIEW_IDENTITIES_PER_RUN
+    ) {
+      throw new Error('request_review retry capacity is exhausted for this Autoloop run');
+    }
+    const targetIter = releasedIterations?.get(request.idempotency_key) ?? ctx.runner.state.iter;
+    const prepared = await ctx.dispatcher.requestReview(request, targetIter);
+    if (prepared.status === 'prepared') {
+      try {
+        const statusBeforeSend = ctx.runner.state.status as string;
+        if (statusBeforeSend === 'paused') {
+          throw new AutoloopChatStateError(
+            'AUTOLOOP_RUN_PAUSED',
+            `Autoloop run '${runId}' became paused before Reviewer-only queue delivery`,
+            false,
+          );
+        }
+        if (statusBeforeSend === 'terminated' || statusBeforeSend === 'crashed') {
+          throw new AutoloopChatStateError(
+            'AUTOLOOP_RUN_TERMINAL',
+            'Autoloop run became terminal before Reviewer-only queue delivery',
+            false,
+          );
+        }
+        await ctx.runner.send(AutoloopMsg.reviewRequest(targetIter, prepared.payload));
+      } catch (error) {
+        if (isCommittedSecureLedgerError(error)) throw error;
+        ctx.dispatcher['releaseReviewRequest'](prepared.idempotency_key, prepared.payload);
+        const byIdentity = releasedIterations ?? new Map<string, number>();
+        byIdentity.set(prepared.idempotency_key, prepared.payload.iter);
+        this._autoloopReleasedReviewIterations.set(runId, byIdentity);
+        if (error instanceof Error && /was not delivered because the run became terminal$/.test(error.message)) {
+          throw new AutoloopChatStateError(
+            'AUTOLOOP_RUN_TERMINAL',
+            'Autoloop run became terminal before Reviewer-only queue delivery',
+            false,
+          );
+        }
+        if (error instanceof Error && /was not delivered because the run is paused$/.test(error.message)) {
+          throw new AutoloopChatStateError(
+            'AUTOLOOP_RUN_PAUSED',
+            `Autoloop run '${runId}' became paused before Reviewer-only queue delivery`,
+            false,
+          );
+        }
+        throw error;
+      }
+      ctx.dispatcher['acceptReviewRequest'](prepared.idempotency_key);
+      releasedIterations?.delete(request.idempotency_key);
+    } else {
+      releasedIterations?.delete(request.idempotency_key);
+    }
+    if (releasedIterations?.size === 0) this._autoloopReleasedReviewIterations.delete(runId);
+    return publicData({
+      status: prepared.status,
+      target: 'reviewer' as const,
+      idempotency_key: prepared.idempotency_key,
+    });
   }
 
   async autoloopStop(runId: string, reason = 'user-stop'): Promise<boolean> {
-    const ctx = this.kernel.handle<AutoloopHandle & { runner: AutoloopRunner }>(runId, LEGACY_NODE);
-    if (!ctx) return false;
-    // Soft stop: a terminate envelope, so the three persistent agents shut down
-    // and the persisted sessions survive for a later resume. The node's exit
-    // watcher sees the status change and lets the run finish on its own.
-    await ctx.runner.send(AutoloopMsg.terminate(ctx.runner.state.iter, { reason }));
-    return true;
+    return await this._withAutoloopRoleMutation(runId, async () => {
+      const ctx = this.kernel.handle<AutoloopHandle & { runner: AutoloopRunner }>(runId, LEGACY_NODE);
+      if (!ctx) return false;
+      // Soft stop: a terminate envelope, so the three persistent agents shut down
+      // and the persisted sessions survive for a later resume. The node's exit
+      // watcher sees the status change and lets the run finish on its own.
+      await ctx.runner.send(AutoloopMsg.terminate(ctx.runner.state.iter, { reason }));
+      return true;
+    });
   }
 
   /**
@@ -3590,6 +7034,50 @@ export class SessionManager {
       if (config?.[`${role}Engine`] === 'custom') roles.push(role);
     }
     return { runId, rolesNeedingCustomEngine: roles };
+  }
+
+  /**
+   * Order a receipt-free stored resume against recovery's prepared claim.
+   *
+   * The lock is intentionally synchronous. `start` invokes `_resumeAutoloopRun`,
+   * whose call to `kernel.resume` acquires and checkpoints the durable run lease
+   * before returning its Promise. We release the recovery lock immediately
+   * after that synchronous ownership boundary; we never pretend to hold it
+   * across the asynchronous boot.
+   */
+  private _orderStoredResumeAgainstRecovery(
+    ledger: SecureAutoloopLedger,
+    runId: string,
+    start: () => Promise<AutoloopState>,
+  ): { kind: 'recovery'; receipt: RecoveryReceipt } | { kind: 'legacy'; operation: Promise<AutoloopState> } {
+    const locked = withFileLock(
+      path.join(ledger.directory, '.autoloop-recovery.lock'),
+      () => {
+        // The earlier snapshot only selects this compatibility candidate. The
+        // decision itself is made here, alongside recovery's receipt append.
+        const receipts = this._recoveryReceiptRows(ledger, runId);
+        const appliedTokens = new Set(
+          receipts.filter((row) => row.status === 'applied').map((row) => row.recovery_token),
+        );
+        const unresolved = receipts.find((row) => row.status === 'prepared' && !appliedTokens.has(row.recovery_token));
+        const applied = [...receipts].reverse().find((row) => row.status === 'applied');
+        const authoritative = unresolved ?? applied;
+        if (authoritative) return { kind: 'recovery' as const, receipt: authoritative };
+
+        // Calling an async function runs through its first await synchronously.
+        // `_resumeAutoloopRun` reaches `kernel.resume`, and `kernel.resume`
+        // durably acquires the lease without awaiting, before `start` returns.
+        return { kind: 'legacy' as const, operation: start() };
+      },
+      { waitMs: 500 },
+    );
+    if (!locked.ok) {
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${runId}' stored resume lock is ${locked.reason}`,
+      );
+    }
+    return locked.value;
   }
 
   async autoloopResume(
@@ -3640,7 +7128,7 @@ export class SessionManager {
       // The checks above and the three operations below are synchronous. Audit
       // first, so an append failure leaves both the dispatcher and runner
       // untouched; after that no asynchronous work can swap the pending id.
-      appendSendTimeoutMigration(live.runner.state.workspace, {
+      const migrationCommitError = appendSendTimeoutMigration(live.dispatcher.secureLedgerCapability, {
         runId,
         field: 'sendTimeoutMs',
         oldValue: current,
@@ -3653,6 +7141,7 @@ export class SessionManager {
         throw new Error(`Autoloop run '${runId}' pending dispatch changed during resume`);
       }
       this._autoloopPublishers.get(runId)?.();
+      if (migrationCommitError) throw migrationCommitError.withAppliedOutcome('send_timeout_migration');
       return live.runner.state;
     }
 
@@ -3674,7 +7163,15 @@ export class SessionManager {
     validateAutoloopEffort('reviewer', config.reviewerEffort as EffortLevel | undefined);
 
     const workspace = typeof config.workspace === 'string' ? config.workspace : record.cwd;
-    const storedContext = readStoredAutoloopResumeContext(workspace, runId, config.sendTimeoutMs);
+    // Pin one run capability for the complete stored-resume transaction. It
+    // remains the authority for audit replay, any prepared migration append,
+    // and the dispatcher that boots below; no stage re-resolves the path.
+    const secureLedger = SecureAutoloopLedger.open(workspace, runId, {
+      create: false,
+      validateExistingFlatFiles: ['decisions.jsonl'],
+      logger: this.logger,
+    });
+    const storedContext = readStoredAutoloopResumeContext(secureLedger, runId, config.sendTimeoutMs);
     const nodeState = (record.nodes[LEGACY_NODE]?.data as { state?: AutoloopState } | undefined)?.state;
     const recordCarriesPending = nodeState
       ? Object.prototype.hasOwnProperty.call(nodeState, 'pending_dispatch')
@@ -3684,6 +7181,56 @@ export class SessionManager {
         ? nodeState.pending_dispatch
         : null
       : storedContext.pendingDispatch;
+
+    const originalSendTimeoutMs = (config.sendTimeoutMs as number | undefined) ?? DEFAULT_SEND_TIMEOUT_MS;
+    const recoveryReceipts = this._recoveryReceiptRows(secureLedger, runId);
+    const appliedRecoveryTokens = new Set(
+      recoveryReceipts.filter((row) => row.status === 'applied').map((row) => row.recovery_token),
+    );
+    const unresolvedRecoveryReceipt = recoveryReceipts.find(
+      (row) => row.status === 'prepared' && !appliedRecoveryTokens.has(row.recovery_token),
+    );
+    const latestAppliedRecoveryReceipt = [...recoveryReceipts].reverse().find((row) => row.status === 'applied');
+    const authoritativeRecoveryReceipt = unresolvedRecoveryReceipt ?? latestAppliedRecoveryReceipt;
+    const hasRecoveryReceipt = recoveryReceipts.length > 0;
+    const hasLegacyStoredResumeState =
+      !hasRecoveryReceipt &&
+      (storedContext.effectiveSendTimeoutMs !== originalSendTimeoutMs ||
+        pending !== null ||
+        record.state === 'cancelled');
+    if (hasRecoveryReceipt || (!hasTimeoutIncrease && !hasLegacyStoredResumeState)) {
+      // A receipt is authoritative over every compatibility shortcut. Without
+      // one, legacy timeout state and receipt-free cancellation keep their
+      // established path below.
+      const bootOverrides: RecoveryBootOverrides = {
+        plannerCustomEngine: opts.plannerCustomEngine,
+        coderCustomEngine: opts.coderCustomEngine,
+        reviewerCustomEngine: opts.reviewerCustomEngine,
+        sendTimeoutMs: storedContext.effectiveSendTimeoutMs,
+      };
+      const recoveryToken =
+        authoritativeRecoveryReceipt?.recovery_token ?? (await this._autoloopRecover(runId)).assessment.recovery_token;
+      const recovery = await this._autoloopRecover(
+        runId,
+        { apply: true, recovery_token: recoveryToken },
+        bootOverrides,
+      );
+      const recovered = this.getAutoloop(runId);
+      if (recovered) return recovered.runner.state;
+      if (recovery.receipt?.status === 'applied') {
+        const replayedState = autoloopStateFromRecord(record);
+        if (replayedState) return replayedState;
+      }
+      throw new AutoloopRecoveryError(
+        'AUTOLOOP_RECOVERY_INCOMPLETE',
+        `Autoloop run '${runId}' recovery has no current live state`,
+      );
+    }
+
+    if (!hasTimeoutIncrease) {
+      const existing = this._autoloopStoredResumeTransactions.get(runId);
+      if (existing) return await existing;
+    }
 
     if (hasTimeoutIncrease && pending && opts.pendingDispatchId === undefined) {
       throw new Error(`pendingDispatchId is required to resume timed-out dispatch '${pending.dispatch_id}'`);
@@ -3713,37 +7260,79 @@ export class SessionManager {
             ...(pending ? { pendingDispatchId: pending.dispatch_id } : {}),
           }
         : undefined;
-    const preparedMigration = migration ? prepareSendTimeoutMigrationAppend(workspace, migration) : undefined;
+    const preparedMigration = migration ? prepareSendTimeoutMigrationAppend(secureLedger, migration) : undefined;
     let migrationCommitted = false;
+    let migrationCommitError: SecureAutoloopLedgerCommitError | undefined;
+    let resumeOperation: Promise<AutoloopState> | undefined;
     try {
       // Custom-engine configs are never persisted (they can carry secrets), so
       // a resume must be given them again by the caller.
-      return await this._resumeAutoloopRun(
-        runId,
-        {
-          ...config,
-          // Effective migrations are replayed from append-only audit rather
-          // than written back into the immutable original spec.
-          sendTimeoutMs: nextSendTimeoutMs,
-          plannerCustomEngine: opts.plannerCustomEngine,
-          coderCustomEngine: opts.coderCustomEngine,
-          reviewerCustomEngine: opts.reviewerCustomEngine,
-        } as Parameters<SessionManager['_bootAutoloop']>[0],
-        {
-          timeoutMigration: hasTimeoutIncrease,
-          commitTimeoutMigration: preparedMigration
-            ? () => {
-                if (migrationCommitted) return;
-                commitPreparedSendTimeoutMigration(preparedMigration);
-                migrationCommitted = true;
-              }
-            : undefined,
-        },
+      const ordered = this._orderStoredResumeAgainstRecovery(secureLedger, runId, () =>
+        this._resumeAutoloopRun(
+          runId,
+          {
+            ...config,
+            // Effective migrations are replayed from append-only audit rather
+            // than written back into the immutable original spec.
+            sendTimeoutMs: nextSendTimeoutMs,
+            plannerCustomEngine: opts.plannerCustomEngine,
+            coderCustomEngine: opts.coderCustomEngine,
+            reviewerCustomEngine: opts.reviewerCustomEngine,
+            _secureLedger: secureLedger,
+          } as Parameters<SessionManager['_bootAutoloop']>[0],
+          {
+            timeoutMigration: hasTimeoutIncrease,
+            commitTimeoutMigration: preparedMigration
+              ? () => {
+                  if (migrationCommitted) return;
+                  try {
+                    migrationCommitError = commitPreparedSendTimeoutMigration(preparedMigration);
+                  } finally {
+                    // Bytes committed is itself a terminal append state even if
+                    // a durability barrier remains incomplete. Any boot retry
+                    // must observe this row, never append the migration again.
+                    migrationCommitted = preparedMigration.append.committed;
+                  }
+                }
+              : undefined,
+          },
+        ),
       );
+      if (ordered.kind === 'recovery') {
+        const recovery = await this._autoloopRecover(
+          runId,
+          { apply: true, recovery_token: ordered.receipt.recovery_token },
+          {
+            plannerCustomEngine: opts.plannerCustomEngine,
+            coderCustomEngine: opts.coderCustomEngine,
+            reviewerCustomEngine: opts.reviewerCustomEngine,
+            sendTimeoutMs: storedContext.effectiveSendTimeoutMs,
+          },
+        );
+        const recovered = this.getAutoloop(runId);
+        if (recovered) return recovered.runner.state;
+        if (recovery.receipt?.status === 'applied') {
+          const replayedRecord = loadRun(runId);
+          const replayedState = replayedRecord ? autoloopStateFromRecord(replayedRecord) : undefined;
+          if (replayedState) return replayedState;
+        }
+        throw new AutoloopRecoveryError(
+          'AUTOLOOP_RECOVERY_INCOMPLETE',
+          `Autoloop run '${runId}' recovery has no current live state`,
+        );
+      }
+      resumeOperation = ordered.operation;
+      if (!hasTimeoutIncrease) this._autoloopStoredResumeTransactions.set(runId, resumeOperation);
+      const state = await resumeOperation;
+      if (migrationCommitError) throw migrationCommitError.withAppliedOutcome('send_timeout_migration');
+      return state;
     } finally {
+      if (resumeOperation && this._autoloopStoredResumeTransactions.get(runId) === resumeOperation) {
+        this._autoloopStoredResumeTransactions.delete(runId);
+      }
       if (preparedMigration) {
         try {
-          fs.closeSync(preparedMigration.fd);
+          preparedMigration.append.close();
         } catch (err) {
           // Descriptor cleanup cannot retroactively turn a committed append
           // and successful startup into a failed migration.
@@ -3777,6 +7366,7 @@ export class SessionManager {
       sendTimeoutMs: config.sendTimeoutMs,
       _resumeTimeoutMigration: opts.timeoutMigration || undefined,
       _commitTimeoutMigration: opts.commitTimeoutMigration,
+      _secureLedger: config._secureLedger,
     };
     try {
       // `restart: true` because an autoloop resume means "bring the loop back
@@ -3814,53 +7404,74 @@ export class SessionManager {
     if ([...this._autoloopStarting.values()].includes(runId)) {
       throw new Error(`Autoloop with id '${runId}' is still starting`);
     }
-    const ctx = this.kernel.handle<AutoloopHandle & { runner: AutoloopRunner; dispatcher: ClaudeAgentDispatcher }>(
-      runId,
-      LEGACY_NODE,
-    );
-    let touched = false;
-    if (ctx) {
-      // Delete = "really gone". Call dispatcher.shutdown directly with
-      // purge:true so persistedSessions entries are removed too —
-      // otherwise the Claude Planner conversation lingers on disk and the
-      // run could be /resume'd back to life. Bypassing runner.send is
-      // intentional: the runner's terminate path is meant to be the
-      // soft-pause we use for autoloopStop / autoloopResume, which keeps
-      // persisted state intact.
-      try {
-        await ctx.dispatcher.shutdown('user-delete', { purge: true });
-      } catch (err) {
-        this.logger.warn?.(`[autoloop/${runId}] dispatcher shutdown during delete failed: ${(err as Error).message}`);
+    const deleteCount = (this._autoloopReviewDeleteCounts.get(runId) ?? 0) + 1;
+    this._autoloopReviewDeleteCounts.set(runId, deleteCount);
+    this._autoloopReviewDeleting.add(runId);
+    try {
+      await (this._autoloopReviewTransactions.get(runId) ?? Promise.resolve());
+      this._autoloopReleasedReviewIterations.delete(runId);
+      this._autoloopReviewTransactions.delete(runId);
+      const ctx = this.kernel.handle<AutoloopHandle & { runner: AutoloopRunner; dispatcher: ClaudeAgentDispatcher }>(
+        runId,
+        LEGACY_NODE,
+      );
+      let touched = false;
+      if (ctx) {
+        // Delete = "really gone". Call dispatcher.shutdown directly with
+        // purge:true so persistedSessions entries are removed too —
+        // otherwise the Claude Planner conversation lingers on disk and the
+        // run could be /resume'd back to life. Bypassing runner.send is
+        // intentional: the runner's terminate path is meant to be the
+        // soft-pause we use for autoloopStop / autoloopResume, which keeps
+        // persisted state intact.
+        try {
+          await ctx.dispatcher.shutdown('user-delete', { purge: true });
+        } catch (err) {
+          this.logger.warn?.(`[autoloop/${runId}] dispatcher shutdown during delete failed: ${(err as Error).message}`);
+        }
+        try {
+          ctx.runner.stop();
+        } catch {
+          /* runner may already be stopped */
+        }
+        this.kernel.cancel(runId);
+        touched = true;
+      } else {
+        // Disk-only run: ensure any leftover persistedSessions entry for the
+        // Planner is cleaned up so it isn't resumed by accident later.
+        try {
+          await this.stopSession(`autoloop-${runId}-planner`);
+        } catch {
+          /* session not in memory — fine */
+        }
+        this.persistedSessions.delete(`autoloop-${runId}-planner`);
+        this.persistedSessions.delete(`autoloop-${runId}-coder`);
+        this.persistedSessions.delete(`autoloop-${runId}-reviewer`);
+        const names = [`autoloop-${runId}-planner`, `autoloop-${runId}-coder`, `autoloop-${runId}-reviewer`];
+        this._withAgentRegistryLock((authoritative) => {
+          const updatedSessions = new Map(authoritative);
+          for (const name of names) updatedSessions.delete(name);
+          return { value: true, updatedSessions };
+        });
       }
-      try {
-        ctx.runner.stop();
-      } catch {
-        /* runner may already be stopped */
+      // No registry to scrub: the run record IS the registry, and removing it is
+      // the delete. The ledger directory under tasks/<runId>/ is deliberately left
+      // alone — postmortem artifacts (chat history, push log, plan.md) outlive the
+      // run, exactly as before.
+      if (loadRun(runId)) {
+        this.kernel.delete(runId);
+        touched = true;
       }
-      this.kernel.cancel(runId);
-      touched = true;
-    } else {
-      // Disk-only run: ensure any leftover persistedSessions entry for the
-      // Planner is cleaned up so it isn't resumed by accident later.
-      try {
-        await this.stopSession(`autoloop-${runId}-planner`);
-      } catch {
-        /* session not in memory — fine */
+      return touched;
+    } finally {
+      const remaining = (this._autoloopReviewDeleteCounts.get(runId) ?? 1) - 1;
+      if (remaining > 0) {
+        this._autoloopReviewDeleteCounts.set(runId, remaining);
+      } else {
+        this._autoloopReviewDeleteCounts.delete(runId);
+        this._autoloopReviewDeleting.delete(runId);
       }
-      this.persistedSessions.delete(`autoloop-${runId}-planner`);
-      this.persistedSessions.delete(`autoloop-${runId}-coder`);
-      this.persistedSessions.delete(`autoloop-${runId}-reviewer`);
-      savePersistedSessions(this.persistedSessions, this.logger);
     }
-    // No registry to scrub: the run record IS the registry, and removing it is
-    // the delete. The ledger directory under tasks/<runId>/ is deliberately left
-    // alone — postmortem artifacts (chat history, push log, plan.md) outlive the
-    // run, exactly as before.
-    if (loadRun(runId)) {
-      this.kernel.delete(runId);
-      touched = true;
-    }
-    return touched;
   }
 
   /** Used by embedded-server to attach SSE listeners. Live runs only. */
@@ -3907,6 +7518,6 @@ export class SessionManager {
         pruned = true;
       }
     }
-    if (pruned) savePersistedSessionsAsync(this.persistedSessions);
+    if (pruned) this._persistRegistrySnapshot();
   }
 }

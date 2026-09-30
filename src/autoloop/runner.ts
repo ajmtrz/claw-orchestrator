@@ -11,7 +11,14 @@
  */
 
 import { EventEmitter } from 'node:events';
-import { type AnyAutoloopMessage, AutoloopRoutingError, Msg, validateMessage } from './messages.js';
+import {
+  type AnyAutoloopMessage,
+  type AutoloopOperationErrorCode,
+  AutoloopRoutingError,
+  canonicalizeMessageBatch,
+  canonicalizeMessage,
+  Msg,
+} from './messages.js';
 import {
   DEFAULT_PUSH_POLICY,
   MAX_METRIC_HISTORY,
@@ -28,6 +35,81 @@ const MAX_PAUSED_BUFFER = 1000;
 const DEFAULT_PHASE_ERROR_CIRCUIT = 3;
 const DEFAULT_STALL_MS = 30 * 60_000;
 const DEFAULT_STALL_CHECK_MS = 30_000;
+
+interface AutoloopOperationFailure extends Error {
+  code: AutoloopOperationErrorCode;
+  committed?: true;
+  retryable?: boolean;
+  secondaryErrors?: Error[];
+}
+
+interface SenderContext {
+  readonly id: string;
+  pending: number;
+  settled: boolean;
+  failure?: unknown;
+  rootDelivered: boolean;
+  requireRootDelivery: boolean;
+  readonly promise: Promise<void>;
+  readonly resolve: () => void;
+  readonly reject: (error: unknown) => void;
+}
+
+const AUTOLOOP_OPERATION_ERROR_CODES = new Set<AutoloopOperationErrorCode>([
+  'AUTOLOOP_EMPTY_REPLY',
+  'AUTOLOOP_SESSION_NOT_CREATED',
+  'AUTOLOOP_ENGINE_FAILURE',
+  'AUTOLOOP_REQUIRED_TOOL_DENIED',
+  'AUTOLOOP_CONTROL_MALFORMED',
+  'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+  'AUTOLOOP_CONTROL_NOT_PERSISTED',
+  'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+  'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+  'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+  'AUTOLOOP_LEDGER_DESCRIPTOR_CLOSE_INCOMPLETE',
+  'AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID',
+]);
+
+const COMMITTED_LEDGER_ERROR_CODES = new Set<AutoloopOperationErrorCode>([
+  'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+  'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+  'AUTOLOOP_LEDGER_DESCRIPTOR_CLOSE_INCOMPLETE',
+  'AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID',
+]);
+
+function isAutoloopOperationFailure(error: unknown): error is AutoloopOperationFailure {
+  if (!(error instanceof Error)) return false;
+  const candidate = error as Error & { code?: unknown; committed?: unknown };
+  if (
+    typeof candidate.code !== 'string' ||
+    !AUTOLOOP_OPERATION_ERROR_CODES.has(candidate.code as AutoloopOperationErrorCode)
+  ) {
+    return false;
+  }
+  if (error.name === 'AutoloopOperationError') return true;
+  return (
+    error.name === 'SecureAutoloopLedgerCommitError' &&
+    candidate.committed === true &&
+    COMMITTED_LEDGER_ERROR_CODES.has(candidate.code as AutoloopOperationErrorCode)
+  );
+}
+
+function normalisePlannerOperationFailure(error: unknown): AutoloopOperationFailure {
+  if (isAutoloopOperationFailure(error)) return error;
+  const cause = error instanceof Error ? error : new Error(String(error));
+  const failure = new Error(`Planner engine transport failed: ${cause.message}`, {
+    cause,
+  }) as AutoloopOperationFailure & { retryable: true };
+  failure.name = 'AutoloopOperationError';
+  failure.code = 'AUTOLOOP_ENGINE_FAILURE';
+  failure.retryable = true;
+  return failure;
+}
+
+function preserveSecondaryOperationFailure(primary: AutoloopOperationFailure, secondary: unknown): void {
+  const error = secondary instanceof Error ? secondary : new Error(String(secondary));
+  (primary.secondaryErrors ??= []).push(error);
+}
 
 /**
  * The single allow-list for activity-lease renewal. These values describe
@@ -78,10 +160,16 @@ export class AutoloopRunner extends EventEmitter {
    */
   private pausedBuffer: AnyAutoloopMessage[] = [];
   private draining = false;
+  /** Shared completion for every sender that joins the active queue drain. */
+  private drainPromise: Promise<void> | null = null;
+  /** Causal sender identity for queued and derived envelopes. */
+  private readonly messageSenders = new WeakMap<object, SenderContext>();
   private regressionStreak = 0;
   private rejectStreak = 0;
   /** Recent push events for dedup (5 min window). */
   private recentPushes: Array<{ key: string; ts: number }> = [];
+  /** Internal mandatory policy emissions must not collide with ordinary pushes. */
+  private readonly mandatoryPolicyPushes = new WeakSet<object>();
   private stallTimer: ReturnType<typeof setInterval> | null = null;
   private activityLeaseTimer: ReturnType<typeof setTimeout> | null = null;
   private hardDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
@@ -273,18 +361,36 @@ export class AutoloopRunner extends EventEmitter {
   private terminate(reason: string, timeoutEvent?: AutoloopTimeoutEvent): Promise<void> {
     if (this.terminationStarted) return this.terminationPromise ?? Promise.resolve();
     this.terminationStarted = true;
+    // Publish terminal status only after the completion promise exists. State
+    // listeners use this promise to distinguish "termination started" from
+    // dispatcher teardown actually finishing.
+    this.terminationPromise = Promise.resolve().then(async () => {
+      await this.config.dispatcher.shutdown?.(reason);
+      this.emit('terminated', reason);
+    });
     this.state.status = 'terminated';
     this.state.status_reason = reason;
     this.state.pending_dispatch = null;
-    this.queue.length = 0;
+    for (const queued of this.queue.splice(0)) {
+      const sender = this.messageSenders.get(queued);
+      if (!sender?.rootDelivered) {
+        this.failSender(
+          sender,
+          new Error(`Autoloop message '${queued.msg_id}' was not delivered because the run became terminal`),
+        );
+      }
+      this.completeSenderMessage(sender);
+    }
     this.pausedBuffer.length = 0;
     this.stop();
     this.emit('state', this.state);
     if (timeoutEvent) this.emit('timeout', timeoutEvent);
-    this.terminationPromise = (async () => {
-      await this.config.dispatcher.shutdown?.(reason);
-      this.emit('terminated', reason);
-    })();
+    return this.terminationPromise;
+  }
+
+  /** Completion of the dispatcher teardown begun by a terminal state change. */
+  waitForTermination(): Promise<void> {
+    if (!this.terminationPromise) throw new Error('Autoloop termination has not started');
     return this.terminationPromise;
   }
 
@@ -306,11 +412,101 @@ export class AutoloopRunner extends EventEmitter {
   }
 
   /** Enqueue a message and drain the queue. Resolves when the queue is idle. */
-  async send(env: AnyAutoloopMessage): Promise<void> {
-    validateMessage(env);
+  async send(env: AnyAutoloopMessage, options: { requireRootDelivery?: boolean } = {}): Promise<void> {
+    const message = canonicalizeMessage(env);
+    if (message.type === 'review_request') {
+      if (this.terminationStarted || ['terminated', 'crashed'].includes(this.state.status)) {
+        throw new Error(`Autoloop message '${message.msg_id}' was not delivered because the run became terminal`);
+      }
+      await this.config.persistReviewEnvelope?.(message);
+      if (this.terminationStarted || ['terminated', 'crashed'].includes(this.state.status)) {
+        throw new Error(`Autoloop message '${message.msg_id}' was not delivered because the run became terminal`);
+      }
+    }
     this.recordActivity('queue_message_accepted');
-    this.queue.push(env);
-    await this.drain();
+    if (this.drainPromise && message.to === 'runner' && message.type === 'terminate') {
+      // Termination is the one pre-emptive control: queueing it behind a stuck
+      // agent send would make the operator unable to stop that send. Apply the
+      // terminal transition now; terminate() clears queued work, and the active
+      // delivery is ignored when it eventually returns into terminal state.
+      await this.handleOne(message);
+      return;
+    }
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
+    });
+    const sender: SenderContext = {
+      id: message.msg_id,
+      pending: 0,
+      settled: false,
+      rootDelivered: false,
+      requireRootDelivery: options.requireRootDelivery === true,
+      promise,
+      resolve,
+      reject,
+    };
+    this.enqueueMessage(message, sender);
+    // Attach rejection handling before the drain can settle this sender. A
+    // failed drain stops at its causal boundary; a later sender then starts a
+    // fresh drain rather than inheriting the earlier failure.
+    const outcome = sender.promise.then(
+      () => ({ ok: true as const }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    while (!sender.settled) await this.drain();
+    const settled = await outcome;
+    if (!settled.ok) throw settled.error;
+    if (sender.requireRootDelivery && !sender.rootDelivered) {
+      throw new Error(`Autoloop message '${message.msg_id}' was not delivered to the agent dispatcher`);
+    }
+  }
+
+  private enqueueMessage(env: AnyAutoloopMessage, sender?: SenderContext, front = false): void {
+    const liveSender = sender && !sender.settled ? sender : undefined;
+    if (liveSender) {
+      liveSender.pending += 1;
+      this.messageSenders.set(env, liveSender);
+    }
+    if (front) {
+      this.queue.unshift(env);
+    } else if (liveSender?.failure !== undefined) {
+      const firstOtherSender = this.queue.findIndex((queued) => this.messageSenders.get(queued) !== liveSender);
+      if (firstOtherSender < 0) this.queue.push(env);
+      else this.queue.splice(firstOtherSender, 0, env);
+    } else {
+      this.queue.push(env);
+    }
+  }
+
+  private failSender(sender: SenderContext | undefined, error: unknown): void {
+    if (!sender || sender.settled) return;
+    if (sender.failure && isAutoloopOperationFailure(sender.failure)) {
+      preserveSecondaryOperationFailure(sender.failure, error);
+    } else if (sender.failure === undefined) {
+      sender.failure = error;
+    }
+  }
+
+  /**
+   * Node treats an `error` event with no listener as a throw. Detached drains
+   * have no caller left to reject, so publish diagnostic errors only when an
+   * observer explicitly subscribed instead of creating an unhandled rejection.
+   */
+  private emitObservedError(error: unknown): void {
+    if (this.listenerCount('error') === 0) return;
+    this.emit('error', error instanceof Error ? error : new Error(String(error)));
+  }
+
+  private completeSenderMessage(sender: SenderContext | undefined): void {
+    if (!sender || sender.settled) return;
+    sender.pending -= 1;
+    if (sender.pending > 0) return;
+    sender.settled = true;
+    if (sender.failure !== undefined) sender.reject(sender.failure);
+    else sender.resolve();
   }
 
   /** External entry: user typed something to Planner. */
@@ -344,13 +540,20 @@ export class AutoloopRunner extends EventEmitter {
     // This entry point is called outside the normal queue drain. Resume only
     // the messages parked *after* the timed-out dispatch; the timed-out message
     // itself is deliberately never requeued.
-    void this.drain().catch((err) => this.emit('error', err));
+    void this.drain().catch((err) => this.emitObservedError(err));
     return true;
   }
 
   /** Mark subagents spawned (called by S3's spawn_subagents tool handler). */
   markSubagentsSpawned(): void {
-    if (this.state.subagents_spawned) return;
+    if (
+      this.terminationStarted ||
+      this.state.status === 'terminated' ||
+      this.state.status === 'crashed' ||
+      this.state.subagents_spawned
+    ) {
+      return;
+    }
     this.recordActivity('lifecycle_transition');
     this.state.subagents_spawned = true;
     this.state.status = 'running';
@@ -359,38 +562,112 @@ export class AutoloopRunner extends EventEmitter {
 
   // ─── Drain loop ────────────────────────────────────────────────────────────
 
-  private async drain(): Promise<void> {
-    if (this.draining) return; // a previous send() is already draining; new items will be picked up
+  private drain(): Promise<void> {
+    if (this.drainPromise) return this.drainPromise;
+
+    let resolveDrain!: () => void;
+    let rejectDrain!: (error: unknown) => void;
+    const activeDrain = new Promise<void>((resolve, reject) => {
+      resolveDrain = resolve;
+      rejectDrain = reject;
+    });
+
+    // Publish the shared completion before starting the loop. handleOne()
+    // emits synchronously, so a listener can re-enter send() before the first
+    // awaited delivery; that sender must join this drain rather than start a
+    // competing consumer.
+    this.drainPromise = activeDrain;
     this.draining = true;
-    try {
-      const maxDepth = this.config.maxDispatchDepth ?? MAX_DISPATCH_DEPTH;
-      let depth = 0;
-      while (this.queue.length > 0) {
-        if (depth++ > maxDepth) {
-          const next = this.queue[0];
-          throw new AutoloopRoutingError(
-            `dispatch depth exceeded ${maxDepth} at iter ${this.state.iter} (next='${next?.type ?? '?'}' to '${next?.to ?? '?'}') — likely message ping-pong; raise config.maxDispatchDepth for legitimately deep workflows`,
-          );
-        }
-        const env = this.queue.shift();
-        if (!env) break;
-        await this.handleOne(env);
-      }
-    } finally {
+    const settle = (): void => {
       this.draining = false;
+      if (this.drainPromise === activeDrain) this.drainPromise = null;
+    };
+    void this.drainUntilIdle().then(
+      () => {
+        settle();
+        resolveDrain();
+      },
+      (error: unknown) => {
+        settle();
+        rejectDrain(error);
+      },
+    );
+    return activeDrain;
+  }
+
+  private async drainUntilIdle(): Promise<void> {
+    const maxDepth = this.config.maxDispatchDepth ?? MAX_DISPATCH_DEPTH;
+    let depth = 0;
+    while (this.queue.length > 0) {
+      if (depth++ > maxDepth) {
+        const next = this.queue[0];
+        const routingError = new AutoloopRoutingError(
+          `dispatch depth exceeded ${maxDepth} at iter ${this.state.iter} (next='${next?.type ?? '?'}' to '${next?.to ?? '?'}') — likely message ping-pong; raise config.maxDispatchDepth for legitimately deep workflows`,
+        );
+        for (const queued of this.queue.splice(0)) {
+          const sender = this.messageSenders.get(queued);
+          this.failSender(sender, routingError);
+          this.completeSenderMessage(sender);
+        }
+        break;
+      }
+      const env = this.queue.shift();
+      if (!env) break;
+      const sender = this.messageSenders.get(env);
+      try {
+        await this.handleOne(env, sender);
+      } catch (error) {
+        let phaseAgent: 'planner' | 'coder' | 'reviewer' | undefined;
+        let operationFailure: AutoloopOperationFailure | undefined;
+        if (error instanceof AutoloopRoutingError) {
+          // Canonical routing/schema rejection happens before an agent effect.
+          // Preserve that public taxonomy instead of turning caller input into
+          // a retryable engine failure that mutates the phase-error circuit.
+        } else if (env.to === 'planner') {
+          phaseAgent = env.to;
+          operationFailure = normalisePlannerOperationFailure(error);
+        } else if ((env.to === 'coder' || env.to === 'reviewer') && isAutoloopOperationFailure(error)) {
+          phaseAgent = env.to;
+          operationFailure = error;
+        }
+        if (phaseAgent && operationFailure) {
+          this.failSender(sender, operationFailure);
+          const phaseError = canonicalizeMessage(
+            Msg.phaseError(env.iter, {
+              agent: phaseAgent,
+              phase: `${phaseAgent}_turn`,
+              code: operationFailure.code,
+              ...(operationFailure.committed === true ? { committed: true as const, retryable: false as const } : {}),
+              error: operationFailure.message,
+            }),
+          );
+          this.enqueueMessage(phaseError, sender, true);
+        } else {
+          this.failSender(sender, error);
+          if (!sender || sender.settled) this.emitObservedError(error);
+        }
+      } finally {
+        this.completeSenderMessage(sender);
+      }
+      if (sender?.failure !== undefined && sender.settled) break;
     }
   }
 
-  private async handleOne(env: AnyAutoloopMessage): Promise<void> {
+  private async handleOne(env: AnyAutoloopMessage, sender?: SenderContext): Promise<void> {
     // 'terminated' is the final state — once reached, no message of any kind is
     // processed (see events contract above). The terminate message itself still
     // runs because status only flips to 'terminated' while handling it.
-    if (this.state.status === 'terminated' || this.state.status === 'crashed') return;
+    if (this.state.status === 'terminated' || this.state.status === 'crashed') {
+      if (sender?.requireRootDelivery && env.msg_id === sender.id) {
+        throw new Error(`Autoloop message '${env.msg_id}' was not delivered because the run became terminal`);
+      }
+      return;
+    }
     this.emit('message', env);
 
     // Runner is the target for a small set of messages — handle them inline.
     if (env.to === 'runner') {
-      await this.handleRunnerInbox(env);
+      await this.handleRunnerInbox(env, sender);
       return;
     }
 
@@ -406,6 +683,12 @@ export class AutoloopRunner extends EventEmitter {
     // Pause: park agent-bound messages until resume. Runner-bound (resume /
     // terminate) and user-bound (push) flow through above and are unaffected.
     if (this.state.status === 'paused') {
+      if (sender?.requireRootDelivery && env.msg_id === sender.id) {
+        throw new Error(`Autoloop message '${env.msg_id}' was not delivered because the run is paused`);
+      }
+      if (env.type === 'review_request' && Object.hasOwn(env.payload, 'checkpoint_sha')) {
+        throw new Error(`Autoloop message '${env.msg_id}' was not delivered because the run is paused`);
+      }
       // Bound the buffer: a long pause + continuous policy pushes would
       // otherwise grow it without limit and OOM the process.
       if (this.pausedBuffer.length >= MAX_PAUSED_BUFFER) {
@@ -416,26 +699,41 @@ export class AutoloopRunner extends EventEmitter {
       return;
     }
     const replies = await this.config.dispatcher.deliver(env);
-    for (const r of replies) {
-      validateMessage(r);
+    if (sender && env.msg_id === sender.id) sender.rootDelivered = true;
+    if (this.terminationStarted || ['terminated', 'crashed'].includes(this.state.status)) return;
+    // Validate and snapshot the complete logical reply batch before recording
+    // progress or enqueueing any member. Otherwise a valid early push/terminate
+    // can take effect even though a malformed later reply rejects this send.
+    const canonicalReplies = canonicalizeMessageBatch(replies);
+    for (let index = 0; index < canonicalReplies.length; index += 1) {
+      const reply = canonicalReplies[index];
       // A dispatcher-generated deadline record is bookkeeping, not agent
       // progress. Letting it renew the lease would make a timeout extend the
       // run whose lack of progress caused it.
-      if (r.type !== 'send_timeout') this.recordActivity('agent_progress');
-      this.queue.push(r);
+      if (reply.type !== 'send_timeout') this.recordActivity('agent_progress');
+      this.enqueueMessage(reply, sender);
     }
   }
 
-  private async handleRunnerInbox(env: AnyAutoloopMessage): Promise<void> {
+  private async handleRunnerInbox(env: AnyAutoloopMessage, sender?: SenderContext): Promise<void> {
     switch (env.type) {
       case 'iter_artifacts': {
         // Coder produced work for iter N; ask Reviewer to audit.
-        const req = Msg.reviewRequest(env.iter, {
-          iter: env.iter,
-          ledger_path: this.config.ledger_dir,
-          prior_metrics: this.state.metric_history.slice(-10),
-        });
-        this.queue.push(req);
+        const req = canonicalizeMessage(
+          Msg.reviewRequest(env.iter, {
+            iter: env.iter,
+            ledger_path: this.config.ledger_dir,
+            prior_metrics: this.state.metric_history.slice(-10),
+          }),
+        ) as Extract<AnyAutoloopMessage, { type: 'review_request' }>;
+        if (this.terminationStarted || ['terminated', 'crashed'].includes(this.state.status)) {
+          throw new Error(`Autoloop message '${req.msg_id}' was not delivered because the run became terminal`);
+        }
+        await this.config.persistReviewEnvelope?.(req);
+        if (this.terminationStarted || ['terminated', 'crashed'].includes(this.state.status)) {
+          throw new Error(`Autoloop message '${req.msg_id}' was not delivered because the run became terminal`);
+        }
+        this.enqueueMessage(req, sender);
         return;
       }
       case 'review_verdict': {
@@ -461,26 +759,28 @@ export class AutoloopRunner extends EventEmitter {
           }
         }
 
-        const done = Msg.iterDone(env.iter, {
-          iter: env.iter,
-          verdict: v.decision,
-          metric: v.metric,
-          regression,
-        });
-        this.queue.push(done);
+        const done = canonicalizeMessage(
+          Msg.iterDone(env.iter, {
+            iter: env.iter,
+            verdict: v.decision,
+            metric: v.metric,
+            regression,
+          }),
+        );
+        this.enqueueMessage(done, sender);
         // A1: advance iter counter after a verdict is committed. The new iter
         // becomes addressable for follow-up directives, push events, and SSE.
         this.state.iter = env.iter + 1;
         this.emit('state', this.state);
         this.emit('iter_done', { iter: env.iter, verdict: v.decision, metric: v.metric });
         // Trigger policy-based push hooks.
-        if (this.regressionStreak >= 2) await this.firePolicyPush('on_metric_regression_2', env.iter);
-        if (this.rejectStreak >= 2) await this.firePolicyPush('on_reviewer_reject_2', env.iter);
+        if (this.regressionStreak >= 2) await this.firePolicyPush('on_metric_regression_2', env.iter, sender);
+        if (this.rejectStreak >= 2) await this.firePolicyPush('on_reviewer_reject_2', env.iter, sender);
         // The one success signal in the policy set. It stayed silent for its
         // whole existence because nothing could tell when the goal was met — a
         // Reviewer verdict is a reading of the Coder's report, not a measurement.
         // An acceptance contract is a measurement, so this fires on it.
-        if (v.accepted) await this.firePolicyPush('on_target_hit', env.iter);
+        if (v.accepted) await this.firePolicyPush('on_target_hit', env.iter, sender);
         return;
       }
       case 'phase_error': {
@@ -491,6 +791,9 @@ export class AutoloopRunner extends EventEmitter {
           ts: env.ts,
           agent: p.agent,
           phase: p.phase,
+          code: p.code,
+          ...(p.committed !== undefined ? { committed: p.committed } : {}),
+          ...(p.retryable !== undefined ? { retryable: p.retryable } : {}),
           error: p.error,
         });
         if (this.state.recent_phase_errors.length > 5) {
@@ -498,13 +801,13 @@ export class AutoloopRunner extends EventEmitter {
         }
         this.emit('state', this.state);
         this.emit('phase_error', p);
-        await this.firePolicyPush('on_phase_error', env.iter);
+        await this.firePolicyPush('on_phase_error', env.iter, sender);
         const circuit = this.config.phaseErrorCircuit ?? DEFAULT_PHASE_ERROR_CIRCUIT;
         if (this.state.consecutive_phase_errors >= circuit) {
           const detail = this.state.recent_phase_errors
             .map((e) => `${e.agent}/${e.phase}: ${e.error.slice(0, 160)}`)
             .join('\n');
-          this.queue.push(
+          const circuitPush = canonicalizeMessage(
             Msg.pushUser(env.iter, {
               level: 'decision',
               summary: `phase-error circuit tripped (${this.state.consecutive_phase_errors} consecutive)`,
@@ -512,11 +815,13 @@ export class AutoloopRunner extends EventEmitter {
               channel: 'both',
             }),
           );
-          this.queue.push(
+          this.enqueueMessage(circuitPush, sender);
+          const circuitTerminate = canonicalizeMessage(
             Msg.terminate(env.iter, {
               reason: 'phase_error_circuit',
             }),
           );
+          this.enqueueMessage(circuitTerminate, sender);
         }
         return;
       }
@@ -536,7 +841,7 @@ export class AutoloopRunner extends EventEmitter {
         }
         this.state.status = 'paused';
         this.state.status_reason = `awaiting_resume:send_timeout:${pending.agent}:${pending.dispatch_id}`;
-        this.state.pending_dispatch = { ...pending };
+        this.state.pending_dispatch = pending;
         this.emit('state', this.state);
         this.emit('send_timeout', this.state.pending_dispatch);
         return;
@@ -583,30 +888,47 @@ export class AutoloopRunner extends EventEmitter {
     const p = env.payload;
     const key = `${p.level}:${p.summary}`;
     const now = Date.now();
+    const mandatoryPolicyPush = this.mandatoryPolicyPushes.has(env);
     // 5 min dedup
     this.recentPushes = this.recentPushes.filter((r) => now - r.ts < 5 * 60_000);
-    if (this.recentPushes.some((r) => r.key === key)) return;
-    this.recentPushes.push({ key, ts: now });
+    if (!mandatoryPolicyPush && this.recentPushes.some((r) => r.key === key)) return;
+    if (!mandatoryPolicyPush) this.recentPushes.push({ key, ts: now });
 
     this.state.push_log_count++;
     this.emit('push', { level: p.level, summary: p.summary, detail: p.detail, channel: p.channel });
     await this.config.notifyUser(p.level, p.summary, p.detail, p.channel);
   }
 
-  private async firePolicyPush(rule: keyof typeof DEFAULT_PUSH_POLICY, iter: number): Promise<void> {
+  private async firePolicyPush(
+    rule: keyof typeof DEFAULT_PUSH_POLICY,
+    iter: number,
+    sender?: SenderContext,
+  ): Promise<void> {
     const policy = this.config.push_policy ?? DEFAULT_PUSH_POLICY;
-    const r = policy[rule];
-    if (!r || r.silent) return;
+    const critical = rule === 'on_phase_error' || rule === 'on_decision_needed';
+    const r = critical ? { ...DEFAULT_PUSH_POLICY[rule], ...policy[rule] } : policy[rule];
+    if (!r || (r.silent && !critical)) return;
+    let level = r.level ?? 'info';
+    if (critical) {
+      if (rule === 'on_phase_error') level = 'error';
+      else if (level !== 'error') level = 'decision';
+    }
+    const channel =
+      critical && r.channel !== 'auto' && r.channel !== 'both'
+        ? (DEFAULT_PUSH_POLICY[rule].channel ?? 'auto')
+        : (r.channel ?? 'auto');
     const summary = `[${rule}] iter ${iter}`;
     // We synthesise a push_user envelope as if Planner had asked for it, so
     // dedup + push_log book-keeping go through the same path.
-    this.queue.push(
+    const message = canonicalizeMessage(
       Msg.pushUser(iter, {
-        level: r.level ?? 'info',
+        level,
         summary,
-        channel: r.channel ?? 'auto',
+        channel,
       }),
     );
+    if (critical) this.mandatoryPolicyPushes.add(message);
+    this.enqueueMessage(message, sender);
     // When firePolicyPush is called from outside a running drain (e.g. the
     // stall-detector interval), the queued message would otherwise sit until
     // the next send(). Kick the drain — the re-entrancy guard makes this safe

@@ -9,9 +9,9 @@
  * consumes no memory beyond the tool schema definitions.
  */
 
-import { SessionManager } from './session-manager.js';
+import { SessionManager, toPublicAutoloopFailure } from './session-manager.js';
 import { createProxyHandler } from './proxy/handler.js';
-import { EmbeddedServer } from './embedded-server.js';
+import { EmbeddedServer, snapshotAutoloopPublicJsonValue } from './embedded-server.js';
 import { sanitizeCwd, validateRegex } from './validation.js';
 import {
   ENGINE_TYPES,
@@ -32,7 +32,7 @@ import { AUTOLOOP_TIMEOUT_SCHEMA, validateAutoloopTimeoutConfig } from './autolo
 
 // ─── Standalone Export ───────────────────────────────────────────────────────
 
-export { SessionManager } from './session-manager.js';
+export { SessionManager, toPublicAutoloopFailure } from './session-manager.js';
 export { PersistentClaudeSession } from './persistent-session.js';
 export { BaseOneShotSession, type OneShotEngineConfig } from './base-oneshot-session.js';
 export { PersistentCodexSession } from './persistent-codex-session.js';
@@ -45,9 +45,39 @@ export { PersistentCustomSession } from './persistent-custom-session.js';
 export { Council, getDefaultCouncilConfig } from './council.js';
 export { AutoloopRunner } from './autoloop/runner.js';
 export { ClaudeAgentDispatcher } from './autoloop/dispatcher.js';
-export { Msg as AutoloopMsg, validateMessage as autoloopValidate } from './autoloop/messages.js';
-export type { AutoloopEnvelope, AnyAutoloopMessage, AutoloopMessageType, AutoloopRole } from './autoloop/messages.js';
-export type { AgentDispatcher, AutoloopConfig, AutoloopState, AutoloopStatus, PushPolicy } from './autoloop/types.js';
+export { assessRecovery, computeRecoveryToken } from './autoloop/recovery.js';
+export {
+  Msg as AutoloopMsg,
+  canonicalizeMessage as autoloopCanonicalize,
+  validateMessage as autoloopValidate,
+} from './autoloop/messages.js';
+export type {
+  AutoloopEnvelope,
+  AnyAutoloopMessage,
+  AutoloopMessageType,
+  AutoloopRole,
+  CheckpointReviewRequestPayload,
+  RequestReviewArgs,
+} from './autoloop/messages.js';
+export type {
+  AgentDispatcher,
+  AutoloopAgentRole,
+  AutoloopChatStateCode,
+  AutoloopConfig,
+  AutoloopPhase,
+  AutoloopState,
+  AutoloopStatus,
+  PhysicalAgentGeneration,
+  PublicAutoloopFailure,
+  PublicAutoloopFailureCode,
+  PushPolicy,
+  RecoveryAgentEvidence,
+  RecoveryArtifactName,
+  RecoveryAssessment,
+  RecoveryDeliveryEvidence,
+  RecoveryInput,
+  RecoveryIterationEvidence,
+} from './autoloop/types.js';
 export { parseConsensus, stripConsensusTags, hasConsensusMarker } from './consensus.js';
 export { sanitizeCwd, validateRegex, validateName } from './validation.js';
 export { type Logger, createConsoleLogger, nullLogger } from './logger.js';
@@ -108,6 +138,15 @@ function normalizeToolResult(result: unknown): AgentToolResult {
   };
 }
 
+function autoloopPublicToolResult(value: unknown): AgentToolResult {
+  const details = snapshotAutoloopPublicJsonValue(value);
+  const text = JSON.stringify(details, (_key, field) => (typeof field === 'bigint' ? field.toString() : field), 2);
+  const content = [Object.freeze(Object.assign(Object.create(null), { type: 'text', text: text ?? 'null' }))];
+  Object.defineProperty(content, 'toJSON', { value: undefined });
+  Object.freeze(content);
+  return Object.freeze(Object.assign(Object.create(null), { content, details })) as AgentToolResult;
+}
+
 const CUSTOM_ENGINE_SCHEMA = {
   type: 'object',
   description: 'Custom engine config (required when the corresponding engine is "custom").',
@@ -154,6 +193,20 @@ const CUSTOM_ENGINE_SCHEMA = {
     sanitizePatterns: { type: 'array', maxItems: 100, items: { type: 'string' } },
   },
   required: ['name', 'bin', 'args'],
+} as const;
+
+const REQUEST_REVIEW_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    run_id: { type: 'string', minLength: 1, maxLength: 512 },
+    checkpoint_sha: { type: 'string', pattern: '^[0-9a-fA-F]{40}$' },
+    source_run_id: { type: 'string', minLength: 1, maxLength: 8192, pattern: '^[A-Za-z0-9][A-Za-z0-9._-]*$' },
+    source_iter: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    scope: { type: 'array', minItems: 1, maxItems: 128, items: { type: 'string', minLength: 1, maxLength: 8192 } },
+    idempotency_key: { type: 'string', minLength: 1, maxLength: 8192 },
+  },
+  required: ['run_id', 'checkpoint_sha', 'source_run_id', 'source_iter', 'scope', 'idempotency_key'],
 } as const;
 
 /**
@@ -2077,8 +2130,14 @@ const plugin = {
         required: ['run_id', 'text'],
       },
       execute: async (_id, args) => {
-        const { reply } = await getManager().autoloopChat(args.run_id as string, args.text as string);
-        return { ok: true, reply };
+        try {
+          const { reply } = await getManager().autoloopChat(args.run_id as string, args.text as string);
+          return { ok: true, reply };
+        } catch (error) {
+          const failure = toPublicAutoloopFailure(error);
+          if (failure) return autoloopPublicToolResult({ ok: false, error: failure });
+          throw error;
+        }
       },
     });
 
@@ -2094,8 +2153,8 @@ const plugin = {
       },
       execute: async (_id, args) => {
         const state = getManager().autoloopStatus(args.run_id as string);
-        if (!state) return { ok: false, error: 'Run not found' };
-        return { ok: true, state };
+        if (!state) return autoloopPublicToolResult({ ok: false, error: 'Run not found' });
+        return autoloopPublicToolResult({ ok: true, state });
       },
     });
 
@@ -2106,8 +2165,70 @@ const plugin = {
       description: 'List all v2 autoloop runs in this manager process.',
       parameters: { type: 'object', properties: {} },
       execute: async () => {
-        if (!manager) return { ok: true, runs: [] };
-        return { ok: true, runs: getManager().autoloopList() };
+        return autoloopPublicToolResult({ ok: true, runs: manager ? getManager().autoloopList() : [] });
+      },
+    });
+
+    // ─── Tool: autoloop_recover ──────────────────────────────────
+
+    registerTool({
+      name: 'autoloop_recover',
+      description: 'Inspect a durable Autoloop recovery, or apply its token-fenced next safe action.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          run_id: { type: 'string', description: 'Run id to inspect or recover' },
+          apply: { type: 'boolean', description: 'Apply the assessed recovery action (default false)' },
+          recovery_token: { type: 'string', description: 'Exact token returned by recovery inspection' },
+        },
+        required: ['run_id'],
+      },
+      execute: async (_id, args) => {
+        if (typeof args !== 'object' || args === null || Array.isArray(args)) {
+          throw new Error('recover arguments must be an object');
+        }
+        const descriptors = Object.getOwnPropertyDescriptors(args);
+        const allowedKeys = new Set(['run_id', 'apply', 'recovery_token']);
+        for (const key of Reflect.ownKeys(args)) {
+          if (typeof key !== 'string' || !allowedKeys.has(key)) {
+            throw new Error(`recover contains unsupported field '${String(key)}'`);
+          }
+        }
+        for (const key of allowedKeys) {
+          if (!Object.hasOwn(descriptors, key) && key in args) {
+            throw new Error(`recover ${key} must be an own data property`);
+          }
+        }
+        const runIdDescriptor = descriptors.run_id;
+        if (!runIdDescriptor || !Object.hasOwn(runIdDescriptor, 'value') || typeof runIdDescriptor.value !== 'string') {
+          throw new Error('recover run_id must be an own string data property');
+        }
+        const applyDescriptor = descriptors.apply;
+        if (
+          applyDescriptor &&
+          (!Object.hasOwn(applyDescriptor, 'value') || typeof applyDescriptor.value !== 'boolean')
+        ) {
+          throw new Error('recover apply must be an own boolean data property');
+        }
+        const tokenDescriptor = descriptors.recovery_token;
+        if (
+          tokenDescriptor &&
+          (!Object.hasOwn(tokenDescriptor, 'value') || typeof tokenDescriptor.value !== 'string')
+        ) {
+          throw new Error('recover recovery_token must be an own string data property');
+        }
+        const options = Object.create(null) as { apply?: boolean; recovery_token?: string };
+        if (applyDescriptor) options.apply = applyDescriptor.value as boolean;
+        if (tokenDescriptor) options.recovery_token = tokenDescriptor.value as string;
+        try {
+          const result = await getManager().autoloopRecover(runIdDescriptor.value, options);
+          return autoloopPublicToolResult({ ok: true, ...result });
+        } catch (error) {
+          const failure = toPublicAutoloopFailure(error);
+          if (failure) return autoloopPublicToolResult({ ok: false, error: failure });
+          throw error;
+        }
       },
     });
 
@@ -2131,7 +2252,7 @@ const plugin = {
         required: ['run_id', 'agent'],
       },
       execute: async (_id, args) => {
-        const ok = await getManager().autoloopResetAgent(
+        const result = await getManager().autoloopResetAgentResult(
           args.run_id as string,
           args.agent as 'planner' | 'coder' | 'reviewer',
           {
@@ -2139,8 +2260,51 @@ const plugin = {
             eagerRestart: args.eager_restart as boolean | undefined,
           },
         );
-        if (!ok) return { ok: false, error: 'Run not found' };
-        return { ok: true };
+        if (!result) return { ok: false, error: 'Run not found' };
+        if (result.ok === false) {
+          const failure = toPublicAutoloopFailure(result);
+          if (!failure) throw new Error('Autoloop reset returned a malformed structured reset result');
+          return autoloopPublicToolResult({ ok: false, error: failure });
+        }
+        if (result.ok === true) return { ok: true };
+        throw new Error('Autoloop reset returned a malformed structured reset result');
+      },
+    });
+
+    registerTool({
+      name: 'autoloop_request_review',
+      description:
+        'Persist and enqueue one idempotent Reviewer-only request bound to an existing checkpoint and source iteration.',
+      parameters: REQUEST_REVIEW_SCHEMA,
+      execute: async (_id, args) => {
+        const descriptors = Object.getOwnPropertyDescriptors(args);
+        if (!descriptors.run_id || !Object.hasOwn(descriptors.run_id, 'value')) {
+          throw new Error('request_review run_id must be an own data property');
+        }
+        const runId = descriptors.run_id.value;
+        if (typeof runId !== 'string' || runId.length < 1 || runId.length > 512) {
+          throw new Error('request_review run_id must be a non-empty string of at most 512 characters');
+        }
+        const request = Object.create(null) as Record<string, unknown>;
+        for (const key of ['checkpoint_sha', 'source_run_id', 'source_iter', 'scope', 'idempotency_key']) {
+          const descriptor = descriptors[key];
+          if (!descriptor) continue;
+          if (!Object.hasOwn(descriptor, 'value')) {
+            throw new Error(`request_review ${key} must be an own data property`);
+          }
+          Object.defineProperty(request, key, {
+            enumerable: true,
+            value: descriptor.value,
+          });
+        }
+        try {
+          const result = await getManager().autoloopRequestReview(runId as string, request as never);
+          return autoloopPublicToolResult({ ok: true, ...result });
+        } catch (error) {
+          const failure = toPublicAutoloopFailure(error);
+          if (failure) return autoloopPublicToolResult({ ok: false, error: failure });
+          throw error;
+        }
       },
     });
 

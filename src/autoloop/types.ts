@@ -2,12 +2,326 @@
  * Runner-level types for autoloop (three-agent architecture).
  */
 
-import type { AnyAutoloopMessage, PushChannel, PushLevel, SendTimeoutPayload } from './messages.js';
+import type {
+  AnyAutoloopMessage,
+  AutoloopOperationErrorCode,
+  PushChannel,
+  PushLevel,
+  SendTimeoutPayload,
+} from './messages.js';
 
 export type AutoloopStatus = 'planning' | 'running' | 'paused' | 'terminated' | 'crashed';
 
+export type AutoloopPhase =
+  | 'PLANNING'
+  | 'AWAITING_CODER'
+  | 'CODER_RUNNING'
+  | 'AWAITING_REVIEW'
+  | 'REVIEWER_RUNNING'
+  | 'PAUSED_RECOVERABLE'
+  | 'BLOCKED'
+  | 'COMPLETED';
+
+export type AutoloopAgentRole = 'planner' | 'coder' | 'reviewer';
+
 /** The three autoloop roles. Single source of truth — dispatcher and SessionManager both use it. */
-export type AutoloopRoleName = 'planner' | 'coder' | 'reviewer';
+export type AutoloopRoleName = AutoloopAgentRole;
+
+export type AutoloopChatStateCode = 'AUTOLOOP_SEND_TIMEOUT' | 'AUTOLOOP_RUN_PAUSED' | 'AUTOLOOP_RUN_TERMINAL';
+
+export type AutoloopRecoveryErrorCode =
+  | 'AUTOLOOP_RECOVERY_TOKEN_REQUIRED'
+  | 'AUTOLOOP_RECOVERY_TOKEN_STALE'
+  | 'AUTOLOOP_RECOVERY_MANUAL_RESOLUTION_REQUIRED'
+  | 'AUTOLOOP_RECOVERY_INCOMPLETE';
+
+export type PublicAutoloopFailureCode = AutoloopOperationErrorCode | AutoloopChatStateCode | AutoloopRecoveryErrorCode;
+
+/** Stable, data-only failure value shared by MCP and embedded HTTP/SSE. */
+export interface PublicAutoloopFailure {
+  readonly code: PublicAutoloopFailureCode;
+  readonly message: string;
+  readonly committed?: true;
+  readonly retryable: boolean;
+  readonly pending_dispatch?: Readonly<SendTimeoutPayload>;
+  readonly status_reason?: string | null;
+}
+
+export interface PhysicalAgentGeneration {
+  role: AutoloopAgentRole;
+  generation: number;
+  session_name: string;
+  session_id?: string;
+  owner_instance_id: string;
+  created_at: string;
+  last_activity_at: string;
+  lease_expires_at: string;
+  state: 'live' | 'stale' | 'orphaned' | 'released';
+}
+
+export type AgentRuntimeLiveness = 'live' | 'absent' | 'unknown';
+
+const RECOVERABLE_AGENT_OWNER_PATTERN = /^session-manager:(\d+):[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+
+export function isRecoverableAgentOwnerInstanceId(value: string): boolean {
+  const match = RECOVERABLE_AGENT_OWNER_PATTERN.exec(value);
+  if (!match) return false;
+  const ownerPid = Number(match[1]);
+  return Number.isSafeInteger(ownerPid) && ownerPid > 0;
+}
+
+export class AutoloopAgentReleaseOwnerError extends Error {
+  readonly code = 'AUTOLOOP_AGENT_RELEASE_OWNER_INVALID' as const;
+  readonly retryable = false;
+
+  constructor(ownerInstanceId: string) {
+    super(`Autoloop release owner '${ownerInstanceId}' is not a recoverable SessionManager identity`);
+    this.name = 'AutoloopAgentReleaseOwnerError';
+  }
+}
+
+/** Durable evidence hooks run while the exact runtime generation remains fenced. */
+export type AgentReservationReleaseOptions =
+  | {
+      /** Restore a just-created reservation whose durable ledger append failed. */
+      rollbackUncommittedReservation: true;
+      expectedOwnerInstanceId: string;
+      expectedSessionId: string;
+      releaseOwnerInstanceId?: never;
+      beforeRelease?: never;
+      persistReleaseEvidence?: never;
+    }
+  | {
+      rollbackUncommittedReservation?: false;
+      expectedOwnerInstanceId: string;
+      /** Explicit undefined is the legacy generation-zero session identity. */
+      expectedSessionId: string | undefined;
+      /** Identifies the one runtime owner allowed to finish a pending release. */
+      releaseOwnerInstanceId: string;
+      /** Runs only after the exact release-owner fence is durable. */
+      beforeRelease?: () => void;
+      /** Runs after the pending tombstone is durable and before the name becomes reusable. */
+      persistReleaseEvidence?: () => void;
+    };
+
+/** Runtime-only facts used to fence durable physical-agent generations. */
+export interface AgentRuntimeProbe {
+  inspect(sessionName: string, sessionId?: string): Promise<AgentRuntimeLiveness>;
+  releaseReservation(
+    sessionName: string,
+    expectedGeneration: number,
+    options: AgentReservationReleaseOptions,
+  ): Promise<boolean>;
+}
+
+export interface RecoveryAssessment {
+  run_id: string;
+  phase: AutoloopPhase;
+  evidence: string[];
+  agents: PhysicalAgentGeneration[];
+  pending_delivery_ids: string[];
+  next_safe_action: 'none' | 'resume_planner' | 'dispatch_coder' | 'request_review' | 'manual_resolution';
+  /** SHA-256 of the exact action reconstructed from durable evidence. */
+  action_sha256: string;
+  recovery_token: string;
+}
+
+/** Exact immutable action bytes fenced by a prepared recovery receipt. */
+export type RecoveryActionSnapshot =
+  | Extract<AnyAutoloopMessage, { type: 'directive' | 'review_request' }>
+  | {
+      type: 'none' | 'resume_planner';
+      run_id: string;
+      iter: number;
+      phase: AutoloopPhase;
+    };
+
+/**
+ * Append-only record for one token-fenced recovery attempt. A prepared receipt
+ * fences the effect; an applied receipt is the only successful result.
+ */
+export interface RecoveryReceipt {
+  schema_version: 1;
+  record_type: 'autoloop_recovery_receipt';
+  /** Non-delivery decision kind keeps the strict outbox parser read-compatible. */
+  kind: 'autoloop_recovery_receipt';
+  run_id: string;
+  recovery_token: string;
+  action_sha256: string;
+  action_snapshot: RecoveryActionSnapshot;
+  /** Unique durable owner of the prepared recovery effect. */
+  claim_id: string;
+  phase: AutoloopPhase;
+  next_safe_action: RecoveryAssessment['next_safe_action'];
+  status: 'prepared' | 'applied';
+  recorded_at: string;
+}
+
+/** Versioned exact Reviewer transport envelope retained for disk-only recovery. */
+export interface RecoveryReviewEnvelope {
+  schema_version: 1;
+  record_type: 'autoloop_recovery_review_envelope';
+  /** Non-delivery decision kind keeps the strict outbox parser read-compatible. */
+  kind: 'autoloop_recovery_review_envelope';
+  run_id: string;
+  envelope: Extract<AnyAutoloopMessage, { type: 'review_request' }>;
+}
+
+export interface RecoveryResult {
+  assessment: RecoveryAssessment;
+  receipt?: RecoveryReceipt;
+}
+
+export class AutoloopRecoveryError extends Error {
+  readonly retryable = false;
+
+  constructor(
+    readonly code: AutoloopRecoveryErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'AutoloopRecoveryError';
+  }
+}
+
+export type RecoveryArtifactName = 'directive' | 'coder_summary' | 'eval_output' | 'diff';
+
+export interface RecoveryIterationEvidence {
+  iter: number;
+  artifacts: readonly RecoveryArtifactName[];
+  verdict?: 'advance' | 'hold' | 'rollback';
+}
+
+export interface RecoveryDeliveryEvidence {
+  delivery_id: string;
+  /** Routing identity that owns this durable delivery id. */
+  idempotency_key?: string;
+  iter: number;
+  kind: 'coder_directive' | 'review_request';
+  acknowledged: boolean;
+}
+
+export type DeliveryKind = 'coder_directive' | 'review_request';
+export type DeliveryTargetRole = Extract<AutoloopAgentRole, 'coder' | 'reviewer'>;
+
+export interface DeliveryIntent {
+  schema_version: 1;
+  delivery_id: string;
+  idempotency_key: string;
+  kind: DeliveryKind;
+  target_role: DeliveryTargetRole;
+  target_generation: number;
+  payload: unknown;
+  payload_sha256: string;
+  created_at: string;
+}
+
+/** Durable proof that a receiver accepted one exact persisted delivery payload. */
+export interface DeliveryAcknowledgement {
+  schema_version: 1;
+  delivery_id: string;
+  payload_sha256: string;
+  acknowledged_at: string;
+}
+
+/** Immutable receiver result written before a Coder delivery acknowledgement. */
+export interface DeliveryResult {
+  schema_version: 1;
+  record_type: 'delivery_result';
+  delivery_id: string;
+  payload_sha256: string;
+  result_kind: 'iter_complete' | 'directive_ack';
+  /** `null` for artifact-backed completions; the exact fallback payload for clarifications. */
+  result_payload: unknown;
+}
+
+/**
+ * Append-only evidence that an unacknowledged delivery moved to the next live
+ * physical generation of the same logical role. The original intent remains
+ * immutable; consumers resolve this chain to obtain its effective generation.
+ */
+export interface DeliveryGenerationRebind {
+  schema_version: 1;
+  record_type: 'delivery_generation_rebind';
+  delivery_id: string;
+  idempotency_key: string;
+  kind: DeliveryKind;
+  target_role: DeliveryTargetRole;
+  from_generation: number;
+  to_generation: number;
+  payload_sha256: string;
+  rebound_at: string;
+}
+
+export interface PrepareDeliveryInput {
+  idempotency_key: string;
+  kind: DeliveryKind;
+  target_role: DeliveryTargetRole;
+  target_generation: number;
+  payload: unknown;
+}
+
+export type AutoloopDeliveryOutboxErrorCode =
+  | 'AUTOLOOP_DELIVERY_INPUT_INVALID'
+  | 'AUTOLOOP_DELIVERY_LEDGER_INVALID'
+  | 'AUTOLOOP_DELIVERY_IDEMPOTENCY_CONFLICT'
+  | 'AUTOLOOP_DELIVERY_ACKNOWLEDGEMENT_CONFLICT'
+  | 'AUTOLOOP_DELIVERY_GENERATION_REBIND_CONFLICT'
+  | 'AUTOLOOP_DELIVERY_OUTBOX_LOCK_CONTENDED'
+  | 'AUTOLOOP_DELIVERY_OUTBOX_LOCK_CLEANUP_FAILED'
+  | 'AUTOLOOP_DELIVERY_COMMITTED_OBSERVATION_FAILED';
+
+const AUTOLOOP_DELIVERY_OUTBOX_RETRYABILITY = {
+  AUTOLOOP_DELIVERY_INPUT_INVALID: false,
+  AUTOLOOP_DELIVERY_LEDGER_INVALID: false,
+  AUTOLOOP_DELIVERY_IDEMPOTENCY_CONFLICT: false,
+  AUTOLOOP_DELIVERY_ACKNOWLEDGEMENT_CONFLICT: false,
+  AUTOLOOP_DELIVERY_GENERATION_REBIND_CONFLICT: false,
+  AUTOLOOP_DELIVERY_OUTBOX_LOCK_CONTENDED: true,
+  AUTOLOOP_DELIVERY_OUTBOX_LOCK_CLEANUP_FAILED: false,
+  AUTOLOOP_DELIVERY_COMMITTED_OBSERVATION_FAILED: false,
+} as const satisfies Record<AutoloopDeliveryOutboxErrorCode, boolean>;
+
+/** Stable failure contract for durable delivery preparation and recovery lookup. */
+export class AutoloopDeliveryOutboxError extends Error {
+  readonly retryable: boolean;
+  declare readonly committed?: true;
+  readonly secondaryErrors: Error[] = [];
+
+  constructor(
+    readonly code: AutoloopDeliveryOutboxErrorCode,
+    message: string,
+    options?: ErrorOptions & { committed?: true },
+  ) {
+    super(message, options);
+    this.name = 'AutoloopDeliveryOutboxError';
+    this.retryable = AUTOLOOP_DELIVERY_OUTBOX_RETRYABILITY[code];
+    if (options?.committed) this.committed = true;
+  }
+}
+
+export interface RecoveryAgentEvidence {
+  generation: PhysicalAgentGeneration;
+  /** Runtime observation for this exact generation and owner tuple. */
+  matching_runtime: 'live' | 'absent' | 'unknown';
+}
+
+export interface RecoveryInput {
+  run_id: string;
+  /** Caller-supplied clock keeps assessment deterministic and side-effect free. */
+  observed_at: string;
+  /** Optional because state written before recovery support has no recovery fields. */
+  legacy_state?: Partial<
+    Pick<AutoloopState, 'status' | 'iter' | 'subagents_spawned' | 'status_reason' | 'pending_dispatch'>
+  >;
+  iterations: readonly RecoveryIterationEvidence[];
+  deliveries: readonly RecoveryDeliveryEvidence[];
+  agents: readonly RecoveryAgentEvidence[];
+  /** Exact directive/review action bytes, canonicalized before token derivation. */
+  action_sha256?: string;
+  /** Explicit durable terminal evidence; legacy `terminated` alone is not completion. */
+  completed?: boolean;
+}
 
 export interface AutoloopState {
   run_id: string;
@@ -32,8 +346,18 @@ export interface AutoloopState {
    * `AutoloopConfig.phaseErrorCircuit`, the runner auto-terminates.
    */
   consecutive_phase_errors: number;
-  /** Recent (≤ 3) phase_error payloads kept around for circuit-trip push detail. */
-  recent_phase_errors: Array<{ ts: string; agent: string; phase: string; error: string }>;
+  /** Recent (≤ 5) phase_error payloads kept around for circuit-trip push detail. */
+  recent_phase_errors: Array<{
+    ts: string;
+    agent: string;
+    phase: string;
+    code?: PublicAutoloopFailureCode;
+    committed?: true;
+    retryable?: boolean;
+    pending_dispatch?: Readonly<SendTimeoutPayload>;
+    status_reason?: string | null;
+    error: string;
+  }>;
   /** Recent metric history (most-recent last, capped at MAX_METRIC_HISTORY). */
   metric_history: number[];
   /** ms since epoch of the last handled message; used by stall detector. */
@@ -190,6 +514,12 @@ export interface AutoloopConfig extends AutoloopTimeoutConfig {
   notifyUser: (level: PushLevel, summary: string, detail: string | undefined, channel: PushChannel) => Promise<void>;
   /** Agent transport layer (mockable). */
   dispatcher: AgentDispatcher;
+  /**
+   * SessionManager-owned durable boundary for an exact Reviewer envelope.
+   * The Runner awaits this before its first queue admission or reviewer send,
+   * so recovery never has to reconstruct a message identity from mutable state.
+   */
+  persistReviewEnvelope?: (envelope: Extract<AnyAutoloopMessage, { type: 'review_request' }>) => Promise<void>;
   /**
    * Phase-error circuit threshold. After this many consecutive `phase_error`
    * messages the runner auto-terminates with reason `phase_error_circuit`

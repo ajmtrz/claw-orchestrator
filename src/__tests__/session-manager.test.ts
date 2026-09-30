@@ -7,10 +7,13 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { execFileSync, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type {
   ISession,
   SessionConfig,
@@ -20,6 +23,10 @@ import type {
   CostBreakdown,
   EffortLevel,
 } from '../types.js';
+import type { AgentReservationReleaseOptions, PhysicalAgentGeneration, RecoveryReceipt } from '../autoloop/types.js';
+import type { AnyAutoloopMessage, PhaseErrorPayload } from '../autoloop/messages.js';
+import type { PlannerToolCall } from '../autoloop/planner-tools.js';
+import { recoveryActionDigest } from '../autoloop/recovery.js';
 
 // ─── Mock ISession ──────────────────────────────────────────────────────────
 
@@ -193,6 +200,13 @@ function patchCreateSession(manager: InstanceType<typeof SessionManager>): void 
 const TEST_WF_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'clawo-sm-wf-'));
 process.env.CLAWO_WF_DIR = TEST_WF_DIR;
 
+const persistenceFsState = vi.hoisted(() => ({
+  files: new Map<string, string>(),
+  descriptors: new Map<number, string>(),
+  openPaths: new Map<number, string>(),
+  nextDescriptor: 1_000_000,
+}));
+
 vi.mock('node:fs', async () => {
   const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
 
@@ -204,34 +218,79 @@ vi.mock('node:fs', async () => {
   // the run store writes its checkpoints through the same `fs`, so a
   // kernel-backed mode looked like it had lost every run. A mock that stubs a
   // whole module to protect two paths is a landmine; this one names them.
-  const PROTECTED = ['claude-sessions.json', 'session-pids.json'];
-  const isProtected = (p: unknown): boolean => typeof p === 'string' && PROTECTED.some((name) => p.includes(name));
+  const isProtectedDataFile = (p: unknown): p is string =>
+    typeof p === 'string' &&
+    (p.endsWith('/claude-sessions.json') ||
+      p.endsWith('/claude-sessions.json.tmp') ||
+      p.endsWith('/session-pids.json'));
+  const missingFile = (p: string): NodeJS.ErrnoException =>
+    Object.assign(new Error(`ENOENT: no such file or directory, open '${p}'`), { code: 'ENOENT' });
 
-  const existsSync = vi.fn((p: string) => (isProtected(p) ? false : actual.existsSync(p)));
-  const readFileSync = vi.fn((p: string, enc?: string) =>
-    isProtected(p) ? '[]' : actual.readFileSync(p, enc as BufferEncoding),
+  const existsSync = vi.fn((p: string) =>
+    isProtectedDataFile(p) ? persistenceFsState.files.has(p) : actual.existsSync(p),
   );
+  const readFileSync = vi.fn((p: string, enc?: string) => {
+    if (!isProtectedDataFile(p)) return actual.readFileSync(p, enc as BufferEncoding);
+    const value = persistenceFsState.files.get(p);
+    if (value === undefined) throw missingFile(p);
+    return value;
+  });
   const writeFileSync = vi.fn((p: unknown, ...rest: unknown[]) => {
-    if (isProtected(p)) return;
+    if (isProtectedDataFile(p)) {
+      const data = rest[0];
+      persistenceFsState.files.set(p, Buffer.isBuffer(data) ? data.toString() : String(data));
+      return;
+    }
     (actual.writeFileSync as (...a: unknown[]) => void)(p, ...rest);
   });
   const appendFileSync = vi.fn((p: unknown, ...rest: unknown[]) => {
-    if (isProtected(p)) return;
+    if (isProtectedDataFile(p)) return;
     (actual.appendFileSync as (...a: unknown[]) => void)(p, ...rest);
   });
-  const openSync = vi.fn((p: unknown, ...rest: unknown[]) =>
-    (actual.openSync as (...a: unknown[]) => number)(p, ...rest),
-  );
+  const openSync = vi.fn((p: unknown, ...rest: unknown[]) => {
+    if (isProtectedDataFile(p)) {
+      const flags = String(rest[0] ?? 'r');
+      if (flags.includes('r') && !persistenceFsState.files.has(p)) throw missingFile(p);
+      const fd = persistenceFsState.nextDescriptor++;
+      persistenceFsState.descriptors.set(fd, p);
+      return fd;
+    }
+    const fd = (actual.openSync as (...a: unknown[]) => number)(p, ...rest);
+    if (typeof p === 'string') persistenceFsState.openPaths.set(fd, p);
+    return fd;
+  });
   const writeSync = vi.fn((fd: unknown, ...rest: unknown[]) =>
     (actual.writeSync as (...a: unknown[]) => number)(fd, ...rest),
   );
+  const fsyncSync = vi.fn((fd: number) => {
+    if (persistenceFsState.descriptors.has(fd)) return;
+    return actual.fsyncSync(fd);
+  });
+  const closeSync = vi.fn((fd: number) => {
+    if (persistenceFsState.descriptors.delete(fd)) return;
+    persistenceFsState.openPaths.delete(fd);
+    return actual.closeSync(fd);
+  });
   const mkdirSync = vi.fn((p: unknown, ...rest: unknown[]) => {
-    if (isProtected(p)) return undefined;
     return (actual.mkdirSync as (...a: unknown[]) => string | undefined)(p, ...rest);
   });
   const renameSync = vi.fn((from: unknown, to: unknown) => {
-    if (isProtected(from) || isProtected(to)) return;
+    if (isProtectedDataFile(from) && isProtectedDataFile(to)) {
+      const value = persistenceFsState.files.get(from);
+      if (value === undefined) throw missingFile(from);
+      persistenceFsState.files.set(to, value);
+      persistenceFsState.files.delete(from);
+      return;
+    }
     (actual.renameSync as (...a: unknown[]) => void)(from, to);
+  });
+
+  const unlinkSync = vi.fn((p: unknown) => {
+    if (isProtectedDataFile(p)) {
+      if (!persistenceFsState.files.delete(p)) throw missingFile(p);
+      return;
+    }
+    (actual.unlinkSync as (path: unknown) => void)(p);
   });
 
   const shim = {
@@ -241,14 +300,33 @@ vi.mock('node:fs', async () => {
     appendFileSync,
     openSync,
     writeSync,
+    fsyncSync,
+    closeSync,
     mkdirSync,
     renameSync,
+    unlinkSync,
     // The async persistence path is stubbed wholesale: nothing else in the
     // codebase uses these callback forms.
-    writeFile: vi.fn((_p: unknown, _d: unknown, cb: (err: null) => void) => cb(null)),
-    rename: vi.fn((_o: unknown, _n: unknown, cb: (err: null) => void) => cb(null)),
+    writeFile: vi.fn((p: unknown, data: unknown, cb: (err: null) => void) => {
+      if (isProtectedDataFile(p)) {
+        persistenceFsState.files.set(p, Buffer.isBuffer(data) ? data.toString() : String(data));
+      }
+      cb(null);
+    }),
+    rename: vi.fn((from: unknown, to: unknown, cb: (err: NodeJS.ErrnoException | null) => void) => {
+      if (isProtectedDataFile(from) && isProtectedDataFile(to)) {
+        const value = persistenceFsState.files.get(from);
+        if (value === undefined) return cb(missingFile(from));
+        persistenceFsState.files.set(to, value);
+        persistenceFsState.files.delete(from);
+      }
+      cb(null);
+    }),
     mkdir: vi.fn((_p: unknown, _opts: unknown, cb: (err: null) => void) => cb(null)),
-    unlink: vi.fn((_p: unknown, cb: () => void) => cb()),
+    unlink: vi.fn((p: unknown, cb: () => void) => {
+      if (isProtectedDataFile(p)) persistenceFsState.files.delete(p);
+      cb();
+    }),
   };
 
   return { ...actual, ...shim, default: { ...actual, ...shim } };
@@ -257,8 +335,76 @@ vi.mock('node:fs', async () => {
 // Import AFTER mocking fs
 const { SessionManager } = await import('../session-manager.js');
 const { Msg: AutoloopMsg } = await import('../autoloop/messages.js');
+const { AutoloopOperationError } = await import('../autoloop/dispatcher.js');
+const { acknowledgeDelivery, prepareDelivery } = await import('../autoloop/outbox.js');
+const { applyValidatedPlannerToolCalls, validatePlannerToolCalls } = await import('../autoloop/planner-tools.js');
+
+const SESSION_REGISTRY_FILE = path.join(os.homedir(), '.openclaw', 'claude-sessions.json');
+const SESSION_PID_FILE = path.join(os.homedir(), '.openclaw', 'session-pids.json');
+const nativeSetImmediate = setImmediate;
+
+function isOpenPath(file: unknown, expectedPath: string): boolean {
+  return (
+    String(file) === expectedPath ||
+    (typeof file === 'number' && persistenceFsState.openPaths.get(file) === expectedPath)
+  );
+}
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+function seedCompleteLegacyReviewArtifacts(workspace: string, runId: string, iter: number): void {
+  const iterDirectory = path.join(workspace, 'tasks', runId, 'iter', String(iter));
+  fs.mkdirSync(iterDirectory, { recursive: true, mode: 0o700 });
+  for (const [name, content] of Object.entries({
+    'directive.json': '{}\n',
+    'eval_output.json': '{}\n',
+    'coder_summary.txt': 'complete\n',
+    'diff.patch': 'diff --git a/a b/a\n',
+  })) {
+    fs.writeFileSync(path.join(iterDirectory, name), content, { mode: 0o600 });
+  }
+}
+
+function successfulRoleReplyFromDeliveryPrompt(
+  role: 'coder' | 'reviewer',
+  message: string | unknown[],
+  summary: string,
+): string {
+  expect(typeof message, `${role} durable delivery prompt`).toBe('string');
+  const provenanceMatch = /<autoloop_delivery delivery_id="([^"]+)" payload_sha256="([a-f0-9]{64})">/.exec(
+    String(message),
+  );
+  expect(provenanceMatch, `${role} durable delivery provenance`).not.toBeNull();
+  const provenance = { delivery_id: provenanceMatch![1], payload_sha256: provenanceMatch![2] };
+  const completion =
+    role === 'coder'
+      ? { tool: 'iter_complete', args: { summary, eval_output: {}, files_changed: [], ...provenance } }
+      : { tool: 'review_complete', args: { decision: 'hold', metric: null, audit_notes: summary, ...provenance } };
+  return [summary, '```autoloop', JSON.stringify(completion), '```'].join('\n');
+}
+
+function recoveryDispatchId(runId: string, envelope: Record<string, unknown>): string {
+  return `dispatch_${createHash('sha256')
+    .update(JSON.stringify([runId, envelope.msg_id, envelope.iter, envelope.from, envelope.to, envelope.type]), 'utf8')
+    .digest('hex')}`;
+}
+
+function recoveryLogicalMessageSha256(envelope: Record<string, unknown>): string {
+  return createHash('sha256')
+    .update(
+      JSON.stringify({
+        msg_id: envelope.msg_id,
+        iter: envelope.iter,
+        from: envelope.from,
+        to: envelope.to,
+        type: envelope.type,
+        ts: envelope.ts,
+        payload: envelope.payload,
+      }),
+      'utf8',
+    )
+    .digest('hex');
+}
 
 function createManager(overrides?: Record<string, unknown>): InstanceType<typeof SessionManager> {
   const mgr = new SessionManager({
@@ -277,6 +423,61 @@ function lastMock(): MockSession {
   return mockSessions[mockSessions.length - 1];
 }
 
+function managerGeneration(
+  sessionName: string,
+  overrides: Partial<PhysicalAgentGeneration> = {},
+): PhysicalAgentGeneration {
+  return {
+    role: 'planner',
+    generation: 1,
+    session_name: sessionName,
+    session_id: 'physical-session-1',
+    owner_instance_id: 'owner-1',
+    created_at: '2026-09-05T10:00:00.000Z',
+    last_activity_at: '2026-09-05T11:00:00.000Z',
+    lease_expires_at: '2026-09-05T11:30:00.000Z',
+    state: 'stale',
+    ...overrides,
+  };
+}
+
+function mockSharedPidContents(contents: string): void {
+  persistenceFsState.files.set(SESSION_PID_FILE, contents);
+}
+
+function mockSharedPidFile(entries: Record<string, unknown>): void {
+  mockSharedPidContents(JSON.stringify(entries));
+}
+
+function persistManagerRegistry(manager: InstanceType<typeof SessionManager>): void {
+  const reservations = (
+    manager as unknown as {
+      persistedSessions: Map<string, Record<string, unknown>>;
+    }
+  ).persistedSessions;
+  persistenceFsState.files.set(SESSION_REGISTRY_FILE, JSON.stringify(Array.from(reservations.values())));
+}
+
+type ManagerReleaseOptions = AgentReservationReleaseOptions;
+
+function uncheckedReleaseOptions(options: Record<string, unknown>): ManagerReleaseOptions {
+  return options as unknown as ManagerReleaseOptions;
+}
+
+function runGit(workspace: string, ...args: string[]): string {
+  return execFileSync('git', args, { cwd: workspace, encoding: 'utf8' });
+}
+
+function initializeGitWorkspace(workspace: string): string {
+  runGit(workspace, 'init', '--quiet');
+  runGit(workspace, 'config', 'user.name', 'Autoloop Test');
+  runGit(workspace, 'config', 'user.email', 'autoloop-test@example.invalid');
+  fs.writeFileSync(path.join(workspace, 'README.md'), 'baseline\n');
+  runGit(workspace, 'add', '--', 'README.md');
+  runGit(workspace, 'commit', '--quiet', '-m', 'test baseline');
+  return runGit(workspace, 'rev-parse', 'HEAD').trim();
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 describe('SessionManager', () => {
@@ -284,6 +485,9 @@ describe('SessionManager', () => {
 
   beforeEach(() => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
+    persistenceFsState.files.clear();
+    persistenceFsState.descriptors.clear();
+    persistenceFsState.nextDescriptor = 1_000_000;
     mockSessions = [];
     createdConfigs = [];
     // Fresh run store per test. These cases use fixed run ids, and the store
@@ -449,6 +653,1482 @@ describe('SessionManager', () => {
 
     it('getStatus throws for unknown session', () => {
       expect(() => mgr.getStatus('nope')).toThrow("Session 'nope' not found");
+    });
+  });
+
+  describe('autoloop agent runtime probe', () => {
+    it('types rollback and normal release as explicit mutually exclusive tuples', () => {
+      const rollback = {
+        rollbackUncommittedReservation: true,
+        expectedOwnerInstanceId: 'reservation-owner',
+        expectedSessionId: 'reservation-session',
+      } satisfies AgentReservationReleaseOptions;
+      const normal = {
+        expectedOwnerInstanceId: 'reservation-owner',
+        expectedSessionId: undefined,
+        releaseOwnerInstanceId: 'release-owner',
+      } satisfies AgentReservationReleaseOptions;
+
+      // @ts-expect-error release without ownership evidence is never valid
+      const empty: AgentReservationReleaseOptions = {};
+      // @ts-expect-error rollback requires the exact physical session
+      const incompleteRollback: AgentReservationReleaseOptions = {
+        rollbackUncommittedReservation: true,
+        expectedOwnerInstanceId: 'reservation-owner',
+      };
+      // @ts-expect-error normal release requires a durable release claimant
+      const incompleteNormal: AgentReservationReleaseOptions = {
+        expectedOwnerInstanceId: 'reservation-owner',
+        expectedSessionId: 'reservation-session',
+      };
+
+      expect([rollback, normal, empty, incompleteRollback, incompleteNormal]).toHaveLength(5);
+    });
+
+    it('rejects an opaque release owner before it can persist a pending fence', async () => {
+      const sessionName = 'autoloop-probe-opaque-release-owner-planner';
+      const first = managerGeneration(sessionName);
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      let evidenceHookCount = 0;
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      const before = structuredClone(reservations.get(sessionName));
+      await expect(
+        mgr.releaseReservation(sessionName, first.generation, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: 'opaque-owner',
+          beforeRelease: () => {
+            evidenceHookCount += 1;
+          },
+          persistReleaseEvidence: () => {
+            evidenceHookCount += 1;
+          },
+        }),
+      ).rejects.toMatchObject({
+        code: 'AUTOLOOP_AGENT_RELEASE_OWNER_INVALID',
+        retryable: false,
+      });
+
+      expect(reservations.get(sessionName)).toEqual(before);
+      expect(evidenceHookCount).toBe(0);
+    });
+
+    it('reports shared PID ownership by another live manager as live', async () => {
+      const sessionName = 'autoloop-probe-shared-live-planner';
+      mockSharedPidFile({
+        [sessionName]: {
+          pid: process.pid,
+          ownerPid: process.ppid,
+          since: '2026-09-05T10:00:00.000Z',
+        },
+      });
+
+      await expect(mgr.inspect(sessionName)).resolves.toBe('live');
+    });
+
+    it('keeps a dead owner live child unknown and reports absent only when both PIDs are dead', async () => {
+      const lingeringSessionName = 'autoloop-probe-shared-lingering-planner';
+      const deadSessionName = 'autoloop-probe-shared-dead-planner';
+      const deadOwnerPid = 2_000_000_000;
+      const deadChildPid = 2_000_000_001;
+      expect(() => process.kill(deadOwnerPid, 0)).toThrow();
+      expect(() => process.kill(deadChildPid, 0)).toThrow();
+      mockSharedPidFile({
+        [lingeringSessionName]: {
+          pid: process.pid,
+          ownerPid: deadOwnerPid,
+          since: '2026-09-05T10:00:00.000Z',
+        },
+        [deadSessionName]: {
+          pid: deadChildPid,
+          ownerPid: deadOwnerPid,
+          since: '2026-09-05T10:00:00.000Z',
+        },
+      });
+
+      await expect(mgr.inspect(lingeringSessionName)).resolves.toBe('unknown');
+      await expect(mgr.inspect(deadSessionName)).resolves.toBe('absent');
+    });
+
+    it('does not infer liveness from a self PID when local ownership evidence is stale', async () => {
+      const deadChildPid = 2_000_000_011;
+      const indeterminateChildPid = 2_000_000_012;
+      const originalKill = process.kill.bind(process);
+      const killSpy = vi.spyOn(process, 'kill').mockImplementation(((pid: number, signal?: number | NodeJS.Signals) => {
+        if (pid === deadChildPid) throw Object.assign(new Error('missing child'), { code: 'ESRCH' });
+        if (pid === indeterminateChildPid) throw Object.assign(new Error('probe denied'), { code: 'EPERM' });
+        return originalKill(pid, signal);
+      }) as typeof process.kill);
+      try {
+        for (const [sessionName, childPid, expected] of [
+          ['autoloop-probe-self-stale-dead', deadChildPid, 'absent'],
+          ['autoloop-probe-self-stale-live', process.ppid, 'unknown'],
+          ['autoloop-probe-self-stale-indeterminate', indeterminateChildPid, 'unknown'],
+        ] as const) {
+          mockSharedPidFile({
+            [sessionName]: {
+              pid: childPid,
+              ownerPid: process.pid,
+              since: '2026-09-05T10:00:00.000Z',
+            },
+          });
+          await expect(mgr.inspect(sessionName)).resolves.toBe(expected);
+        }
+      } finally {
+        killSpy.mockRestore();
+      }
+    });
+
+    it('keeps malformed and incomplete shared PID evidence conservatively unknown', async () => {
+      const sessionName = 'autoloop-probe-malformed-pid-evidence';
+      const malformedInputs = [
+        '{',
+        '[]',
+        '42',
+        JSON.stringify({ [sessionName]: 42 }),
+        JSON.stringify({ [sessionName]: { pid: 1234 } }),
+        JSON.stringify({ [sessionName]: { pid: 0, ownerPid: 'invalid' } }),
+      ];
+
+      for (const contents of malformedInputs) {
+        mockSharedPidContents(contents);
+        await expect(mgr.inspect(sessionName)).resolves.toBe('unknown');
+      }
+    });
+
+    it('fails closed when the shared session registry is corrupt, unreadable, or not an array', () => {
+      const existingName = 'autoloop-probe-authority-existing-planner';
+      const attemptedName = 'autoloop-probe-authority-attempted-planner';
+      const existing = managerGeneration(existingName);
+      const attempted = managerGeneration(attemptedName);
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+
+      expect(mgr.reserveAgentGeneration(existing, '/tmp')).toBe(true);
+      const inMemoryBefore = structuredClone(Array.from(reservations.entries()));
+
+      for (const invalidAuthority of ['{', JSON.stringify({ entries: [] })]) {
+        persistenceFsState.files.set(SESSION_REGISTRY_FILE, invalidAuthority);
+
+        expect(() => mgr.reserveAgentGeneration(attempted, '/tmp')).toThrow(
+          expect.objectContaining({
+            code: 'AUTOLOOP_AGENT_REGISTRY_CORRUPT',
+            retryable: false,
+          }),
+        );
+        expect(persistenceFsState.files.get(SESSION_REGISTRY_FILE)).toBe(invalidAuthority);
+        expect(Array.from(reservations.entries())).toEqual(inMemoryBefore);
+      }
+
+      const validAuthority = JSON.stringify(Array.from(reservations.values()));
+      persistenceFsState.files.set(SESSION_REGISTRY_FILE, validAuthority);
+      const readFile = vi.mocked(fs.readFileSync).getMockImplementation()!;
+      vi.mocked(fs.readFileSync).mockImplementationOnce(((file: string, ...args: unknown[]) => {
+        if (file === SESSION_REGISTRY_FILE) {
+          throw Object.assign(new Error('registry read denied'), { code: 'EACCES' });
+        }
+        return (readFile as unknown as (file: string, ...rest: unknown[]) => unknown)(file, ...args);
+      }) as typeof fs.readFileSync);
+
+      expect(() => mgr.reserveAgentGeneration(attempted, '/tmp')).toThrow(
+        expect.objectContaining({
+          code: 'AUTOLOOP_AGENT_REGISTRY_READ_FAILED',
+          retryable: true,
+        }),
+      );
+      expect(persistenceFsState.files.get(SESSION_REGISTRY_FILE)).toBe(validAuthority);
+      expect(Array.from(reservations.entries())).toEqual(inMemoryBefore);
+    });
+
+    it("keeps one name's unflushed resume metadata when another name enters registry CAS", async () => {
+      const firstName = 'autoloop-probe-unflushed-first-planner';
+      const secondName = 'autoloop-probe-unflushed-second-planner';
+      const first = managerGeneration(firstName);
+      const second = managerGeneration(secondName, {
+        session_id: 'physical-session-2',
+        owner_instance_id: 'owner-2',
+      });
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      await mgr.startSession({ name: firstName, cwd: '/tmp' }, first);
+      const unflushedResumeId = reservations.get(firstName)?.claudeSessionId;
+      expect(unflushedResumeId).toMatch(/^mock-session-/);
+      expect(
+        JSON.parse(persistenceFsState.files.get(SESSION_REGISTRY_FILE)!) as Array<Record<string, unknown>>,
+      ).toEqual(expect.arrayContaining([expect.objectContaining({ name: firstName, claudeSessionId: '' })]));
+
+      expect(mgr.reserveAgentGeneration(second, '/tmp')).toBe(true);
+      expect(reservations.get(firstName)?.claudeSessionId).toBe(unflushedResumeId);
+    });
+
+    it('requires the full generation owner and session tuple to release an active reservation', async () => {
+      const invalidOptions = [
+        { expectedSessionId: 'physical-session-1' },
+        { expectedOwnerInstanceId: 'owner-1' },
+        { expectedOwnerInstanceId: 'owner-wrong', expectedSessionId: 'physical-session-1' },
+        { expectedOwnerInstanceId: 'owner-1', expectedSessionId: 'physical-session-wrong' },
+      ];
+      let evidenceHookCount = 0;
+      const results: boolean[] = [];
+
+      for (const [index, tuple] of invalidOptions.entries()) {
+        const sessionName = `autoloop-probe-incomplete-tuple-${index}-planner`;
+        const generation = managerGeneration(sessionName);
+        const reservations = (
+          mgr as unknown as {
+            persistedSessions: Map<string, Record<string, unknown>>;
+          }
+        ).persistedSessions;
+        expect(mgr.reserveAgentGeneration(generation, '/tmp')).toBe(true);
+        const before = structuredClone(reservations.get(sessionName));
+        results.push(
+          await mgr.releaseReservation(
+            sessionName,
+            generation.generation,
+            uncheckedReleaseOptions({
+              ...tuple,
+              releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+              beforeRelease: () => {
+                evidenceHookCount += 1;
+              },
+              persistReleaseEvidence: () => {
+                evidenceHookCount += 1;
+              },
+            }),
+          ),
+        );
+        expect(reservations.get(sessionName)).toEqual(before);
+        expect(reservations.get(sessionName)).not.toHaveProperty('agentReleasePending');
+      }
+
+      expect(results).toEqual([false, false, false, false]);
+      expect(evidenceHookCount).toBe(0);
+    });
+
+    it('rolls back an uncommitted generation without evidence and permits a replacement reservation', async () => {
+      const sessionName = 'autoloop-probe-uncommitted-rollback-planner';
+      const first = managerGeneration(sessionName);
+      const replacement = managerGeneration(sessionName, {
+        session_id: 'physical-session-replacement',
+        owner_instance_id: 'owner-replacement',
+      });
+      let evidenceHookCount = 0;
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      await expect(
+        mgr.releaseReservation(
+          sessionName,
+          first.generation,
+          uncheckedReleaseOptions({
+            expectedOwnerInstanceId: first.owner_instance_id,
+            expectedSessionId: first.session_id,
+            rollbackUncommittedReservation: true,
+            beforeRelease: () => {
+              evidenceHookCount += 1;
+            },
+            persistReleaseEvidence: () => {
+              evidenceHookCount += 1;
+            },
+          }),
+        ),
+      ).resolves.toBe(true);
+
+      expect(evidenceHookCount).toBe(0);
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(true);
+    });
+
+    it('probes exact released-generation reusability atomically and rejects owner or session mismatch', async () => {
+      const sessionName = 'autoloop-reset-probe-planner';
+      const generation = managerGeneration(sessionName);
+      expect(mgr.reserveAgentGeneration(generation, '/tmp')).toBe(true);
+      await expect(
+        mgr.releaseReservation(sessionName, generation.generation, {
+          expectedOwnerInstanceId: generation.owner_instance_id,
+          expectedSessionId: generation.session_id,
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+          beforeRelease: () => undefined,
+          persistReleaseEvidence: () => undefined,
+        }),
+      ).resolves.toBe(true);
+      const before = persistenceFsState.files.get(SESSION_REGISTRY_FILE);
+      const managerProbe = mgr as unknown as {
+        probeAgentNameReusable?: (name: string, released?: PhysicalAgentGeneration) => boolean;
+      };
+
+      expect(managerProbe.probeAgentNameReusable?.(sessionName, generation)).toBe(true);
+      expect(
+        managerProbe.probeAgentNameReusable?.(sessionName, {
+          ...generation,
+          owner_instance_id: 'wrong-owner',
+        }),
+      ).toBe(false);
+      expect(
+        managerProbe.probeAgentNameReusable?.(sessionName, {
+          ...generation,
+          session_id: 'wrong-session',
+        }),
+      ).toBe(false);
+      expect(persistenceFsState.files.get(SESSION_REGISTRY_FILE)).toBe(before);
+    });
+
+    it('restores an uncommitted reservation when rollback persistence fails and permits a safe retry', async () => {
+      const sessionName = 'autoloop-probe-uncommitted-rollback-save-failure-planner';
+      const first = managerGeneration(sessionName);
+      const replacement = managerGeneration(sessionName, {
+        session_id: 'replacement-physical-session',
+        owner_instance_id: 'replacement-owner',
+      });
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      const rollbackOptions: AgentReservationReleaseOptions = {
+        rollbackUncommittedReservation: true,
+        expectedOwnerInstanceId: first.owner_instance_id,
+        expectedSessionId: first.session_id!,
+      };
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      const before = structuredClone(reservations.get(sessionName));
+      vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+        throw new Error('rollback registry rename failed');
+      });
+
+      await expect(mgr.releaseReservation(sessionName, first.generation, rollbackOptions)).rejects.toMatchObject({
+        code: 'AUTOLOOP_AGENT_REGISTRY_PERSIST_FAILED',
+      });
+      expect(reservations.get(sessionName)).toEqual(before);
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(false);
+
+      await expect(mgr.releaseReservation(sessionName, first.generation, rollbackOptions)).resolves.toBe(true);
+      expect(reservations.has(sessionName)).toBe(false);
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(true);
+    });
+
+    it('restores the prior released tombstone when an uncommitted replacement rolls back', async () => {
+      const sessionName = 'autoloop-probe-uncommitted-tombstone-planner';
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      reservations.set(sessionName, {
+        name: sessionName,
+        claudeSessionId: 'prior-session-id',
+        cwd: '/tmp',
+        originalCreated: '2026-09-05T09:00:00.000Z',
+        lastResumed: '2026-09-05T09:00:00.000Z',
+        lastActivity: Date.parse('2026-09-05T09:00:00.000Z'),
+        agentReleasedGeneration: 1,
+        agentReleasedOwnerInstanceId: 'prior-owner',
+        agentReleasedSessionId: 'prior-physical-session',
+      });
+      persistManagerRegistry(mgr);
+      const uncommitted = managerGeneration(sessionName, {
+        generation: 2,
+        session_id: 'uncommitted-physical-session',
+        owner_instance_id: 'uncommitted-owner',
+      });
+      const replacement = managerGeneration(sessionName, {
+        generation: 2,
+        session_id: 'replacement-physical-session',
+        owner_instance_id: 'replacement-owner',
+      });
+
+      expect(mgr.reserveAgentGeneration(uncommitted, '/tmp')).toBe(true);
+      await expect(
+        mgr.releaseReservation(sessionName, uncommitted.generation, {
+          expectedOwnerInstanceId: uncommitted.owner_instance_id,
+          expectedSessionId: uncommitted.session_id,
+          rollbackUncommittedReservation: true,
+        } as ManagerReleaseOptions),
+      ).resolves.toBe(true);
+
+      expect(reservations.get(sessionName)).toMatchObject({
+        agentGeneration: undefined,
+        agentReleasedGeneration: 1,
+        agentReleasedOwnerInstanceId: 'prior-owner',
+        agentReleasedSessionId: 'prior-physical-session',
+      });
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(true);
+    });
+
+    it('generation-fences release of a stale registry-only reservation', async () => {
+      const sessionName = 'autoloop-probe-stale-planner';
+      const first = managerGeneration(sessionName);
+      const replacement = managerGeneration(sessionName, {
+        generation: 2,
+        session_id: 'physical-session-2',
+        owner_instance_id: 'owner-2',
+      });
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      await expect(mgr.inspect(sessionName, first.session_id)).resolves.toBe('absent');
+      let mismatchedOrphan = false;
+      await expect(
+        mgr.releaseReservation(sessionName, 2, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+          beforeRelease: () => {
+            mismatchedOrphan = true;
+          },
+        }),
+      ).resolves.toBe(false);
+      expect(mismatchedOrphan).toBe(false);
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(false);
+      let competingReservation: boolean | undefined;
+      await expect(
+        mgr.releaseReservation(sessionName, 1, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+          beforeRelease: () => undefined,
+          persistReleaseEvidence: () => {
+            competingReservation = mgr.reserveAgentGeneration(replacement, '/tmp');
+          },
+        } as ManagerReleaseOptions),
+      ).resolves.toBe(true);
+      expect(competingReservation).toBe(false);
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(true);
+    });
+
+    it('reports pending creation as unknown and keeps a stopped name reserved until fenced release', async () => {
+      const sessionName = 'autoloop-probe-pending-planner';
+      const first = managerGeneration(sessionName);
+      const replacement = managerGeneration(sessionName, {
+        generation: 2,
+        session_id: 'physical-session-2',
+        owner_instance_id: 'owner-2',
+      });
+      let releaseStart!: () => void;
+      const startGate = new Promise<void>((resolve) => {
+        releaseStart = resolve;
+      });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (mgr as any)._createSession = (): ISession => {
+        const mock = new MockSession();
+        mock.start = async () => {
+          await startGate;
+          mock.sessionId = 'engine-session-1';
+          return mock;
+        };
+        mockSessions.push(mock);
+        return mock;
+      };
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      const starting = mgr.startSession({ name: sessionName, cwd: '/tmp' }, first);
+      const releaseOptions: ManagerReleaseOptions = {
+        expectedOwnerInstanceId: first.owner_instance_id,
+        expectedSessionId: first.session_id,
+        releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+      };
+
+      await expect(mgr.inspect(sessionName, first.session_id)).resolves.toBe('unknown');
+      await expect(mgr.releaseReservation(sessionName, 1, releaseOptions)).resolves.toBe(false);
+      releaseStart();
+      await starting;
+      await expect(mgr.inspect(sessionName, first.session_id)).resolves.toBe('live');
+      await expect(mgr.releaseReservation(sessionName, 1, releaseOptions)).resolves.toBe(false);
+
+      await mgr.stopSession(sessionName);
+      await expect(mgr.inspect(sessionName, first.session_id)).resolves.toBe('absent');
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(false);
+      let competingReservation: boolean | undefined;
+      await expect(
+        mgr.releaseReservation(sessionName, 1, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+          beforeRelease: () => undefined,
+          persistReleaseEvidence: () => {
+            competingReservation = mgr.reserveAgentGeneration(replacement, '/tmp');
+          },
+        } as ManagerReleaseOptions),
+      ).resolves.toBe(true);
+      expect(competingReservation).toBe(false);
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(true);
+    });
+
+    it('keeps a legacy generation-zero tombstone fenced until release evidence is durable', async () => {
+      // This ordinary legacy fixture must still be inside the seven-day TTL
+      // when release claims its durable generation-zero fence.
+      vi.setSystemTime(new Date('2026-09-05T12:00:00.000Z'));
+      const sessionName = 'autoloop-probe-legacy-planner';
+      const next = managerGeneration(sessionName);
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      reservations.set(sessionName, {
+        name: sessionName,
+        claudeSessionId: 'legacy-session-id',
+        cwd: '/tmp',
+        originalCreated: '2026-09-05T10:00:00.000Z',
+        lastResumed: '2026-09-05T10:00:00.000Z',
+        lastActivity: Date.parse('2026-09-05T10:00:00.000Z'),
+      });
+      persistManagerRegistry(mgr);
+      let orphanEvidenceDurable = false;
+      let releaseEvidenceDurable = false;
+      let competingReservation: boolean | undefined;
+
+      await expect(
+        mgr.releaseReservation(sessionName, 0, {
+          expectedOwnerInstanceId: 'legacy-registry',
+          expectedSessionId: undefined,
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+          beforeRelease: () => {
+            orphanEvidenceDurable = true;
+          },
+          persistReleaseEvidence: () => {
+            expect(orphanEvidenceDurable).toBe(true);
+            competingReservation = mgr.reserveAgentGeneration(next, '/tmp');
+            releaseEvidenceDurable = true;
+          },
+        } as ManagerReleaseOptions),
+      ).resolves.toBe(true);
+
+      expect(orphanEvidenceDurable).toBe(true);
+      expect(releaseEvidenceDurable).toBe(true);
+      expect(competingReservation).toBe(false);
+      expect(mgr.reserveAgentGeneration(next, '/tmp')).toBe(true);
+    });
+
+    it('treats a released legacy tombstone retry as side-effect-free idempotent success', async () => {
+      const sessionName = 'autoloop-probe-released-legacy-planner';
+      const legacyTombstone = {
+        name: sessionName,
+        claudeSessionId: 'legacy-session-id',
+        cwd: '/tmp',
+        originalCreated: '2026-09-05T10:00:00.000Z',
+        lastResumed: '2026-09-05T10:00:00.000Z',
+        lastActivity: Date.parse('2026-09-05T10:00:00.000Z'),
+        agentReleasedGeneration: 0,
+      };
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      reservations.set(sessionName, legacyTombstone);
+      persistManagerRegistry(mgr);
+      let evidenceHookCount = 0;
+
+      await expect(
+        mgr.releaseReservation(sessionName, 0, {
+          expectedOwnerInstanceId: 'arbitrary-owner-that-was-never-stored',
+          expectedSessionId: 'arbitrary-session-that-was-never-stored',
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+          beforeRelease: () => {
+            evidenceHookCount += 1;
+          },
+          persistReleaseEvidence: () => {
+            evidenceHookCount += 1;
+          },
+        } as ManagerReleaseOptions),
+      ).resolves.toBe(true);
+
+      expect(evidenceHookCount).toBe(0);
+      expect(reservations.get(sessionName)).toEqual(legacyTombstone);
+    });
+
+    it('rejects every mismatch against each field present on a released tombstone without side effects', async () => {
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      const baseTombstone = {
+        claudeSessionId: 'released-session-id',
+        cwd: '/tmp',
+        originalCreated: '2026-09-05T10:00:00.000Z',
+        lastResumed: '2026-09-05T10:00:00.000Z',
+        lastActivity: Date.parse('2026-09-05T10:00:00.000Z'),
+        agentReleasedGeneration: 1,
+      };
+      const cases = [
+        {
+          name: 'released-owner-only',
+          stored: { agentReleasedOwnerInstanceId: 'stored-owner' },
+          generation: 1,
+          expectedOwnerInstanceId: 'wrong-owner',
+          expectedSessionId: undefined,
+        },
+        {
+          name: 'released-session-only',
+          stored: { agentReleasedSessionId: 'stored-session' },
+          generation: 1,
+          expectedOwnerInstanceId: 'unused-owner',
+          expectedSessionId: 'wrong-session',
+        },
+        {
+          name: 'released-wrong-generation',
+          stored: {},
+          generation: 2,
+          expectedOwnerInstanceId: 'unused-owner',
+          expectedSessionId: undefined,
+        },
+        {
+          name: 'released-modern-mismatch',
+          stored: {
+            agentReleasedOwnerInstanceId: 'stored-owner',
+            agentReleasedSessionId: 'stored-session',
+          },
+          generation: 1,
+          expectedOwnerInstanceId: 'stored-owner',
+          expectedSessionId: 'wrong-session',
+        },
+      ];
+      let evidenceHookCount = 0;
+
+      for (const testCase of cases) {
+        reservations.set(testCase.name, {
+          ...baseTombstone,
+          name: testCase.name,
+          ...testCase.stored,
+        });
+      }
+      persistManagerRegistry(mgr);
+
+      for (const testCase of cases) {
+        const before = structuredClone(reservations.get(testCase.name));
+        await expect(
+          mgr.releaseReservation(testCase.name, testCase.generation, {
+            expectedOwnerInstanceId: testCase.expectedOwnerInstanceId,
+            expectedSessionId: testCase.expectedSessionId,
+            releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+            beforeRelease: () => {
+              evidenceHookCount += 1;
+            },
+            persistReleaseEvidence: () => {
+              evidenceHookCount += 1;
+            },
+          } as ManagerReleaseOptions),
+        ).resolves.toBe(false);
+        expect(reservations.get(testCase.name)).toEqual(before);
+      }
+      expect(evidenceHookCount).toBe(0);
+    });
+
+    it('accepts matching modern full-tuple, owner-only, and session-only tombstone retries without hooks', async () => {
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      const baseTombstone = {
+        claudeSessionId: 'released-session-id',
+        cwd: '/tmp',
+        originalCreated: '2026-09-05T10:00:00.000Z',
+        lastResumed: '2026-09-05T10:00:00.000Z',
+        lastActivity: Date.parse('2026-09-05T10:00:00.000Z'),
+        agentReleasedGeneration: 1,
+      };
+      const cases = [
+        {
+          name: 'released-matching-full-tuple',
+          stored: {
+            agentReleasedOwnerInstanceId: 'stored-owner',
+            agentReleasedSessionId: 'stored-session',
+          },
+          expectedOwnerInstanceId: 'stored-owner',
+          expectedSessionId: 'stored-session',
+        },
+        {
+          name: 'released-matching-owner-only',
+          stored: { agentReleasedOwnerInstanceId: 'stored-owner' },
+          expectedOwnerInstanceId: 'stored-owner',
+          expectedSessionId: undefined,
+        },
+        {
+          name: 'released-matching-session-only',
+          stored: { agentReleasedSessionId: 'stored-session' },
+          expectedOwnerInstanceId: 'unused-owner',
+          expectedSessionId: 'stored-session',
+        },
+      ];
+      let evidenceHookCount = 0;
+
+      for (const testCase of cases) {
+        reservations.set(testCase.name, {
+          ...baseTombstone,
+          name: testCase.name,
+          ...testCase.stored,
+        });
+      }
+      persistManagerRegistry(mgr);
+
+      for (const testCase of cases) {
+        const before = structuredClone(reservations.get(testCase.name));
+        await expect(
+          mgr.releaseReservation(testCase.name, 1, {
+            expectedOwnerInstanceId: testCase.expectedOwnerInstanceId,
+            expectedSessionId: testCase.expectedSessionId,
+            releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+            beforeRelease: () => {
+              evidenceHookCount += 1;
+            },
+            persistReleaseEvidence: () => {
+              evidenceHookCount += 1;
+            },
+          }),
+        ).resolves.toBe(true);
+        expect(reservations.get(testCase.name)).toEqual(before);
+      }
+      expect(evidenceHookCount).toBe(0);
+    });
+
+    it('keeps the generation reservation when an engine has no resumable conversation id yet', async () => {
+      const sessionName = 'autoloop-probe-one-shot-planner';
+      const generation = managerGeneration(sessionName);
+
+      expect(mgr.reserveAgentGeneration(generation, '/tmp')).toBe(true);
+      await mgr.startSession({ name: sessionName, cwd: '/tmp', engine: 'agy' }, generation);
+
+      const persisted = (
+        mgr as unknown as {
+          persistedSessions: Map<string, { agentGeneration?: number; agentOwnerInstanceId?: string }>;
+        }
+      ).persistedSessions.get(sessionName);
+      expect(persisted).toMatchObject({
+        agentGeneration: generation.generation,
+        agentOwnerInstanceId: generation.owner_instance_id,
+      });
+    });
+
+    it('reports adopted registry-lock cleanup failure as terminal and non-retryable', () => {
+      // This catches the registry adapter collapsing an entered lock cleanup
+      // failure into ordinary retryable lock contention.
+      const sessionName = 'autoloop-registry-cleanup-failed-planner';
+      const lockPath = `${SESSION_REGISTRY_FILE}.lock`;
+      const reclaimPath = `${lockPath}.reclaim`;
+      fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+      fs.writeFileSync(reclaimPath, JSON.stringify({ pid: 999_999_999 }), { mode: 0o600 });
+      fs.utimesSync(reclaimPath, new Date(Date.now() - 120_000), new Date(Date.now() - 120_000));
+      const originalRmSync = fs.rmSync;
+      const releaseFailure = new Error(
+        'injected adopted registry-lock reclaim release failure',
+      ) as NodeJS.ErrnoException;
+      releaseFailure.code = 'EBUSY';
+      const rmSpy = vi.spyOn(fs, 'rmSync').mockImplementation(((target: fs.PathLike, options?: fs.RmDirOptions) => {
+        if (String(target).startsWith(`${reclaimPath}.adopt-`)) throw releaseFailure;
+        return originalRmSync(target, options);
+      }) as typeof fs.rmSync);
+
+      try {
+        expect(() => mgr.reserveAgentGeneration(managerGeneration(sessionName), '/tmp')).toThrow(
+          expect.objectContaining({
+            code: 'AUTOLOOP_AGENT_REGISTRY_LOCK_CLEANUP_FAILED',
+            retryable: false,
+          }),
+        );
+      } finally {
+        rmSpy.mockRestore();
+        fs.rmSync(lockPath, { force: true });
+        fs.rmSync(reclaimPath, { force: true });
+      }
+
+      expect((mgr as unknown as { persistedSessions: Map<string, unknown> }).persistedSessions.has(sessionName)).toBe(
+        false,
+      );
+    });
+
+    it('distinguishes registry lock and persistence failures from ownership rejection', async () => {
+      const sessionName = 'autoloop-probe-persist-failure-planner';
+      const first = managerGeneration(sessionName);
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, { agentGeneration?: number; agentOwnerInstanceId?: string }>;
+        }
+      ).persistedSessions;
+
+      const openFile = vi.mocked(fs.openSync).getMockImplementation()!;
+      vi.mocked(fs.openSync).mockImplementationOnce(((file: string, ...args: unknown[]) => {
+        if (file.endsWith('/claude-sessions.json.lock')) {
+          throw Object.assign(new Error('registry lock unavailable'), { code: 'EACCES' });
+        }
+        return (openFile as unknown as (file: string, ...rest: unknown[]) => number)(file, ...args);
+      }) as typeof fs.openSync);
+      expect(() => mgr.reserveAgentGeneration(first, '/tmp')).toThrow(
+        expect.objectContaining({
+          code: 'AUTOLOOP_AGENT_REGISTRY_LOCK_CONTENDED',
+          retryable: true,
+        }),
+      );
+      expect(reservations.has(sessionName)).toBe(false);
+
+      vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+        throw new Error('registry rename failed');
+      });
+      expect(() => mgr.reserveAgentGeneration(first, '/tmp')).toThrow(
+        expect.objectContaining({
+          code: 'AUTOLOOP_AGENT_REGISTRY_PERSIST_FAILED',
+          retryable: true,
+        }),
+      );
+      expect(reservations.has(sessionName)).toBe(false);
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      let orphanEvidenceCount = 0;
+      let releaseEvidenceCount = 0;
+      vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+        throw new Error('registry rename failed');
+      });
+      await expect(
+        mgr.releaseReservation(sessionName, first.generation, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+          beforeRelease: () => {
+            orphanEvidenceCount += 1;
+          },
+          persistReleaseEvidence: () => {
+            releaseEvidenceCount += 1;
+          },
+        } as ManagerReleaseOptions),
+      ).rejects.toMatchObject({
+        code: 'AUTOLOOP_AGENT_REGISTRY_PERSIST_FAILED',
+        retryable: true,
+      });
+      expect(orphanEvidenceCount).toBe(0);
+      expect(releaseEvidenceCount).toBe(0);
+      expect(reservations.get(sessionName)).toMatchObject({
+        agentGeneration: first.generation,
+        agentOwnerInstanceId: first.owner_instance_id,
+      });
+    });
+
+    it('persists a single-winner release-owner fence before orphan evidence', async () => {
+      const sessionName = 'autoloop-probe-release-owner-planner';
+      const first = managerGeneration(sessionName);
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      let winnerHookCount = 0;
+      let competingHookCount = 0;
+      let competingRelease: Promise<boolean> | undefined;
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      await expect(
+        mgr.releaseReservation(sessionName, first.generation, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+          beforeRelease: () => {
+            winnerHookCount += 1;
+            expect(reservations.get(sessionName)).toMatchObject({
+              agentReleasePending: true,
+              agentReleaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+            });
+            competingRelease = mgr.releaseReservation(sessionName, first.generation, {
+              expectedOwnerInstanceId: first.owner_instance_id,
+              expectedSessionId: first.session_id,
+              releaseOwnerInstanceId: `session-manager:${process.pid}:00000000-0000-4000-8000-000000000002`,
+              beforeRelease: () => {
+                competingHookCount += 1;
+              },
+              persistReleaseEvidence: () => {
+                competingHookCount += 1;
+              },
+            } as ManagerReleaseOptions);
+          },
+          persistReleaseEvidence: () => {
+            winnerHookCount += 1;
+          },
+        } as ManagerReleaseOptions),
+      ).resolves.toBe(true);
+
+      await expect(competingRelease).resolves.toBe(false);
+      expect(winnerHookCount).toBe(2);
+      expect(competingHookCount).toBe(0);
+    });
+
+    it('lets the first exact-tuple claimant own a pre-fix pending release with no release owner', async () => {
+      const sessionName = 'autoloop-probe-ownerless-pending-planner';
+      const first = managerGeneration(sessionName);
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      let evidenceHookCount = 0;
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      reservations.set(sessionName, {
+        ...reservations.get(sessionName),
+        agentReleasePending: true,
+        agentReleaseOwnerInstanceId: undefined,
+      });
+      persistManagerRegistry(mgr);
+
+      await expect(
+        mgr.releaseReservation(sessionName, first.generation, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: 'wrong-physical-session',
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+          beforeRelease: () => {
+            evidenceHookCount += 1;
+          },
+          persistReleaseEvidence: () => {
+            evidenceHookCount += 1;
+          },
+        }),
+      ).resolves.toBe(false);
+      expect(reservations.get(sessionName)).toMatchObject({ agentReleasePending: true });
+      expect(reservations.get(sessionName)).not.toHaveProperty('agentReleaseOwnerInstanceId');
+      expect(evidenceHookCount).toBe(0);
+
+      await expect(
+        mgr.releaseReservation(sessionName, first.generation, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+          beforeRelease: () => {
+            evidenceHookCount += 1;
+          },
+          persistReleaseEvidence: () => {
+            evidenceHookCount += 1;
+          },
+        } as ManagerReleaseOptions),
+      ).resolves.toBe(true);
+
+      expect(evidenceHookCount).toBe(2);
+      expect(reservations.get(sessionName)).toMatchObject({
+        agentGeneration: undefined,
+        agentReleasePending: undefined,
+        agentReleasedGeneration: first.generation,
+      });
+    });
+
+    it('transfers a pending release only after its prior manager owner shuts down and completes once', async () => {
+      const sessionName = 'autoloop-probe-restart-release-owner-planner';
+      const first = managerGeneration(sessionName);
+      let priorOwnerHookCount = 0;
+      let successorHookCount = 0;
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      await expect(
+        mgr.releaseReservation(sessionName, first.generation, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+          beforeRelease: () => {
+            priorOwnerHookCount += 1;
+            throw new Error('simulated crash after pending claim');
+          },
+          persistReleaseEvidence: () => {
+            priorOwnerHookCount += 1;
+          },
+        } as ManagerReleaseOptions),
+      ).rejects.toThrow('simulated crash after pending claim');
+
+      const successor = createManager();
+      const successorOptions: ManagerReleaseOptions = {
+        expectedOwnerInstanceId: first.owner_instance_id,
+        expectedSessionId: first.session_id,
+        releaseOwnerInstanceId: successor.autoloopOwnerInstanceId,
+        beforeRelease: () => {
+          successorHookCount += 1;
+        },
+        persistReleaseEvidence: () => {
+          successorHookCount += 1;
+        },
+      };
+      try {
+        await expect(successor.releaseReservation(sessionName, first.generation, successorOptions)).resolves.toBe(
+          false,
+        );
+        expect(successorHookCount).toBe(0);
+
+        await mgr.shutdown();
+
+        await expect(successor.releaseReservation(sessionName, first.generation, successorOptions)).resolves.toBe(true);
+        await expect(successor.releaseReservation(sessionName, first.generation, successorOptions)).resolves.toBe(true);
+        expect(priorOwnerHookCount).toBe(1);
+        expect(successorHookCount).toBe(2);
+      } finally {
+        await successor.shutdown();
+      }
+    });
+
+    it('keeps the release owner live when shutdown starts inside an evidence hook', async () => {
+      const sessionName = 'autoloop-probe-mid-hook-shutdown-planner';
+      const first = managerGeneration(sessionName);
+      const successor = createManager();
+      let shutdown: Promise<void> | undefined;
+      let competingRelease: Promise<boolean> | undefined;
+      let priorEvidenceCount = 0;
+      let successorEvidenceCount = 0;
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      try {
+        await expect(
+          mgr.releaseReservation(sessionName, first.generation, {
+            expectedOwnerInstanceId: first.owner_instance_id,
+            expectedSessionId: first.session_id,
+            releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+            beforeRelease: () => {
+              priorEvidenceCount += 1;
+              shutdown = mgr.shutdown();
+              competingRelease = successor.releaseReservation(sessionName, first.generation, {
+                expectedOwnerInstanceId: first.owner_instance_id,
+                expectedSessionId: first.session_id,
+                releaseOwnerInstanceId: successor.autoloopOwnerInstanceId,
+                beforeRelease: () => {
+                  successorEvidenceCount += 1;
+                },
+                persistReleaseEvidence: () => {
+                  successorEvidenceCount += 1;
+                },
+              });
+            },
+            persistReleaseEvidence: () => {
+              priorEvidenceCount += 1;
+            },
+          }),
+        ).resolves.toBe(true);
+
+        await expect(competingRelease).resolves.toBe(false);
+        await shutdown;
+        expect(priorEvidenceCount).toBe(2);
+        expect(successorEvidenceCount).toBe(0);
+      } finally {
+        await successor.shutdown();
+      }
+    });
+
+    it('keeps the release owner live from durable claim through queued evidence hooks', async () => {
+      const sessionName = 'autoloop-probe-pre-hook-shutdown-planner';
+      const first = managerGeneration(sessionName);
+      const successor = createManager();
+      let priorEvidenceCount = 0;
+      let successorEvidenceCount = 0;
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      try {
+        const release = mgr.releaseReservation(sessionName, first.generation, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+          beforeRelease: () => {
+            priorEvidenceCount += 1;
+          },
+          persistReleaseEvidence: () => {
+            priorEvidenceCount += 1;
+          },
+        });
+        const shutdown = mgr.shutdown();
+        const competingRelease = successor.releaseReservation(sessionName, first.generation, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: successor.autoloopOwnerInstanceId,
+          beforeRelease: () => {
+            successorEvidenceCount += 1;
+          },
+          persistReleaseEvidence: () => {
+            successorEvidenceCount += 1;
+          },
+        });
+
+        await expect(release).resolves.toBe(true);
+        await expect(competingRelease).resolves.toBe(false);
+        await shutdown;
+        expect(priorEvidenceCount).toBe(2);
+        expect(successorEvidenceCount).toBe(0);
+      } finally {
+        await successor.shutdown();
+      }
+    });
+
+    it('waits for a durably claimed release whose evidence hook body has not started', async () => {
+      const sessionName = 'autoloop-probe-queued-release-shutdown-planner';
+      const first = managerGeneration(sessionName);
+      const successor = createManager();
+      let priorEvidenceCount = 0;
+      let successorEvidenceCount = 0;
+      let startQueuedRelease: (() => void) | undefined;
+      let queuedReleaseStarted = false;
+      let resolveQueuedRelease!: (value: boolean) => void;
+      let rejectQueuedRelease!: (reason?: unknown) => void;
+      const queuedRelease = new Promise<boolean>((resolve, reject) => {
+        resolveQueuedRelease = resolve;
+        rejectQueuedRelease = reject;
+      });
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      const nativePromiseResolve = Promise.resolve.bind(Promise);
+      const resolveSpy = vi.spyOn(Promise, 'resolve').mockImplementationOnce((() => ({
+        then: (runRelease: () => boolean) => {
+          startQueuedRelease = () => {
+            if (queuedReleaseStarted) return;
+            queuedReleaseStarted = true;
+            try {
+              resolveQueuedRelease(runRelease());
+            } catch (err) {
+              rejectQueuedRelease(err);
+            }
+          };
+          return queuedRelease;
+        },
+      })) as typeof Promise.resolve);
+      let release: Promise<boolean>;
+      try {
+        release = mgr.releaseReservation(sessionName, first.generation, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+          beforeRelease: () => {
+            priorEvidenceCount += 1;
+          },
+          persistReleaseEvidence: () => {
+            priorEvidenceCount += 1;
+          },
+        });
+      } finally {
+        resolveSpy.mockRestore();
+      }
+
+      expect(startQueuedRelease).toBeDefined();
+      let shutdownSettled = false;
+      const shutdown = mgr.shutdown().then(() => {
+        shutdownSettled = true;
+      });
+      await nativePromiseResolve();
+      await nativePromiseResolve();
+
+      expect(shutdownSettled).toBe(false);
+      expect(priorEvidenceCount).toBe(0);
+      try {
+        await expect(
+          successor.releaseReservation(sessionName, first.generation, {
+            expectedOwnerInstanceId: first.owner_instance_id,
+            expectedSessionId: first.session_id,
+            releaseOwnerInstanceId: successor.autoloopOwnerInstanceId,
+            beforeRelease: () => {
+              successorEvidenceCount += 1;
+            },
+            persistReleaseEvidence: () => {
+              successorEvidenceCount += 1;
+            },
+          }),
+        ).resolves.toBe(false);
+        expect(successorEvidenceCount).toBe(0);
+
+        startQueuedRelease!();
+        await expect(release).resolves.toBe(true);
+        await shutdown;
+        expect(priorEvidenceCount).toBe(2);
+      } finally {
+        startQueuedRelease?.();
+        await Promise.allSettled([release, shutdown]);
+        await successor.shutdown();
+      }
+    });
+
+    it('does not admit a new release after shutdown establishes its lifecycle fence', async () => {
+      const sessionName = 'autoloop-probe-post-shutdown-release-planner';
+      const first = managerGeneration(sessionName);
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      let evidenceHookCount = 0;
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      const before = structuredClone(reservations.get(sessionName));
+      const shutdown = mgr.shutdown();
+      await expect(
+        mgr.releaseReservation(sessionName, first.generation, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+          beforeRelease: () => {
+            evidenceHookCount += 1;
+          },
+          persistReleaseEvidence: () => {
+            evidenceHookCount += 1;
+          },
+        }),
+      ).resolves.toBe(false);
+      await shutdown;
+
+      expect(reservations.get(sessionName)).toEqual(before);
+      expect(evidenceHookCount).toBe(0);
+    });
+
+    it('keeps a pending release fenced when the prior release owner is indeterminate', async () => {
+      const sessionName = 'autoloop-probe-unknown-release-owner-planner';
+      const first = managerGeneration(sessionName);
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      let evidenceHookCount = 0;
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      reservations.set(sessionName, {
+        ...reservations.get(sessionName),
+        agentReleasePending: true,
+        agentReleaseOwnerInstanceId: 'session-manager:2000000000:not-a-valid-instance-id',
+      });
+      persistManagerRegistry(mgr);
+      const before = structuredClone(reservations.get(sessionName));
+      const claimant = createManager();
+      try {
+        await expect(
+          claimant.releaseReservation(sessionName, first.generation, {
+            expectedOwnerInstanceId: first.owner_instance_id,
+            expectedSessionId: first.session_id,
+            releaseOwnerInstanceId: claimant.autoloopOwnerInstanceId,
+            beforeRelease: () => {
+              evidenceHookCount += 1;
+            },
+            persistReleaseEvidence: () => {
+              evidenceHookCount += 1;
+            },
+          }),
+        ).resolves.toBe(false);
+
+        expect(evidenceHookCount).toBe(0);
+        expect(claimant.listPersistedSessions().find((entry) => entry.name === sessionName)).toEqual(before);
+      } finally {
+        await claimant.shutdown();
+      }
+    });
+
+    it('takes over a well-formed pending release whose prior owner PID is dead', async () => {
+      const sessionName = 'autoloop-probe-dead-release-owner-planner';
+      const first = managerGeneration(sessionName);
+      const deadOwnerPid = 2_000_000_000;
+      const deadOwnerInstanceId = `session-manager:${deadOwnerPid}:00000000-0000-4000-8000-000000000003`;
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      let evidenceHookCount = 0;
+
+      expect(() => process.kill(deadOwnerPid, 0)).toThrow();
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      reservations.set(sessionName, {
+        ...reservations.get(sessionName),
+        agentReleasePending: true,
+        agentReleaseOwnerInstanceId: deadOwnerInstanceId,
+      });
+      persistManagerRegistry(mgr);
+
+      const claimant = createManager();
+      try {
+        await expect(
+          claimant.releaseReservation(sessionName, first.generation, {
+            expectedOwnerInstanceId: first.owner_instance_id,
+            expectedSessionId: first.session_id,
+            releaseOwnerInstanceId: claimant.autoloopOwnerInstanceId,
+            beforeRelease: () => {
+              evidenceHookCount += 1;
+            },
+            persistReleaseEvidence: () => {
+              evidenceHookCount += 1;
+            },
+          }),
+        ).resolves.toBe(true);
+        expect(evidenceHookCount).toBe(2);
+      } finally {
+        await claimant.shutdown();
+      }
+    });
+
+    it('uses shared disk CAS across same-process managers so one writer wins and a successor survives', async () => {
+      const sessionName = 'autoloop-probe-cross-manager-cas-planner';
+      const first = managerGeneration(sessionName);
+      const successorGeneration = managerGeneration(sessionName, {
+        generation: 2,
+        owner_instance_id: 'successor-generation-owner',
+        session_id: 'successor-generation-session',
+      });
+      const hookOwners: string[] = [];
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      const contender = createManager();
+      const staleCompletion = createManager();
+      let competingRelease: Promise<boolean> | undefined;
+      const release = (manager: InstanceType<typeof SessionManager>, contend = false) =>
+        manager.releaseReservation(sessionName, first.generation, {
+          expectedOwnerInstanceId: first.owner_instance_id,
+          expectedSessionId: first.session_id,
+          releaseOwnerInstanceId: manager.autoloopOwnerInstanceId,
+          beforeRelease: () => {
+            hookOwners.push(manager.autoloopOwnerInstanceId);
+            if (contend) competingRelease = release(contender);
+          },
+          persistReleaseEvidence: () => {
+            hookOwners.push(manager.autoloopOwnerInstanceId);
+          },
+        } as ManagerReleaseOptions);
+
+      try {
+        await expect(release(mgr, true)).resolves.toBe(true);
+        await expect(competingRelease).resolves.toBe(false);
+        await expect(release(contender)).resolves.toBe(true);
+        expect(hookOwners).toEqual([mgr.autoloopOwnerInstanceId, mgr.autoloopOwnerInstanceId]);
+        expect(contender.reserveAgentGeneration(successorGeneration, '/tmp')).toBe(true);
+
+        await expect(release(staleCompletion)).resolves.toBe(false);
+        expect(hookOwners).toEqual([mgr.autoloopOwnerInstanceId, mgr.autoloopOwnerInstanceId]);
+        const authoritativeSuccessor = staleCompletion
+          .listPersistedSessions()
+          .find((entry) => entry.name === sessionName);
+        expect(authoritativeSuccessor).toMatchObject({
+          agentGeneration: successorGeneration.generation,
+          agentOwnerInstanceId: successorGeneration.owner_instance_id,
+          agentSessionId: successorGeneration.session_id,
+        });
+        expect(authoritativeSuccessor).not.toHaveProperty('agentReleasePending');
+
+        // The winning manager still holds a released-generation snapshot. Its
+        // later lifecycle persistence must not overwrite the successor that a
+        // different manager committed through the shared CAS authority.
+        await mgr.shutdown();
+        const verifier = createManager();
+        try {
+          expect(verifier.listPersistedSessions().find((entry) => entry.name === sessionName)).toMatchObject({
+            agentGeneration: successorGeneration.generation,
+            agentOwnerInstanceId: successorGeneration.owner_instance_id,
+            agentSessionId: successorGeneration.session_id,
+          });
+        } finally {
+          await verifier.shutdown();
+        }
+      } finally {
+        await contender.shutdown();
+        await staleCompletion.shutdown();
+      }
+    });
+
+    it('keeps failed orphan evidence fenced for retry by the exact release owner', async () => {
+      const sessionName = 'autoloop-probe-release-retry-planner';
+      const first = managerGeneration(sessionName);
+      const replacement = managerGeneration(sessionName, {
+        generation: 2,
+        session_id: 'physical-session-2',
+        owner_instance_id: 'owner-2',
+      });
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      let failOrphanEvidence = true;
+      let winnerOrphanHookCount = 0;
+      let winnerReleaseHookCount = 0;
+      let competingHookCount = 0;
+      const winnerOptions: ManagerReleaseOptions = {
+        expectedOwnerInstanceId: first.owner_instance_id,
+        expectedSessionId: first.session_id,
+        releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+        beforeRelease: () => {
+          winnerOrphanHookCount += 1;
+          if (failOrphanEvidence) {
+            failOrphanEvidence = false;
+            throw new Error('orphan evidence append failed');
+          }
+        },
+        persistReleaseEvidence: () => {
+          winnerReleaseHookCount += 1;
+        },
+      };
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      await expect(mgr.releaseReservation(sessionName, first.generation, winnerOptions)).rejects.toThrow(
+        'orphan evidence append failed',
+      );
+      expect(reservations.get(sessionName)).toMatchObject({
+        agentReleasePending: true,
+        agentReleaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+      });
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(false);
+
+      await expect(
+        mgr.releaseReservation(sessionName, first.generation, {
+          ...winnerOptions,
+          releaseOwnerInstanceId: `session-manager:${process.pid}:00000000-0000-4000-8000-000000000002`,
+          beforeRelease: () => {
+            competingHookCount += 1;
+          },
+          persistReleaseEvidence: () => {
+            competingHookCount += 1;
+          },
+        }),
+      ).resolves.toBe(false);
+      await expect(mgr.releaseReservation(sessionName, first.generation, winnerOptions)).resolves.toBe(true);
+
+      expect(winnerOrphanHookCount).toBe(2);
+      expect(winnerReleaseHookCount).toBe(1);
+      expect(competingHookCount).toBe(0);
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(true);
+    });
+
+    it('keeps a prepared tombstone fenced when completion persistence fails, then finishes idempotently', async () => {
+      const sessionName = 'autoloop-probe-completion-failure-planner';
+      const first = managerGeneration(sessionName);
+      const replacement = managerGeneration(sessionName, {
+        generation: 2,
+        session_id: 'physical-session-2',
+        owner_instance_id: 'owner-2',
+      });
+      const options: ManagerReleaseOptions = {
+        expectedOwnerInstanceId: first.owner_instance_id,
+        expectedSessionId: first.session_id,
+        releaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+        beforeRelease: () => {
+          beforeEvidenceCount += 1;
+        },
+        persistReleaseEvidence: () => {
+          releaseEvidenceCount += 1;
+        },
+      };
+      let beforeEvidenceCount = 0;
+      let releaseEvidenceCount = 0;
+
+      expect(mgr.reserveAgentGeneration(first, '/tmp')).toBe(true);
+      const persistRename = vi.mocked(fs.renameSync).getMockImplementation()!;
+      vi.mocked(fs.renameSync)
+        .mockImplementationOnce(persistRename)
+        .mockImplementationOnce(() => {
+          throw new Error('registry rename failed');
+        });
+      await expect(mgr.releaseReservation(sessionName, 1, options)).rejects.toMatchObject({
+        code: 'AUTOLOOP_AGENT_REGISTRY_PERSIST_FAILED',
+      });
+      expect(beforeEvidenceCount).toBe(1);
+      expect(releaseEvidenceCount).toBe(1);
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(false);
+      await expect(mgr.releaseReservation(sessionName, 1, options)).resolves.toBe(true);
+      await expect(mgr.releaseReservation(sessionName, 1, options)).resolves.toBe(true);
+      expect(beforeEvidenceCount).toBe(1);
+      expect(releaseEvidenceCount).toBe(1);
+      expect(mgr.reserveAgentGeneration(replacement, '/tmp')).toBe(true);
     });
   });
 
@@ -1235,11 +2915,110 @@ describe('SessionManager', () => {
       expect(cancelled).toBe(true);
     });
 
+    it('waits for kernel-triggered Autoloop reservation releases before closing the release fence', async () => {
+      const runId = 'shutdown-agent-releases';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      fs.mkdirSync(workspace, { recursive: true });
+      await mgr.autoloopStart({ runId, workspace });
+      await mgr.getAutoloop(runId)!.dispatcher.spawnSubagents();
+
+      await mgr.shutdown();
+
+      const reservations = (
+        mgr as unknown as {
+          persistedSessions: Map<string, Record<string, unknown>>;
+        }
+      ).persistedSessions;
+      for (const role of ['planner', 'coder', 'reviewer']) {
+        const reservation = reservations.get(`autoloop-${runId}-${role}`);
+        expect(reservation).toMatchObject({ agentReleasedGeneration: 1 });
+        expect(reservation).not.toHaveProperty('agentGeneration');
+        expect(reservation).not.toHaveProperty('agentReleasePending');
+      }
+    });
+
+    it('keeps release admission open until natural Autoloop termination finishes dispatcher teardown', async () => {
+      const runId = 'shutdown-overlapping-natural-autoloop-termination';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      fs.mkdirSync(workspace, { recursive: true });
+      await mgr.autoloopStart({ runId, workspace });
+      const handle = mgr.getAutoloop(runId)!;
+      await handle.dispatcher.spawnSubagents();
+
+      const originalDispatcherShutdown = handle.dispatcher.shutdown.bind(handle.dispatcher);
+      let signalTeardownStarted!: () => void;
+      const teardownStarted = new Promise<void>((resolve) => {
+        signalTeardownStarted = resolve;
+      });
+      let allowTeardown!: () => void;
+      const teardownBarrier = new Promise<void>((resolve) => {
+        allowTeardown = resolve;
+      });
+      handle.dispatcher.shutdown = async (reason, options) => {
+        signalTeardownStarted();
+        await teardownBarrier;
+        await originalDispatcherShutdown(reason, options);
+      };
+
+      let naturalTermination: Promise<boolean> | undefined;
+      let managerShutdown: Promise<void> | undefined;
+      try {
+        naturalTermination = mgr.autoloopStop(runId, 'natural-test-termination');
+        await teardownStarted;
+
+        let managerShutdownSettled = false;
+        managerShutdown = mgr.shutdown().then(() => {
+          managerShutdownSettled = true;
+        });
+        await new Promise<void>((resolve) => nativeSetImmediate(resolve));
+
+        expect(managerShutdownSettled).toBe(false);
+
+        allowTeardown();
+        await expect(naturalTermination).resolves.toBe(true);
+        await managerShutdown;
+
+        const reservations = (
+          mgr as unknown as {
+            persistedSessions: Map<string, Record<string, unknown>>;
+          }
+        ).persistedSessions;
+        for (const role of ['planner', 'coder', 'reviewer']) {
+          const reservation = reservations.get(`autoloop-${runId}-${role}`);
+          expect(reservation).toMatchObject({ agentReleasedGeneration: 1 });
+          expect(reservation).not.toHaveProperty('agentGeneration');
+          expect(reservation).not.toHaveProperty('agentReleasePending');
+        }
+      } finally {
+        allowTeardown();
+        await Promise.allSettled([naturalTermination, managerShutdown].filter((value) => value !== undefined));
+      }
+    });
+
     it('is idempotent', async () => {
       await mgr.startSession({ name: 'idempotent', cwd: '/tmp' });
       await mgr.shutdown();
       // Second shutdown should not throw
       await mgr.shutdown();
+    });
+
+    it('cancels a pending debounced registry write before returning', async () => {
+      await mgr.startSession({ name: 'debounced-shutdown', cwd: '/tmp' });
+      const internals = mgr as unknown as {
+        _persistRegistrySnapshot(): boolean;
+      };
+      const persist = internals._persistRegistrySnapshot.bind(mgr);
+      let writesAfterSessionStart = 0;
+      internals._persistRegistrySnapshot = () => {
+        writesAfterSessionStart += 1;
+        return persist();
+      };
+
+      await mgr.shutdown();
+      expect(writesAfterSessionStart).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(writesAfterSessionStart).toBe(1);
     });
   });
 
@@ -1433,6 +3212,45 @@ describe('SessionManager', () => {
   // ─── Autoloop role configuration ───────────────────────────────────
 
   describe('autoloop role configuration', () => {
+    it.each(['claude', 'codex', 'codex-app', 'gemini', 'agy', 'cursor', 'grok', 'opencode'] as const)(
+      'starts the %s Planner with an enforced read-only sandbox',
+      async (plannerEngine) => {
+        const runId = `readonly-planner-${plannerEngine}`;
+
+        await mgr.autoloopStart({ runId, workspace: '/tmp', plannerEngine });
+
+        expect(createdConfigs[0]).toMatchObject({
+          name: `autoloop-${runId}-planner`,
+          engine: plannerEngine,
+          permissionMode: 'manual',
+          sandboxMode: 'read-only',
+        });
+      },
+    );
+
+    it('starts a custom Planner with the same enforced read-only sandbox', async () => {
+      const plannerCustomEngine = {
+        name: 'readonly-custom',
+        bin: 'readonly-custom',
+        args: { permissionMode: '--permission-mode' },
+        permissionModes: { manual: 'plan' },
+      };
+
+      await mgr.autoloopStart({
+        runId: 'readonly-planner-custom',
+        workspace: '/tmp',
+        plannerEngine: 'custom',
+        plannerCustomEngine,
+      });
+
+      expect(createdConfigs[0]).toMatchObject({
+        engine: 'custom',
+        permissionMode: 'manual',
+        sandboxMode: 'read-only',
+        customEngine: plannerCustomEngine,
+      });
+    });
+
     it('passes independent role engines, models, efforts, and custom configs into dispatcher sessions', async () => {
       const coderCustomEngine = { name: 'coder-cli', bin: 'coder-cli', args: {} };
       await mgr.autoloopStart({
@@ -1661,6 +3479,3104 @@ describe('SessionManager', () => {
       expect(after.spec).toEqual(before!.spec);
     });
 
+    describe('strict Planner turn success', () => {
+      it('rejects transport success with an empty logical reply without advancing phase', async () => {
+        const runId = 'planner-empty-reply';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: '   ',
+          event: { type: 'result', result: '   ' },
+        });
+        const phaseErrors: PhaseErrorPayload[] = [];
+        handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+
+        await expect(mgr.autoloopChat(runId, 'return a reply')).rejects.toMatchObject({
+          code: 'AUTOLOOP_EMPTY_REPLY',
+        });
+        expect(phaseErrors).toEqual([
+          {
+            agent: 'planner',
+            phase: 'planner_turn',
+            code: 'AUTOLOOP_EMPTY_REPLY',
+            error: 'Planner transport completed without a non-empty logical reply',
+          },
+        ]);
+        expect(handle.runner.state).toMatchObject({
+          status: 'planning',
+          iter: 0,
+          subagents_spawned: false,
+          consecutive_phase_errors: 1,
+        });
+      });
+
+      it('rejects an empty logical reply when optional turn counters are unavailable', async () => {
+        const runId = 'planner-empty-reply-no-counters';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: '   ',
+          event: { type: 'result', result: '   ' },
+        });
+        vi.spyOn(mgr, 'getStatus').mockImplementation(() => {
+          throw new Error('optional counters unavailable');
+        });
+
+        await expect(mgr.autoloopChat(runId, 'return a reply')).rejects.toMatchObject({
+          code: 'AUTOLOOP_EMPTY_REPLY',
+        });
+      });
+
+      it('normalizes a raw Planner boundary failure before one durable and one Runner phase-error path', async () => {
+        const runId = 'planner-raw-boundary-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const cause = new Error('runtime liveness probe failed');
+        vi.spyOn(mgr, 'inspect').mockRejectedValueOnce(cause);
+        mockSessions[0].sendImplementation = async () => ({
+          text: 'reply whose generation cannot be verified',
+          event: { type: 'result', result: 'reply whose generation cannot be verified' },
+        });
+
+        const originalDeliver = handle.dispatcher.deliver.bind(handle.dispatcher);
+        let boundaryFailure: unknown;
+        vi.spyOn(handle.dispatcher, 'deliver').mockImplementation(async (env) => {
+          try {
+            return await originalDeliver(env);
+          } catch (error) {
+            boundaryFailure = error;
+            throw error;
+          }
+        });
+        const phaseErrors: PhaseErrorPayload[] = [];
+        const pushes: Array<{ summary: string }> = [];
+        handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+        handle.runner.on('push', (payload: { summary: string }) => pushes.push(payload));
+
+        let callerFailure: unknown;
+        try {
+          await mgr.autoloopChat(runId, 'exercise the raw dispatcher boundary');
+        } catch (error) {
+          callerFailure = error;
+        }
+
+        expect(boundaryFailure).toBeInstanceOf(AutoloopOperationError);
+        expect(callerFailure).toBe(boundaryFailure);
+        expect(callerFailure).toMatchObject({
+          name: 'AutoloopOperationError',
+          code: 'AUTOLOOP_ENGINE_FAILURE',
+          retryable: true,
+          cause,
+          message: 'Planner engine transport failed: runtime liveness probe failed',
+        });
+        expect(phaseErrors).toEqual([
+          {
+            agent: 'planner',
+            phase: 'planner_turn',
+            code: 'AUTOLOOP_ENGINE_FAILURE',
+            error: 'Planner engine transport failed: runtime liveness probe failed',
+          },
+        ]);
+        expect(pushes.map(({ summary }) => summary)).toEqual(['[on_phase_error] iter 0']);
+        expect(handle.runner.state).toMatchObject({
+          consecutive_phase_errors: 1,
+          push_log_count: 1,
+        });
+        const decisions = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: PhaseErrorPayload });
+        expect(
+          decisions.filter(
+            (row) =>
+              row.kind === 'phase_error' &&
+              row.payload.agent === 'planner' &&
+              row.payload.code === 'AUTOLOOP_ENGINE_FAILURE',
+          ),
+        ).toEqual([
+          expect.objectContaining({
+            payload: expect.objectContaining({
+              error: 'Planner engine transport failed: runtime liveness probe failed',
+            }),
+          }),
+        ]);
+      });
+
+      it('rethrows the same specific typed Planner failure instead of normalizing it to engine failure', async () => {
+        const runId = 'planner-specific-boundary-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents"}', '```'].join('\n'),
+          event: { type: 'result', result: 'malformed control' },
+        });
+        const originalDeliver = handle.dispatcher.deliver.bind(handle.dispatcher);
+        let boundaryFailure: unknown;
+        vi.spyOn(handle.dispatcher, 'deliver').mockImplementation(async (env) => {
+          try {
+            return await originalDeliver(env);
+          } catch (error) {
+            boundaryFailure = error;
+            throw error;
+          }
+        });
+
+        let callerFailure: unknown;
+        try {
+          await mgr.autoloopChat(runId, 'preserve the specific failure');
+        } catch (error) {
+          callerFailure = error;
+        }
+
+        expect(boundaryFailure).toBeInstanceOf(AutoloopOperationError);
+        expect(callerFailure).toBe(boundaryFailure);
+        expect(callerFailure).toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+          retryable: false,
+        });
+      });
+
+      it('creates the Planner control ledger owner-only and hardens pre-existing weak permissions', async () => {
+        const runId = 'planner-private-control-ledger';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        const ledgerDir = path.join(workspace, 'tasks', runId);
+        const decisionsPath = path.join(ledgerDir, 'decisions.jsonl');
+        fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o777 });
+        fs.chmodSync(ledgerDir, 0o775);
+        fs.writeFileSync(decisionsPath, '', { mode: 0o666 });
+        fs.chmodSync(decisionsPath, 0o664);
+
+        await mgr.autoloopStart({ runId, workspace });
+
+        expect(fs.statSync(ledgerDir).mode & 0o777).toBe(0o700);
+        expect(fs.statSync(decisionsPath).mode & 0o777).toBe(0o600);
+      });
+
+      it('creates a new Planner ledger directory and decisions file with owner-only permissions', async () => {
+        const runId = 'planner-new-private-control-ledger';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        const ledgerDir = path.join(workspace, 'tasks', runId);
+        const decisionsPath = path.join(ledgerDir, 'decisions.jsonl');
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents"}', '```'].join('\n'),
+          event: { type: 'result', result: 'invalid control' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'create private decision evidence')).rejects.toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+        });
+
+        expect(fs.statSync(ledgerDir).mode & 0o777).toBe(0o700);
+        expect(fs.statSync(decisionsPath).mode & 0o777).toBe(0o600);
+      });
+
+      it('does not weaken already owner-only Planner control ledger permissions', async () => {
+        const runId = 'planner-private-control-ledger-preserved';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        const ledgerDir = path.join(workspace, 'tasks', runId);
+        const decisionsPath = path.join(ledgerDir, 'decisions.jsonl');
+        fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o700 });
+        fs.chmodSync(ledgerDir, 0o700);
+        fs.writeFileSync(decisionsPath, '', { mode: 0o600 });
+        fs.chmodSync(decisionsPath, 0o600);
+
+        await mgr.autoloopStart({ runId, workspace });
+
+        expect(fs.statSync(ledgerDir).mode & 0o777).toBe(0o700);
+        expect(fs.statSync(decisionsPath).mode & 0o777).toBe(0o600);
+      });
+
+      it('refuses a pre-planted Planner ledger-directory symlink without writing its target', async () => {
+        const runId = 'planner-ledger-directory-symlink';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        const tasksDir = path.join(workspace, 'tasks');
+        const external = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-external-`));
+        fs.mkdirSync(tasksDir, { recursive: true });
+        fs.symlinkSync(external, path.join(tasksDir, runId), 'dir');
+
+        await expect(mgr.autoloopStart({ runId, workspace })).rejects.toThrow(/ledger.*symbolic link/i);
+        expect(fs.readdirSync(external)).toEqual([]);
+      });
+
+      it('refuses a pre-planted decisions symlink without changing its external target', async () => {
+        const runId = 'planner-decisions-symlink';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        const ledgerDir = path.join(workspace, 'tasks', runId);
+        const external = path.join(TEST_WF_DIR, `${runId}-external.txt`);
+        fs.mkdirSync(ledgerDir, { recursive: true });
+        fs.writeFileSync(external, 'external decision sentinel\n');
+        fs.symlinkSync(external, path.join(ledgerDir, 'decisions.jsonl'));
+
+        await expect(mgr.autoloopStart({ runId, workspace })).rejects.toThrow(/decisions\.jsonl.*symbolic link/i);
+        expect(fs.readFileSync(external, 'utf8')).toBe('external decision sentinel\n');
+      });
+
+      it.each(['unavailable', 'non-finite'] as const)(
+        'fails closed before persisting a fenced AGY control when Planner success counters are %s',
+        async (counterState) => {
+          const runId = `planner-fenced-control-${counterState}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace, plannerEngine: 'agy' });
+          const handle = mgr.getAutoloop(runId)!;
+          mockSessions[0].sendImplementation = async () => ({
+            text: ['starting agents', '```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+            event: { type: 'result', result: 'starting agents' },
+          });
+          const originalGetStatus = mgr.getStatus.bind(mgr);
+          vi.spyOn(mgr, 'getStatus').mockImplementation((name) => {
+            if (counterState === 'unavailable') throw new Error('authoritative Planner counters unavailable');
+            const status = originalGetStatus(name);
+            return { ...status, stats: { ...status.stats, turnsSucceeded: Number.NaN } };
+          });
+          const phaseErrors: PhaseErrorPayload[] = [];
+          handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+
+          await expect(mgr.autoloopChat(runId, 'start the approved implementation')).rejects.toMatchObject({
+            code: 'AUTOLOOP_REQUIRED_TOOL_DENIED',
+            retryable: true,
+          });
+
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string; payload: { code?: string } });
+          expect(decisions.filter((row) => row.kind === 'planner_turn_control')).toEqual([]);
+          expect(decisions.filter((row) => row.kind === 'spawn_subagents')).toEqual([]);
+          expect(mockSessions).toHaveLength(1);
+          expect(phaseErrors.map(({ code }) => code)).toEqual(['AUTOLOOP_REQUIRED_TOOL_DENIED']);
+          expect(handle.runner.state).toMatchObject({
+            status: 'planning',
+            iter: 0,
+            subagents_spawned: false,
+            consecutive_phase_errors: 1,
+          });
+        },
+      );
+
+      it('surfaces a verified fences-only control as an unambiguous logical result', async () => {
+        const runId = 'planner-fences-only';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"update_push_policy","args":{"on_start":{"level":"info"}}}', '```'].join('\n'),
+          event: { type: 'result', result: 'control only' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'apply the approved policy')).resolves.toEqual({
+          reply: 'Planner controls persisted: update_push_policy',
+        });
+        const decisions = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: Record<string, unknown> });
+        expect(decisions.find((row) => row.kind === 'planner_turn_control')?.payload).toMatchObject({
+          tools: ['update_push_policy'],
+          controls: [{ tool: 'update_push_policy', args: { on_start: { level: 'info' } } }],
+        });
+      });
+
+      it('normalizes Planner control property order before digest, persistence, comparison, and application', async () => {
+        const runId = 'planner-control-semantic-order';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: [
+            '```autoloop',
+            '{"args":{"on_start":{"level":"info","channel":"auto"},"on_iter_done_ok":{"level":"warn","channel":"both"}},"tool":"update_push_policy"}',
+            '```',
+          ].join('\n'),
+          event: { type: 'result', result: 'control only' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'apply the approved policy')).resolves.toEqual({
+          reply: 'Planner controls persisted: update_push_policy',
+        });
+        const decisions = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: Record<string, unknown> });
+        expect(decisions.find((row) => row.kind === 'planner_turn_control')?.payload).toMatchObject({
+          controls: [
+            {
+              tool: 'update_push_policy',
+              args: {
+                on_iter_done_ok: { channel: 'both', level: 'warn' },
+                on_start: { channel: 'auto', level: 'info' },
+              },
+            },
+          ],
+          controls_sha256: '3f044aad5fc0d2583e26bb8f235c0b8a7ce53f35c0d500e947a7bb3fb4b055f4',
+        });
+        expect(handle.runner.config.push_policy).toMatchObject({
+          on_iter_done_ok: { channel: 'both', level: 'warn' },
+          on_start: { channel: 'auto', level: 'info' },
+        });
+      });
+
+      it('keeps every concurrent runner sender pending until the active drain reaches idle', async () => {
+        const runId = 'planner-runner-drain-waiters';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        let releaseFirst!: () => void;
+        const firstGate = new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+        let markFirstEntered!: () => void;
+        const firstEntered = new Promise<void>((resolve) => {
+          markFirstEntered = resolve;
+        });
+        let turn = 0;
+        mockSessions[0].sendImplementation = async () => {
+          turn += 1;
+          if (turn === 1) {
+            markFirstEntered();
+            await firstGate;
+          }
+          return { text: `runner reply ${turn}`, event: { type: 'result', result: `runner reply ${turn}` } };
+        };
+
+        const first = handle.runner.send(AutoloopMsg.chat(0, { text: 'first direct runner chat' }));
+        await firstEntered;
+        let secondSettled = false;
+        const second = handle.runner.send(AutoloopMsg.chat(0, { text: 'second direct runner chat' })).finally(() => {
+          secondSettled = true;
+        });
+        await new Promise<void>((resolve) => nativeSetImmediate(resolve));
+
+        expect(secondSettled).toBe(false);
+        releaseFirst();
+        await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined]);
+        expect(mockSessions[0].sendCalls).toHaveLength(2);
+      });
+
+      it('publishes the active drain before synchronous message listeners can send again', async () => {
+        const runId = 'planner-runner-reentrant-drain-waiter';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        let releasePlanner!: () => void;
+        const plannerGate = new Promise<void>((resolve) => {
+          releasePlanner = resolve;
+        });
+        let markPlannerEntered!: () => void;
+        const plannerEntered = new Promise<void>((resolve) => {
+          markPlannerEntered = resolve;
+        });
+        mockSessions[0].sendImplementation = async () => {
+          markPlannerEntered();
+          await plannerGate;
+          return { text: 'planner reply', event: { type: 'result', result: 'planner reply' } };
+        };
+        let reentrantSettled = false;
+        let reentrant: Promise<void> | undefined;
+        handle.runner.on('message', (env: { type?: string }) => {
+          if (env.type !== 'chat' || reentrant) return;
+          reentrant = handle.runner.send(AutoloopMsg.pause(0, { reason: 'listener pause' })).finally(() => {
+            reentrantSettled = true;
+          });
+        });
+
+        const first = handle.runner.send(AutoloopMsg.chat(0, { text: 'trigger synchronous listener' }));
+        await plannerEntered;
+        await new Promise<void>((resolve) => nativeSetImmediate(resolve));
+
+        expect(reentrant).toBeDefined();
+        expect(reentrantSettled).toBe(false);
+        releasePlanner();
+        await expect(Promise.all([first, reentrant!])).resolves.toEqual([undefined, undefined]);
+        expect(handle.runner.state).toMatchObject({ status: 'paused', status_reason: 'listener pause' });
+      });
+
+      it('serializes overlapping chats so each caller receives only its own ordered Planner reply', async () => {
+        const runId = 'planner-overlapping-chat-replies';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        let releaseFirst!: () => void;
+        const firstGate = new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+        let markFirstEntered!: () => void;
+        const firstEntered = new Promise<void>((resolve) => {
+          markFirstEntered = resolve;
+        });
+        let turn = 0;
+        mockSessions[0].sendImplementation = async () => {
+          turn += 1;
+          if (turn === 1) {
+            markFirstEntered();
+            await firstGate;
+          }
+          return { text: `reply ${turn}`, event: { type: 'result', result: `reply ${turn}` } };
+        };
+
+        const first = mgr.autoloopChat(runId, 'first user chat');
+        await firstEntered;
+        let secondSettled = false;
+        const second = mgr
+          .autoloopChat(runId, 'second user chat')
+          .then(
+            (value) => ({ value }),
+            (error: unknown) => ({ error }),
+          )
+          .finally(() => {
+            secondSettled = true;
+          });
+        await new Promise<void>((resolve) => nativeSetImmediate(resolve));
+
+        expect(secondSettled).toBe(false);
+        expect(mockSessions[0].sendCalls).toHaveLength(1);
+        releaseFirst();
+        await expect(first).resolves.toEqual({ reply: 'reply 1' });
+        await expect(second).resolves.toEqual({ value: { reply: 'reply 2' } });
+        expect(mockSessions[0].sendCalls).toHaveLength(2);
+        expect(
+          (mgr as unknown as { _autoloopChatTransactions: Map<string, Promise<void>> })._autoloopChatTransactions.size,
+        ).toBe(0);
+      });
+
+      it('does not let a rejected overlapping chat poison or consume the following chat reply', async () => {
+        const runId = 'planner-overlapping-chat-rejection';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        let releaseFirst!: () => void;
+        const firstGate = new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+        let markFirstEntered!: () => void;
+        const firstEntered = new Promise<void>((resolve) => {
+          markFirstEntered = resolve;
+        });
+        let turn = 0;
+        mockSessions[0].sendImplementation = async () => {
+          turn += 1;
+          if (turn === 1) {
+            markFirstEntered();
+            await firstGate;
+            return {
+              text: ['```autoloop', '{"tool":"notify_user","args":{}}', '```'].join('\n'),
+              event: { type: 'result', result: 'rejected first control' },
+            };
+          }
+          return { text: 'fresh second reply', event: { type: 'result', result: 'fresh second reply' } };
+        };
+
+        const first = mgr.autoloopChat(runId, 'first rejected user chat');
+        await firstEntered;
+        let secondSettled = false;
+        const second = mgr
+          .autoloopChat(runId, 'second valid user chat')
+          .then(
+            (value) => ({ value }),
+            (error: unknown) => ({ error }),
+          )
+          .finally(() => {
+            secondSettled = true;
+          });
+        await new Promise<void>((resolve) => nativeSetImmediate(resolve));
+
+        expect(secondSettled).toBe(false);
+        expect(mockSessions[0].sendCalls).toHaveLength(1);
+        releaseFirst();
+        await expect(first).rejects.toMatchObject({ code: 'AUTOLOOP_CONTROL_MALFORMED' });
+        await expect(second).resolves.toEqual({ value: { reply: 'fresh second reply' } });
+        expect(mockSessions[0].sendCalls).toHaveLength(2);
+        expect(
+          (mgr as unknown as { _autoloopChatTransactions: Map<string, Promise<void>> })._autoloopChatTransactions.size,
+        ).toBe(0);
+      });
+
+      it('rejects a Planner reply when its physical generation is absent after send', async () => {
+        const runId = 'planner-session-absent';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        vi.spyOn(mgr, 'inspect').mockResolvedValue('absent');
+
+        await expect(mgr.autoloopChat(runId, 'return a reply')).rejects.toMatchObject({
+          code: 'AUTOLOOP_SESSION_NOT_CREATED',
+        });
+        expect(handle.runner.state).toMatchObject({
+          status: 'planning',
+          iter: 0,
+          subagents_spawned: false,
+        });
+      });
+
+      it('rejects a Planner generation whose post-send liveness is unknown', async () => {
+        const runId = 'planner-session-unknown';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        vi.spyOn(mgr, 'inspect').mockResolvedValue('unknown');
+
+        await expect(mgr.autoloopChat(runId, 'return a reply')).rejects.toMatchObject({
+          code: 'AUTOLOOP_SESSION_NOT_CREATED',
+        });
+      });
+
+      it('rejects a Planner turn whose required tool was denied without advancing phase', async () => {
+        const runId = 'planner-required-tool-denied';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].turnsSucceededOverride = 0;
+
+        await expect(mgr.autoloopChat(runId, 'inspect with the required tool')).rejects.toMatchObject({
+          code: 'AUTOLOOP_REQUIRED_TOOL_DENIED',
+        });
+        expect(handle.runner.state).toMatchObject({
+          status: 'planning',
+          iter: 0,
+          subagents_spawned: false,
+        });
+      });
+
+      it('classifies an engine result failure separately from a required-tool denial', async () => {
+        const runId = 'planner-engine-result-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: 'engine authentication failed',
+          event: { type: 'result', result: 'engine authentication failed', is_error: true },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'inspect before planning')).rejects.toMatchObject({
+          code: 'AUTOLOOP_ENGINE_FAILURE',
+          retryable: true,
+        });
+      });
+
+      it('wraps a thrown Planner transport failure in the engine failure taxonomy', async () => {
+        const runId = 'planner-transport-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => {
+          throw Object.assign(new Error('planner socket reset'), { code: 'ECONNRESET' });
+        };
+
+        await expect(mgr.autoloopChat(runId, 'inspect before planning')).rejects.toMatchObject({
+          code: 'AUTOLOOP_ENGINE_FAILURE',
+          retryable: true,
+        });
+      });
+
+      it('classifies malformed Planner control syntax without applying or persisting controls', async () => {
+        const runId = 'planner-control-malformed';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents"}', '```'].join('\n'),
+          event: { type: 'result', result: 'malformed control' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'start the implementation')).rejects.toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+          retryable: false,
+        });
+        expect(mockSessions).toHaveLength(1);
+        const decisions = fs.readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8');
+        expect(decisions).not.toContain('planner_turn_control');
+      });
+
+      it('rejects array spawn_subagents arguments before durable evidence or session effects', async () => {
+        const runId = 'planner-control-array-arguments';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents","args":[]}', '```'].join('\n'),
+          event: { type: 'result', result: 'array arguments are invalid' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'start the implementation')).rejects.toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+          retryable: false,
+        });
+        expect(mockSessions).toHaveLength(1);
+        const decisions = fs.readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8');
+        expect(decisions).not.toContain('planner_turn_control');
+        expect(decisions).not.toContain('spawn_subagents');
+      });
+
+      it('classifies invalid Planner control arguments as malformed before persistence', async () => {
+        const runId = 'planner-control-invalid-arguments';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"notify_user","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'invalid control arguments' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'notify me')).rejects.toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+          retryable: false,
+        });
+        const decisions = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { code?: string } });
+        expect(decisions.filter((row) => row.kind === 'planner_turn_control')).toEqual([]);
+        expect(decisions.filter((row) => row.kind === 'phase_error').at(-1)?.payload.code).toBe(
+          'AUTOLOOP_CONTROL_MALFORMED',
+        );
+      });
+
+      it('bounds every durable Planner metadata field by UTF-8 bytes and every directive array by count', () => {
+        const metadataLimit = 8_192;
+        const arrayItemLimit = 128;
+        const oversizedAscii = 'x'.repeat(metadataLimit + 1);
+        const oversizedUtf8 = '🚀'.repeat(metadataLimit / 4 + 1);
+        const tooManyItems = Array.from({ length: arrayItemLimit + 1 }, () => 'bounded');
+        const cases: Array<{ label: string; control: PlannerToolCall; expected: string }> = [
+          {
+            label: 'notify summary',
+            control: { tool: 'notify_user', args: { summary: oversizedUtf8 } },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+          {
+            label: 'notify detail',
+            control: { tool: 'notify_user', args: { summary: 'status', detail: oversizedAscii } },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+          {
+            label: 'directive goal',
+            control: { tool: 'send_directive', args: { goal: oversizedAscii } },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+          {
+            label: 'directive constraint element',
+            control: { tool: 'send_directive', args: { goal: 'ship', constraints: [oversizedUtf8] } },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+          {
+            label: 'directive success-criteria count',
+            control: { tool: 'send_directive', args: { goal: 'ship', success_criteria: tooManyItems } },
+            expected: `${arrayItemLimit}-item limit`,
+          },
+          {
+            label: 'pause reason',
+            control: { tool: 'pause_loop', args: { reason: oversizedAscii } },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+          {
+            label: 'terminate reason',
+            control: { tool: 'terminate', args: { reason: oversizedUtf8 } },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+          {
+            label: 'spawn initial directive goal',
+            control: {
+              tool: 'spawn_subagents',
+              args: { initial_directive: { goal: oversizedAscii } },
+            },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+          {
+            label: 'spawn initial directive constraint',
+            control: {
+              tool: 'spawn_subagents',
+              args: { initial_directive: { goal: 'ship', constraints: [oversizedUtf8] } },
+            },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+          {
+            label: 'coder model',
+            control: { tool: 'spawn_subagents', args: { coder_model: oversizedUtf8 } },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+          {
+            label: 'reviewer model',
+            control: { tool: 'spawn_subagents', args: { reviewer_model: oversizedAscii } },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+          {
+            label: 'plan commit message',
+            control: { tool: 'write_plan', args: { content: '# plan', commit_message: oversizedAscii } },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+          {
+            label: 'goal commit message',
+            control: { tool: 'write_goal', args: { content: '{}', commit_message: oversizedUtf8 } },
+            expected: `${metadataLimit}-byte UTF-8 limit`,
+          },
+        ];
+
+        for (const { label, control, expected } of cases) {
+          const validation = validatePlannerToolCalls([control]);
+          expect(validation.calls, label).toEqual([]);
+          expect(validation.errors[0]?.error, label).toContain(expected);
+        }
+      });
+
+      it('accepts exact metadata, array-count, content, and normalized serialized-batch boundaries', () => {
+        const metadataLimit = 8_192;
+        const arrayItemLimit = 128;
+        const contentLimit = 1_048_576;
+        const batchLimit = 1_114_112;
+        const exactUtf8 = '🚀'.repeat(metadataLimit / 4);
+        const exactItems = Array.from({ length: arrayItemLimit }, () => 'bounded');
+
+        expect(
+          validatePlannerToolCalls([
+            { tool: 'notify_user', args: { summary: exactUtf8, detail: 'x'.repeat(metadataLimit) } },
+            {
+              tool: 'send_directive',
+              args: { goal: 'g'.repeat(metadataLimit), constraints: exactItems, success_criteria: exactItems },
+            },
+            {
+              tool: 'spawn_subagents',
+              args: { coder_model: 'c'.repeat(metadataLimit), reviewer_model: exactUtf8 },
+            },
+            {
+              tool: 'write_goal',
+              args: { content: '{}', commit_message: 'm'.repeat(metadataLimit) },
+            },
+          ]).errors,
+        ).toEqual([]);
+
+        // One content allocation is shared by both the exact and +1-byte batch
+        // checks. The literal component lengths make the JSON boundary exact:
+        // 1 MiB content + the write_plan envelope, then three full notify
+        // envelopes and one shortened envelope. Canonical notify defaults are
+        // included in every normalized row before this byte limit is applied.
+        const content = 'p'.repeat(contentLimit);
+        const exactBatch: PlannerToolCall[] = [
+          { tool: 'write_plan', args: { content } },
+          ...Array.from({ length: 3 }, () => ({
+            tool: 'notify_user' as const,
+            args: { summary: 's'.repeat(metadataLimit), detail: 'd'.repeat(metadataLimit) },
+          })),
+          {
+            tool: 'notify_user',
+            args: { summary: 's'.repeat(metadataLimit), detail: 'd'.repeat(7_739) },
+          },
+        ];
+        const exact = validatePlannerToolCalls(exactBatch);
+        expect(exact.errors).toEqual([]);
+        expect(Buffer.byteLength(exact.controls_json ?? '', 'utf8')).toBe(batchLimit);
+
+        const overBoundary = exactBatch.map((control, index) =>
+          index === exactBatch.length - 1
+            ? {
+                tool: control.tool,
+                args: { ...control.args, detail: `${String(control.args.detail)}x` },
+              }
+            : control,
+        );
+        const oversized = validatePlannerToolCalls(overBoundary);
+        expect(oversized.calls).toEqual([]);
+        expect(oversized.errors[0]?.error).toContain(`${batchLimit}-byte UTF-8 limit`);
+      });
+
+      it('rejects too many controls before allocating a durable batch', () => {
+        const controls = Array.from<unknown, PlannerToolCall>({ length: 65 }, () => ({
+          tool: 'notify_user',
+          args: { summary: 'bounded' },
+        }));
+
+        const validation = validatePlannerToolCalls(controls);
+
+        expect(validation.calls).toEqual([]);
+        expect(validation.errors[0]?.error).toContain('64-control limit');
+      });
+
+      it('rejects an oversized mixed batch at the chat boundary without a durable control or earlier effect', async () => {
+        const runId = 'planner-oversized-mixed-batch';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents');
+        const individuallyValidControls: PlannerToolCall[] = [
+          { tool: 'spawn_subagents', args: {} },
+          { tool: 'write_plan', args: { content: 'p'.repeat(1_048_576) } },
+          ...Array.from({ length: 4 }, () => ({
+            tool: 'notify_user' as const,
+            args: { summary: 's'.repeat(8_192), detail: 'd'.repeat(8_192) },
+          })),
+        ];
+        mockSessions[0].sendImplementation = async () => ({
+          text: individuallyValidControls
+            .flatMap((control) => ['```autoloop', JSON.stringify(control), '```'])
+            .join('\n'),
+          event: { type: 'result', result: 'oversized mixed batch' },
+        });
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'apply the oversized mixed batch')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_MALFORMED',
+            retryable: false,
+          });
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string });
+          expect(decisions.filter((row) => row.kind === 'planner_turn_control')).toEqual([]);
+          expect(decisions.filter((row) => row.kind === 'spawn_subagents')).toEqual([]);
+          expect(spawn).not.toHaveBeenCalled();
+          expect(mockSessions).toHaveLength(1);
+          expect(fs.existsSync(path.join(workspace, 'plan.md'))).toBe(false);
+          expect(handle.runner.state).toMatchObject({ status: 'planning', subagents_spawned: false });
+        } finally {
+          spawn.mockRestore();
+        }
+      });
+
+      it('rejects a truly empty push-policy control without durable evidence or an effect', async () => {
+        const runId = 'planner-empty-push-policy-control';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const policyBefore = JSON.stringify(handle.runner.config.push_policy);
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"update_push_policy","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'empty policy control' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'apply an empty policy update')).rejects.toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+          retryable: false,
+        });
+        const decisions = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string });
+        expect(decisions.filter((row) => row.kind === 'planner_turn_control')).toEqual([]);
+        expect(decisions.filter((row) => row.kind === 'update_push_policy')).toEqual([]);
+        expect(JSON.stringify(handle.runner.config.push_policy)).toBe(policyBefore);
+      });
+
+      it('rejects and sanitizes the complete control batch before persisting or applying an earlier spawn', async () => {
+        const runId = 'planner-batch-prevalidation';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const secretMarker = 'R5_REJECTED_CUSTOM_ENGINE_SECRET';
+        const pushes: Array<{ summary: string }> = [];
+        handle.runner.on('push', (payload: { summary: string }) => pushes.push(payload));
+        mockSessions[0].sendImplementation = async () => ({
+          text: [
+            '```autoloop',
+            '{"tool":"spawn_subagents","args":{}}',
+            '```',
+            '```autoloop',
+            JSON.stringify({
+              tool: 'spawn_subagents',
+              args: { coder_custom_engine: { env: { TOKEN: secretMarker } } },
+            }),
+            '```',
+          ].join('\n'),
+          event: { type: 'result', result: 'apply controls' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'apply the complete control batch')).rejects.toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+          retryable: false,
+        });
+
+        const decisionText = fs.readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8');
+        const decisions = decisionText
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: Record<string, unknown> });
+        expect(decisionText).not.toContain(secretMarker);
+        expect(decisions.filter((row) => row.kind === 'planner_turn_control')).toEqual([]);
+        expect(decisions.filter((row) => row.kind === 'spawn_subagents')).toEqual([]);
+        expect(mockSessions).toHaveLength(1);
+        expect(pushes.map(({ summary }) => summary)).toEqual(['[on_phase_error] iter 0']);
+        expect(handle.runner.state).toMatchObject({
+          status: 'planning',
+          iter: 0,
+          subagents_spawned: false,
+          push_log_count: 1,
+        });
+      });
+
+      const invalidNestedPlannerControls: Array<{ label: string; control: Record<string, unknown> }> = [
+        {
+          label: 'spawn initial_directive goal',
+          control: { tool: 'spawn_subagents', args: { initial_directive: { goal: '   ' } } },
+        },
+        {
+          label: 'spawn initial_directive constraints',
+          control: {
+            tool: 'spawn_subagents',
+            args: { initial_directive: { goal: 'ship', constraints: ['safe', 7] } },
+          },
+        },
+        {
+          label: 'spawn initial_directive success criteria',
+          control: {
+            tool: 'spawn_subagents',
+            args: { initial_directive: { goal: 'ship', success_criteria: ['green', false] } },
+          },
+        },
+        {
+          label: 'spawn initial_directive max attempts',
+          control: {
+            tool: 'spawn_subagents',
+            args: { initial_directive: { goal: 'ship', max_attempts: 0 } },
+          },
+        },
+        {
+          label: 'send_directive string arrays',
+          control: { tool: 'send_directive', args: { goal: 'ship', constraints: ['safe', null] } },
+        },
+        {
+          label: 'send_directive positive integer max attempts',
+          control: { tool: 'send_directive', args: { goal: 'ship', max_attempts: 1.5 } },
+        },
+        {
+          label: 'notify_user level',
+          control: { tool: 'notify_user', args: { summary: 'status', level: 'debug' } },
+        },
+        {
+          label: 'notify_user channel',
+          control: { tool: 'notify_user', args: { summary: 'status', channel: 'sms' } },
+        },
+      ];
+
+      it.each(invalidNestedPlannerControls)(
+        'rejects invalid $label before control persistence or effects',
+        async ({ label, control }) => {
+          const runId = `planner-invalid-${label.replaceAll(' ', '-').replaceAll('_', '-')}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          const pushes: Array<{ summary: string }> = [];
+          handle.runner.on('push', (payload: { summary: string }) => pushes.push(payload));
+          mockSessions[0].sendImplementation = async () => ({
+            text: ['```autoloop', JSON.stringify(control), '```'].join('\n'),
+            event: { type: 'result', result: 'invalid nested control' },
+          });
+
+          await expect(mgr.autoloopChat(runId, 'apply invalid control')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_MALFORMED',
+            retryable: false,
+          });
+
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string });
+          expect(decisions.filter((row) => row.kind === 'planner_turn_control')).toEqual([]);
+          expect(decisions.filter((row) => row.kind === 'spawn_subagents')).toEqual([]);
+          expect(mockSessions).toHaveLength(1);
+          expect(pushes.map(({ summary }) => summary)).toEqual(['[on_phase_error] iter 0']);
+        },
+      );
+
+      const invalidPushPolicies: Array<{ label: string; args: Record<string, unknown> }> = [
+        { label: 'level', args: { on_start: { level: 'debug' } } },
+        { label: 'channel', args: { on_start: { channel: 'sms' } } },
+        { label: 'silent flag', args: { on_start: { silent: 'yes' } } },
+        { label: 'rule value', args: { on_start: false } },
+        { label: 'policy key', args: { on_unknown_event: { level: 'info' } } },
+        { label: 'rule field', args: { on_start: { untrusted: true } } },
+      ];
+
+      it.each(invalidPushPolicies)(
+        'rejects an invalid push-policy $label atomically without changing live policy',
+        async ({ label, args }) => {
+          const runId = `planner-invalid-push-policy-${label.replaceAll(' ', '-')}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          const policyBefore = JSON.stringify(handle.runner.config.push_policy);
+          mockSessions[0].sendImplementation = async () => ({
+            text: [
+              '```autoloop',
+              '{"tool":"spawn_subagents","args":{}}',
+              '```',
+              '```autoloop',
+              JSON.stringify({ tool: 'update_push_policy', args }),
+              '```',
+            ].join('\n'),
+            event: { type: 'result', result: 'invalid push policy batch' },
+          });
+
+          await expect(mgr.autoloopChat(runId, 'apply the policy batch')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_MALFORMED',
+            retryable: false,
+          });
+
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string });
+          expect(decisions.filter((row) => row.kind === 'planner_turn_control')).toEqual([]);
+          expect(decisions.filter((row) => row.kind === 'spawn_subagents')).toEqual([]);
+          expect(mockSessions).toHaveLength(1);
+          expect(JSON.stringify(handle.runner.config.push_policy)).toBe(policyBefore);
+        },
+      );
+
+      it('treats an explicitly empty push-policy rule as an intentional reset', async () => {
+        const runId = 'planner-empty-push-policy-rule-reset';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"update_push_policy","args":{"on_start":{}}}', '```'].join('\n'),
+          event: { type: 'result', result: 'reset push policy rule' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'reset the start policy')).resolves.toEqual({
+          reply: 'Planner controls persisted: update_push_policy',
+        });
+        expect(handle.runner.config.push_policy?.on_start).toEqual({});
+        const decisions = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { controls?: unknown } });
+        expect(decisions.find((row) => row.kind === 'planner_turn_control')?.payload.controls).toEqual([
+          { tool: 'update_push_policy', args: { on_start: {} } },
+        ]);
+      });
+
+      it('persists and applies only allowlisted arguments from an accepted Planner control', async () => {
+        const runId = 'planner-control-allowlist';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const secretMarker = 'R5_IGNORED_CONTROL_SECRET';
+        const pushes: Array<{ level: string; summary: string; detail?: string; channel: string }> = [];
+        handle.runner.on('push', (payload: { level: string; summary: string; detail?: string; channel: string }) =>
+          pushes.push(payload),
+        );
+        mockSessions[0].sendImplementation = async () => ({
+          text: [
+            '```autoloop',
+            JSON.stringify({
+              tool: 'notify_user',
+              args: {
+                level: 'info',
+                summary: 'allowlisted status',
+                channel: 'auto',
+                ignored: { token: secretMarker },
+              },
+            }),
+            '```',
+          ].join('\n'),
+          event: { type: 'result', result: 'accepted sanitized control' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'apply sanitized control')).resolves.toEqual({
+          reply: 'Planner controls persisted: notify_user',
+        });
+
+        const decisionText = fs.readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8');
+        const decisions = decisionText
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: Record<string, unknown> });
+        expect(decisionText).not.toContain(secretMarker);
+        expect(decisions.find((row) => row.kind === 'planner_turn_control')?.payload.controls).toEqual([
+          {
+            tool: 'notify_user',
+            args: { channel: 'auto', level: 'info', summary: 'allowlisted status' },
+          },
+        ]);
+        expect(pushes).toEqual([{ level: 'info', summary: 'allowlisted status', detail: undefined, channel: 'auto' }]);
+      });
+
+      it('round-trips legitimate multi-chunk plan and goal controls through durable persistence and application', async () => {
+        const runId = 'planner-large-control-tail-round-trip';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const planContent = `# Approved plan\n${'plan detail\n'.repeat(900)}`;
+        const goalContent = JSON.stringify({ goal: 'g'.repeat(9_000), success: ['tests pass'] });
+        expect(Buffer.byteLength(planContent, 'utf8')).toBeGreaterThan(8_192);
+        expect(Buffer.byteLength(goalContent, 'utf8')).toBeGreaterThan(8_192);
+        mockSessions[0].sendImplementation = async () => ({
+          text: [
+            '```autoloop',
+            JSON.stringify({ tool: 'write_plan', args: { content: planContent } }),
+            '```',
+            '```autoloop',
+            JSON.stringify({ tool: 'write_goal', args: { content: goalContent } }),
+            '```',
+          ].join('\n'),
+          event: { type: 'result', result: 'persist both large artifacts' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'persist the approved artifacts')).resolves.toEqual({
+          reply: 'Planner controls persisted: write_plan, write_goal',
+        });
+
+        expect(fs.readFileSync(path.join(workspace, 'plan.md'), 'utf8')).toBe(planContent);
+        expect(fs.readFileSync(path.join(workspace, 'goal.json'), 'utf8')).toBe(goalContent);
+        const decisions = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { controls?: PlannerToolCall[] } });
+        expect(decisions.find((row) => row.kind === 'planner_turn_control')?.payload.controls).toEqual([
+          {
+            tool: 'write_plan',
+            args: { commit_message: 'autoloop: planner writes plan.md', content: planContent },
+          },
+          {
+            tool: 'write_goal',
+            args: { commit_message: 'autoloop: planner writes goal.json', content: goalContent },
+          },
+        ]);
+      });
+
+      it('crash-flushes a new control file and its parent directory before applying its first effect', async () => {
+        const runId = 'planner-control-flush-order';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const ledgerDir = path.join(workspace, 'tasks', runId);
+        const decisionsPath = path.join(ledgerDir, 'decisions.jsonl');
+        expect(fs.existsSync(decisionsPath)).toBe(false);
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'spawn after flush' },
+        });
+        const order: string[] = [];
+        const openedTargets = new Map<number, string>();
+        const openFile = vi.mocked(fs.openSync);
+        const openImplementation = openFile.getMockImplementation()!;
+        openFile.mockImplementation(((target: unknown, ...args: unknown[]) => {
+          const fd = (openImplementation as (...values: unknown[]) => number)(target, ...args);
+          openedTargets.set(fd, String(target));
+          return fd;
+        }) as typeof fs.openSync);
+        const flush = vi.mocked(fs.fsyncSync);
+        const flushImplementation = flush.getMockImplementation()!;
+        flush.mockImplementation((fd) => {
+          const target = openedTargets.get(fd);
+          if (target === decisionsPath) order.push('control-flushed');
+          if (target === ledgerDir) order.push('directory-flushed');
+          return flushImplementation(fd);
+        });
+        const spawnImplementation = handle.dispatcher.spawnSubagents.bind(handle.dispatcher);
+        const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents');
+        spawn.mockImplementation(async (args) => {
+          order.push('effect-started');
+          return await spawnImplementation(args);
+        });
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'spawn after durable evidence')).resolves.toEqual({
+            reply: 'Planner controls persisted: spawn_subagents',
+          });
+          expect(order.slice(0, 3)).toEqual(['control-flushed', 'directory-flushed', 'effect-started']);
+        } finally {
+          openFile.mockImplementation(openImplementation);
+          flush.mockImplementation(flushImplementation);
+          spawn.mockRestore();
+        }
+      });
+
+      it('crash-flushes the parent directory after a rejected turn already created the control file', async () => {
+        const runId = 'planner-control-flush-after-rejected-audit';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const ledgerDir = path.join(workspace, 'tasks', runId);
+        const decisionsPath = path.join(ledgerDir, 'decisions.jsonl');
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents"}', '```'].join('\n'),
+          event: { type: 'result', result: 'rejected control' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'reject this control')).rejects.toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+        });
+        expect(fs.existsSync(decisionsPath)).toBe(true);
+
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'spawn after prior audit' },
+        });
+        const order: string[] = [];
+        const openedTargets = new Map<number, string>();
+        const openFile = vi.mocked(fs.openSync);
+        const openImplementation = openFile.getMockImplementation()!;
+        openFile.mockImplementation(((target: unknown, ...args: unknown[]) => {
+          const fd = (openImplementation as (...values: unknown[]) => number)(target, ...args);
+          openedTargets.set(fd, String(target));
+          return fd;
+        }) as typeof fs.openSync);
+        const flush = vi.mocked(fs.fsyncSync);
+        const flushImplementation = flush.getMockImplementation()!;
+        flush.mockImplementation((fd) => {
+          const target = openedTargets.get(fd);
+          if (target === decisionsPath) order.push('control-flushed');
+          if (target === ledgerDir) order.push('directory-flushed');
+          return flushImplementation(fd);
+        });
+        const spawnImplementation = handle.dispatcher.spawnSubagents.bind(handle.dispatcher);
+        const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents');
+        spawn.mockImplementation(async (args) => {
+          order.push('effect-started');
+          return await spawnImplementation(args);
+        });
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'spawn after durable evidence')).resolves.toEqual({
+            reply: 'Planner controls persisted: spawn_subagents',
+          });
+          expect(order.slice(0, 3)).toEqual(['control-flushed', 'directory-flushed', 'effect-started']);
+        } finally {
+          openFile.mockImplementation(openImplementation);
+          flush.mockImplementation(flushImplementation);
+          spawn.mockRestore();
+        }
+      });
+
+      it.each([
+        { barrier: 'file', target: 'decisions.jsonl' },
+        { barrier: 'directory', target: '' },
+      ] as const)(
+        'finishes a matching committed control after one $barrier-sync interruption and applies it once',
+        async ({ barrier, target }) => {
+          const runId = `planner-control-${barrier}-sync-reconcile`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          const ledgerDir = path.join(workspace, 'tasks', runId);
+          const decisionsPath = path.join(ledgerDir, 'decisions.jsonl');
+          const failedTarget = target ? path.join(ledgerDir, target) : ledgerDir;
+          mockSessions[0].sendImplementation = async () => ({
+            text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+            event: { type: 'result', result: 'commit exactly one control' },
+          });
+          const flush = vi.mocked(fs.fsyncSync);
+          const flushImplementation = flush.getMockImplementation()!;
+          let injectedFailures = 0;
+          flush.mockImplementation((fd) => {
+            if (persistenceFsState.openPaths.get(fd) === failedTarget && injectedFailures === 0) {
+              injectedFailures++;
+              throw new Error(`injected Planner ${barrier} sync interruption`);
+            }
+            return flushImplementation(fd);
+          });
+          const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents');
+
+          try {
+            await expect(mgr.autoloopChat(runId, 'apply one committed control')).resolves.toEqual({
+              reply: 'Planner controls persisted: spawn_subagents',
+            });
+            expect(injectedFailures).toBe(1);
+            expect(spawn).toHaveBeenCalledTimes(1);
+            expect(mockSessions).toHaveLength(3);
+            const controls = fs
+              .readFileSync(decisionsPath, 'utf8')
+              .trim()
+              .split('\n')
+              .map((line) => JSON.parse(line) as { kind?: string })
+              .filter((row) => row.kind === 'planner_turn_control');
+            expect(controls).toHaveLength(1);
+            expect(handle.runner.state).toMatchObject({ status: 'running', subagents_spawned: true });
+          } finally {
+            flush.mockImplementation(flushImplementation);
+            spawn.mockRestore();
+          }
+        },
+      );
+
+      it('preserves a committed directory-incomplete control outcome without applying its effect', async () => {
+        const runId = 'planner-control-directory-flush-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const ledgerDir = path.join(workspace, 'tasks', runId);
+        const openedTargets = new Map<number, string>();
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'directory flush must succeed' },
+        });
+        const openFile = vi.mocked(fs.openSync);
+        const openImplementation = openFile.getMockImplementation()!;
+        openFile.mockImplementation(((target: unknown, ...args: unknown[]) => {
+          const fd = (openImplementation as (...values: unknown[]) => number)(target, ...args);
+          openedTargets.set(fd, String(target));
+          return fd;
+        }) as typeof fs.openSync);
+        const flush = vi.mocked(fs.fsyncSync);
+        const flushImplementation = flush.getMockImplementation()!;
+        flush.mockImplementation((fd) => {
+          if (openedTargets.get(fd) === ledgerDir) throw new Error('directory entry flush failed');
+          return flushImplementation(fd);
+        });
+        const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents');
+        const phaseErrors: PhaseErrorPayload[] = [];
+        handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'require directory durability')).rejects.toMatchObject({
+            code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+            committed: true,
+            retryable: false,
+            effectsApplied: false,
+            operation: 'secure_ledger_append',
+          });
+          expect(spawn).not.toHaveBeenCalled();
+          expect(mockSessions).toHaveLength(1);
+          expect(handle.runner.state).toMatchObject({
+            status: 'planning',
+            subagents_spawned: false,
+            consecutive_phase_errors: 1,
+            recent_phase_errors: [
+              expect.objectContaining({
+                code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+                committed: true,
+                retryable: false,
+              }),
+            ],
+          });
+          expect(phaseErrors).toEqual([
+            expect.objectContaining({
+              code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+              committed: true,
+              retryable: false,
+            }),
+          ]);
+          const controls = fs
+            .readFileSync(path.join(ledgerDir, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind?: string })
+            .filter((row) => row.kind === 'planner_turn_control');
+          expect(controls).toHaveLength(1);
+          expect(
+            fs
+              .readFileSync(path.join(ledgerDir, 'decisions.jsonl'), 'utf8')
+              .trim()
+              .split('\n')
+              .map((line) => JSON.parse(line) as { kind?: string })
+              .filter((row) => row.kind === 'phase_error'),
+          ).toHaveLength(0);
+        } finally {
+          openFile.mockImplementation(openImplementation);
+          flush.mockImplementation(flushImplementation);
+          spawn.mockRestore();
+        }
+      });
+
+      it('preserves a committed directory-incomplete control outcome after a prior rejected audit', async () => {
+        const runId = 'planner-existing-control-directory-flush-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const ledgerDir = path.join(workspace, 'tasks', runId);
+        const decisionsPath = path.join(ledgerDir, 'decisions.jsonl');
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents"}', '```'].join('\n'),
+          event: { type: 'result', result: 'rejected control' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'reject this control')).rejects.toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+        });
+        expect(fs.existsSync(decisionsPath)).toBe(true);
+
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'directory flush must succeed' },
+        });
+        const openedTargets = new Map<number, string>();
+        const openFile = vi.mocked(fs.openSync);
+        const openImplementation = openFile.getMockImplementation()!;
+        openFile.mockImplementation(((target: unknown, ...args: unknown[]) => {
+          const fd = (openImplementation as (...values: unknown[]) => number)(target, ...args);
+          openedTargets.set(fd, String(target));
+          return fd;
+        }) as typeof fs.openSync);
+        const flush = vi.mocked(fs.fsyncSync);
+        const flushImplementation = flush.getMockImplementation()!;
+        flush.mockImplementation((fd) => {
+          if (openedTargets.get(fd) === ledgerDir) throw new Error('existing directory entry flush failed');
+          return flushImplementation(fd);
+        });
+        const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents');
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'require existing directory durability')).rejects.toMatchObject({
+            code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+            committed: true,
+          });
+          expect(spawn).not.toHaveBeenCalled();
+          expect(mockSessions).toHaveLength(1);
+          expect(handle.runner.state).toMatchObject({
+            status: 'planning',
+            subagents_spawned: false,
+            consecutive_phase_errors: 2,
+          });
+          const controls = fs
+            .readFileSync(decisionsPath, 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind?: string })
+            .filter((row) => row.kind === 'planner_turn_control');
+          expect(controls).toHaveLength(1);
+        } finally {
+          openFile.mockImplementation(openImplementation);
+          flush.mockImplementation(flushImplementation);
+          spawn.mockRestore();
+        }
+      });
+
+      it('flushes the control file without directory fsync and warns explicitly on win32', async () => {
+        const runId = 'planner-control-win32-durability';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        const warn = vi.fn();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (mgr as any).logger.warn = warn;
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const ledgerDir = path.join(workspace, 'tasks', runId);
+        const decisionsPath = path.join(ledgerDir, 'decisions.jsonl');
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'spawn on win32' },
+        });
+        const order: string[] = [];
+        const openHistory: Array<{ fd: number; target: string; flags: unknown }> = [];
+        const currentOpens = new Map<number, { target: string; flags: unknown }>();
+        const controlFlushFlags: unknown[] = [];
+        const flushedTargets: string[] = [];
+        const openFile = vi.mocked(fs.openSync);
+        const openImplementation = openFile.getMockImplementation()!;
+        openFile.mockImplementation(((target: unknown, ...args: unknown[]) => {
+          const fd = (openImplementation as (...values: unknown[]) => number)(target, ...args);
+          const opened = { target: String(target), flags: args[0] };
+          openHistory.push({ fd, ...opened });
+          currentOpens.set(fd, opened);
+          return fd;
+        }) as typeof fs.openSync);
+        const flush = vi.mocked(fs.fsyncSync);
+        const flushImplementation = flush.getMockImplementation()!;
+        flush.mockImplementation((fd) => {
+          const currentOpen = currentOpens.get(fd);
+          if (currentOpen) flushedTargets.push(currentOpen.target);
+          if (currentOpen?.target === decisionsPath) {
+            order.push('control-flushed');
+            controlFlushFlags.push(currentOpen.flags);
+          }
+          return flushImplementation(fd);
+        });
+        const spawnImplementation = handle.dispatcher.spawnSubagents.bind(handle.dispatcher);
+        const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents');
+        spawn.mockImplementation(async (args) => {
+          order.push('effect-started');
+          return await spawnImplementation(args);
+        });
+        const platform = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'spawn with Windows durability semantics')).resolves.toEqual({
+            reply: 'Planner controls persisted: spawn_subagents',
+          });
+          expect(order).toEqual(['control-flushed', 'effect-started']);
+          expect(openHistory.map(({ target }) => target)).toContain(ledgerDir);
+          expect(flushedTargets).not.toContain(ledgerDir);
+          expect(controlFlushFlags).toHaveLength(1);
+          expect((controlFlushFlags[0] as number) & fs.constants.O_RDWR).toBe(fs.constants.O_RDWR);
+          expect(warn).toHaveBeenCalledWith(
+            '[autoloop] parent-directory fsync is unavailable on win32; control file contents were flushed without a POSIX directory-entry guarantee',
+          );
+        } finally {
+          platform.mockRestore();
+          openFile.mockImplementation(openImplementation);
+          flush.mockImplementation(flushImplementation);
+          spawn.mockRestore();
+        }
+      });
+
+      it('preserves a committed file-incomplete control outcome without applying its effect', async () => {
+        const runId = 'planner-control-flush-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'flush must succeed' },
+        });
+        const flush = vi.mocked(fs.fsyncSync);
+        const flushImplementation = flush.getMockImplementation()!;
+        const phaseErrors: PhaseErrorPayload[] = [];
+        handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+        flush.mockImplementation(() => {
+          throw new Error('stable-storage flush failed');
+        });
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'require a durable control row')).rejects.toMatchObject({
+            code: 'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+            committed: true,
+            retryable: false,
+            effectsApplied: false,
+            operation: 'secure_ledger_append',
+          });
+          expect(mockSessions).toHaveLength(1);
+          expect(handle.runner.state).toMatchObject({
+            status: 'planning',
+            subagents_spawned: false,
+            consecutive_phase_errors: 1,
+            recent_phase_errors: [
+              expect.objectContaining({
+                code: 'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+                committed: true,
+                retryable: false,
+              }),
+            ],
+          });
+          expect(phaseErrors).toEqual([
+            expect.objectContaining({
+              code: 'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+              committed: true,
+              retryable: false,
+            }),
+          ]);
+          const controls = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind?: string })
+            .filter((row) => row.kind === 'planner_turn_control');
+          expect(controls).toHaveLength(1);
+          expect(
+            fs
+              .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+              .trim()
+              .split('\n')
+              .map((line) => JSON.parse(line) as { kind?: string })
+              .filter((row) => row.kind === 'phase_error'),
+          ).toHaveLength(0);
+        } finally {
+          flush.mockImplementation(flushImplementation);
+        }
+      });
+
+      it('keeps a recovered matching control authoritative after later valid decision rows', async () => {
+        const runId = 'planner-control-committed-recovery-reentry';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const ledgerDir = path.join(workspace, 'tasks', runId);
+        const decisionsPath = path.join(ledgerDir, 'decisions.jsonl');
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'same committed logical control' },
+        });
+        const envelope = AutoloopMsg.chat(0, { text: 'recover this exact logical control' });
+        const dispatchState = handle.dispatcher as unknown as {
+          logicalDispatches: Map<string, unknown>;
+          settledDispatches: Set<string>;
+        };
+        const forgetProcessLocalDispatch = () => {
+          dispatchState.logicalDispatches.clear();
+          dispatchState.settledDispatches.clear();
+        };
+        const flush = vi.mocked(fs.fsyncSync);
+        const flushImplementation = flush.getMockImplementation()!;
+        flush.mockImplementation((fd) => {
+          if (persistenceFsState.openPaths.get(fd) === ledgerDir) {
+            throw new Error('persistent control directory sync interruption');
+          }
+          return flushImplementation(fd);
+        });
+        const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents');
+
+        try {
+          await expect(handle.dispatcher.deliver(envelope)).rejects.toMatchObject({
+            code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+            committed: true,
+          });
+          flush.mockImplementation(flushImplementation);
+          fs.appendFileSync(
+            decisionsPath,
+            `${JSON.stringify({
+              ts: '2026-09-06T00:00:00.000Z',
+              kind: 'phase_error',
+              actor: 'dispatcher',
+              payload: {
+                agent: 'planner',
+                phase: 'planner_turn',
+                code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+                error: 'later valid audit row',
+              },
+            })}\n`,
+          );
+
+          forgetProcessLocalDispatch();
+          await expect(handle.dispatcher.deliver(envelope)).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+            retryable: false,
+          });
+          forgetProcessLocalDispatch();
+          await expect(handle.dispatcher.deliver(envelope)).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+            retryable: false,
+          });
+
+          expect(spawn).not.toHaveBeenCalled();
+          expect(mockSessions).toHaveLength(1);
+          const controls = fs
+            .readFileSync(decisionsPath, 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind?: string })
+            .filter((row) => row.kind === 'planner_turn_control');
+          expect(controls).toHaveLength(1);
+        } finally {
+          flush.mockImplementation(flushImplementation);
+          spawn.mockRestore();
+        }
+      });
+
+      it('rejects a conflicting control for the same committed logical dispatch after later rows', async () => {
+        const runId = 'planner-control-committed-conflict-after-later-row';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const ledgerDir = path.join(workspace, 'tasks', runId);
+        const decisionsPath = path.join(ledgerDir, 'decisions.jsonl');
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'first logical claim' },
+        });
+        const envelope = AutoloopMsg.chat(0, { text: 'one immutable logical dispatch' });
+        const dispatchState = handle.dispatcher as unknown as {
+          logicalDispatches: Map<string, unknown>;
+          settledDispatches: Set<string>;
+        };
+        const flush = vi.mocked(fs.fsyncSync);
+        const flushImplementation = flush.getMockImplementation()!;
+        flush.mockImplementation((fd) => {
+          if (persistenceFsState.openPaths.get(fd) === ledgerDir) {
+            throw new Error('persistent control directory sync interruption');
+          }
+          return flushImplementation(fd);
+        });
+        const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents');
+        const pushes: Array<{ summary: string }> = [];
+        handle.runner.on('push', (payload: { summary: string }) => pushes.push(payload));
+
+        try {
+          await expect(handle.dispatcher.deliver(envelope)).rejects.toMatchObject({
+            code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+            committed: true,
+          });
+          flush.mockImplementation(flushImplementation);
+          fs.appendFileSync(
+            decisionsPath,
+            `${JSON.stringify({
+              ts: '2026-09-06T00:00:01.000Z',
+              kind: 'phase_error',
+              actor: 'dispatcher',
+              payload: { agent: 'planner', phase: 'planner_turn', error: 'later valid audit row' },
+            })}\n`,
+          );
+          mockSessions[0].sendImplementation = async () => ({
+            text: [
+              '```autoloop',
+              '{"tool":"notify_user","args":{"level":"info","summary":"must not run","channel":"auto"}}',
+              '```',
+            ].join('\n'),
+            event: { type: 'result', result: 'conflicting logical claim' },
+          });
+          dispatchState.logicalDispatches.clear();
+          dispatchState.settledDispatches.clear();
+
+          await expect(handle.dispatcher.deliver(envelope)).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+            retryable: false,
+          });
+
+          expect(spawn).not.toHaveBeenCalled();
+          expect(pushes).toEqual([]);
+          expect(mockSessions).toHaveLength(1);
+          const controls = fs
+            .readFileSync(decisionsPath, 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind?: string })
+            .filter((row) => row.kind === 'planner_turn_control');
+          expect(controls).toHaveLength(1);
+        } finally {
+          flush.mockImplementation(flushImplementation);
+          spawn.mockRestore();
+        }
+      });
+
+      it.each([
+        {
+          label: 'malformed',
+          arrange: (decisionsPath: string) => fs.writeFileSync(decisionsPath, 'not-json\n'),
+        },
+        {
+          label: 'oversized',
+          arrange: (decisionsPath: string) => {
+            const maximumLedgerBytes = 64 * 1024 * 1024;
+            fs.writeFileSync(decisionsPath, '{"kind":"phase_error"}\n');
+            fs.truncateSync(decisionsPath, maximumLedgerBytes + 1);
+            const fd = fs.openSync(decisionsPath, 'r+');
+            try {
+              fs.writeSync(fd, Buffer.from('\n'), 0, 1, maximumLedgerBytes);
+            } finally {
+              fs.closeSync(fd);
+            }
+          },
+        },
+      ])(
+        'fails closed before applying a Planner control when the decision ledger is $label',
+        async ({ label, arrange }) => {
+          const runId = `planner-control-ledger-${label}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          const decisionsPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+          arrange(decisionsPath);
+          const sizeBefore = fs.statSync(decisionsPath).size;
+          mockSessions[0].sendImplementation = async () => ({
+            text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+            event: { type: 'result', result: 'must fail closed' },
+          });
+          const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents');
+
+          try {
+            await expect(mgr.autoloopChat(runId, 'do not trust an invalid ledger')).rejects.toMatchObject({
+              code: 'AUTOLOOP_CONTROL_NOT_PERSISTED',
+              retryable: true,
+            });
+            expect(spawn).not.toHaveBeenCalled();
+            expect(mockSessions).toHaveLength(1);
+            expect(fs.statSync(decisionsPath).size).toBe(sizeBefore);
+          } finally {
+            spawn.mockRestore();
+          }
+        },
+      );
+
+      it('records only accepted Planner turns in replay history for non-native engines', async () => {
+        const runId = 'planner-replay-accepted-only';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace, plannerEngine: 'gemini' });
+        const planner = mockSessions[0];
+        const rejectedMarker = 'R5_REJECTED_HISTORY_MARKER';
+        const acceptedUserMarker = 'R5_ACCEPTED_USER_MARKER';
+        const acceptedAgentMarker = 'R5_ACCEPTED_AGENT_MARKER';
+        let turn = 0;
+        planner.sendImplementation = async () => {
+          turn += 1;
+          if (turn === 1) {
+            return {
+              text: [rejectedMarker, '```autoloop', '{"tool":"spawn_subagents"}', '```'].join('\n'),
+              event: { type: 'result', result: 'rejected control' },
+            };
+          }
+          return {
+            text: turn === 2 ? acceptedAgentMarker : 'third accepted reply',
+            event: { type: 'result', result: 'accepted turn' },
+          };
+        };
+
+        await expect(mgr.autoloopChat(runId, 'R5_REJECTED_USER_MARKER')).rejects.toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+        });
+        await expect(mgr.autoloopChat(runId, acceptedUserMarker)).resolves.toEqual({ reply: acceptedAgentMarker });
+        expect(String(planner.sendCalls[1].message)).not.toContain(rejectedMarker);
+
+        await expect(mgr.autoloopChat(runId, 'third user turn')).resolves.toEqual({ reply: 'third accepted reply' });
+        const thirdPrompt = String(planner.sendCalls[2].message);
+        expect(thirdPrompt).not.toContain(rejectedMarker);
+        expect(thirdPrompt.match(new RegExp(acceptedUserMarker, 'g'))).toHaveLength(1);
+        expect(thirdPrompt.match(new RegExp(acceptedAgentMarker, 'g'))).toHaveLength(1);
+      });
+
+      it('marks a durably verified successful spawn at its committed effect boundary', async () => {
+        const runId = 'planner-spawn-committed';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'spawn agents' },
+        });
+
+        const order: string[] = [];
+        const spawnImplementation = handle.dispatcher.spawnSubagents.bind(handle.dispatcher);
+        const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents').mockImplementation(async (args) => {
+          order.push('spawn-start');
+          await spawnImplementation(args);
+          order.push('spawn-finish');
+        });
+        const markImplementation = handle.runner.markSubagentsSpawned.bind(handle.runner);
+        const mark = vi.spyOn(handle.runner, 'markSubagentsSpawned').mockImplementation(() => {
+          order.push('mark-committed');
+          markImplementation();
+        });
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'start the approved implementation')).resolves.toEqual({
+            reply: 'Planner controls persisted: spawn_subagents',
+          });
+
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string });
+          expect(decisions.filter((row) => row.kind === 'planner_turn_control')).toHaveLength(1);
+          expect(decisions.filter((row) => row.kind === 'spawn_subagents')).toHaveLength(1);
+          expect(order).toEqual(['spawn-start', 'spawn-finish', 'mark-committed']);
+          expect(mockSessions).toHaveLength(3);
+          expect(handle.runner.state).toMatchObject({
+            status: 'running',
+            iter: 0,
+            subagents_spawned: true,
+          });
+        } finally {
+          spawn.mockRestore();
+          mark.mockRestore();
+        }
+      });
+
+      it('keeps planning truth and does not mark a failed spawn as committed', async () => {
+        const runId = 'planner-spawn-fails-before-commit';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'spawn agents' },
+        });
+        const order: string[] = [];
+        const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents').mockImplementation(async () => {
+          order.push('spawn-start');
+          throw new Error('spawn failed before completion');
+        });
+        const markImplementation = handle.runner.markSubagentsSpawned.bind(handle.runner);
+        const mark = vi.spyOn(handle.runner, 'markSubagentsSpawned').mockImplementation(() => {
+          order.push('mark-committed');
+          markImplementation();
+        });
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'start the approved implementation')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+            retryable: false,
+          });
+          expect(order).toEqual(['spawn-start']);
+          expect(mark).not.toHaveBeenCalled();
+          expect(mockSessions).toHaveLength(1);
+          expect(handle.runner.state).toMatchObject({
+            status: 'planning',
+            iter: 0,
+            subagents_spawned: false,
+          });
+        } finally {
+          spawn.mockRestore();
+          mark.mockRestore();
+        }
+      });
+
+      it('suppresses spawn when the preceding atomic artifact transaction fails', async () => {
+        const runId = 'planner-spawn-before-operational-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: [
+            '```autoloop',
+            '{"tool":"spawn_subagents","args":{}}',
+            '```',
+            '```autoloop',
+            '{"tool":"write_plan","args":{"content":"# Approved plan"}}',
+            '```',
+          ].join('\n'),
+          event: { type: 'result', result: 'apply controls' },
+        });
+        const planPath = path.join(workspace, 'plan.md');
+        const rename = vi.mocked(fs.renameSync);
+        const renameImplementation = rename.getMockImplementation()!;
+        rename.mockImplementation(((from: unknown, to: unknown) => {
+          if (String(to) === planPath) throw new Error('operational plan write failed');
+          return (renameImplementation as (...values: unknown[]) => unknown)(from, to);
+        }) as typeof fs.renameSync);
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'apply both approved controls')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+            retryable: false,
+          });
+
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string; payload: Record<string, unknown> });
+          expect(decisions.find((row) => row.kind === 'planner_turn_control')?.payload.controls).toEqual([
+            { tool: 'spawn_subagents', args: {} },
+            {
+              tool: 'write_plan',
+              args: {
+                content: '# Approved plan',
+                commit_message: 'autoloop: planner writes plan.md',
+              },
+            },
+          ]);
+          expect(decisions.filter((row) => row.kind === 'spawn_subagents')).toHaveLength(0);
+          expect(mockSessions).toHaveLength(1);
+          expect(handle.runner.state).toMatchObject({
+            status: 'planning',
+            iter: 0,
+            subagents_spawned: false,
+            consecutive_phase_errors: 1,
+          });
+        } finally {
+          rename.mockImplementation(renameImplementation);
+        }
+      });
+
+      const runnerMediatedPlannerFailures: Array<{
+        label: string;
+        code: NonNullable<PhaseErrorPayload['code']>;
+        retryable: boolean;
+        configure: (context: { runId: string; workspace: string }) => void | (() => void);
+      }> = [
+        {
+          label: 'missing live generation',
+          code: 'AUTOLOOP_SESSION_NOT_CREATED',
+          retryable: true,
+          configure: () => {
+            vi.spyOn(mgr, 'inspect').mockResolvedValue('absent');
+          },
+        },
+        {
+          label: 'engine result failure',
+          code: 'AUTOLOOP_ENGINE_FAILURE',
+          retryable: true,
+          configure: () => {
+            mockSessions[0].sendImplementation = async () => ({
+              text: 'engine authentication failed',
+              event: { type: 'result', result: 'engine authentication failed', is_error: true },
+            });
+          },
+        },
+        {
+          label: 'required tool denial',
+          code: 'AUTOLOOP_REQUIRED_TOOL_DENIED',
+          retryable: true,
+          configure: () => {
+            mockSessions[0].turnsSucceededOverride = 0;
+          },
+        },
+        {
+          label: 'malformed control',
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+          retryable: false,
+          configure: () => {
+            mockSessions[0].sendImplementation = async () => ({
+              text: ['```autoloop', '{"tool":"spawn_subagents"}', '```'].join('\n'),
+              event: { type: 'result', result: 'malformed control' },
+            });
+          },
+        },
+        {
+          label: 'control application failure',
+          code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+          retryable: false,
+          configure: ({ workspace }) => {
+            mockSessions[0].sendImplementation = async () => ({
+              text: ['```autoloop', '{"tool":"write_plan","args":{"content":"# Validated plan"}}', '```'].join('\n'),
+              event: { type: 'result', result: 'validated control with operational failure' },
+            });
+            const planPath = path.join(workspace, 'plan.md');
+            const rename = vi.mocked(fs.renameSync);
+            const renameImplementation = rename.getMockImplementation()!;
+            rename.mockImplementation(((from: unknown, to: unknown) => {
+              if (String(to) === planPath) throw new Error('operational plan write failed');
+              return (renameImplementation as (...values: unknown[]) => unknown)(from, to);
+            }) as typeof fs.renameSync);
+            return () => rename.mockImplementation(renameImplementation);
+          },
+        },
+        {
+          label: 'control persistence failure',
+          code: 'AUTOLOOP_CONTROL_NOT_PERSISTED',
+          retryable: true,
+          configure: ({ runId, workspace }) => {
+            mockSessions[0].sendImplementation = async () => ({
+              text: ['```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+              event: { type: 'result', result: 'control persistence must commit' },
+            });
+            const decisionsPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+            const appendFile = vi.mocked(fs.appendFileSync);
+            const appendImplementation = appendFile.getMockImplementation()!;
+            appendFile.mockImplementation(((file: unknown, data: unknown, ...args: unknown[]) => {
+              if (isOpenPath(file, decisionsPath) && String(data).includes('"kind":"planner_turn_control"')) return;
+              return (appendImplementation as (...values: unknown[]) => unknown)(file, data, ...args);
+            }) as typeof fs.appendFileSync);
+            return () => appendFile.mockImplementation(appendImplementation);
+          },
+        },
+      ];
+
+      it.each(runnerMediatedPlannerFailures)(
+        'routes $label through exactly one typed Runner phase-error path',
+        async ({ label, code, retryable, configure }) => {
+          const runId = `planner-runner-phase-error-${label.replaceAll(' ', '-')}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          const cleanup = configure({ runId, workspace });
+          const phaseErrors: PhaseErrorPayload[] = [];
+          handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+
+          try {
+            await expect(mgr.autoloopChat(runId, 'exercise the typed Planner failure')).rejects.toMatchObject({
+              code,
+              retryable,
+            });
+
+            expect(phaseErrors).toHaveLength(1);
+            expect(phaseErrors[0]).toMatchObject({ agent: 'planner', phase: 'planner_turn', code });
+            expect(handle.runner.state).toMatchObject({
+              consecutive_phase_errors: 1,
+              recent_phase_errors: [expect.objectContaining({ agent: 'planner', phase: 'planner_turn', code })],
+            });
+            expect(handle.runner.state.recent_phase_errors[0]).not.toHaveProperty('committed');
+            expect(handle.runner.state.recent_phase_errors[0]).not.toHaveProperty('retryable');
+            const decisions = fs
+              .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+              .trim()
+              .split('\n')
+              .map((line) => JSON.parse(line) as { kind: string; payload: { code?: string } });
+            expect(decisions.filter((row) => row.kind === 'phase_error' && row.payload.code === code)).toHaveLength(1);
+          } finally {
+            cleanup?.();
+          }
+        },
+      );
+
+      it('preserves the original typed Planner failure when its synthetic phase-error drain also fails', async () => {
+        const runId = 'planner-original-error-survives-secondary-drain-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents"}', '```'].join('\n'),
+          event: { type: 'result', result: 'invalid control' },
+        });
+        handle.runner.config.notifyUser = async () => {
+          throw new Error('secondary notification transport failed');
+        };
+        const phaseErrors: PhaseErrorPayload[] = [];
+        handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+
+        let caught: unknown;
+        try {
+          await mgr.autoloopChat(runId, 'exercise post-catch failure');
+        } catch (error) {
+          caught = error;
+        }
+
+        expect(caught).toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+          retryable: false,
+          secondaryErrors: [expect.objectContaining({ message: 'secondary notification transport failed' })],
+        });
+        expect(phaseErrors).toHaveLength(1);
+        expect(handle.runner.state).toMatchObject({
+          consecutive_phase_errors: 1,
+          recent_phase_errors: [expect.objectContaining({ code: 'AUTOLOOP_CONTROL_MALFORMED' })],
+        });
+      });
+
+      it('keeps an empty Planner reply primary without recording agent progress when notification fails', async () => {
+        const runId = 'planner-empty-reply-survives-secondary-notification-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: '   ',
+          event: { type: 'result', result: '   ' },
+        });
+        handle.runner.config.notifyUser = async () => {
+          throw new Error('secondary empty-reply notification failed');
+        };
+        const activity = vi.spyOn(handle.runner, 'recordActivity');
+        const phaseErrors: PhaseErrorPayload[] = [];
+        handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+
+        let caught: unknown;
+        try {
+          await mgr.autoloopChat(runId, 'return a reply');
+        } catch (error) {
+          caught = error;
+        }
+
+        expect(caught).toMatchObject({
+          name: 'AutoloopOperationError',
+          code: 'AUTOLOOP_EMPTY_REPLY',
+          retryable: true,
+          secondaryErrors: [expect.objectContaining({ message: 'secondary empty-reply notification failed' })],
+        });
+        expect(activity.mock.calls.map(([kind]) => kind)).toEqual(['queue_message_accepted']);
+        expect(phaseErrors).toEqual([
+          expect.objectContaining({ agent: 'planner', phase: 'planner_turn', code: 'AUTOLOOP_EMPTY_REPLY' }),
+        ]);
+        expect(handle.runner.state).toMatchObject({
+          status: 'planning',
+          consecutive_phase_errors: 1,
+          recent_phase_errors: [expect.objectContaining({ code: 'AUTOLOOP_EMPTY_REPLY' })],
+        });
+      });
+
+      it('preserves the original typed Planner failure when max dispatch depth stops its synthetic phase-error', async () => {
+        const runId = 'planner-original-error-survives-max-dispatch-depth';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        handle.runner.config.maxDispatchDepth = 0;
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"spawn_subagents"}', '```'].join('\n'),
+          event: { type: 'result', result: 'invalid control' },
+        });
+        const phaseErrors: PhaseErrorPayload[] = [];
+        const pushes: Array<{ summary: string }> = [];
+        handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+        handle.runner.on('push', (payload: { summary: string }) => pushes.push(payload));
+
+        let caught: unknown;
+        try {
+          await mgr.autoloopChat(runId, 'exercise max-depth after typed Planner failure');
+        } catch (error) {
+          caught = error;
+        }
+
+        expect(caught).toMatchObject({
+          name: 'AutoloopOperationError',
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+          retryable: false,
+          secondaryErrors: [
+            expect.objectContaining({
+              name: 'AutoloopRoutingError',
+              message: expect.stringContaining("dispatch depth exceeded 0 at iter 0 (next='phase_error' to 'runner')"),
+            }),
+          ],
+        });
+        expect(phaseErrors).toEqual([]);
+        expect(handle.runner.state.consecutive_phase_errors).toBe(0);
+        const decisionsPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+        const phaseErrorRowsBeforeRetry = fs
+          .readFileSync(decisionsPath, 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string })
+          .filter((row) => row.kind === 'phase_error').length;
+
+        mockSessions[0].sendImplementation = async () => ({
+          text: 'fresh Planner reply',
+          event: { type: 'result', result: 'fresh Planner reply' },
+        });
+        await expect(mgr.autoloopChat(runId, 'retry after the rejected control')).resolves.toEqual({
+          reply: 'fresh Planner reply',
+        });
+
+        const decisions = fs
+          .readFileSync(decisionsPath, 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string });
+        expect(phaseErrors).toEqual([]);
+        expect(pushes).toEqual([]);
+        expect(decisions.filter((row) => row.kind === 'phase_error')).toHaveLength(phaseErrorRowsBeforeRetry);
+        expect(handle.runner.state).toMatchObject({
+          consecutive_phase_errors: 0,
+          recent_phase_errors: [],
+          push_log_count: 0,
+        });
+      });
+
+      it('keeps max dispatch depth as the primary error without a pending Planner failure', async () => {
+        const runId = 'planner-max-dispatch-depth-without-pending-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        handle.runner.config.maxDispatchDepth = 0;
+        mockSessions[0].sendImplementation = async () => ({
+          text: [
+            '```autoloop',
+            '{"tool":"notify_user","args":{"level":"info","summary":"queued push","channel":"auto"}}',
+            '```',
+          ].join('\n'),
+          event: { type: 'result', result: 'valid queued control' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'exercise ordinary max-depth guard')).rejects.toMatchObject({
+          name: 'AutoloopRoutingError',
+          message: expect.stringContaining("dispatch depth exceeded 0 at iter 0 (next='push_user' to 'user')"),
+        });
+      });
+
+      it('rejects an empty Planner success even when phase-error event plumbing drops the code', async () => {
+        const runId = 'planner-empty-reply-lost-event';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: '',
+          event: { type: 'result', result: '' },
+        });
+        const originalEmit = handle.runner.emit;
+        vi.spyOn(handle.runner, 'emit').mockImplementation(function (eventName, ...args) {
+          if (eventName === 'phase_error') return false;
+          return originalEmit.call(handle.runner, eventName, ...args);
+        });
+
+        await expect(mgr.autoloopChat(runId, 'return a reply')).rejects.toMatchObject({
+          code: 'AUTOLOOP_EMPTY_REPLY',
+          retryable: true,
+        });
+        expect(handle.runner.state.consecutive_phase_errors).toBe(1);
+        expect(handle.runner.state.recent_phase_errors).toEqual([
+          expect.objectContaining({ code: 'AUTOLOOP_EMPTY_REPLY' }),
+        ]);
+      });
+
+      it('rejects a claimed control with no matching persisted event without advancing phase', async () => {
+        const runId = 'planner-control-not-persisted';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const planner = mockSessions[0];
+        planner.sendImplementation = async () => ({
+          text: ['starting agents', '```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'starting agents' },
+        });
+        const decisionsPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+        const appendFile = vi.mocked(fs.appendFileSync);
+        const appendImplementation = appendFile.getMockImplementation()!;
+        appendFile.mockImplementation(((file: unknown, ...args: unknown[]) => {
+          if (isOpenPath(file, decisionsPath)) return;
+          return (appendImplementation as (...values: unknown[]) => unknown)(file, ...args);
+        }) as typeof fs.appendFileSync);
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'start the approved implementation')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_NOT_PERSISTED',
+          });
+          expect(handle.runner.state).toMatchObject({
+            status: 'planning',
+            iter: 0,
+            subagents_spawned: false,
+          });
+          expect(mockSessions).toHaveLength(1);
+        } finally {
+          appendFile.mockImplementation(appendImplementation);
+        }
+      });
+
+      it('rejects a same-id durable control whose persisted generation does not match the Planner turn', async () => {
+        const runId = 'planner-control-wrong-payload';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const planner = mockSessions[0];
+        planner.sendImplementation = async () => ({
+          text: ['starting agents', '```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          event: { type: 'result', result: 'starting agents' },
+        });
+        const decisionsPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+        const appendFile = vi.mocked(fs.appendFileSync);
+        const appendImplementation = appendFile.getMockImplementation()!;
+        appendFile.mockImplementation(((file: unknown, data: unknown, ...args: unknown[]) => {
+          if (isOpenPath(file, decisionsPath) && String(data).includes('"kind":"planner_turn_control"')) {
+            const row = JSON.parse(String(data)) as { payload: { generation: number } };
+            row.payload.generation = 999;
+            return (appendImplementation as (...values: unknown[]) => unknown)(
+              file,
+              `${JSON.stringify(row)}\n`,
+              ...args,
+            );
+          }
+          return (appendImplementation as (...values: unknown[]) => unknown)(file, data, ...args);
+        }) as typeof fs.appendFileSync);
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'start the approved implementation')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_NOT_PERSISTED',
+          });
+          expect(mockSessions).toHaveLength(1);
+        } finally {
+          appendFile.mockImplementation(appendImplementation);
+        }
+      });
+
+      const durableControlCorruptions: Array<{
+        label: string;
+        mutate: (payload: Record<string, unknown>) => void;
+      }> = [
+        {
+          label: 'complete controls',
+          mutate: (payload) => {
+            payload.controls = [{ tool: 'spawn_subagents', args: { coder_model: 'tampered-model' } }];
+          },
+        },
+        {
+          label: 'controls digest',
+          mutate: (payload) => {
+            payload.controls_sha256 = '0'.repeat(64);
+          },
+        },
+        {
+          label: 'owner identity',
+          mutate: (payload) => {
+            payload.owner_instance_id = 'session-manager:999999:00000000-0000-4000-8000-000000000000';
+          },
+        },
+        {
+          label: 'session identity',
+          mutate: (payload) => {
+            payload.session_id = '00000000-0000-4000-8000-000000000000';
+          },
+        },
+        {
+          label: 'dispatch identity',
+          mutate: (payload) => {
+            payload.dispatch_id = 'tampered-dispatch';
+          },
+        },
+        {
+          label: 'message identity',
+          mutate: (payload) => {
+            payload.message_id = 'tampered-message';
+          },
+        },
+        {
+          label: 'iteration identity',
+          mutate: (payload) => {
+            payload.iter = 99;
+          },
+        },
+        {
+          label: 'tools sequence only',
+          mutate: (payload) => {
+            payload.tools = ['write_plan'];
+          },
+        },
+      ];
+
+      it.each(durableControlCorruptions)(
+        'rejects durable Planner control corruption in $label before effects',
+        async ({ label, mutate }) => {
+          const runId = `planner-control-corrupt-${label.replaceAll(' ', '-')}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          mockSessions[0].sendImplementation = async () => ({
+            text: ['starting agents', '```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+            event: { type: 'result', result: 'starting agents' },
+          });
+          const decisionsPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+          const appendFile = vi.mocked(fs.appendFileSync);
+          const appendImplementation = appendFile.getMockImplementation()!;
+          appendFile.mockImplementation(((file: unknown, data: unknown, ...args: unknown[]) => {
+            if (isOpenPath(file, decisionsPath) && String(data).includes('"kind":"planner_turn_control"')) {
+              const row = JSON.parse(String(data)) as { payload: Record<string, unknown> };
+              mutate(row.payload);
+              return (appendImplementation as (...values: unknown[]) => unknown)(
+                file,
+                `${JSON.stringify(row)}\n`,
+                ...args,
+              );
+            }
+            return (appendImplementation as (...values: unknown[]) => unknown)(file, data, ...args);
+          }) as typeof fs.appendFileSync);
+
+          try {
+            await expect(mgr.autoloopChat(runId, 'start the approved implementation')).rejects.toMatchObject({
+              code: 'AUTOLOOP_CONTROL_NOT_PERSISTED',
+              retryable: true,
+            });
+            expect(mockSessions).toHaveLength(1);
+            expect(handle.runner.state).toMatchObject({
+              status: 'planning',
+              iter: 0,
+              subagents_spawned: false,
+            });
+          } finally {
+            appendFile.mockImplementation(appendImplementation);
+          }
+        },
+      );
+
+      it('returns a structured reset failure when the exact reservation remains occupied', async () => {
+        const runId = 'reset-reservation-occupied';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const plannerName = handle.dispatcher.sessionNames.planner;
+        const reservations = (
+          mgr as unknown as {
+            persistedSessions: Map<string, Record<string, unknown>>;
+          }
+        ).persistedSessions;
+        vi.spyOn(mgr, 'releaseReservation').mockImplementation(
+          async (_name, _generation, options: AgentReservationReleaseOptions) => {
+            if (!options.rollbackUncommittedReservation) {
+              options.beforeRelease?.();
+              options.persistReleaseEvidence?.();
+            }
+            return true;
+          },
+        );
+
+        const result = await handle.dispatcher.resetAgent('planner', { force: true });
+
+        expect(result).toMatchObject({
+          ok: false,
+          code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+          agent: 'planner',
+          previous_generation: 1,
+        });
+        expect(reservations.get(plannerName)).toMatchObject({ agentGeneration: 1 });
+      });
+
+      it('does not map a failed reset postcondition to legacy boolean success', async () => {
+        const runId = 'reset-legacy-false';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        vi.spyOn(mgr, 'releaseReservation').mockImplementation(
+          async (_name, _generation, options: AgentReservationReleaseOptions) => {
+            if (!options.rollbackUncommittedReservation) {
+              options.beforeRelease?.();
+              options.persistReleaseEvidence?.();
+            }
+            return true;
+          },
+        );
+
+        await expect(mgr.autoloopResetAgent(runId, 'planner', { force: true })).resolves.toBe(false);
+      });
+
+      it.each(['coder', 'reviewer'] as const)(
+        'carries a typed reset postcondition failure through the %s fatal send path without retrying',
+        async (role) => {
+          const runId = `reset-code-${role}-fatal-send`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          await handle.dispatcher.spawnSubagents();
+          const roleIndex = role === 'coder' ? 1 : 2;
+          mockSessions[roleIndex].sendImplementation = async () => {
+            throw new Error(`${role} subprocess failed`);
+          };
+          const reset = vi.spyOn(handle.dispatcher, 'resetAgent').mockResolvedValue({
+            ok: false,
+            code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+            agent: role,
+            previous_generation: 1,
+            message: `${role} reset could not prove reuse`,
+            retryable: false,
+          });
+          const phaseErrors: PhaseErrorPayload[] = [];
+          const phaseEnvelopes: PhaseErrorPayload[] = [];
+          handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+          handle.runner.on('message', (env: { type?: string; payload?: PhaseErrorPayload }) => {
+            if (env.type === 'phase_error' && env.payload) phaseEnvelopes.push(env.payload);
+          });
+
+          if (role === 'coder') {
+            await handle.runner.send(
+              AutoloopMsg.directive(0, {
+                goal: 'exercise coder fatal recovery',
+                constraints: [],
+                success_criteria: [],
+                max_attempts: 1,
+              }),
+            );
+          } else {
+            seedCompleteLegacyReviewArtifacts(workspace, runId, 0);
+            await handle.runner.send(
+              AutoloopMsg.reviewRequest(0, {
+                iter: 0,
+                ledger_path: path.join(workspace, 'tasks', runId),
+                prior_metrics: [],
+              }),
+            );
+          }
+
+          expect(mockSessions[roleIndex].sendCalls).toHaveLength(1);
+          expect(reset).toHaveBeenCalledTimes(1);
+          expect(phaseErrors).toEqual([
+            {
+              agent: role,
+              phase: 'send',
+              code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+              error: `${role} reset could not prove reuse`,
+            },
+          ]);
+          expect(phaseEnvelopes).toEqual(phaseErrors);
+          expect(handle.runner.state.recent_phase_errors).toEqual([
+            expect.objectContaining({ agent: role, phase: 'send', code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED' }),
+          ]);
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string; payload: { agent?: string; code?: string } });
+          expect(
+            decisions.filter(
+              (row) =>
+                row.kind === 'phase_error' &&
+                row.payload.agent === role &&
+                row.payload.code === 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+            ),
+          ).toHaveLength(1);
+        },
+      );
+
+      it.each(['coder', 'reviewer'] as const)(
+        'classifies an exhausted %s reset-and-retry send as AUTOLOOP_ENGINE_FAILURE',
+        async (role) => {
+          const runId = `engine-code-${role}-exhausted-send`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          await handle.dispatcher.spawnSubagents();
+          const roleIndex = role === 'coder' ? 1 : 2;
+          mockSessions[roleIndex].sendImplementation = async () => {
+            throw new Error(`${role} engine unavailable`);
+          };
+          const reset = vi.spyOn(handle.dispatcher, 'resetAgent').mockResolvedValue({
+            ok: true,
+            agent: role,
+            previous_generation: 1,
+            active_generation: 2,
+            reusable: true,
+          });
+          const phaseErrors: PhaseErrorPayload[] = [];
+          handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+
+          const dispatch = (() => {
+            if (role === 'coder') {
+              return handle.runner.send(
+                AutoloopMsg.directive(0, {
+                  goal: 'exercise exhausted coder recovery',
+                  constraints: [],
+                  success_criteria: [],
+                  max_attempts: 1,
+                }),
+              );
+            }
+            seedCompleteLegacyReviewArtifacts(workspace, runId, 0);
+            return handle.runner.send(
+              AutoloopMsg.reviewRequest(0, {
+                iter: 0,
+                ledger_path: path.join(workspace, 'tasks', runId),
+                prior_metrics: [],
+              }),
+            );
+          })();
+          await vi.advanceTimersByTimeAsync(1_000);
+          await dispatch;
+
+          expect(reset).toHaveBeenCalledTimes(1);
+          expect(mockSessions[roleIndex].sendCalls).toHaveLength(2);
+          expect(phaseErrors).toEqual([
+            {
+              agent: role,
+              phase: 'send',
+              code: 'AUTOLOOP_ENGINE_FAILURE',
+              error: `${role} engine unavailable`,
+            },
+          ]);
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string; payload: PhaseErrorPayload });
+          expect(
+            decisions.filter(
+              (row) =>
+                row.kind === 'phase_error' &&
+                row.payload.agent === role &&
+                row.payload.code === 'AUTOLOOP_ENGINE_FAILURE',
+            ),
+          ).toHaveLength(1);
+        },
+      );
+
+      it('preserves Reviewer started state and its frozen prompt when exact-generation release fails', async () => {
+        const runId = 'reset-release-preserves-reviewer';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        await handle.dispatcher.spawnSubagents();
+        const roleState = handle.dispatcher as unknown as {
+          reviewerStarted: boolean;
+          reviewerSessionPrompt: string | null;
+        };
+        const priorPrompt = roleState.reviewerSessionPrompt;
+        vi.spyOn(mgr, 'releaseReservation').mockResolvedValue(false);
+
+        const result = await handle.dispatcher.resetAgent('reviewer');
+
+        expect(result).toMatchObject({ ok: false, code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED' });
+        expect(roleState.reviewerStarted).toBe(true);
+        expect(roleState.reviewerSessionPrompt).toBe(priorPrompt);
+      });
+
+      it('finishes a real pending registry release exactly once before creating the next generation', async () => {
+        const runId = 'reset-release-evidence-then-registry-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const plannerName = handle.dispatcher.sessionNames.planner;
+        const roleState = handle.dispatcher as unknown as { plannerStarted: boolean };
+        const generationLedgerPath = path.join(workspace, 'tasks', runId, 'agent-generations.jsonl');
+        const readRegistryReservation = () =>
+          (JSON.parse(persistenceFsState.files.get(SESSION_REGISTRY_FILE)!) as Array<Record<string, unknown>>).find(
+            (reservation) => reservation.name === plannerName,
+          );
+        const readGenerationRows = () =>
+          fs
+            .readFileSync(generationLedgerPath, 'utf8')
+            .trim()
+            .split('\n')
+            .map(
+              (line) =>
+                JSON.parse(line) as {
+                  kind: string;
+                  payload: PhysicalAgentGeneration;
+                },
+            );
+        const persistedRename = vi.mocked(fs.renameSync).getMockImplementation()!;
+        let completionFailureInjected = false;
+        vi.mocked(fs.renameSync).mockImplementation(((from: unknown, to: unknown) => {
+          if (!completionFailureInjected && String(to) === SESSION_REGISTRY_FILE) {
+            const pendingSnapshot = persistenceFsState.files.get(String(from));
+            const plannerReservation = pendingSnapshot
+              ? (JSON.parse(pendingSnapshot) as Array<Record<string, unknown>>).find(
+                  (reservation) => reservation.name === plannerName,
+                )
+              : undefined;
+            if (
+              plannerReservation?.agentReleasedGeneration === 1 &&
+              plannerReservation.agentGeneration === undefined &&
+              plannerReservation.agentReleasePending !== true
+            ) {
+              completionFailureInjected = true;
+              throw new Error('registry finalization failed after release evidence');
+            }
+          }
+          return (persistedRename as unknown as (source: unknown, destination: unknown) => void)(from, to);
+        }) as typeof fs.renameSync);
+
+        try {
+          await expect(handle.dispatcher.resetAgent('planner', { force: true })).resolves.toMatchObject({
+            ok: false,
+            code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+            previous_generation: 1,
+          });
+
+          expect(completionFailureInjected).toBe(true);
+          expect(roleState.plannerStarted).toBe(false);
+          expect(readRegistryReservation()).toMatchObject({
+            agentGeneration: 1,
+            agentReleasePending: true,
+            agentReleaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+          });
+          expect(mgr.probeAgentNameReusable(plannerName, readGenerationRows().at(-1)!.payload)).toBe(false);
+          expect(readGenerationRows()).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                kind: 'agent_generation_released',
+                payload: expect.objectContaining({ generation: 1, state: 'released' }),
+              }),
+            ]),
+          );
+          expect(readGenerationRows().some(({ payload }) => payload.generation === 2)).toBe(false);
+
+          const blockedGeneration: PhysicalAgentGeneration = {
+            ...readGenerationRows().at(-1)!.payload,
+            generation: 2,
+            session_id: 'blocked-before-release-completion',
+            state: 'stale',
+          };
+          expect(mgr.reserveAgentGeneration(blockedGeneration, workspace)).toBe(false);
+          await expect(
+            mgr.startSession({ name: plannerName, cwd: workspace }, blockedGeneration),
+          ).rejects.toMatchObject({ code: 'AUTOLOOP_AGENT_GENERATION_CONFLICT' });
+          expect(mockSessions).toHaveLength(1);
+
+          await expect(handle.dispatcher.resetAgent('planner', { force: true })).resolves.toMatchObject({
+            ok: true,
+            previous_generation: 1,
+            reusable: true,
+          });
+          const reusableReservation = readRegistryReservation();
+          expect(reusableReservation).toMatchObject({ agentReleasedGeneration: 1 });
+          expect(reusableReservation).not.toHaveProperty('agentGeneration');
+          expect(reusableReservation).not.toHaveProperty('agentReleasePending');
+          expect(
+            readGenerationRows().filter(
+              ({ kind, payload }) => kind === 'agent_generation_released' && payload.generation === 1,
+            ),
+          ).toHaveLength(1);
+          expect(mockSessions).toHaveLength(1);
+
+          await expect(mgr.autoloopChat(runId, 'continue after registry recovery')).resolves.toMatchObject({
+            reply: expect.any(String),
+          });
+
+          expect(roleState.plannerStarted).toBe(true);
+          expect(mockSessions).toHaveLength(2);
+          expect(mgr.listSessions().filter(({ name }) => name === plannerName)).toHaveLength(1);
+          const generationRows = readGenerationRows();
+          expect(
+            generationRows.filter(
+              ({ kind, payload }) => kind === 'agent_generation_released' && payload.generation === 1,
+            ),
+          ).toHaveLength(1);
+          expect(
+            generationRows.filter(({ payload }) => payload.generation === 2 && payload.state === 'live'),
+          ).toHaveLength(1);
+          expect(generationRows.some(({ payload }) => payload.generation > 2)).toBe(false);
+          expect(generationRows.at(-1)).toMatchObject({
+            kind: 'agent_generation_started',
+            payload: { generation: 2, state: 'live' },
+          });
+        } finally {
+          vi.mocked(fs.renameSync).mockImplementation(persistedRename);
+        }
+      });
+
+      it('finishes a real pending registry release on direct chat before starting exactly one successor', async () => {
+        const runId = 'chat-reconciles-pending-planner-release';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const plannerName = handle.dispatcher.sessionNames.planner;
+        const generationLedgerPath = path.join(workspace, 'tasks', runId, 'agent-generations.jsonl');
+        const readRegistryReservation = () =>
+          (JSON.parse(persistenceFsState.files.get(SESSION_REGISTRY_FILE)!) as Array<Record<string, unknown>>).find(
+            (reservation) => reservation.name === plannerName,
+          );
+        const readGenerationRows = () =>
+          fs
+            .readFileSync(generationLedgerPath, 'utf8')
+            .trim()
+            .split('\n')
+            .map(
+              (line) =>
+                JSON.parse(line) as {
+                  kind: string;
+                  payload: PhysicalAgentGeneration;
+                },
+            );
+        const persistedRename = vi.mocked(fs.renameSync).getMockImplementation()!;
+        let completionFailureInjected = false;
+        let releaseCompletionCommitted = false;
+        vi.mocked(fs.renameSync).mockImplementation(((from: unknown, to: unknown) => {
+          if (String(to) === SESSION_REGISTRY_FILE) {
+            const pendingSnapshot = persistenceFsState.files.get(String(from));
+            const plannerReservation = pendingSnapshot
+              ? (JSON.parse(pendingSnapshot) as Array<Record<string, unknown>>).find(
+                  (reservation) => reservation.name === plannerName,
+                )
+              : undefined;
+            if (
+              plannerReservation?.agentReleasedGeneration === 1 &&
+              plannerReservation.agentGeneration === undefined &&
+              plannerReservation.agentReleasePending !== true
+            ) {
+              if (!completionFailureInjected) {
+                completionFailureInjected = true;
+                throw new Error('registry finalization failed after release evidence');
+              }
+              const result = (persistedRename as unknown as (source: unknown, destination: unknown) => void)(from, to);
+              releaseCompletionCommitted = true;
+              return result;
+            }
+          }
+          return (persistedRename as unknown as (source: unknown, destination: unknown) => void)(from, to);
+        }) as typeof fs.renameSync);
+
+        try {
+          await expect(handle.dispatcher.resetAgent('planner', { force: true })).resolves.toMatchObject({
+            ok: false,
+            code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+            previous_generation: 1,
+          });
+
+          expect(completionFailureInjected).toBe(true);
+          expect(releaseCompletionCommitted).toBe(false);
+          expect(readRegistryReservation()).toMatchObject({
+            agentGeneration: 1,
+            agentReleasePending: true,
+            agentReleaseOwnerInstanceId: mgr.autoloopOwnerInstanceId,
+          });
+          expect(readGenerationRows().some(({ payload }) => payload.generation === 2)).toBe(false);
+          expect(mockSessions).toHaveLength(1);
+
+          const originalStartSession = mgr.startSession.bind(mgr);
+          const successorStarts = vi.spyOn(mgr, 'startSession').mockImplementation(async (config, generation) => {
+            if (config.name === plannerName) expect(releaseCompletionCommitted).toBe(true);
+            return await originalStartSession(config, generation);
+          });
+
+          await expect(
+            mgr.autoloopChat(runId, 'continue through pending release reconciliation'),
+          ).resolves.toMatchObject({ reply: expect.any(String) });
+
+          expect(releaseCompletionCommitted).toBe(true);
+          expect(successorStarts).toHaveBeenCalledTimes(1);
+          expect(readRegistryReservation()).toMatchObject({
+            agentGeneration: 2,
+            agentReleasedGeneration: 1,
+          });
+          expect(readRegistryReservation()).not.toHaveProperty('agentReleasePending');
+          expect(mockSessions).toHaveLength(2);
+          expect(mgr.listSessions().filter(({ name }) => name === plannerName)).toHaveLength(1);
+          const generationRows = readGenerationRows();
+          expect(
+            generationRows.filter(
+              ({ kind, payload }) => kind === 'agent_generation_released' && payload.generation === 1,
+            ),
+          ).toHaveLength(1);
+          expect(
+            generationRows.filter(
+              ({ kind, payload }) => kind === 'agent_generation_reserved' && payload.generation === 2,
+            ),
+          ).toHaveLength(1);
+          expect(
+            generationRows.filter(
+              ({ kind, payload }) => kind === 'agent_generation_started' && payload.generation === 2,
+            ),
+          ).toHaveLength(1);
+          expect(generationRows.some(({ payload }) => payload.generation > 2)).toBe(false);
+        } finally {
+          vi.mocked(fs.renameSync).mockImplementation(persistedRename);
+        }
+      });
+
+      it('fails a post-release reusability probe without resurrecting the released Planner generation', async () => {
+        const runId = 'reset-probe-preserves-state';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const plannerName = handle.dispatcher.sessionNames.planner;
+        const roleState = handle.dispatcher as unknown as { plannerStarted: boolean };
+        const managerWithProbe = mgr as unknown as {
+          probeAgentNameReusable: (name: string, generation?: PhysicalAgentGeneration) => boolean;
+          persistedSessions: Map<string, Record<string, unknown>>;
+        };
+        managerWithProbe.probeAgentNameReusable = vi.fn(() => false);
+
+        const result = await handle.dispatcher.resetAgent('planner', { force: true });
+        const reservation = managerWithProbe.persistedSessions.get(plannerName);
+
+        expect(result).toMatchObject({ ok: false, code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED' });
+        expect(reservation).toMatchObject({
+          agentGeneration: undefined,
+          agentReleasePending: undefined,
+          agentReleasedGeneration: 1,
+        });
+        expect(roleState.plannerStarted).toBe(false);
+      });
+
+      it('clears released Reviewer state and its frozen prompt when a post-release probe fails', async () => {
+        const runId = 'reset-reviewer-post-release-probe';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        await handle.dispatcher.spawnSubagents();
+        const roleState = handle.dispatcher as unknown as {
+          reviewerStarted: boolean;
+          reviewerSessionPrompt: string | null;
+        };
+        const managerWithProbe = mgr as unknown as {
+          probeAgentNameReusable: (name: string, generation?: PhysicalAgentGeneration) => boolean;
+        };
+        managerWithProbe.probeAgentNameReusable = vi.fn(() => false);
+
+        const result = await handle.dispatcher.resetAgent('reviewer');
+
+        expect(result).toMatchObject({ ok: false, code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED' });
+        expect(roleState.reviewerStarted).toBe(false);
+        expect(roleState.reviewerSessionPrompt).toBeNull();
+      });
+
+      it('leaves a failed eager replacement released and permits a later exact-generation recovery', async () => {
+        const runId = 'reset-eager-restart-fails';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const roleState = handle.dispatcher as unknown as { plannerStarted: boolean };
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (mgr as any)._createSession = (): ISession => {
+          const mock = new MockSession();
+          mock.start = async () => {
+            throw new Error('replacement Planner failed to start');
+          };
+          mockSessions.push(mock);
+          return mock;
+        };
+
+        const result = await handle.dispatcher.resetAgent('planner', { force: true, eagerRestart: true });
+
+        expect(result).toMatchObject({ ok: false, code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED' });
+        expect(roleState.plannerStarted).toBe(false);
+        let generationRows = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { generation: number; state: string } });
+        expect(generationRows.at(-1)).toMatchObject({
+          kind: 'agent_generation_released',
+          payload: { generation: 2, state: 'released' },
+        });
+
+        patchCreateSession(mgr);
+        await expect(mgr.autoloopChat(runId, 'continue after replacement recovery')).resolves.toMatchObject({
+          reply: expect.any(String),
+        });
+        expect(roleState.plannerStarted).toBe(true);
+        generationRows = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { generation: number; state: string } });
+        expect(generationRows.at(-1)).toMatchObject({
+          kind: 'agent_generation_started',
+          payload: { generation: 3, state: 'live' },
+        });
+      });
+
+      it('keeps the Planner started flag when reset liveness is unknown', async () => {
+        const runId = 'reset-liveness-unknown';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const roleState = handle.dispatcher as unknown as { plannerStarted: boolean };
+        vi.spyOn(mgr, 'inspect').mockResolvedValue('unknown');
+
+        const result = await handle.dispatcher.resetAgent('planner', { force: true });
+
+        expect(result).toMatchObject({ ok: false, code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED' });
+        expect(roleState.plannerStarted).toBe(true);
+      });
+
+      it('proves production name reuse and creates the next exact generation after reset', async () => {
+        const runId = 'reset-production-reuse';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+
+        await expect(handle.dispatcher.resetAgent('planner', { force: true })).resolves.toMatchObject({
+          ok: true,
+          previous_generation: 1,
+          reusable: true,
+        });
+        await expect(mgr.autoloopChat(runId, 'continue')).resolves.toMatchObject({ reply: expect.any(String) });
+
+        const generationRows = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { generation: number; state: string } });
+        expect(generationRows.at(-1)).toMatchObject({
+          kind: 'agent_generation_started',
+          payload: { generation: 2, state: 'live' },
+        });
+      });
+
+      it('returns the live replacement generation after a successful eager reset', async () => {
+        const runId = 'reset-eager-restart-success';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+
+        await expect(
+          handle.dispatcher.resetAgent('planner', { force: true, eagerRestart: true }),
+        ).resolves.toMatchObject({
+          ok: true,
+          previous_generation: 1,
+          active_generation: 2,
+          reusable: true,
+        });
+        await expect(mgr.inspect(handle.dispatcher.sessionNames.planner)).resolves.toBe('live');
+        const generationRows = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { generation: number; state: string } });
+        expect(generationRows.at(-1)).toMatchObject({
+          kind: 'agent_generation_started',
+          payload: { generation: 2, state: 'live' },
+        });
+      });
+
+      it('retains an unproven eager replacement without duplicate startup and recovers when it proves live', async () => {
+        const runId = 'reset-eager-restart-liveness-unknown';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const roleState = handle.dispatcher as unknown as { plannerStarted: boolean };
+        const inspect = vi
+          .spyOn(mgr, 'inspect')
+          .mockResolvedValueOnce('absent')
+          .mockResolvedValueOnce('absent')
+          .mockResolvedValueOnce('unknown');
+
+        await expect(
+          handle.dispatcher.resetAgent('planner', { force: true, eagerRestart: true }),
+        ).resolves.toMatchObject({
+          ok: false,
+          code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+          previous_generation: 1,
+        });
+        expect(roleState.plannerStarted).toBe(true);
+        expect(mockSessions).toHaveLength(2);
+        let generationRows = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { generation: number; state: string } });
+        expect(generationRows.at(-1)).toMatchObject({
+          kind: 'agent_generation_started',
+          payload: { generation: 2, state: 'live' },
+        });
+
+        inspect.mockResolvedValue('live');
+        await expect(mgr.autoloopChat(runId, 'continue on the retained replacement')).resolves.toMatchObject({
+          reply: expect.any(String),
+        });
+        expect(mockSessions).toHaveLength(2);
+        generationRows = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { generation: number; state: string } });
+        expect(generationRows.at(-1)).toMatchObject({
+          kind: 'agent_generation_started',
+          payload: { generation: 2, state: 'live' },
+        });
+      });
+    });
+
     describe('Autoloop send-timeout resume migration', () => {
       type ResumeOverride = {
         sendTimeoutMs?: unknown;
@@ -1716,6 +6632,170 @@ describe('SessionManager', () => {
         await mgr.shutdown();
         mgr = createManager();
       };
+
+      const generationScopedTimeoutHistory = async (runId: string, migrateReplacement = true) => {
+        const workspace = workspaceFor(runId);
+        await mgr.autoloopStart({ runId, workspace, sendTimeoutMs: 600_000 });
+        const timeoutAndIncrease = async (next?: number) => {
+          vi.setSystemTime(Date.now() + 10);
+          lastMock().sendImplementation = async () => {
+            throw new Error('Timeout waiting for response');
+          };
+          await expect(mgr.autoloopChat(runId, `timeout before ${next}`)).rejects.toMatchObject({
+            code: 'AUTOLOOP_SEND_TIMEOUT',
+          });
+          const pending = mgr.getAutoloop(runId)!.runner.state.pending_dispatch!;
+          if (next !== undefined)
+            await mgr.autoloopResume(runId, { sendTimeoutMs: next, pendingDispatchId: pending.dispatch_id });
+        };
+        for (const next of [1_200_000, 2_400_000, 3_600_000]) await timeoutAndIncrease(next);
+        vi.setSystemTime(Date.now() + 10);
+        await terminateAndReconstructManager(runId);
+        // Reproduce the old controller's physical restart with the immutable
+        // starting configuration. Kernel, dispatcher, generations and all
+        // timeout/migration persistence remain real; only the engine is fake.
+        vi.setSystemTime(Date.now() + 10);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await (mgr as any)._resumeAutoloopRun(runId, { runId, workspace, sendTimeoutMs: 600_000 });
+        await timeoutAndIncrease(migrateReplacement ? 1_200_000 : undefined);
+        vi.setSystemTime(Date.now() + 10);
+        await terminateAndReconstructManager(runId);
+        const auditPath = auditPathFor(workspace, runId);
+        const generationPath = path.join(workspace, 'tasks', runId, 'agent-generations.jsonl');
+        const audit = fs.readFileSync(auditPath, 'utf8');
+        const generations = fs.readFileSync(generationPath, 'utf8');
+        const rows = audit
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line));
+        expect(
+          rows.filter((row) => row.kind === 'timeout_migration').map((row) => [row.oldValue, row.newValue]),
+        ).toEqual([
+          [600_000, 1_200_000],
+          [1_200_000, 2_400_000],
+          [2_400_000, 3_600_000],
+          ...(migrateReplacement ? [[600_000, 1_200_000]] : []),
+        ]);
+        const started = generations
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line))
+          .filter((row) => row.kind === 'agent_generation_started' && row.payload.role === 'planner');
+        expect(started.map((row) => row.payload.generation)).toEqual([1, 2]);
+        expect(started[0].payload.owner_instance_id).not.toBe(started[1].payload.owner_instance_id);
+        return { workspace, auditPath, generationPath, audit, generations };
+      };
+
+      const observedResume = (
+        runId: string,
+        _observed: { auditPath: string; generationPath: string },
+        options?: { sendTimeoutMs: number },
+      ) => mgr.autoloopResume(runId, options);
+
+      it('cold-resumes a timeout reset proved by durable generation replacement without rewriting history', async () => {
+        const runId = 'timeout-generation-reset';
+        const observed = await generationScopedTimeoutHistory(runId);
+        const specBefore = fs.readFileSync(storedSpecPath(runId), 'utf8');
+        await expect(observedResume(runId, observed)).resolves.toMatchObject({ run_id: runId });
+        expect(mgr.getAutoloop(runId)!.dispatcher.effectiveSendTimeoutMs).toBe(1_200_000);
+        expect(fs.readFileSync(observed.auditPath, 'utf8')).toBe(observed.audit);
+        expect(fs.readFileSync(observed.generationPath, 'utf8').startsWith(observed.generations)).toBe(true);
+        expect(fs.readFileSync(storedSpecPath(runId), 'utf8')).toBe(specBefore);
+        const migrations = observed.audit
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line))
+          .filter((row) => row.kind === 'timeout_migration');
+        expect(migrations.every((row) => row.schema_version === 1)).toBe(true);
+      });
+
+      it('blocks a legacy timeout reset without durable generation evidence', async () => {
+        const runId = 'legacy-timeout-reset-without-generation';
+        const workspace = workspaceFor(runId);
+        await mgr.autoloopStart({ runId, workspace, sendTimeoutMs: 600_000 });
+        await terminateAndReconstructManager(runId);
+        const retained = fileURLToPath(new URL('./fixtures/autoloop-legacy-timeout-decisions.jsonl', import.meta.url));
+        const bytes = fs.readFileSync(retained, 'utf8');
+        expect(createHash('sha256').update(bytes).digest('hex')).toBe(
+          '3ebd7e952456596cdf57b70498705aabbecbdabdcf529b9af882c136fad5dc46',
+        );
+        const auditPath = auditPathFor(workspace, runId);
+        fs.writeFileSync(auditPath, bytes);
+        fs.unlinkSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'));
+        const observed = {
+          auditPath,
+          generationPath: path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'),
+        };
+        await expect(observedResume(runId, observed)).rejects.toThrow(/timeout.*(chain|generation)/i);
+        expect(mgr.getAutoloop(runId)).toBeUndefined();
+        expect(fs.readFileSync(auditPath, 'utf8')).toBe(bytes);
+      });
+
+      it('cold-resumes a proved generation reset terminated before its timeout migration', async () => {
+        const runId = 'timeout-terminated-generation';
+        const observed = await generationScopedTimeoutHistory(runId, false);
+        await observedResume(runId, observed, { sendTimeoutMs: 1_200_000 });
+        expect(mgr.getAutoloop(runId)!.dispatcher.effectiveSendTimeoutMs).toBe(1_200_000);
+        await terminateAndReconstructManager(runId);
+        const before = fs.readFileSync(observed.auditPath, 'utf8');
+        expect(before.startsWith(observed.audit)).toBe(true);
+        await expect(observedResume(runId, observed)).resolves.toMatchObject({ run_id: runId });
+        expect(mgr.getAutoloop(runId)!.dispatcher.effectiveSendTimeoutMs).toBe(1_200_000);
+        expect(fs.readFileSync(observed.auditPath, 'utf8')).toBe(before);
+      });
+
+      it.each([
+        'missing-release',
+        'same-owner',
+        'wrong-session',
+        'wrong-generation',
+        'late-start',
+        'future-created',
+        'torn',
+        'decreasing',
+        'wrong-dispatch',
+      ])('blocks a timeout generation reset with %s evidence without changing the ledger', async (fault) => {
+        const runId = `timeout-generation-${fault}`;
+        const observed = await generationScopedTimeoutHistory(runId);
+        let rows = observed.generations
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line));
+        const first = rows.find((row) => row.kind === 'agent_generation_started').payload;
+        if (fault === 'missing-release')
+          rows = rows.filter((row) => !(row.kind === 'agent_generation_released' && row.payload.generation === 1));
+        if (fault === 'same-owner') for (const row of rows) row.payload.owner_instance_id = first.owner_instance_id;
+        if (fault === 'wrong-session')
+          rows.find((row) => row.kind === 'agent_generation_released').payload.session_id =
+            'different-physical-session';
+        if (fault === 'wrong-generation')
+          for (const row of rows) if (row.payload.generation === 2) row.payload.generation = 3;
+        if (fault === 'late-start')
+          rows.find((row) => row.kind === 'agent_generation_started' && row.payload.generation === 2).ts = new Date(
+            Date.now() + 1000,
+          ).toISOString();
+        if (fault === 'future-created')
+          for (const row of rows)
+            if (row.payload.generation === 2) row.payload.created_at = new Date(Date.now() + 1000).toISOString();
+        fs.writeFileSync(
+          observed.generationPath,
+          rows.map((row) => JSON.stringify(row) + '\n').join('') + (fault === 'torn' ? '{"kind":' : ''),
+        );
+        if (fault === 'decreasing' || fault === 'wrong-dispatch') {
+          const decisions = observed.audit
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line));
+          const migration = decisions.filter((row) => row.kind === 'timeout_migration').at(-1)!;
+          if (fault === 'decreasing') migration.newValue = 599_999;
+          else migration.pendingDispatchId = 'unrelated-dispatch';
+          fs.writeFileSync(observed.auditPath, decisions.map((row) => JSON.stringify(row) + '\n').join(''));
+        }
+        const before = fs.readFileSync(observed.auditPath, 'utf8');
+        await expect(observedResume(runId, observed)).rejects.toThrow(/timeout.*(chain|generation)|malformed/i);
+        expect(mgr.getAutoloop(runId)).toBeUndefined();
+        expect(fs.readFileSync(observed.auditPath, 'utf8')).toBe(before);
+      });
 
       it('increases a live recoverable timeout through the matching dispatch without replaying it', async () => {
         const runId = 'resume-timeout-live';
@@ -1783,6 +6863,157 @@ describe('SessionManager', () => {
           resumeWithOverride(runId, { sendTimeoutMs: 7_200_000, pendingDispatchId: dispatchId }),
         ).rejects.toThrow(/not awaiting.*send timeout/i);
         expect(fs.readFileSync(auditPath, 'utf8')).toBe(auditAfter);
+      });
+
+      it.each([
+        { barrier: 'file', target: 'decisions.jsonl' },
+        { barrier: 'directory', target: '' },
+      ] as const)(
+        'reconciles a committed live migration after one $barrier-sync interruption',
+        async ({ barrier, target }) => {
+          const runId = `resume-timeout-live-${barrier}-sync-incomplete`;
+          const workspace = workspaceFor(runId);
+          const dispatchId = `dispatch-live-${barrier}-sync-incomplete`;
+          const { handle } = await pauseForTimeout(runId, workspace, 600_000, dispatchId);
+          const auditPath = auditPathFor(workspace, runId);
+          const failedTarget = target ? path.join(workspace, 'tasks', runId, target) : path.dirname(auditPath);
+          const flush = vi.mocked(fs.fsyncSync);
+          const flushImplementation = flush.getMockImplementation()!;
+          let injectedFailures = 0;
+          flush.mockImplementation((fd) => {
+            if (persistenceFsState.openPaths.get(fd) === failedTarget && injectedFailures === 0) {
+              injectedFailures++;
+              throw new Error(`injected live ${barrier} sync interruption`);
+            }
+            return flushImplementation(fd);
+          });
+
+          try {
+            await expect(
+              resumeWithOverride(runId, { sendTimeoutMs: 700_000, pendingDispatchId: dispatchId }),
+            ).resolves.toBe(handle.runner.state);
+          } finally {
+            flush.mockImplementation(flushImplementation);
+          }
+
+          expect(injectedFailures).toBe(1);
+          expect(handle.dispatcher.effectiveSendTimeoutMs).toBe(700_000);
+          expect(handle.runner.state).toMatchObject({ status: 'running', pending_dispatch: null });
+          const migrations = fs
+            .readFileSync(auditPath, 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind?: string })
+            .filter((row) => row.kind === 'timeout_migration');
+          expect(migrations).toHaveLength(1);
+
+          await expect(
+            resumeWithOverride(runId, { sendTimeoutMs: 700_000, pendingDispatchId: dispatchId }),
+          ).rejects.toThrow(/not awaiting.*send timeout/i);
+          expect(
+            fs
+              .readFileSync(auditPath, 'utf8')
+              .trim()
+              .split('\n')
+              .map((line) => JSON.parse(line) as { kind?: string })
+              .filter((row) => row.kind === 'timeout_migration'),
+          ).toHaveLength(1);
+        },
+      );
+
+      it.each([
+        {
+          barrier: 'file',
+          target: 'decisions.jsonl',
+          code: 'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+        },
+        {
+          barrier: 'directory',
+          target: '',
+          code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+        },
+      ] as const)(
+        'reports applied live migration effects after a persistent $barrier-sync failure without replay',
+        async ({ barrier, target, code }) => {
+          const runId = `resume-timeout-live-${barrier}-sync-persistent`;
+          const workspace = workspaceFor(runId);
+          const dispatchId = `dispatch-live-${barrier}-sync-persistent`;
+          const { handle } = await pauseForTimeout(runId, workspace, 600_000, dispatchId);
+          const auditPath = auditPathFor(workspace, runId);
+          const failedTarget = target ? path.join(workspace, 'tasks', runId, target) : path.dirname(auditPath);
+          const flush = vi.mocked(fs.fsyncSync);
+          const flushImplementation = flush.getMockImplementation()!;
+          let injectedFailures = 0;
+          flush.mockImplementation((fd) => {
+            if (persistenceFsState.openPaths.get(fd) === failedTarget) {
+              injectedFailures++;
+              throw new Error(`persistent live ${barrier} sync failure`);
+            }
+            return flushImplementation(fd);
+          });
+
+          try {
+            await expect(
+              resumeWithOverride(runId, { sendTimeoutMs: 700_000, pendingDispatchId: dispatchId }),
+            ).rejects.toMatchObject({
+              code,
+              committed: true,
+              retryable: false,
+              effectsApplied: true,
+              operation: 'send_timeout_migration',
+            });
+          } finally {
+            flush.mockImplementation(flushImplementation);
+          }
+
+          expect(injectedFailures).toBe(2);
+          expect(handle.dispatcher.effectiveSendTimeoutMs).toBe(700_000);
+          expect(handle.runner.state).toMatchObject({ status: 'running', pending_dispatch: null });
+          const auditAfter = fs.readFileSync(auditPath, 'utf8');
+          expect(
+            auditAfter
+              .trim()
+              .split('\n')
+              .map((line) => JSON.parse(line) as { kind?: string })
+              .filter((row) => row.kind === 'timeout_migration'),
+          ).toHaveLength(1);
+          const sendsAfterMigration = mockSessions[0].sendCalls.length;
+
+          await expect(
+            resumeWithOverride(runId, { sendTimeoutMs: 700_000, pendingDispatchId: dispatchId }),
+          ).rejects.toThrow(/not awaiting.*send timeout/i);
+          expect(mockSessions[0].sendCalls).toHaveLength(sendsAfterMigration);
+          expect(handle.dispatcher.effectiveSendTimeoutMs).toBe(700_000);
+          expect(handle.runner.state).toMatchObject({ status: 'running', pending_dispatch: null });
+          expect(fs.readFileSync(auditPath, 'utf8')).toBe(auditAfter);
+        },
+      );
+
+      it('contains a live timeout migration inside its pinned run capability after a run-directory swap', async () => {
+        const runId = 'resume-timeout-live-pinned-run-swap';
+        const workspace = workspaceFor(runId);
+        const dispatchId = 'dispatch-live-pinned-run-swap';
+        const { handle, pending } = await pauseForTimeout(runId, workspace, 600_000, dispatchId);
+        const runDir = path.join(workspace, 'tasks', runId);
+        const originalDir = `${runDir}.saved`;
+        fs.renameSync(runDir, originalDir);
+        fs.mkdirSync(runDir);
+
+        await expect(
+          resumeWithOverride(runId, { sendTimeoutMs: 700_000, pendingDispatchId: dispatchId }),
+        ).rejects.toThrow(/identity|changed|replaced/i);
+
+        expect(handle.dispatcher.effectiveSendTimeoutMs).toBe(600_000);
+        expect(handle.runner.state).toMatchObject({ status: 'paused', pending_dispatch: pending });
+        expect(fs.readdirSync(runDir)).toEqual([]);
+        expect(
+          readIfPresent(path.join(originalDir, 'decisions.jsonl'))
+            .trim()
+            .split('\n')
+            .filter(Boolean)
+            .map((line) => JSON.parse(line) as { kind?: string })
+            .filter((row) => row.kind === 'timeout_migration'),
+        ).toHaveLength(0);
       });
 
       it('rejects equal, decreased, malformed, and out-of-range live overrides atomically', async () => {
@@ -1903,6 +7134,274 @@ describe('SessionManager', () => {
         expect(fs.readFileSync(evidencePath, 'utf8')).toBe(original.evidence);
       });
 
+      it('keeps a stored timeout migration on the legacy resume path without recovery receipts', async () => {
+        const runId = 'resume-timeout-stored-migration-legacy-path';
+        const workspace = workspaceFor(runId);
+        await mgr.autoloopStart({ runId, workspace, sendTimeoutMs: 650_000 });
+        await terminateAndReconstructManager(runId);
+        await resumeWithOverride(runId, { sendTimeoutMs: 700_000 });
+
+        const auditPath = auditPathFor(workspace, runId);
+        await terminateAndReconstructManager(runId);
+        const auditBeforeResume = fs.readFileSync(auditPath, 'utf8');
+
+        await expect(mgr.autoloopResume(runId)).resolves.toMatchObject({ run_id: runId });
+        expect(fs.readFileSync(auditPath, 'utf8')).toBe(auditBeforeResume);
+      });
+
+      it.each((['migrated', 'pending', 'cancelled'] as const).map((state) => ({ state })))(
+        'coalesces concurrent receipt-free $state stored resumes into one successful boot',
+        async ({ state }) => {
+          // Mutation caught: allowing both callers into _resumeAutoloopRun
+          // creates competing readiness tags and can strand one caller.
+          const runId = `resume-concurrent-receipt-free-${state}`;
+          const workspace = workspaceFor(runId);
+          if (state === 'pending') {
+            await pauseForTimeout(runId, workspace, 650_000, `dispatch-${runId}`);
+            const checkpointPath = path.join(TEST_WF_DIR, runId, 'run.json');
+            const pendingCheckpoint = fs.readFileSync(checkpointPath, 'utf8');
+            await terminateAndReconstructManager(runId);
+            fs.writeFileSync(checkpointPath, pendingCheckpoint);
+          } else {
+            await mgr.autoloopStart({ runId, workspace, sendTimeoutMs: 650_000 });
+            await terminateAndReconstructManager(runId);
+            if (state === 'migrated') {
+              await resumeWithOverride(runId, { sendTimeoutMs: 700_000 });
+              await terminateAndReconstructManager(runId);
+            } else {
+              const checkpointPath = path.join(TEST_WF_DIR, runId, 'run.json');
+              const checkpoint = JSON.parse(fs.readFileSync(checkpointPath, 'utf8')) as { state: string };
+              checkpoint.state = 'cancelled';
+              fs.writeFileSync(checkpointPath, JSON.stringify(checkpoint));
+            }
+          }
+          const receiptRows = fs
+            .readFileSync(auditPathFor(workspace, runId), 'utf8')
+            .split('\n')
+            .filter((line) => line.includes('autoloop_recovery_receipt'));
+          expect(receiptRows).toEqual([]);
+
+          let enterBoot!: () => void;
+          const bootEntered = new Promise<void>((resolve) => {
+            enterBoot = resolve;
+          });
+          let releaseBoot!: () => void;
+          const bootBarrier = new Promise<void>((resolve) => {
+            releaseBoot = resolve;
+          });
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const resume = (mgr as any)._resumeAutoloopRun.bind(mgr);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const boot = vi.spyOn(mgr as any, '_resumeAutoloopRun').mockImplementation(async (...args: unknown[]) => {
+            enterBoot();
+            await bootBarrier;
+            return await resume(...args);
+          });
+
+          const first = mgr.autoloopResume(runId);
+          await bootEntered;
+          const second = mgr.autoloopResume(runId);
+          await new Promise<void>((resolve) => nativeSetImmediate(resolve));
+          releaseBoot();
+          const [firstState, secondState] = await Promise.all([first, second]);
+
+          expect(boot).toHaveBeenCalledTimes(1);
+          expect(firstState).toBe(secondState);
+          expect(firstState).toBe(mgr.getAutoloop(runId)!.runner.state);
+        },
+      );
+
+      it.each([
+        { barrier: 'file', target: 'decisions.jsonl' },
+        { barrier: 'directory', target: '' },
+      ] as const)(
+        'recovers a committed stored migration after a $barrier-sync interruption without appending it again',
+        async ({ barrier, target }) => {
+          const runId = `resume-timeout-stored-${barrier}-sync-incomplete`;
+          const workspace = workspaceFor(runId);
+          const dispatchId = `dispatch-stored-${barrier}-sync-incomplete`;
+          await pauseForTimeout(runId, workspace, 600_000, dispatchId);
+
+          // Simulate process loss while retaining the recoverable timeout state.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const oldKernel = (mgr as any).kernel;
+          oldKernel.cancel(runId);
+          await oldKernel.wait(runId);
+          await mgr.shutdown();
+          mgr = createManager();
+
+          const auditPath = auditPathFor(workspace, runId);
+          const ledgerDir = path.dirname(auditPath);
+          const failedTarget = target ? path.join(ledgerDir, target) : ledgerDir;
+          const appendFile = vi.mocked(fs.appendFileSync);
+          const appendImplementation = appendFile.getMockImplementation()!;
+          const flush = vi.mocked(fs.fsyncSync);
+          const flushImplementation = flush.getMockImplementation()!;
+          let migrationBytesAppended = false;
+          let injectedFailures = 0;
+          appendFile.mockImplementation(((file: unknown, data: unknown, ...args: unknown[]) => {
+            const result = (appendImplementation as (...values: unknown[]) => unknown)(file, data, ...args);
+            if (isOpenPath(file, auditPath) && String(data).includes('"kind":"timeout_migration"')) {
+              migrationBytesAppended = true;
+            }
+            return result;
+          }) as typeof fs.appendFileSync);
+          flush.mockImplementation((fd) => {
+            if (
+              migrationBytesAppended &&
+              persistenceFsState.openPaths.get(fd) === failedTarget &&
+              injectedFailures === 0
+            ) {
+              injectedFailures++;
+              throw new Error(`injected stored ${barrier} sync interruption`);
+            }
+            return flushImplementation(fd);
+          });
+
+          try {
+            await expect(
+              resumeWithOverride(runId, { sendTimeoutMs: 700_000, pendingDispatchId: dispatchId }),
+            ).resolves.toMatchObject({ run_id: runId });
+          } finally {
+            appendFile.mockImplementation(appendImplementation);
+            flush.mockImplementation(flushImplementation);
+          }
+
+          expect(injectedFailures).toBe(1);
+          expect(mgr.getAutoloop(runId)!.dispatcher.effectiveSendTimeoutMs).toBe(700_000);
+          let migrations = fs
+            .readFileSync(auditPath, 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind?: string })
+            .filter((row) => row.kind === 'timeout_migration');
+          expect(migrations).toHaveLength(1);
+
+          await terminateAndReconstructManager(runId);
+          const beforePlainRecovery = fs.readFileSync(auditPath, 'utf8');
+          await expect(mgr.autoloopResume(runId)).resolves.toMatchObject({ run_id: runId });
+          expect(mgr.getAutoloop(runId)!.dispatcher.effectiveSendTimeoutMs).toBe(700_000);
+          expect(fs.readFileSync(auditPath, 'utf8')).toBe(beforePlainRecovery);
+          migrations = beforePlainRecovery
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind?: string })
+            .filter((row) => row.kind === 'timeout_migration');
+          expect(migrations).toHaveLength(1);
+        },
+      );
+
+      it.each([
+        {
+          barrier: 'file',
+          target: 'decisions.jsonl',
+          code: 'AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE',
+        },
+        {
+          barrier: 'directory',
+          target: '',
+          code: 'AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE',
+        },
+      ] as const)(
+        'reports applied stored migration effects after a persistent $barrier-sync failure across restart',
+        async ({ barrier, target, code }) => {
+          const runId = `resume-timeout-stored-${barrier}-sync-persistent`;
+          const workspace = workspaceFor(runId);
+          const dispatchId = `dispatch-stored-${barrier}-sync-persistent`;
+          await pauseForTimeout(runId, workspace, 600_000, dispatchId);
+
+          // Simulate process loss while retaining the recoverable timeout state.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const oldKernel = (mgr as any).kernel;
+          oldKernel.cancel(runId);
+          await oldKernel.wait(runId);
+          await mgr.shutdown();
+          mgr = createManager();
+
+          const auditPath = auditPathFor(workspace, runId);
+          const ledgerDir = path.dirname(auditPath);
+          const failedTarget = target ? path.join(ledgerDir, target) : ledgerDir;
+          const appendFile = vi.mocked(fs.appendFileSync);
+          const appendImplementation = appendFile.getMockImplementation()!;
+          const flush = vi.mocked(fs.fsyncSync);
+          const flushImplementation = flush.getMockImplementation()!;
+          let migrationBytesAppended = false;
+          let injectedFailures = 0;
+          appendFile.mockImplementation(((file: unknown, data: unknown, ...args: unknown[]) => {
+            const result = (appendImplementation as (...values: unknown[]) => unknown)(file, data, ...args);
+            if (isOpenPath(file, auditPath) && String(data).includes('"kind":"timeout_migration"')) {
+              migrationBytesAppended = true;
+            }
+            return result;
+          }) as typeof fs.appendFileSync);
+          flush.mockImplementation((fd) => {
+            if (migrationBytesAppended && persistenceFsState.openPaths.get(fd) === failedTarget) {
+              injectedFailures++;
+              throw new Error(`persistent stored ${barrier} sync failure`);
+            }
+            return flushImplementation(fd);
+          });
+
+          try {
+            await expect(
+              resumeWithOverride(runId, { sendTimeoutMs: 700_000, pendingDispatchId: dispatchId }),
+            ).rejects.toMatchObject({
+              code,
+              committed: true,
+              retryable: false,
+              effectsApplied: true,
+              operation: 'send_timeout_migration',
+            });
+          } finally {
+            appendFile.mockImplementation(appendImplementation);
+            flush.mockImplementation(flushImplementation);
+          }
+
+          expect(injectedFailures).toBe(2);
+          const liveAfterError = mgr.getAutoloop(runId)!;
+          expect(liveAfterError.dispatcher.effectiveSendTimeoutMs).toBe(700_000);
+          expect(liveAfterError.runner.state).toMatchObject({ status: 'planning', pending_dispatch: null });
+          const auditAfter = fs.readFileSync(auditPath, 'utf8');
+          expect(
+            auditAfter
+              .trim()
+              .split('\n')
+              .map((line) => JSON.parse(line) as { kind?: string })
+              .filter((row) => row.kind === 'timeout_migration'),
+          ).toHaveLength(1);
+
+          // A fresh manager reconstructs the committed row as authoritative.
+          // The identical outer request cannot append again or revive the
+          // resolved pending dispatch; a plain recovery keeps the new timeout.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const resumedKernel = (mgr as any).kernel;
+          resumedKernel.cancel(runId);
+          await resumedKernel.wait(runId);
+          await mgr.shutdown();
+          mgr = createManager();
+          const auditBeforeOuterRetry = fs.readFileSync(auditPath, 'utf8');
+          expect(auditBeforeOuterRetry.startsWith(auditAfter)).toBe(true);
+          expect(
+            auditBeforeOuterRetry
+              .trim()
+              .split('\n')
+              .map((line) => JSON.parse(line) as { kind?: string })
+              .filter((row) => row.kind === 'timeout_migration'),
+          ).toHaveLength(1);
+
+          await expect(
+            resumeWithOverride(runId, { sendTimeoutMs: 700_000, pendingDispatchId: dispatchId }),
+          ).rejects.toThrow(/no pending dispatch/i);
+          expect(mgr.getAutoloop(runId)).toBeUndefined();
+          expect(fs.readFileSync(auditPath, 'utf8')).toBe(auditBeforeOuterRetry);
+
+          await expect(mgr.autoloopResume(runId)).resolves.toMatchObject({ run_id: runId });
+          expect(mgr.getAutoloop(runId)!.dispatcher.effectiveSendTimeoutMs).toBe(700_000);
+          expect(mgr.getAutoloop(runId)!.runner.state).toMatchObject({ status: 'planning', pending_dispatch: null });
+          expect(fs.readFileSync(auditPath, 'utf8')).toBe(auditBeforeOuterRetry);
+        },
+      );
+
       it('uses the 600000ms compatibility default for a legacy stored run', async () => {
         const runId = 'resume-timeout-legacy';
         const workspace = workspaceFor(runId);
@@ -2012,11 +7511,17 @@ describe('SessionManager', () => {
             (mgr.workflowStatus(runId).nodes.main.data as any).state.pending_dispatch,
           ),
         };
-        const actualFs = await vi.importActual<typeof import('node:fs')>('node:fs');
         const auditOpen = vi.mocked((await import('node:fs')).openSync);
+        const openImplementation = auditOpen.getMockImplementation()!;
         auditOpen.mockImplementation(((file, flags, mode) => {
-          if (String(file) === auditPath && flags === 'a') throw new Error('audit append unavailable');
-          return actualFs.openSync(file, flags, mode);
+          if (
+            String(file) === auditPath &&
+            typeof flags === 'number' &&
+            (flags & fs.constants.O_APPEND) === fs.constants.O_APPEND
+          ) {
+            throw new Error('audit append unavailable');
+          }
+          return openImplementation(file, flags, mode);
         }) as typeof fs.openSync);
 
         try {
@@ -2024,8 +7529,7 @@ describe('SessionManager', () => {
             resumeWithOverride(runId, { sendTimeoutMs: 700_000, pendingDispatchId: dispatchId }),
           ).rejects.toThrow('audit append unavailable');
         } finally {
-          auditOpen.mockImplementation(((file, flags, mode) =>
-            actualFs.openSync(file, flags, mode)) as typeof fs.openSync);
+          auditOpen.mockImplementation(openImplementation);
         }
 
         expect(mgr.getAutoloop(runId)).toBeUndefined();
@@ -2124,7 +7628,17 @@ describe('SessionManager', () => {
             planner.sendImplementation = undefined;
             throw new Error('Timeout waiting for response');
           };
-          await mgr.autoloopChat(runId, 'one logical send that reaches its deadline');
+          await expect(mgr.autoloopChat(runId, 'one logical send that reaches its deadline')).rejects.toMatchObject({
+            code: 'AUTOLOOP_SEND_TIMEOUT',
+            retryable: true,
+            pending_dispatch: {
+              status: 'awaiting_resume',
+              agent: 'planner',
+              message_type: 'chat',
+              timeout_ms: 600_000,
+              dispatch_id: expect.stringMatching(/^dispatch_[a-f0-9]{64}$/),
+            },
+          });
 
           expect(planner.sendCalls).toHaveLength(1);
           expect(planner.sendCalls[0].options?.timeout).toBe(600_000);
@@ -2278,7 +7792,11 @@ describe('SessionManager', () => {
             }
 
             rejectSend(new Error('Timeout waiting for response'));
-            await chat;
+            await expect(chat).rejects.toMatchObject({
+              code: 'AUTOLOOP_RUN_TERMINAL',
+              retryable: false,
+              status_reason: terminalCause === 'hard timeout' ? 'hard_timeout_exceeded' : 'operator-stop-during-send',
+            });
 
             expect(handle.runner.state).toMatchObject({
               status: 'terminated',
@@ -2289,6 +7807,1763 @@ describe('SessionManager', () => {
             expect(planner.sendCalls).toHaveLength(1);
           },
         );
+      });
+    });
+
+    describe('recovery response boundaries', () => {
+      it('returns the initiating chat reply when the same drain contains a later Planner turn', async () => {
+        const runId = 'planner-turn-bound-reply';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        let turn = 0;
+        mockSessions[0].sendImplementation = async () => {
+          turn += 1;
+          return {
+            text: `turn-bound reply ${turn}`,
+            event: { type: 'result', result: `turn-bound reply ${turn}` },
+          };
+        };
+        let followUp: Promise<void> | undefined;
+        handle.dispatcher.on('planner_reply', () => {
+          if (followUp) return;
+          followUp = handle.runner.send(AutoloopMsg.chat(0, { text: 'later internal Planner turn' }));
+        });
+
+        await expect(mgr.autoloopChat(runId, 'initiating user turn')).resolves.toEqual({
+          reply: 'turn-bound reply 1',
+        });
+        await expect(followUp).resolves.toBeUndefined();
+        expect(mockSessions[0].sendCalls).toHaveLength(2);
+      });
+
+      it('reports an ordinary paused chat as non-retryable and resumes the parked turn exactly once', async () => {
+        const runId = 'planner-chat-ordinary-pause';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        await handle.runner.send(AutoloopMsg.pause(0, { reason: 'operator-review' }));
+
+        await expect(mgr.autoloopChat(runId, 'park this exact turn')).rejects.toMatchObject({
+          code: 'AUTOLOOP_RUN_PAUSED',
+          retryable: false,
+          pending_dispatch: undefined,
+          status_reason: 'operator-review',
+        });
+        expect(
+          (handle.runner as unknown as { pausedBuffer: Array<{ payload: { text?: string } }> }).pausedBuffer,
+        ).toEqual([expect.objectContaining({ payload: { text: 'park this exact turn' } })]);
+        expect(mockSessions[0].sendCalls).toHaveLength(0);
+
+        await handle.runner.send(AutoloopMsg.resume(0));
+        await vi.waitFor(() => expect(mockSessions[0].sendCalls).toHaveLength(1));
+        expect(mockSessions[0].sendCalls[0].message).toContain('park this exact turn');
+        expect(
+          (handle.runner as unknown as { pausedBuffer: Array<{ payload: { text?: string } }> }).pausedBuffer,
+        ).toEqual([]);
+      });
+
+      it('contains a soft-resume parked Planner delivery failure without an error listener', async () => {
+        const runId = 'planner-resumed-parked-delivery-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        await handle.runner.send(AutoloopMsg.pause(0, { reason: 'operator-review' }));
+
+        await expect(mgr.autoloopChat(runId, 'park before failing on resume')).rejects.toMatchObject({
+          code: 'AUTOLOOP_RUN_PAUSED',
+          retryable: false,
+        });
+        const phaseErrors: PhaseErrorPayload[] = [];
+        const pushes: Array<{ summary: string }> = [];
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => unhandled.push(reason);
+        handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+        handle.runner.on('push', (payload: { summary: string }) => pushes.push(payload));
+        process.on('unhandledRejection', onUnhandled);
+        expect(handle.runner.listenerCount('error')).toBe(0);
+        const delivery = vi
+          .spyOn(handle.dispatcher, 'deliver')
+          .mockRejectedValueOnce(new Error('resumed parked chat delivery failed'));
+
+        try {
+          await expect(handle.runner.send(AutoloopMsg.resume(0))).resolves.toBeUndefined();
+          await new Promise<void>((resolve) => nativeSetImmediate(resolve));
+          expect(delivery).toHaveBeenCalledTimes(1);
+          expect(unhandled).toEqual([]);
+          expect(phaseErrors).toEqual([
+            {
+              agent: 'planner',
+              phase: 'planner_turn',
+              code: 'AUTOLOOP_ENGINE_FAILURE',
+              error: 'Planner engine transport failed: resumed parked chat delivery failed',
+            },
+          ]);
+          expect(pushes.map(({ summary }) => summary)).toEqual(['[on_phase_error] iter 0']);
+          expect(handle.runner.state).toMatchObject({
+            status: 'running',
+            consecutive_phase_errors: 1,
+            recent_phase_errors: [expect.objectContaining({ code: 'AUTOLOOP_ENGINE_FAILURE' })],
+            push_log_count: 1,
+          });
+          const pushRows = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'push_log.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { summary: string });
+          expect(pushRows).toEqual([expect.objectContaining({ summary: '[on_phase_error] iter 0' })]);
+        } finally {
+          process.off('unhandledRejection', onUnhandled);
+          delivery.mockRestore();
+        }
+      });
+
+      it('contains a soft-resume Planner failure when its mandatory phase-error notification also fails', async () => {
+        const runId = 'planner-soft-resume-notification-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        await handle.runner.send(AutoloopMsg.pause(0, { reason: 'operator-review' }));
+        await expect(mgr.autoloopChat(runId, 'park before both failures')).rejects.toMatchObject({
+          code: 'AUTOLOOP_RUN_PAUSED',
+          retryable: false,
+        });
+        mockSessions[0].sendImplementation = async () => ({
+          text: 'reply whose generation probe will fail',
+          event: { type: 'result', result: 'reply whose generation probe will fail' },
+        });
+        vi.spyOn(mgr, 'inspect').mockRejectedValueOnce(new Error('soft-resume liveness probe failed'));
+        handle.runner.config.notifyUser = async () => {
+          throw new Error('mandatory Planner phase-error notification failed');
+        };
+
+        const originalDeliver = handle.dispatcher.deliver.bind(handle.dispatcher);
+        let boundaryFailure: unknown;
+        vi.spyOn(handle.dispatcher, 'deliver').mockImplementation(async (env) => {
+          try {
+            return await originalDeliver(env);
+          } catch (error) {
+            boundaryFailure = error;
+            throw error;
+          }
+        });
+        const phaseErrors: PhaseErrorPayload[] = [];
+        const pushes: Array<{ summary: string }> = [];
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => unhandled.push(reason);
+        handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+        handle.runner.on('push', (payload: { summary: string }) => pushes.push(payload));
+        process.on('unhandledRejection', onUnhandled);
+        expect(handle.runner.listenerCount('error')).toBe(0);
+
+        try {
+          await expect(handle.runner.send(AutoloopMsg.resume(0))).resolves.toBeUndefined();
+          await new Promise<void>((resolve) => nativeSetImmediate(resolve));
+
+          expect(boundaryFailure).toBeInstanceOf(AutoloopOperationError);
+          expect(phaseErrors).toEqual([
+            {
+              agent: 'planner',
+              phase: 'planner_turn',
+              code: 'AUTOLOOP_ENGINE_FAILURE',
+              error: 'Planner engine transport failed: soft-resume liveness probe failed',
+            },
+          ]);
+          expect(pushes.map(({ summary }) => summary)).toEqual(['[on_phase_error] iter 0']);
+          expect(unhandled).toEqual([]);
+          expect(handle.runner.state).toMatchObject({
+            status: 'running',
+            consecutive_phase_errors: 1,
+            push_log_count: 1,
+          });
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string; payload: PhaseErrorPayload });
+          expect(
+            decisions.filter(
+              (row) =>
+                row.kind === 'phase_error' &&
+                row.payload.agent === 'planner' &&
+                row.payload.code === 'AUTOLOOP_ENGINE_FAILURE',
+            ),
+          ).toHaveLength(1);
+        } finally {
+          process.off('unhandledRejection', onUnhandled);
+        }
+      });
+
+      it('contains a timeout-resume parked Planner delivery failure without an unhandled rejection', async () => {
+        const runId = 'planner-timeout-resumed-parked-delivery-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({
+          runId,
+          workspace,
+          sendTimeoutMs: 600_000,
+          activityLeaseMs: 1_800_000,
+          autoloopHardTimeoutMs: 86_400_000,
+        });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => {
+          mockSessions[0].sendImplementation = undefined;
+          throw new Error('Timeout waiting for response');
+        };
+        await expect(mgr.autoloopChat(runId, 'establish the timed-out Planner dispatch')).rejects.toMatchObject({
+          code: 'AUTOLOOP_SEND_TIMEOUT',
+          retryable: true,
+        });
+        const pending = handle.runner.state.pending_dispatch!;
+        await expect(mgr.autoloopChat(runId, 'park after the timed-out dispatch')).rejects.toMatchObject({
+          code: 'AUTOLOOP_RUN_PAUSED',
+          retryable: false,
+        });
+
+        const phaseErrors: PhaseErrorPayload[] = [];
+        const pushes: Array<{ summary: string }> = [];
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => unhandled.push(reason);
+        handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+        handle.runner.on('push', (payload: { summary: string }) => pushes.push(payload));
+        process.on('unhandledRejection', onUnhandled);
+        expect(handle.runner.listenerCount('error')).toBe(0);
+        const delivery = vi
+          .spyOn(handle.dispatcher, 'deliver')
+          .mockRejectedValueOnce(new Error('timeout-resumed parked chat delivery failed'));
+
+        try {
+          await expect(
+            mgr.autoloopResume(runId, {
+              sendTimeoutMs: 700_000,
+              pendingDispatchId: pending.dispatch_id,
+            }),
+          ).resolves.toMatchObject({ status: 'running', pending_dispatch: null });
+          await vi.waitFor(() => expect(handle.runner.state.push_log_count).toBe(1));
+          await new Promise<void>((resolve) => nativeSetImmediate(resolve));
+
+          expect(delivery).toHaveBeenCalledTimes(1);
+          expect(unhandled).toEqual([]);
+          expect(phaseErrors).toEqual([
+            {
+              agent: 'planner',
+              phase: 'planner_turn',
+              code: 'AUTOLOOP_ENGINE_FAILURE',
+              error: 'Planner engine transport failed: timeout-resumed parked chat delivery failed',
+            },
+          ]);
+          expect(pushes.map(({ summary }) => summary)).toEqual(['[on_phase_error] iter 0']);
+          expect(handle.runner.state).toMatchObject({
+            status: 'running',
+            consecutive_phase_errors: 1,
+            recent_phase_errors: [expect.objectContaining({ code: 'AUTOLOOP_ENGINE_FAILURE' })],
+            push_log_count: 1,
+          });
+          const pushRows = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'push_log.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { summary: string });
+          expect(pushRows).toEqual([expect.objectContaining({ summary: '[on_phase_error] iter 0' })]);
+        } finally {
+          process.off('unhandledRejection', onUnhandled);
+          delivery.mockRestore();
+        }
+      });
+
+      it('contains a detached timeout-resume failure for a parked non-Planner message without an error listener', async () => {
+        const runId = 'coder-timeout-resume-parked-delivery-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({
+          runId,
+          workspace,
+          sendTimeoutMs: 600_000,
+          activityLeaseMs: 1_800_000,
+          autoloopHardTimeoutMs: 86_400_000,
+        });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => {
+          throw new Error('Timeout waiting for response');
+        };
+        await expect(mgr.autoloopChat(runId, 'establish timeout before parking Coder work')).rejects.toMatchObject({
+          code: 'AUTOLOOP_SEND_TIMEOUT',
+          retryable: true,
+        });
+        const pending = handle.runner.state.pending_dispatch!;
+        await handle.runner.send(
+          AutoloopMsg.directive(0, {
+            goal: 'park this Coder delivery',
+            constraints: [],
+            success_criteria: [],
+            max_attempts: 1,
+          }),
+        );
+
+        const originalDeliver = handle.dispatcher.deliver.bind(handle.dispatcher);
+        const delivery = vi.spyOn(handle.dispatcher, 'deliver').mockImplementation(async (env) => {
+          if (env.to === 'coder') throw new Error('parked Coder delivery failed');
+          return await originalDeliver(env);
+        });
+        const phaseErrors: PhaseErrorPayload[] = [];
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => unhandled.push(reason);
+        handle.runner.on('phase_error', (payload: PhaseErrorPayload) => phaseErrors.push(payload));
+        process.on('unhandledRejection', onUnhandled);
+        expect(handle.runner.listenerCount('error')).toBe(0);
+
+        try {
+          await expect(
+            mgr.autoloopResume(runId, {
+              sendTimeoutMs: 700_000,
+              pendingDispatchId: pending.dispatch_id,
+            }),
+          ).resolves.toMatchObject({ status: 'running', pending_dispatch: null });
+          await vi.waitFor(() => expect(delivery.mock.calls.some(([env]) => env.to === 'coder')).toBe(true));
+          await new Promise<void>((resolve) => nativeSetImmediate(resolve));
+
+          expect(unhandled).toEqual([]);
+          expect(phaseErrors).toEqual([]);
+          expect(handle.runner.state).toMatchObject({
+            status: 'running',
+            consecutive_phase_errors: 0,
+          });
+        } finally {
+          process.off('unhandledRejection', onUnhandled);
+        }
+      });
+
+      it('does not attribute an older send-timeout dispatch to a newly parked chat', async () => {
+        const runId = 'planner-chat-behind-timeout';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        let plannerTurns = 0;
+        mockSessions[0].sendImplementation = async () => {
+          plannerTurns += 1;
+          if (plannerTurns === 1) throw Object.assign(new Error('Planner deadline'), { code: 'ETIMEDOUT' });
+          return { text: 'exact parked chat delivered', event: { type: 'result', result: 'delivered after resume' } };
+        };
+        let originalPending: Record<string, unknown> | undefined;
+        try {
+          await mgr.autoloopChat(runId, 'the dispatch that times out');
+        } catch (error) {
+          originalPending = (error as { pending_dispatch?: Record<string, unknown> }).pending_dispatch;
+        }
+        expect(originalPending).toMatchObject({ agent: 'planner', message_type: 'chat' });
+
+        await expect(mgr.autoloopChat(runId, 'a distinct parked chat')).rejects.toMatchObject({
+          code: 'AUTOLOOP_RUN_PAUSED',
+          retryable: false,
+          pending_dispatch: undefined,
+        });
+        expect(handle.runner.state.pending_dispatch).toEqual(originalPending);
+        expect(mockSessions[0].sendCalls).toHaveLength(1);
+        const parked = (
+          handle.runner as unknown as {
+            pausedBuffer: Array<{ msg_id: string; type: string; payload: { text?: string } }>;
+          }
+        ).pausedBuffer;
+        expect(parked).toEqual([
+          expect.objectContaining({
+            msg_id: expect.stringMatching(/^m_/),
+            type: 'chat',
+            payload: { text: 'a distinct parked chat' },
+          }),
+        ]);
+        const parkedMessageId = parked[0].msg_id;
+        const deliveredEnvelopes: string[] = [];
+        handle.runner.on('message', (env: { msg_id?: string }) => {
+          if (env.msg_id === parkedMessageId) deliveredEnvelopes.push(env.msg_id);
+        });
+
+        await mgr.autoloopResume(runId, {
+          sendTimeoutMs: 700_000,
+          pendingDispatchId: String(originalPending?.dispatch_id),
+        });
+        await vi.waitFor(() => expect(mockSessions[0].sendCalls).toHaveLength(2));
+
+        expect(String(mockSessions[0].sendCalls[1].message)).toContain('a distinct parked chat');
+        expect((handle.runner as unknown as { pausedBuffer: Array<{ msg_id: string }> }).pausedBuffer).toEqual([]);
+        expect(deliveredEnvelopes).toEqual([parkedMessageId]);
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(mockSessions[0].sendCalls).toHaveLength(2);
+        expect(deliveredEnvelopes).toEqual([parkedMessageId]);
+      });
+
+      it('isolates a failed Planner sender from a later queued sender', async () => {
+        const runId = 'planner-drain-sender-isolation';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        let releaseFirst!: () => void;
+        const firstGate = new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+        let markFirstEntered!: () => void;
+        const firstEntered = new Promise<void>((resolve) => {
+          markFirstEntered = resolve;
+        });
+        let turn = 0;
+        mockSessions[0].sendImplementation = async () => {
+          turn += 1;
+          if (turn === 1) {
+            markFirstEntered();
+            await firstGate;
+            return {
+              text: ['```autoloop', '{"tool":"notify_user","args":{}}', '```'].join('\n'),
+              event: { type: 'result', result: 'bad first turn' },
+            };
+          }
+          return { text: 'independent second reply', event: { type: 'result', result: 'independent second reply' } };
+        };
+
+        const first = handle.runner.send(AutoloopMsg.chat(0, { text: 'failing sender' }));
+        await firstEntered;
+        const second = handle.runner.send(AutoloopMsg.chat(0, { text: 'independent sender' }));
+        releaseFirst();
+
+        await expect(first).rejects.toMatchObject({ code: 'AUTOLOOP_CONTROL_MALFORMED' });
+        await expect(second).resolves.toBeUndefined();
+        expect(mockSessions[0].sendCalls).toHaveLength(2);
+      });
+
+      it.each([
+        { label: 'plain reply', output: 'late plain Planner success', control: false },
+        {
+          label: 'spawn control',
+          output: ['late spawn', '```autoloop', '{"tool":"spawn_subagents","args":{}}', '```'].join('\n'),
+          control: true,
+        },
+      ])('fences a late Planner $label after pre-emptive termination', async ({ label, output, control }) => {
+        const runId = `planner-terminal-fence-${label.replace(' ', '-')}`;
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        let releaseTurn!: () => void;
+        let markTurnEntered!: () => void;
+        const turnEntered = new Promise<void>((resolve) => {
+          markTurnEntered = resolve;
+        });
+        const turnGate = new Promise<void>((resolve) => {
+          releaseTurn = resolve;
+        });
+        mockSessions[0].sendImplementation = async () => {
+          markTurnEntered();
+          await turnGate;
+          return { text: output, event: { type: 'result', result: output } };
+        };
+        let releasePlannerStop!: () => void;
+        let markPlannerStopEntered!: () => void;
+        const plannerStopEntered = new Promise<void>((resolve) => {
+          markPlannerStopEntered = resolve;
+        });
+        const plannerStopGate = new Promise<void>((resolve) => {
+          releasePlannerStop = resolve;
+        });
+        const stopImplementation = mgr.stopSession.bind(mgr);
+        const stop = vi.spyOn(mgr, 'stopSession').mockImplementation(async (name, options) => {
+          if (name === handle.dispatcher.sessionNames.planner) {
+            markPlannerStopEntered();
+            await plannerStopGate;
+          }
+          return await stopImplementation(name, options);
+        });
+        const replies: string[] = [];
+        handle.dispatcher.on('planner_reply', (reply: string) => replies.push(reply));
+
+        try {
+          const chat = mgr.autoloopChat(runId, 'turn racing terminal state');
+          await turnEntered;
+          const stopping = mgr.autoloopStop(runId, 'operator-terminal-fence');
+          await plannerStopEntered;
+          expect(handle.runner.state.status).toBe('terminated');
+          releaseTurn();
+
+          await expect(chat).rejects.toMatchObject({
+            code: 'AUTOLOOP_RUN_TERMINAL',
+            retryable: false,
+            status_reason: 'operator-terminal-fence',
+          });
+          releasePlannerStop();
+          await expect(stopping).resolves.toBe(true);
+          expect(replies).toEqual([]);
+          expect(handle.runner.state).toMatchObject({ status: 'terminated', subagents_spawned: false });
+          expect(mockSessions).toHaveLength(1);
+          const decisionsPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+          const decisions = fs
+            .readFileSync(decisionsPath, 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string });
+          expect(decisions.filter((row) => row.kind === 'planner_turn_control')).toHaveLength(0);
+          if (control) expect(decisions.filter((row) => row.kind === 'spawn_subagents')).toHaveLength(0);
+        } finally {
+          releasePlannerStop();
+          stop.mockRestore();
+        }
+      });
+
+      it('returns a structured internal failure when Planner reset omits force', async () => {
+        const runId = 'planner-reset-force-required';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+
+        await expect(mgr.getAutoloop(runId)!.dispatcher.resetAgent('planner')).resolves.toMatchObject({
+          ok: false,
+          code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+          agent: 'planner',
+          retryable: false,
+          message: expect.stringContaining('force=true'),
+        });
+      });
+
+      it.each(['coder', 'reviewer'] as const)(
+        'does not retain a fatal rejected one-shot %s send in replay history or the next prompt',
+        async (role) => {
+          const runId = `fatal-${role}-history-exclusion`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          if (role === 'coder') initializeGitWorkspace(workspace);
+          await mgr.autoloopStart({
+            runId,
+            workspace,
+            ...(role === 'coder' ? { coderEngine: 'cursor' as const } : { reviewerEngine: 'cursor' as const }),
+          });
+          const handle = mgr.getAutoloop(runId)!;
+          await handle.dispatcher.spawnSubagents();
+          const roleIndex = role === 'coder' ? 1 : 2;
+          const rejectedMarker = role === 'coder' ? 'FATAL_CODER_TURN_MUST_NOT_REPLAY' : '987654321';
+          mockSessions[roleIndex].sendImplementation = async () => {
+            throw new Error(`${role} fatal turn`);
+          };
+          const reset = vi.spyOn(handle.dispatcher, 'resetAgent').mockResolvedValue({
+            ok: false,
+            code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+            agent: role,
+            previous_generation: 1,
+            message: `${role} cannot recover`,
+            retryable: false,
+          });
+
+          if (role === 'coder') {
+            await handle.dispatcher.deliver(
+              AutoloopMsg.directive(0, {
+                goal: rejectedMarker,
+                constraints: [],
+                success_criteria: [],
+                max_attempts: 1,
+              }),
+            );
+          } else {
+            seedCompleteLegacyReviewArtifacts(workspace, runId, 0);
+            await handle.dispatcher.deliver(
+              AutoloopMsg.reviewRequest(0, {
+                iter: 0,
+                ledger_path: path.join(workspace, 'tasks', runId),
+                prior_metrics: [Number(rejectedMarker)],
+              }),
+            );
+          }
+
+          expect(
+            (
+              handle.dispatcher as unknown as {
+                transcripts: Record<'coder' | 'reviewer', Array<{ who: string; text: string }>>;
+              }
+            ).transcripts[role],
+          ).toEqual([]);
+
+          mockSessions[roleIndex].sendImplementation = async (message) => {
+            const text = successfulRoleReplyFromDeliveryPrompt(
+              role,
+              message,
+              role === 'coder' ? 'next coder reply' : 'next reviewer reply',
+            );
+            return { text, event: { type: 'result', result: text } };
+          };
+          if (role === 'coder') {
+            await handle.dispatcher.deliver(
+              AutoloopMsg.directive(1, {
+                goal: 'accepted next coder turn',
+                constraints: [],
+                success_criteria: [],
+                max_attempts: 1,
+              }),
+            );
+          } else {
+            seedCompleteLegacyReviewArtifacts(workspace, runId, 1);
+            await handle.dispatcher.deliver(
+              AutoloopMsg.reviewRequest(1, {
+                iter: 1,
+                ledger_path: path.join(workspace, 'tasks', runId),
+                prior_metrics: [123],
+              }),
+            );
+          }
+
+          expect(String(mockSessions[roleIndex].sendCalls.at(-1)?.message)).not.toContain(rejectedMarker);
+          reset.mockRestore();
+        },
+      );
+
+      it.each(['coder', 'reviewer'] as const)(
+        'excludes a fatal %s one-shot after a real successful reset and failed retry',
+        async (role) => {
+          const runId = `real-reset-fatal-${role}-history-exclusion`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          if (role === 'coder') initializeGitWorkspace(workspace);
+          let targetGenerationsStarted = 0;
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (mgr as any)._createSession = (_engine: string, config: SessionConfig): ISession => {
+            const mock = new MockSession();
+            if (config.name === `autoloop-${runId}-${role}`) {
+              targetGenerationsStarted += 1;
+              if (targetGenerationsStarted === 1) {
+                mock.sendImplementation = async () => {
+                  throw new Error(`${role} first generation failed`);
+                };
+              } else {
+                let replacementTurns = 0;
+                mock.sendImplementation = async (message) => {
+                  replacementTurns += 1;
+                  if (replacementTurns === 1) throw new Error(`${role} replacement retry failed`);
+                  const text = successfulRoleReplyFromDeliveryPrompt(role, message, `${role} later success`);
+                  return { text, event: { type: 'result', result: text } };
+                };
+              }
+            }
+            mockSessions.push(mock);
+            createdConfigs.push(config);
+            return mock;
+          };
+          await mgr.autoloopStart({
+            runId,
+            workspace,
+            ...(role === 'coder' ? { coderEngine: 'cursor' as const } : { reviewerEngine: 'cursor' as const }),
+          });
+          const handle = mgr.getAutoloop(runId)!;
+          await handle.dispatcher.spawnSubagents();
+          const rejectedMarker = role === 'coder' ? 'REAL_RESET_CODER_MUST_NOT_REPLAY' : '135791113';
+          const rejectedEnvelope =
+            role === 'coder'
+              ? AutoloopMsg.directive(0, {
+                  goal: rejectedMarker,
+                  constraints: [],
+                  success_criteria: [],
+                  max_attempts: 1,
+                })
+              : AutoloopMsg.reviewRequest(0, {
+                  iter: 0,
+                  ledger_path: path.join(workspace, 'tasks', runId),
+                  prior_metrics: [Number(rejectedMarker)],
+                });
+
+          if (role === 'reviewer') seedCompleteLegacyReviewArtifacts(workspace, runId, 0);
+
+          const rejected = handle.dispatcher.deliver(rejectedEnvelope);
+          await vi.advanceTimersByTimeAsync(1_000);
+          await expect(rejected).resolves.toEqual([
+            expect.objectContaining({
+              type: 'phase_error',
+              payload: expect.objectContaining({ agent: role, code: 'AUTOLOOP_ENGINE_FAILURE' }),
+            }),
+          ]);
+
+          expect(targetGenerationsStarted).toBe(2);
+          expect(
+            (
+              handle.dispatcher as unknown as {
+                transcripts: Record<'coder' | 'reviewer', Array<{ who: string; text: string }>>;
+              }
+            ).transcripts[role],
+          ).toEqual([]);
+          const generations = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string; payload: { role?: string; generation?: number } });
+          expect(
+            generations.filter(
+              (row) =>
+                row.payload.role === role && row.kind === 'agent_generation_started' && row.payload.generation === 2,
+            ),
+          ).toHaveLength(1);
+
+          const acceptedEnvelope =
+            role === 'coder'
+              ? AutoloopMsg.directive(1, {
+                  goal: 'accepted coder turn',
+                  constraints: [],
+                  success_criteria: [],
+                  max_attempts: 1,
+                })
+              : AutoloopMsg.reviewRequest(1, {
+                  iter: 1,
+                  ledger_path: path.join(workspace, 'tasks', runId),
+                  prior_metrics: [2468],
+                });
+          if (role === 'reviewer') seedCompleteLegacyReviewArtifacts(workspace, runId, 1);
+          await handle.dispatcher.deliver(acceptedEnvelope);
+          const replacementIndex = createdConfigs.map((config) => config.name).lastIndexOf(`autoloop-${runId}-${role}`);
+          const replacementSession = mockSessions[replacementIndex];
+          expect(String(replacementSession?.sendCalls.at(-1)?.message)).not.toContain(rejectedMarker);
+        },
+      );
+
+      it.each([
+        { key: 'on_phase_error' as const, channel: 'wechat' as const },
+        { key: 'on_phase_error' as const, channel: 'webchat' as const },
+        { key: 'on_phase_error' as const, channel: 'email' as const },
+        { key: 'on_decision_needed' as const, channel: 'wechat' as const },
+        { key: 'on_decision_needed' as const, channel: 'webchat' as const },
+        { key: 'on_decision_needed' as const, channel: 'email' as const },
+      ])(
+        'rejects $key diversion to the $channel channel with the fallback-chain diagnostic',
+        async ({ key, channel }) => {
+          const runId = `planner-critical-policy-channel-${key}-${channel}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          const before = JSON.stringify(handle.runner.config.push_policy);
+          mockSessions[0].sendImplementation = async () => ({
+            text: [
+              '```autoloop',
+              JSON.stringify({ tool: 'update_push_policy', args: { [key]: { channel } } }),
+              '```',
+            ].join('\n'),
+            event: { type: 'result', result: 'unsafe critical channel update' },
+          });
+
+          await expect(mgr.autoloopChat(runId, 'do not divert the critical channel')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_MALFORMED',
+            retryable: false,
+            message: expect.stringContaining(
+              `update_push_policy ${key} channel '${channel}' bypasses the required fallback chain`,
+            ),
+          });
+          expect(JSON.stringify(handle.runner.config.push_policy)).toBe(before);
+        },
+      );
+
+      it.each([
+        {
+          key: 'on_phase_error' as const,
+          state: 'missing',
+          legacyRule: null,
+          expectedLevel: 'error',
+          expectedChannel: 'both',
+        },
+        {
+          key: 'on_decision_needed' as const,
+          state: 'missing',
+          legacyRule: null,
+          expectedLevel: 'decision',
+          expectedChannel: 'both',
+        },
+        {
+          key: 'on_phase_error' as const,
+          state: 'weak-info',
+          legacyRule: { level: 'info', channel: 'both' },
+          expectedLevel: 'error',
+          expectedChannel: 'both',
+        },
+        {
+          key: 'on_decision_needed' as const,
+          state: 'weak-warn',
+          legacyRule: { level: 'warn', channel: 'both' },
+          expectedLevel: 'decision',
+          expectedChannel: 'both',
+        },
+        ...(['wechat', 'webchat', 'email'] as const).flatMap((channel) => [
+          {
+            key: 'on_phase_error' as const,
+            state: `unsafe-${channel}`,
+            legacyRule: { level: 'error' as const, channel },
+            expectedLevel: 'error' as const,
+            expectedChannel: 'both' as const,
+          },
+          {
+            key: 'on_decision_needed' as const,
+            state: `unsafe-${channel}`,
+            legacyRule: { level: 'decision' as const, channel },
+            expectedLevel: 'decision' as const,
+            expectedChannel: 'both' as const,
+          },
+        ]),
+        {
+          key: 'on_phase_error' as const,
+          state: 'silent-partial',
+          legacyRule: { silent: true },
+          expectedLevel: 'error',
+          expectedChannel: 'both',
+        },
+        {
+          key: 'on_decision_needed' as const,
+          state: 'silent-partial',
+          legacyRule: { silent: true },
+          expectedLevel: 'decision',
+          expectedChannel: 'both',
+        },
+        {
+          key: 'on_decision_needed' as const,
+          state: 'stronger-error',
+          legacyRule: { level: 'error', channel: 'auto', silent: true },
+          expectedLevel: 'error',
+          expectedChannel: 'auto',
+        },
+      ])(
+        'emits a safe critical policy final emission for $key with a $state legacy rule',
+        async ({ key, state, legacyRule, expectedLevel, expectedChannel }) => {
+          const runId = `planner-critical-policy-emission-${key}-${state}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          const policy = handle.runner.config.push_policy as unknown as Record<string, unknown>;
+          if (legacyRule === null) delete policy[key];
+          else policy[key] = legacyRule;
+          const pushes: Array<{ level: string; summary: string; channel: string }> = [];
+          handle.runner.on('push', (payload: { level: string; summary: string; channel: string }) =>
+            pushes.push(payload),
+          );
+
+          await (
+            handle.runner as unknown as {
+              firePolicyPush(rule: typeof key, iter: number): Promise<void>;
+            }
+          ).firePolicyPush(key, 7);
+
+          expect(pushes).toEqual([{ level: expectedLevel, summary: `[${key}] iter 7`, channel: expectedChannel }]);
+        },
+      );
+
+      it('does not let an ordinary push deduplicate a mandatory critical policy emission', async () => {
+        const runId = 'planner-critical-policy-dedup-origin';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const pushes: Array<{ level: string; summary: string; channel: string }> = [];
+        handle.runner.on('push', (payload: { level: string; summary: string; channel: string }) =>
+          pushes.push(payload),
+        );
+
+        await handle.runner.send(
+          AutoloopMsg.pushUser(7, {
+            level: 'error',
+            summary: '[on_phase_error] iter 7',
+            channel: 'auto',
+          }),
+        );
+        await (
+          handle.runner as unknown as {
+            firePolicyPush(rule: 'on_phase_error', iter: number): Promise<void>;
+          }
+        ).firePolicyPush('on_phase_error', 7);
+
+        expect(pushes).toEqual([
+          { level: 'error', summary: '[on_phase_error] iter 7', channel: 'auto' },
+          { level: 'error', summary: '[on_phase_error] iter 7', channel: 'both' },
+        ]);
+        expect(handle.runner.state.push_log_count).toBe(2);
+      });
+
+      it.each([
+        {
+          key: 'on_start' as const,
+          delta: { level: 'warn' as const },
+          expected: { level: 'warn', channel: 'wechat' },
+        },
+        {
+          key: 'on_iter_done_ok' as const,
+          delta: { channel: 'auto' as const },
+          expected: { channel: 'auto', silent: true },
+        },
+      ])('merges a noncritical $key PATCH with its current policy rule', async ({ key, delta, expected }) => {
+        const runId = `planner-noncritical-policy-patch-${key}`;
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', JSON.stringify({ tool: 'update_push_policy', args: { [key]: delta } }), '```'].join(
+            '\n',
+          ),
+          event: { type: 'result', result: 'partial noncritical update' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'patch only the supplied policy fields')).resolves.toMatchObject({
+          reply: expect.stringContaining('update_push_policy'),
+        });
+
+        expect(handle.runner.config.push_policy?.[key]).toEqual(expected);
+        const decisions = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { applied?: Record<string, unknown> } });
+        expect(decisions.find((row) => row.kind === 'update_push_policy')?.payload.applied).toEqual({
+          [key]: expected,
+        });
+      });
+
+      it.each(['on_phase_error', 'on_decision_needed'] as const)(
+        'repairs a legacy non-fallback %s channel during an allowed partial update',
+        async (key) => {
+          const runId = `planner-critical-policy-defensive-${key}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          const requiredLevel = key === 'on_phase_error' ? 'error' : 'decision';
+          handle.runner.config.push_policy![key] = { level: requiredLevel, channel: 'webchat' };
+          mockSessions[0].sendImplementation = async () => ({
+            text: [
+              '```autoloop',
+              JSON.stringify({ tool: 'update_push_policy', args: { [key]: { level: requiredLevel } } }),
+              '```',
+            ].join('\n'),
+            event: { type: 'result', result: 'repair legacy critical channel' },
+          });
+
+          await expect(mgr.autoloopChat(runId, 'retain a fallback-capable channel')).resolves.toMatchObject({
+            reply: expect.stringContaining('update_push_policy'),
+          });
+          expect(handle.runner.config.push_policy?.[key]).toEqual({ level: requiredLevel, channel: 'both' });
+        },
+      );
+
+      it('preserves critical push-policy severity across an allowed fallback-capable partial update', async () => {
+        const runId = 'planner-critical-policy-partial-update';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: [
+            '```autoloop',
+            '{"tool":"update_push_policy","args":{"on_phase_error":{"channel":"auto"}}}',
+            '```',
+          ].join('\n'),
+          event: { type: 'result', result: 'partial critical update' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'narrow only the channel')).resolves.toMatchObject({
+          reply: expect.stringContaining('update_push_policy'),
+        });
+        expect(handle.runner.config.push_policy?.on_phase_error).toEqual({ level: 'error', channel: 'auto' });
+      });
+
+      it('rejects a weakening critical push-policy severity atomically', async () => {
+        const runId = 'planner-critical-policy-weakening';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const before = JSON.stringify(handle.runner.config.push_policy);
+        mockSessions[0].sendImplementation = async () => ({
+          text: [
+            '```autoloop',
+            '{"tool":"update_push_policy","args":{"on_decision_needed":{"level":"info"}}}',
+            '```',
+          ].join('\n'),
+          event: { type: 'result', result: 'weaken critical severity' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'reject the weakening update')).rejects.toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+        });
+        expect(JSON.stringify(handle.runner.config.push_policy)).toBe(before);
+      });
+
+      it.each(['on_phase_error', 'on_decision_needed'] as const)(
+        'refuses prose plus a silence-only %s attempt without policy or successful-control audit mutation',
+        async (key) => {
+          const runId = `planner-critical-silence-with-text-${key}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          const policyBefore = JSON.stringify(handle.runner.config.push_policy);
+          mockSessions[0].sendImplementation = async () => ({
+            text: [
+              'I silenced the critical notification.',
+              '```autoloop',
+              JSON.stringify({ tool: 'update_push_policy', args: { [key]: { silent: true } } }),
+              '```',
+            ].join('\n'),
+            event: { type: 'result', result: 'silence critical policy' },
+          });
+
+          await expect(mgr.autoloopChat(runId, 'do not accept prose as a control result')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_MALFORMED',
+            retryable: false,
+          });
+
+          expect(JSON.stringify(handle.runner.config.push_policy)).toBe(policyBefore);
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string; payload: { keys?: string[] } });
+          expect(decisions.filter((row) => row.kind === 'planner_turn_control')).toEqual([]);
+          expect(decisions.filter((row) => row.kind === 'update_push_policy')).toEqual([]);
+          expect(decisions.filter((row) => row.kind === 'policy_silence_blocked')).toEqual([]);
+        },
+      );
+
+      it('retains a valid non-weakening control beside a blocked critical silence attempt', async () => {
+        const runId = 'planner-critical-silence-mixed-batch';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        mockSessions[0].sendImplementation = async () => ({
+          text: [
+            '```autoloop',
+            '{"tool":"update_push_policy","args":{"on_phase_error":{"silent":true}}}',
+            '```',
+            '```autoloop',
+            '{"tool":"update_push_policy","args":{"on_start":{"level":"warn"}}}',
+            '```',
+          ].join('\n'),
+          event: { type: 'result', result: 'mixed policy controls' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'apply only the valid policy control')).resolves.toMatchObject({
+          reply: expect.stringContaining('update_push_policy'),
+        });
+        expect(handle.runner.config.push_policy?.on_phase_error).toEqual({ level: 'error', channel: 'both' });
+        expect(handle.runner.config.push_policy?.on_start).toEqual({ level: 'warn', channel: 'wechat' });
+      });
+
+      it('rejects an oversized artifact batch before materializing every large body', () => {
+        const body = 'x'.repeat(1_048_576);
+        const reads: number[] = [];
+        const controls = Array.from({ length: 8 }, (_, index) => {
+          const args: Record<string, unknown> = {};
+          Object.defineProperty(args, 'content', {
+            enumerable: true,
+            get: () => {
+              reads.push(index);
+              return body;
+            },
+          });
+          return { tool: 'write_plan' as const, args };
+        });
+
+        const validation = validatePlannerToolCalls(controls);
+
+        expect(validation.calls).toEqual([]);
+        expect(validation.errors[0]?.error).toContain('1114112-byte UTF-8 limit');
+        expect(reads).toEqual([0, 1]);
+      });
+
+      it('applies an already validated batch through the trusted path without a second boundary pass', async () => {
+        const validation = validatePlannerToolCalls([{ tool: 'notify_user', args: { summary: 'one effect' } }]);
+        const updatePushPolicy = vi.fn();
+
+        const result = await applyValidatedPlannerToolCalls(
+          validation,
+          {
+            spawnSubagents: async () => undefined,
+            updatePushPolicy,
+            writePlanFiles: async () => undefined,
+          },
+          0,
+        );
+
+        expect(result.errors).toEqual([]);
+        expect(result.emitted_messages).toEqual([
+          expect.objectContaining({ type: 'push_user', payload: expect.objectContaining({ summary: 'one effect' }) }),
+        ]);
+        expect(updatePushPolicy).not.toHaveBeenCalled();
+      });
+
+      it('materializes deterministic effect defaults in the canonical validated controls', () => {
+        const validation = validatePlannerToolCalls([
+          { tool: 'notify_user', args: { summary: 'default notification' } },
+          { tool: 'send_directive', args: { goal: 'default directive' } },
+          {
+            tool: 'spawn_subagents',
+            args: { initial_directive: { goal: 'default initial directive' } },
+          },
+          { tool: 'write_plan', args: { content: '# Canonical plan' } },
+          { tool: 'write_goal', args: { content: '{"gates":[]}' } },
+        ]);
+
+        expect(validation.errors).toEqual([]);
+        expect(validation.calls).toEqual([
+          {
+            tool: 'notify_user',
+            args: { channel: 'auto', level: 'info', summary: 'default notification' },
+          },
+          {
+            tool: 'send_directive',
+            args: { constraints: [], goal: 'default directive', max_attempts: 1, success_criteria: [] },
+          },
+          {
+            tool: 'spawn_subagents',
+            args: {
+              initial_directive: {
+                constraints: [],
+                goal: 'default initial directive',
+                max_attempts: 1,
+                success_criteria: [],
+              },
+            },
+          },
+          {
+            tool: 'write_plan',
+            args: { commit_message: 'autoloop: planner writes plan.md', content: '# Canonical plan' },
+          },
+          {
+            tool: 'write_goal',
+            args: { commit_message: 'autoloop: planner writes goal.json', content: '{"gates":[]}' },
+          },
+        ]);
+        expect(JSON.parse(validation.controls_json ?? 'null')).toEqual(validation.calls);
+      });
+
+      it('persists the same omitted defaults that real Planner chat emits and applies', async () => {
+        const runId = 'planner-durable-default-effect-equality';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        initializeGitWorkspace(workspace);
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const expectedControls: PlannerToolCall[] = [
+          {
+            tool: 'notify_user',
+            args: { channel: 'auto', level: 'info', summary: 'defaulted notification' },
+          },
+          {
+            tool: 'spawn_subagents',
+            args: {},
+          },
+          {
+            tool: 'send_directive',
+            args: {
+              constraints: [],
+              goal: 'defaulted follow-up directive',
+              max_attempts: 1,
+              success_criteria: [],
+            },
+          },
+        ];
+        let plannerTurn = 0;
+        mockSessions[0].sendImplementation = async () => {
+          plannerTurn += 1;
+          const text =
+            plannerTurn === 1
+              ? [
+                  '```autoloop',
+                  '{"tool":"notify_user","args":{"summary":"defaulted notification"}}',
+                  '```',
+                  '```autoloop',
+                  '{"tool":"spawn_subagents","args":{}}',
+                  '```',
+                  '```autoloop',
+                  '{"tool":"send_directive","args":{"goal":"defaulted follow-up directive"}}',
+                  '```',
+                ].join('\n')
+              : 'follow-up acknowledgement';
+          return { text, event: { type: 'result', result: text } };
+        };
+        const pushes: Array<Record<string, unknown>> = [];
+        const directives: Array<Record<string, unknown>> = [];
+        handle.runner.on('push', (payload: Record<string, unknown>) => pushes.push(payload));
+        handle.runner.on('message', (message: { type?: string; from?: string; payload?: Record<string, unknown> }) => {
+          if (message.type === 'directive' && message.from === 'planner' && message.payload) {
+            directives.push(message.payload);
+          }
+        });
+        const spawnImplementation = handle.dispatcher.spawnSubagents.bind(handle.dispatcher);
+        let spawnEffect: unknown;
+        const spawn = vi.spyOn(handle.dispatcher, 'spawnSubagents').mockImplementation(async (args) => {
+          spawnEffect = JSON.parse(JSON.stringify(args));
+          await spawnImplementation(args);
+          mockSessions[1].sendImplementation = async (message) => {
+            const text = successfulRoleReplyFromDeliveryPrompt('coder', message, 'follow-up acknowledgement');
+            return { text, event: { type: 'result', result: text } };
+          };
+          mockSessions[2].sendImplementation = async (message) => {
+            const text = successfulRoleReplyFromDeliveryPrompt('reviewer', message, 'follow-up review');
+            return { text, event: { type: 'result', result: text } };
+          };
+        });
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'apply every deterministic default')).resolves.toMatchObject({
+            reply: expect.stringContaining('notify_user'),
+          });
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string; payload: { controls?: PlannerToolCall[] } });
+          expect(decisions.find((row) => row.kind === 'planner_turn_control')?.payload.controls).toEqual(
+            expectedControls,
+          );
+          expect(spawnEffect).toEqual(expectedControls[1].args);
+          expect(pushes).toEqual([
+            { level: 'info', summary: 'defaulted notification', detail: undefined, channel: 'auto' },
+          ]);
+          expect(directives).toEqual([expectedControls[2].args]);
+        } finally {
+          spawn.mockRestore();
+        }
+      });
+
+      it('persists omitted artifact commit defaults identical to the real git effects', async () => {
+        const runId = 'planner-durable-artifact-commit-defaults';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        initializeGitWorkspace(workspace);
+        await mgr.autoloopStart({ runId, workspace });
+        const planContent = '# Durable default plan';
+        const goalContent = '{"gates":[]}';
+        mockSessions[0].sendImplementation = async () => ({
+          text: [
+            '```autoloop',
+            JSON.stringify({ tool: 'write_plan', args: { content: planContent } }),
+            '```',
+            '```autoloop',
+            JSON.stringify({ tool: 'write_goal', args: { content: goalContent } }),
+            '```',
+          ].join('\n'),
+          event: { type: 'result', result: 'persist artifact defaults' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'persist deterministic artifact defaults')).resolves.toMatchObject({
+          reply: expect.stringContaining('write_plan, write_goal'),
+        });
+
+        const expectedControls: PlannerToolCall[] = [
+          {
+            tool: 'write_plan',
+            args: {
+              commit_message: 'autoloop: planner writes plan.md',
+              content: planContent,
+            },
+          },
+          {
+            tool: 'write_goal',
+            args: {
+              commit_message: 'autoloop: planner writes goal.json',
+              content: goalContent,
+            },
+          },
+        ];
+        const decisions = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind: string; payload: { controls?: PlannerToolCall[] } });
+        expect(decisions.find((row) => row.kind === 'planner_turn_control')?.payload.controls).toEqual(
+          expectedControls,
+        );
+        expect(runGit(workspace, 'log', '-2', '--format=%s').trim().split('\n')).toEqual([
+          String(expectedControls[0].args.commit_message),
+          'test baseline',
+        ]);
+        expect(fs.readFileSync(path.join(workspace, 'plan.md'), 'utf8')).toBe(planContent);
+        expect(fs.readFileSync(path.join(workspace, 'goal.json'), 'utf8')).toBe(goalContent);
+      });
+
+      it.each(['pause_loop', 'terminate'] as const)(
+        'persists and applies the canonical omitted %s reason through Planner chat',
+        async (tool) => {
+          const runId = `planner-canonical-default-${tool}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          mockSessions[0].sendImplementation = async () => ({
+            text: ['```autoloop', JSON.stringify({ tool, args: {} }), '```'].join('\n'),
+            event: { type: 'result', result: 'default lifecycle reason' },
+          });
+
+          await expect(mgr.autoloopChat(runId, 'use the deterministic lifecycle default')).resolves.toEqual({
+            reply: `Planner controls persisted: ${tool}`,
+          });
+
+          const reason = tool === 'pause_loop' ? 'planner-pause' : 'planner-terminate';
+          expect(handle.runner.state).toMatchObject({
+            status: tool === 'pause_loop' ? 'paused' : 'terminated',
+            status_reason: reason,
+          });
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string; payload: { controls?: PlannerToolCall[] } });
+          expect(decisions.find((row) => row.kind === 'planner_turn_control')?.payload.controls).toEqual([
+            { tool, args: { reason } },
+          ]);
+        },
+      );
+
+      it.each(['pause_loop', 'terminate'] as const)(
+        'rejects a supplied blank %s reason at the complete Planner chat boundary',
+        async (tool) => {
+          const runId = `planner-blank-chat-reason-${tool}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          mockSessions[0].sendImplementation = async () => ({
+            text: ['```autoloop', JSON.stringify({ tool, args: { reason: '   ' } }), '```'].join('\n'),
+            event: { type: 'result', result: 'blank lifecycle reason' },
+          });
+
+          await expect(mgr.autoloopChat(runId, 'reject the blank reason')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_MALFORMED',
+            retryable: false,
+            message: expect.stringContaining(`${tool} reason must be a non-empty string`),
+          });
+          expect(handle.runner.state).toMatchObject({ status: 'planning', status_reason: null });
+          const decisionsPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+          const decisions = fs.existsSync(decisionsPath) ? fs.readFileSync(decisionsPath, 'utf8') : '';
+          expect(decisions).not.toContain('planner_turn_control');
+        },
+      );
+
+      it.each(['pause_loop', 'terminate'] as const)(
+        'rejects a non-final %s control before any later direct effect or durable control event',
+        async (tool) => {
+          const runId = `planner-lifecycle-order-${tool}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          const policyBefore = JSON.stringify(handle.runner.config.push_policy);
+          mockSessions[0].sendImplementation = async () => ({
+            text: [
+              '```autoloop',
+              JSON.stringify({ tool, args: {} }),
+              '```',
+              '```autoloop',
+              '{"tool":"update_push_policy","args":{"on_start":{"level":"warn"}}}',
+              '```',
+            ].join('\n'),
+            event: { type: 'result', result: 'invalid lifecycle ordering' },
+          });
+
+          await expect(mgr.autoloopChat(runId, 'reject effects after lifecycle control')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_MALFORMED',
+            retryable: false,
+            message: expect.stringContaining(`${tool} must be the final Planner control in its batch`),
+          });
+          expect(handle.runner.state).toMatchObject({ status: 'planning', status_reason: null });
+          expect(JSON.stringify(handle.runner.config.push_policy)).toBe(policyBefore);
+          const decisionsPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+          const decisions = fs.existsSync(decisionsPath) ? fs.readFileSync(decisionsPath, 'utf8') : '';
+          expect(decisions).not.toContain('planner_turn_control');
+          expect(decisions).not.toContain('update_push_policy');
+        },
+      );
+
+      it.each(['pause_loop', 'terminate'] as const)(
+        'rejects a supplied blank %s reason while preserving the omitted default',
+        async (tool) => {
+          const blank = validatePlannerToolCalls([{ tool, args: { reason: '   ' } }]);
+          expect(blank.calls).toEqual([]);
+          expect(blank.errors).toEqual([
+            expect.objectContaining({ tool, error: expect.stringContaining('must be a non-empty string') }),
+          ]);
+
+          const omitted = validatePlannerToolCalls([{ tool, args: {} }]);
+          expect(omitted.errors).toEqual([]);
+          const applied = await applyValidatedPlannerToolCalls(
+            omitted,
+            {
+              spawnSubagents: async () => undefined,
+              updatePushPolicy: () => undefined,
+              writePlanFiles: async () => undefined,
+            },
+            0,
+          );
+          expect(applied.errors).toEqual([]);
+          expect(applied.emitted_messages).toEqual([
+            expect.objectContaining({
+              type: tool === 'pause_loop' ? 'pause' : 'terminate',
+              payload: { reason: tool === 'pause_loop' ? 'planner-pause' : 'planner-terminate' },
+            }),
+          ]);
+        },
+      );
+
+      it.each([
+        { tool: 'write_plan' as const, file: 'plan.md', content: '# blank commit message' },
+        { tool: 'write_goal' as const, file: 'goal.json', content: '{"blank":true}' },
+      ])('rejects a blank $tool commit_message before writing $file', async ({ tool, file, content }) => {
+        const runId = `planner-blank-commit-${tool}`;
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        initializeGitWorkspace(workspace);
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', JSON.stringify({ tool, args: { content, commit_message: '   ' } }), '```'].join('\n'),
+          event: { type: 'result', result: 'blank commit message' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'reject the blank commit message')).rejects.toMatchObject({
+          code: 'AUTOLOOP_CONTROL_MALFORMED',
+          retryable: false,
+          message: expect.stringContaining(`${tool} commit_message must be a non-empty string`),
+        });
+        expect(fs.existsSync(path.join(workspace, file))).toBe(false);
+      });
+
+      it.each([
+        { tool: 'write_plan' as const, file: 'plan.md' as const, content: '# must not be written' },
+        { tool: 'write_goal' as const, file: 'goal.json' as const, content: '{"must_not":"be written"}' },
+      ])(
+        'keeps the atomically materialized $tool when termination begins during the later spawn effect',
+        async ({ tool, file, content }) => {
+          const runId = `planner-terminal-batch-${tool}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          const originalHead = initializeGitWorkspace(workspace);
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          handle.dispatcher.config.onSpawnSubagents = async () => {
+            await handle.runner.send(AutoloopMsg.terminate(0, { reason: 'terminal-during-spawn-effect' }));
+          };
+          mockSessions[0].sendImplementation = async () => ({
+            text: [
+              '```autoloop',
+              '{"tool":"spawn_subagents","args":{}}',
+              '```',
+              '```autoloop',
+              JSON.stringify({ tool, args: { content } }),
+              '```',
+            ].join('\n'),
+            event: { type: 'result', result: 'persisted multi-control batch' },
+          });
+
+          await expect(mgr.autoloopChat(runId, 'terminate between persisted effects')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+            retryable: false,
+          });
+          expect(handle.runner.state).toMatchObject({
+            status: 'terminated',
+            status_reason: 'terminal-during-spawn-effect',
+          });
+          expect(fs.readFileSync(path.join(workspace, file), 'utf8')).toBe(content);
+          expect(runGit(workspace, 'rev-parse', 'HEAD').trim()).not.toBe(originalHead);
+
+          const decisions = fs
+            .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string; payload?: { tools?: string[] } });
+          expect(decisions).toContainEqual(
+            expect.objectContaining({
+              kind: 'planner_turn_control',
+              payload: expect.objectContaining({ tools: ['spawn_subagents', tool] }),
+            }),
+          );
+        },
+      );
+
+      it('commits only the exact Planner control artifact and leaves unrelated dirty state untouched', async () => {
+        const runId = 'planner-exact-control-commit-scope';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        fs.mkdirSync(workspace, { recursive: true });
+        initializeGitWorkspace(workspace);
+        fs.writeFileSync(path.join(workspace, 'dirty.txt'), 'baseline dirty\n');
+        fs.writeFileSync(path.join(workspace, 'staged.txt'), 'baseline staged\n');
+        runGit(workspace, 'add', '--', 'dirty.txt', 'staged.txt');
+        runGit(workspace, 'commit', '--quiet', '-m', 'unrelated baselines');
+        fs.writeFileSync(path.join(workspace, 'dirty.txt'), 'unstaged user change\n');
+        fs.writeFileSync(path.join(workspace, 'staged.txt'), 'staged user change\n');
+        runGit(workspace, 'add', '--', 'staged.txt');
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"write_plan","args":{"content":"# Exact plan"}}', '```'].join('\n'),
+          event: { type: 'result', result: 'write exact plan' },
+        });
+
+        await expect(mgr.autoloopChat(runId, 'commit only plan.md')).resolves.toMatchObject({
+          reply: expect.stringContaining('write_plan'),
+        });
+
+        expect(
+          runGit(workspace, 'show', '--pretty=format:', '--name-only', 'HEAD').trim().split('\n').filter(Boolean),
+        ).toEqual(['plan.md']);
+        expect(runGit(workspace, 'diff', '--name-only')).toContain('dirty.txt');
+        expect(runGit(workspace, 'diff', '--cached', '--name-only')).toContain('staged.txt');
+        expect(runGit(workspace, 'status', '--porcelain', '--', 'tasks')).toContain('?? tasks/');
+      });
+
+      it.each(['status', 'add', 'commit'] as const)(
+        'surfaces a Planner git %s failure instead of claiming control success',
+        async (failedStep) => {
+          const runId = `planner-git-${failedStep}-failure`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          initializeGitWorkspace(workspace);
+          await mgr.autoloopStart({ runId, workspace });
+          if (failedStep === 'status') {
+            fs.writeFileSync(path.join(workspace, '.git', 'index'), 'corrupt index');
+          } else if (failedStep === 'add') {
+            fs.writeFileSync(path.join(workspace, '.git', 'index.lock'), 'locked');
+          } else {
+            const hook = path.join(workspace, '.git', 'hooks', 'pre-commit');
+            fs.writeFileSync(hook, '#!/bin/sh\necho intentional commit failure >&2\nexit 1\n');
+            fs.chmodSync(hook, 0o755);
+          }
+          mockSessions[0].sendImplementation = async () => ({
+            text: ['```autoloop', '{"tool":"write_plan","args":{"content":"# Failing plan"}}', '```'].join('\n'),
+            event: { type: 'result', result: 'git operation should fail' },
+          });
+
+          await expect(mgr.autoloopChat(runId, `surface ${failedStep} failure`)).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+            retryable: false,
+            message: expect.stringContaining(`git ${failedStep}`),
+          });
+        },
+      );
+
+      it.each([
+        { tool: 'write_plan' as const, file: 'plan.md', content: '# unsafe overwrite' },
+        { tool: 'write_goal' as const, file: 'goal.json', content: '{"unsafe":true}' },
+      ])(
+        'refuses a pre-planted $file symlink without touching its external target',
+        async ({ tool, file, content }) => {
+          const runId = `planner-${tool}-symlink-refusal`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          const external = path.join(TEST_WF_DIR, `${runId}-external.txt`);
+          fs.writeFileSync(external, 'external sentinel');
+          fs.symlinkSync(external, path.join(workspace, file));
+          await mgr.autoloopStart({ runId, workspace });
+          mockSessions[0].sendImplementation = async () => ({
+            text: ['```autoloop', JSON.stringify({ tool, args: { content } }), '```'].join('\n'),
+            event: { type: 'result', result: 'write through symlink' },
+          });
+
+          await expect(mgr.autoloopChat(runId, 'persist safely')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+          });
+          expect(fs.readFileSync(external, 'utf8')).toBe('external sentinel');
+          expect(fs.lstatSync(path.join(workspace, file)).isSymbolicLink()).toBe(true);
+        },
+      );
+
+      it.each(['absent', 'staged'] as const)(
+        'restores the exact %s Planner artifact index state after a failed commit',
+        async (prior) => {
+          const runId = `planner-index-restore-${prior}`;
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          initializeGitWorkspace(workspace);
+          fs.writeFileSync(path.join(workspace, 'dirty.txt'), 'dirty baseline\n');
+          fs.writeFileSync(path.join(workspace, 'staged.txt'), 'staged baseline\n');
+          runGit(workspace, 'add', '--', 'dirty.txt', 'staged.txt');
+          runGit(workspace, 'commit', '--quiet', '-m', 'unrelated baselines');
+          fs.writeFileSync(path.join(workspace, 'dirty.txt'), 'unrelated unstaged change\n');
+          fs.writeFileSync(path.join(workspace, 'staged.txt'), 'unrelated staged change\n');
+          runGit(workspace, 'add', '--', 'staged.txt');
+          if (prior === 'staged') {
+            fs.writeFileSync(path.join(workspace, 'plan.md'), '# prior staged plan\n');
+            runGit(workspace, 'add', '--', 'plan.md');
+          }
+          const artifactIndexBefore = runGit(workspace, 'ls-files', '--stage', '--', 'plan.md');
+          const unrelatedIndexBefore = runGit(workspace, 'diff', '--cached', '--', 'staged.txt');
+          const unrelatedWorktreeBefore = runGit(workspace, 'diff', '--', 'dirty.txt');
+          const hook = path.join(workspace, '.git', 'hooks', 'pre-commit');
+          fs.writeFileSync(hook, '#!/bin/sh\necho intentional commit failure >&2\nexit 1\n');
+          fs.chmodSync(hook, 0o755);
+          await mgr.autoloopStart({ runId, workspace });
+          mockSessions[0].sendImplementation = async () => ({
+            text: ['```autoloop', '{"tool":"write_plan","args":{"content":"# replacement plan"}}', '```'].join('\n'),
+            event: { type: 'result', result: 'commit should fail' },
+          });
+
+          await expect(mgr.autoloopChat(runId, 'exercise exact index restoration')).rejects.toMatchObject({
+            code: 'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+            message: expect.stringContaining('git commit failed for plan.md'),
+          });
+
+          expect(runGit(workspace, 'ls-files', '--stage', '--', 'plan.md')).toBe(artifactIndexBefore);
+          expect(runGit(workspace, 'diff', '--cached', '--', 'staged.txt')).toBe(unrelatedIndexBefore);
+          expect(runGit(workspace, 'diff', '--', 'dirty.txt')).toBe(unrelatedWorktreeBefore);
+          expect(fs.readFileSync(path.join(workspace, 'plan.md'), 'utf8')).toBe('# replacement plan');
+          expect(runGit(workspace, 'status', '--porcelain', '--', 'plan.md').trim()).toBe(
+            prior === 'absent' ? '?? plan.md' : 'AM plan.md',
+          );
+        },
+      );
+
+      it('materializes a regular goal atomically through a same-directory rename', async () => {
+        const runId = 'planner-goal-atomic-replace';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        const goalPath = path.join(workspace, 'goal.json');
+        fs.writeFileSync(goalPath, '{"old":true}');
+        await mgr.autoloopStart({ runId, workspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: ['```autoloop', '{"tool":"write_goal","args":{"content":"{\\"new\\":true}"}}', '```'].join('\n'),
+          event: { type: 'result', result: 'replace goal atomically' },
+        });
+        const rename = vi.mocked(fs.renameSync);
+        const renameImplementation = rename.getMockImplementation()!;
+        const replacements: Array<{ from: string; to: string }> = [];
+        rename.mockImplementation(((from: unknown, to: unknown) => {
+          if (String(to) === goalPath) replacements.push({ from: String(from), to: String(to) });
+          return (renameImplementation as (...values: unknown[]) => unknown)(from, to);
+        }) as typeof fs.renameSync);
+
+        try {
+          await expect(mgr.autoloopChat(runId, 'replace the goal')).resolves.toMatchObject({
+            reply: expect.stringContaining('write_goal'),
+          });
+          expect(fs.readFileSync(goalPath, 'utf8')).toBe('{"new":true}');
+          expect(replacements).toHaveLength(1);
+          expect(path.dirname(replacements[0].from)).toBe(workspace);
+          expect(replacements[0].to).toBe(goalPath);
+        } finally {
+          rename.mockImplementation(renameImplementation);
+        }
+      });
+
+      it('flushes the registry temp file, rename, and parent directory in order', () => {
+        const sessionName = 'durable-registry-order';
+        const generation = managerGeneration(sessionName, {
+          owner_instance_id: mgr.autoloopOwnerInstanceId,
+          session_id: 'durable-registry-session',
+        });
+        const tmpPath = `${SESSION_REGISTRY_FILE}.tmp`;
+        const registryDir = path.dirname(SESSION_REGISTRY_FILE);
+        const openedTargets = new Map<number, string>();
+        const order: string[] = [];
+        const openFile = vi.mocked(fs.openSync);
+        const openImplementation = openFile.getMockImplementation()!;
+        openFile.mockImplementation(((target: unknown, ...args: unknown[]) => {
+          const fd = (openImplementation as (...values: unknown[]) => number)(target, ...args);
+          openedTargets.set(fd, String(target));
+          return fd;
+        }) as typeof fs.openSync);
+        const flush = vi.mocked(fs.fsyncSync);
+        const flushImplementation = flush.getMockImplementation()!;
+        flush.mockImplementation((fd) => {
+          if (openedTargets.get(fd) === tmpPath) order.push('registry-file-flushed');
+          if (openedTargets.get(fd) === registryDir) order.push('registry-directory-flushed');
+          return flushImplementation(fd);
+        });
+        const rename = vi.mocked(fs.renameSync);
+        const renameImplementation = rename.getMockImplementation()!;
+        rename.mockImplementation(((from: unknown, to: unknown) => {
+          if (String(from) === tmpPath && String(to) === SESSION_REGISTRY_FILE) order.push('registry-renamed');
+          return (renameImplementation as (...values: unknown[]) => unknown)(from, to);
+        }) as typeof fs.renameSync);
+
+        try {
+          expect(mgr.reserveAgentGeneration(generation, '/tmp')).toBe(true);
+          expect(order).toEqual(['registry-file-flushed', 'registry-renamed', 'registry-directory-flushed']);
+        } finally {
+          openFile.mockImplementation(openImplementation);
+          flush.mockImplementation(flushImplementation);
+          rename.mockImplementation(renameImplementation);
+        }
+      });
+
+      it('fails closed when the registry temp-file flush fails before replacement', () => {
+        const sessionName = 'durable-registry-flush-failure';
+        const generation = managerGeneration(sessionName, {
+          owner_instance_id: mgr.autoloopOwnerInstanceId,
+          session_id: 'durable-registry-flush-session',
+        });
+        const tmpPath = `${SESSION_REGISTRY_FILE}.tmp`;
+        const flush = vi.mocked(fs.fsyncSync);
+        const flushImplementation = flush.getMockImplementation()!;
+        flush.mockImplementation((fd) => {
+          if (persistenceFsState.descriptors.get(fd) === tmpPath) throw new Error('registry temp flush failed');
+          return flushImplementation(fd);
+        });
+
+        try {
+          expect(() => mgr.reserveAgentGeneration(generation, '/tmp')).toThrow(
+            expect.objectContaining({ code: 'AUTOLOOP_AGENT_REGISTRY_PERSIST_FAILED' }),
+          );
+          expect(persistenceFsState.files.has(SESSION_REGISTRY_FILE)).toBe(false);
+        } finally {
+          flush.mockImplementation(flushImplementation);
+        }
+      });
+
+      it('fails reset closed when generation release evidence cannot be flushed', async () => {
+        const runId = 'generation-release-flush-failure';
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const generationPath = path.join(workspace, 'tasks', runId, 'agent-generations.jsonl');
+        const openedTargets = new Map<number, string>();
+        const openFile = vi.mocked(fs.openSync);
+        const openImplementation = openFile.getMockImplementation()!;
+        openFile.mockImplementation(((target: unknown, ...args: unknown[]) => {
+          const fd = (openImplementation as (...values: unknown[]) => number)(target, ...args);
+          openedTargets.set(fd, String(target));
+          return fd;
+        }) as typeof fs.openSync);
+        const flush = vi.mocked(fs.fsyncSync);
+        const flushImplementation = flush.getMockImplementation()!;
+        flush.mockImplementation((fd) => {
+          if (openedTargets.get(fd) === generationPath) throw new Error('generation evidence flush failed');
+          return flushImplementation(fd);
+        });
+
+        try {
+          await expect(handle.dispatcher.resetAgent('planner', { force: true })).resolves.toMatchObject({
+            ok: false,
+            code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+            message: expect.stringContaining('generation evidence flush failed'),
+          });
+        } finally {
+          openFile.mockImplementation(openImplementation);
+          flush.mockImplementation(flushImplementation);
+        }
+      });
+
+      it.skipIf(process.platform === 'win32')(
+        'fails reset closed when the generation-ledger parent directory cannot be flushed on POSIX',
+        async () => {
+          const runId = 'generation-release-directory-flush-failure';
+          const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+          await mgr.autoloopStart({ runId, workspace });
+          const handle = mgr.getAutoloop(runId)!;
+          const ledgerDir = path.join(workspace, 'tasks', runId);
+          const openedTargets = new Map<number, string>();
+          const openFile = vi.mocked(fs.openSync);
+          const openImplementation = openFile.getMockImplementation()!;
+          openFile.mockImplementation(((target: unknown, ...args: unknown[]) => {
+            const fd = (openImplementation as (...values: unknown[]) => number)(target, ...args);
+            openedTargets.set(fd, String(target));
+            return fd;
+          }) as typeof fs.openSync);
+          const flush = vi.mocked(fs.fsyncSync);
+          const flushImplementation = flush.getMockImplementation()!;
+          flush.mockImplementation((fd) => {
+            if (openedTargets.get(fd) === ledgerDir) throw new Error('generation directory flush failed');
+            return flushImplementation(fd);
+          });
+
+          try {
+            await expect(handle.dispatcher.resetAgent('planner', { force: true })).resolves.toMatchObject({
+              ok: false,
+              code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+              message: expect.stringContaining('generation directory flush failed'),
+            });
+          } finally {
+            openFile.mockImplementation(openImplementation);
+            flush.mockImplementation(flushImplementation);
+          }
+        },
+      );
+
+      it('keeps Planner reply listeners isolated across simultaneous runs', async () => {
+        const firstWorkspace = fs.mkdtempSync(path.join(TEST_WF_DIR, 'cross-run-first-'));
+        const secondWorkspace = fs.mkdtempSync(path.join(TEST_WF_DIR, 'cross-run-second-'));
+        await mgr.autoloopStart({ runId: 'cross-run-first', workspace: firstWorkspace });
+        await mgr.autoloopStart({ runId: 'cross-run-second', workspace: secondWorkspace });
+        mockSessions[0].sendImplementation = async () => ({
+          text: 'first run reply',
+          event: { type: 'result', result: 'first run reply' },
+        });
+        mockSessions[1].sendImplementation = async () => ({
+          text: 'second run reply',
+          event: { type: 'result', result: 'second run reply' },
+        });
+
+        await expect(
+          Promise.all([
+            mgr.autoloopChat('cross-run-first', 'first run turn'),
+            mgr.autoloopChat('cross-run-second', 'second run turn'),
+          ]),
+        ).resolves.toEqual([{ reply: 'first run reply' }, { reply: 'second run reply' }]);
       });
     });
 
@@ -2409,6 +9684,2087 @@ describe('SessionManager', () => {
 
     it('councilReject throws for unknown council', async () => {
       await expect(mgr.councilReject('unknown', 'bad work')).rejects.toThrow("Council 'unknown' not found");
+    });
+  });
+
+  // ─── Durable recovery core ─────────────────────────────────────────────
+
+  describe('autoloop recovery core', () => {
+    const reconstructManager = async (runId: string): Promise<void> => {
+      // Model loss of the physical process while preserving the kernel record
+      // and every ledger byte used by disk-only recovery.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const oldKernel = (mgr as any).kernel;
+      oldKernel.cancel(runId);
+      await oldKernel.wait(runId);
+      await mgr.shutdown();
+      mgr = createManager();
+    };
+
+    const seedExactReviewArtifacts = (workspace: string, runId: string, iter: number): void => {
+      seedCompleteLegacyReviewArtifacts(workspace, runId, iter);
+      fs.writeFileSync(
+        path.join(workspace, 'tasks', runId, 'iter', String(iter), 'directive.json'),
+        `${JSON.stringify({
+          iter,
+          message_id: `directive-recovery-${iter}`,
+          ts: '2026-09-12T00:00:00.000Z',
+          dispatch_id: `dispatch-recovery-${iter}`,
+          goal: 'recover the exact Reviewer delivery',
+          constraints: [],
+          success_criteria: [],
+          max_attempts: 1,
+        })}\n`,
+      );
+    };
+
+    type StoredResumeCompatibilityState = 'pending' | 'migrated' | 'cancelled';
+
+    const startStoredResumeCompatibilityState = async (runId: string): Promise<string> => {
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace, sendTimeoutMs: 650_000 });
+      return workspace;
+    };
+
+    const layerStoredResumeCompatibilityState = async (
+      runId: string,
+      workspace: string,
+      state: StoredResumeCompatibilityState,
+    ): Promise<void> => {
+      if (state === 'pending') {
+        await mgr.getAutoloop(runId)!.runner.send(
+          AutoloopMsg.sendTimeout(0, {
+            status: 'awaiting_resume',
+            dispatch_id: `dispatch-${runId}`,
+            agent: 'planner',
+            message_id: `message-${runId}`,
+            message_type: 'chat',
+            iter: 0,
+            timeout_ms: 650_000,
+            error: 'Timed out after 650000ms',
+          }),
+        );
+      } else if (state === 'migrated') {
+        const timestamp = '2026-09-12T00:00:01.000Z';
+        fs.appendFileSync(
+          path.join(workspace, 'tasks', runId, 'decisions.jsonl'),
+          `${JSON.stringify({
+            ts: timestamp,
+            kind: 'timeout_migration',
+            actor: 'operator',
+            timestamp,
+            runId,
+            field: 'sendTimeoutMs',
+            oldValue: 650_000,
+            newValue: 700_000,
+            reason: 'stored_run_resume',
+          })}\n`,
+        );
+      }
+      const checkpointPath = path.join(TEST_WF_DIR, runId, 'run.json');
+      const checkpoint = JSON.parse(fs.readFileSync(checkpointPath, 'utf8')) as { state: string };
+      if (state === 'cancelled') checkpoint.state = 'cancelled';
+      await reconstructManager(runId);
+      fs.writeFileSync(checkpointPath, JSON.stringify(checkpoint));
+      fs.writeFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), '');
+    };
+
+    const appendRecoveryReceiptPair = async (
+      runId: string,
+      workspace: string,
+      status: 'prepared' | 'applied',
+    ): Promise<string> => {
+      const inspection = await mgr.autoloopRecover(runId);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const recovered = await (mgr as any)._recoveryInput(runId);
+      const receipt = {
+        schema_version: 1,
+        record_type: 'autoloop_recovery_receipt',
+        kind: 'autoloop_recovery_receipt',
+        run_id: runId,
+        recovery_token: inspection.assessment.recovery_token,
+        action_sha256: inspection.assessment.action_sha256,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        action_snapshot: (mgr as any)._recoveryActionSnapshot(recovered),
+        claim_id: '12345678-1234-1234-1234-123456789abc',
+        phase: inspection.assessment.phase,
+        next_safe_action: inspection.assessment.next_safe_action,
+        status: 'prepared',
+        recorded_at: '2026-09-12T00:00:00.000Z',
+      } as const;
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      fs.appendFileSync(
+        decisionPath,
+        `${JSON.stringify(receipt)}\n${status === 'applied' ? `${JSON.stringify({ ...receipt, status })}\n` : ''}`,
+      );
+      return decisionPath;
+    };
+
+    it('lets a cross-process prepared recovery claim win after the legacy receipt snapshot', async () => {
+      // Mutation caught: deciding from the first empty receipt read without
+      // sharing recovery's file lock lets this explicit migration boot after a
+      // different process has durably prepared the same recovery effect.
+      const runId = 'resume-recovery-claim-wins-after-empty-snapshot';
+      const workspace = await startStoredResumeCompatibilityState(runId);
+      await layerStoredResumeCompatibilityState(runId, workspace, 'migrated');
+      const inspection = await mgr.autoloopRecover(runId);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const recovered = await (mgr as any)._recoveryInput(runId);
+      expect(inspection.assessment.next_safe_action).toBe('resume_planner');
+      const receipt: RecoveryReceipt = {
+        schema_version: 1,
+        record_type: 'autoloop_recovery_receipt',
+        kind: 'autoloop_recovery_receipt',
+        run_id: runId,
+        recovery_token: inspection.assessment.recovery_token,
+        action_sha256: inspection.assessment.action_sha256,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        action_snapshot: (mgr as any)._recoveryActionSnapshot(recovered),
+        claim_id: '12345678-1234-1234-1234-123456789abc',
+        phase: inspection.assessment.phase,
+        next_safe_action: inspection.assessment.next_safe_action,
+        status: 'prepared',
+        recorded_at: '2026-09-12T00:00:00.000Z',
+      };
+      const ledgerDirectory = path.join(workspace, 'tasks', runId);
+      const decisionPath = path.join(ledgerDirectory, 'decisions.jsonl');
+      const recoveryLockPath = path.join(ledgerDirectory, '.autoloop-recovery.lock');
+      const snapshotBarrierPath = path.join(ledgerDirectory, 'legacy-receipt-snapshot-observed');
+      const decisionBefore = fs.readFileSync(decisionPath, 'utf8');
+      const timeoutMigrationsBefore = decisionBefore
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as { kind?: string })
+        .filter((row) => row.kind === 'timeout_migration');
+
+      const childScript = String.raw`
+        (async () => {
+          const fs = await import('node:fs');
+          const path = await import('node:path');
+          const { withFileLock } = await import('./src/kernel/file-lock.ts');
+          const [lockPath, decisionPath, barrierPath, receiptJson] = process.argv.slice(1);
+          const result = withFileLock(lockPath, () => {
+            process.stdout.write('LOCKED\n');
+            const deadline = Date.now() + 5000;
+            while (!fs.existsSync(barrierPath)) {
+              if (Date.now() >= deadline) throw new Error('legacy receipt snapshot barrier timed out');
+              Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+            }
+            const receiptFd = fs.openSync(decisionPath, 'a');
+            try {
+              fs.writeSync(receiptFd, receiptJson + '\n');
+              fs.fsyncSync(receiptFd);
+            } finally {
+              fs.closeSync(receiptFd);
+            }
+            const directoryFd = fs.openSync(path.dirname(decisionPath), 'r');
+            try {
+              fs.fsyncSync(directoryFd);
+            } finally {
+              fs.closeSync(directoryFd);
+            }
+          }, { waitMs: 5000 });
+          if (!result.ok) throw new Error(result.error);
+        })().catch((error) => {
+          process.stderr.write(String(error && error.stack ? error.stack : error));
+          process.exitCode = 1;
+        });
+      `;
+      const claimant = spawn(
+        process.execPath,
+        [
+          '--import',
+          'tsx',
+          '--eval',
+          childScript,
+          recoveryLockPath,
+          decisionPath,
+          snapshotBarrierPath,
+          JSON.stringify(receipt),
+        ],
+        { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      let childStdout = '';
+      let childStderr = '';
+      claimant.stdout.setEncoding('utf8');
+      claimant.stderr.setEncoding('utf8');
+      claimant.stdout.on('data', (chunk: string) => {
+        childStdout += chunk;
+      });
+      claimant.stderr.on('data', (chunk: string) => {
+        childStderr += chunk;
+      });
+      const claimantLocked = new Promise<void>((resolve, reject) => {
+        const inspect = (): void => {
+          if (childStdout.includes('LOCKED\n')) resolve();
+        };
+        claimant.stdout.on('data', inspect);
+        claimant.once('error', reject);
+        claimant.once('exit', (code) => {
+          if (!childStdout.includes('LOCKED\n')) {
+            reject(new Error(`receipt claimant exited ${String(code)} before locking: ${childStderr}`));
+          }
+        });
+      });
+      const claimantExit = new Promise<number | null>((resolve, reject) => {
+        claimant.once('error', reject);
+        claimant.once('exit', resolve);
+      });
+      await claimantLocked;
+
+      let emptySnapshotObserved = false;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const readReceipts = (mgr as any)._recoveryReceiptRows.bind(mgr);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      vi.spyOn(mgr as any, '_recoveryReceiptRows').mockImplementation((...args: unknown[]) => {
+        const rows = readReceipts(...args) as RecoveryReceipt[];
+        if (!emptySnapshotObserved && rows.length === 0) {
+          emptySnapshotObserved = true;
+          fs.writeFileSync(snapshotBarrierPath, 'observed\n');
+        }
+        return rows;
+      });
+      const legacyBoot = new Error('legacy boot crossed the recovery claim');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const boot = vi.spyOn(mgr as any, '_resumeAutoloopRun').mockImplementation(async (...args: unknown[]) => {
+        (args[2] as { commitTimeoutMigration?: () => void } | undefined)?.commitTimeoutMigration?.();
+        throw legacyBoot;
+      });
+      const sessionsBefore = createdConfigs.length;
+
+      const [outcome] = await Promise.allSettled([mgr.autoloopResume(runId, { sendTimeoutMs: 750_000 })]);
+      const childExitCode = await claimantExit;
+      const decisionAfter = fs.readFileSync(decisionPath, 'utf8');
+      const rowsAfter = decisionAfter
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as { kind?: string; record_type?: string; status?: string });
+
+      expect(childExitCode, childStderr).toBe(0);
+      expect(emptySnapshotObserved).toBe(true);
+      expect(outcome).toMatchObject({
+        status: 'rejected',
+        reason: { code: 'AUTOLOOP_RECOVERY_INCOMPLETE', retryable: false },
+      });
+      expect(boot).not.toHaveBeenCalled();
+      expect(createdConfigs).toHaveLength(sessionsBefore);
+      expect(rowsAfter.filter((row) => row.kind === 'timeout_migration')).toEqual(timeoutMigrationsBefore);
+      expect(rowsAfter.filter((row) => row.record_type === 'autoloop_recovery_receipt')).toMatchObject([
+        { status: 'prepared' },
+      ]);
+    });
+
+    it('lets the legacy durable lease win before a concurrent recovery receipt claim', async () => {
+      // Mutation caught: starting the legacy boot without ordering recovery's
+      // under-lock receipt validation against its durable lease lets the peer
+      // append a prepared claim and reach a competing physical recovery.
+      const runId = 'resume-legacy-lease-wins-before-recovery-claim';
+      const workspace = await startStoredResumeCompatibilityState(runId);
+      await layerStoredResumeCompatibilityState(runId, workspace, 'migrated');
+      const inspection = await mgr.autoloopRecover(runId);
+      expect(inspection.assessment.next_safe_action).toBe('resume_planner');
+      const peer = createManager();
+      const competingRecovery = new Error('competing recovery boot crossed the legacy lease');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const recoveryBoot = vi.spyOn(peer as any, '_resumeAutoloopRun').mockRejectedValue(competingRecovery);
+      const state = mgr.autoloopStatus(runId)!;
+      const runDirectory = path.join(TEST_WF_DIR, runId);
+      const incarnation = JSON.parse(fs.readFileSync(path.join(runDirectory, 'incarnation.json'), 'utf8')) as {
+        incarnationId: string;
+        nextFence: number;
+      };
+      const leasePath = path.join(runDirectory, 'lease.json');
+      let legacyBootEntered!: () => void;
+      const legacyBootBarrier = new Promise<void>((resolve) => {
+        legacyBootEntered = resolve;
+      });
+      let releaseLegacyBoot!: () => void;
+      const legacyBootRelease = new Promise<void>((resolve) => {
+        releaseLegacyBoot = resolve;
+      });
+      // `_resumeAutoloopRun` invokes kernel.resume before its first await. The
+      // test double keeps that durable synchronous boundary real and replaces
+      // only the slow boot body that follows it.
+      const legacyBoot = vi
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        .spyOn(mgr as any, '_resumeAutoloopRun')
+        .mockImplementation(async (_observedRunId: unknown, _config: unknown, options: unknown) => {
+          const now = new Date().toISOString();
+          fs.writeFileSync(
+            leasePath,
+            JSON.stringify({
+              runId,
+              incarnationId: incarnation.incarnationId,
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              ownerId: (mgr as any).kernel.ownerId,
+              acquisitionId: '87654321-4321-4321-4321-cba987654321',
+              fence: incarnation.nextFence + 1,
+              pid: process.pid,
+              host: os.hostname(),
+              acquiredAt: now,
+              renewedAt: now,
+            }),
+          );
+          legacyBootEntered();
+          await legacyBootRelease;
+          (options as { commitTimeoutMigration?: () => void } | undefined)?.commitTimeoutMigration?.();
+          return state;
+        });
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const decisionBefore = fs.readFileSync(decisionPath, 'utf8');
+      const sessionsBefore = createdConfigs.length;
+
+      const legacy = mgr.autoloopResume(runId, { sendTimeoutMs: 750_000 });
+      await legacyBootBarrier;
+      const [recoveryOutcome] = await Promise.allSettled([
+        peer.autoloopRecover(runId, {
+          apply: true,
+          recovery_token: inspection.assessment.recovery_token,
+        }),
+      ]);
+      releaseLegacyBoot();
+      const [legacyOutcome] = await Promise.allSettled([legacy]);
+      await peer.shutdown();
+      fs.rmSync(leasePath, { force: true });
+
+      const decisionAfter = fs.readFileSync(decisionPath, 'utf8');
+      const rowsBefore = decisionBefore
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as { kind?: string });
+      const rowsAfter = decisionAfter
+        .trim()
+        .split('\n')
+        .map(
+          (line) =>
+            JSON.parse(line) as {
+              kind?: string;
+              record_type?: string;
+              oldValue?: number;
+              newValue?: number;
+            },
+        );
+      expect(recoveryOutcome).toMatchObject({
+        status: 'rejected',
+        reason: { code: 'AUTOLOOP_RECOVERY_TOKEN_STALE', retryable: false },
+      });
+      expect(legacyOutcome).toMatchObject({ status: 'fulfilled', value: state });
+      expect(legacyBoot).toHaveBeenCalledTimes(1);
+      expect(recoveryBoot).not.toHaveBeenCalled();
+      expect(createdConfigs).toHaveLength(sessionsBefore);
+      expect(rowsAfter.filter((row) => row.record_type === 'autoloop_recovery_receipt')).toEqual([]);
+      expect(rowsAfter.filter((row) => row.kind === 'timeout_migration')).toEqual([
+        ...rowsBefore.filter((row) => row.kind === 'timeout_migration'),
+        expect.objectContaining({ oldValue: 700_000, newValue: 750_000 }),
+      ]);
+    });
+
+    it.each(
+      (['pending', 'migrated', 'cancelled'] as const).flatMap((state) =>
+        (['prepared', 'applied'] as const).map((receiptStatus) => ({ state, receiptStatus })),
+      ),
+    )(
+      'makes an $receiptStatus recovery receipt authoritative over a $state stored resume',
+      async ({ state, receiptStatus }) => {
+        // Mutation caught: allowing a timeout/pending/cancelled compatibility
+        // shortcut to outrank a receipt boots a duplicate Planner process.
+        const runId = `resume-receipt-authority-${state}-${receiptStatus}`;
+        const workspace = await startStoredResumeCompatibilityState(runId);
+        const decisionPath = await appendRecoveryReceiptPair(runId, workspace, receiptStatus);
+        await layerStoredResumeCompatibilityState(runId, workspace, state);
+        const decisionBefore = fs.readFileSync(decisionPath, 'utf8');
+        const sessionsBefore = createdConfigs.length;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const boot = vi.spyOn(mgr as any, '_resumeAutoloopRun');
+
+        const outcome = mgr.autoloopResume(runId);
+        if (receiptStatus === 'prepared') {
+          await expect(outcome).rejects.toMatchObject({
+            code: 'AUTOLOOP_RECOVERY_INCOMPLETE',
+            retryable: false,
+          });
+        } else {
+          await expect(outcome).resolves.toMatchObject({ run_id: runId });
+        }
+
+        expect(boot).not.toHaveBeenCalled();
+        expect(createdConfigs).toHaveLength(sessionsBefore);
+        expect(fs.readFileSync(decisionPath, 'utf8')).toBe(decisionBefore);
+      },
+    );
+
+    it.each(
+      (['pending', 'migrated', 'cancelled'] as const).flatMap((state) =>
+        (['prepared', 'applied'] as const).map((receiptStatus) => ({
+          state,
+          receiptStatus,
+          requestedSendTimeoutMs: state === 'migrated' ? 750_000 : 700_000,
+        })),
+      ),
+    )(
+      'makes an $receiptStatus recovery receipt authoritative over an explicit timeout increase on a $state stored resume',
+      async ({ state, receiptStatus, requestedSendTimeoutMs }) => {
+        // Mutation caught: gating receipt routing on the absence of a timeout
+        // increase lets the legacy migration path boot or dispatch twice.
+        const runId = `resume-receipt-timeout-authority-${state}-${receiptStatus}`;
+        const workspace = await startStoredResumeCompatibilityState(runId);
+        const decisionPath = await appendRecoveryReceiptPair(runId, workspace, receiptStatus);
+        await layerStoredResumeCompatibilityState(runId, workspace, state);
+        const decisionBefore = fs.readFileSync(decisionPath, 'utf8');
+        const rowsBefore = decisionBefore
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind?: string; record_type?: string });
+        const receiptRowsBefore = rowsBefore.filter((row) => row.record_type === 'autoloop_recovery_receipt');
+        const timeoutMigrationsBefore = rowsBefore.filter((row) => row.kind === 'timeout_migration');
+        const sessionsBefore = createdConfigs.length;
+        const sendsBefore = mockSessions.reduce((total, session) => total + session.sendCalls.length, 0);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const boot = vi.spyOn(mgr as any, '_resumeAutoloopRun');
+
+        const outcome = mgr.autoloopResume(runId, { sendTimeoutMs: requestedSendTimeoutMs });
+        if (receiptStatus === 'prepared') {
+          await expect(outcome).rejects.toMatchObject({
+            code: 'AUTOLOOP_RECOVERY_INCOMPLETE',
+            retryable: false,
+          });
+        } else {
+          await expect(outcome).resolves.toMatchObject({ run_id: runId });
+        }
+
+        const decisionAfter = fs.readFileSync(decisionPath, 'utf8');
+        const rowsAfter = decisionAfter
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { kind?: string; record_type?: string });
+        expect(boot).not.toHaveBeenCalled();
+        expect(createdConfigs).toHaveLength(sessionsBefore);
+        expect(mockSessions.reduce((total, session) => total + session.sendCalls.length, 0)).toBe(sendsBefore);
+        expect(rowsAfter.filter((row) => row.kind === 'timeout_migration')).toEqual(timeoutMigrationsBefore);
+        expect(rowsAfter.filter((row) => row.record_type === 'autoloop_recovery_receipt')).toEqual(receiptRowsBefore);
+        expect(decisionAfter).toBe(decisionBefore);
+      },
+    );
+
+    it('passes a migrated timeout only through the in-memory token-recovery boot', async () => {
+      // Mutation caught: rebuilding recovery boot config from the immutable
+      // spec alone silently restores the original timeout after migration.
+      const runId = 'resume-recovery-effective-timeout';
+      const workspace = await startStoredResumeCompatibilityState(runId);
+      const checkpointPath = path.join(TEST_WF_DIR, runId, 'run.json');
+      const checkpoint = fs.readFileSync(checkpointPath, 'utf8');
+      const specPath = path.join(TEST_WF_DIR, runId, 'spec.json');
+      const originalSpec = fs.readFileSync(specPath, 'utf8');
+      const timestamp = '2026-09-12T00:00:01.000Z';
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      fs.appendFileSync(
+        decisionPath,
+        `${JSON.stringify({
+          ts: timestamp,
+          kind: 'timeout_migration',
+          actor: 'operator',
+          timestamp,
+          runId,
+          field: 'sendTimeoutMs',
+          oldValue: 650_000,
+          newValue: 700_000,
+          reason: 'stored_run_resume',
+        })}\n`,
+      );
+      await reconstructManager(runId);
+      fs.writeFileSync(checkpointPath, checkpoint);
+      fs.writeFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), '');
+
+      const inspection = await mgr.autoloopRecover(runId);
+      const coldBootReached = new Error('migrated timeout recovery boot reached');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const boot = vi.spyOn(mgr as any, '_resumeAutoloopRun').mockRejectedValue(coldBootReached);
+      // Exercise the internal recovery boot used by stored no-option resume;
+      // caller options remain process-local and outside the durable receipt.
+      await expect(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (mgr as any)._autoloopRecover(
+          runId,
+          { apply: true, recovery_token: inspection.assessment.recovery_token },
+          { sendTimeoutMs: 700_000 },
+        ),
+      ).rejects.toBe(coldBootReached);
+      expect(boot).toHaveBeenCalledWith(runId, expect.objectContaining({ sendTimeoutMs: 700_000 }));
+
+      expect(fs.readFileSync(specPath, 'utf8')).toBe(originalSpec);
+      const receipts = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as { record_type?: string; action_snapshot?: Record<string, unknown> })
+        .filter((row) => row.record_type === 'autoloop_recovery_receipt');
+      expect(receipts).toHaveLength(1);
+      expect(receipts.every((row) => !Object.hasOwn(row.action_snapshot ?? {}, 'sendTimeoutMs'))).toBe(true);
+    });
+
+    it('routes a stored plain resume through the exact inspected recovery token', async () => {
+      // Mutation caught: restoring the legacy direct _resumeAutoloopRun path
+      // bypasses the durable inspect/apply fence and produces no recovery pair.
+      const runId = 'legacy-resume-recovery-token';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const checkpoint = path.join(TEST_WF_DIR, runId, 'run.json');
+      const beforeCrash = fs.readFileSync(checkpoint, 'utf8');
+      await reconstructManager(runId);
+      // Model a process loss after its last durable checkpoint: teardown must
+      // release local resources, while the stored state remains pre-loss.
+      fs.writeFileSync(checkpoint, beforeCrash);
+      fs.writeFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), '');
+      const inspection = await mgr.autoloopRecover(runId);
+
+      const coldBoot = new Error('cold boot reached through recovery');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const resume = vi.spyOn(mgr as any, '_resumeAutoloopRun').mockRejectedValue(coldBoot);
+      await expect(mgr.autoloopResume(runId)).rejects.toBe(coldBoot);
+      expect(resume).toHaveBeenCalledTimes(1);
+      const receipts = fs
+        .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as { record_type?: string; recovery_token?: string; status?: string })
+        .filter((row) => row.record_type === 'autoloop_recovery_receipt');
+      expect(receipts).toEqual([
+        expect.objectContaining({ status: 'prepared', recovery_token: inspection.assessment.recovery_token }),
+      ]);
+    });
+
+    it('fails closed on an unresolved recovery receipt instead of directly booting a stored run', async () => {
+      // Mutation caught: a fallback to the legacy boot path would start a new
+      // Planner despite a crash-window claim whose physical effect is unknown.
+      const runId = 'legacy-resume-unresolved-receipt';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const inspection = await mgr.autoloopRecover(runId);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const recovered = await (mgr as any)._recoveryInput(runId);
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      fs.appendFileSync(
+        decisionPath,
+        `${JSON.stringify({
+          schema_version: 1,
+          record_type: 'autoloop_recovery_receipt',
+          kind: 'autoloop_recovery_receipt',
+          run_id: runId,
+          recovery_token: inspection.assessment.recovery_token,
+          action_sha256: inspection.assessment.action_sha256,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          action_snapshot: (mgr as any)._recoveryActionSnapshot(recovered),
+          claim_id: '12345678-1234-1234-1234-123456789abc',
+          phase: inspection.assessment.phase,
+          next_safe_action: inspection.assessment.next_safe_action,
+          status: 'prepared',
+          recorded_at: '2026-09-12T00:00:00.000Z',
+        })}\n`,
+      );
+      await reconstructManager(runId);
+      const sessionsBefore = createdConfigs.length;
+
+      await expect(mgr.autoloopResume(runId)).rejects.toMatchObject({
+        code: 'AUTOLOOP_RECOVERY_INCOMPLETE',
+        retryable: false,
+      });
+
+      expect(createdConfigs).toHaveLength(sessionsBefore);
+      expect(
+        fs
+          .readFileSync(decisionPath, 'utf8')
+          .split('\n')
+          .filter((line) => line.includes('autoloop_recovery_receipt')),
+      ).toHaveLength(1);
+    });
+
+    it('makes a prepared receipt authoritative through the public workflowResume method', async () => {
+      // Mutation caught: calling kernel.resume directly from workflowResume
+      // bypasses Autoloop recovery receipt authority and boots a second Planner.
+      const runId = 'workflow-resume-prepared-receipt-authority';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const checkpointPath = path.join(TEST_WF_DIR, runId, 'run.json');
+      const checkpointBeforeCrash = fs.readFileSync(checkpointPath, 'utf8');
+      const decisionPath = await appendRecoveryReceiptPair(runId, workspace, 'prepared');
+      await reconstructManager(runId);
+      fs.writeFileSync(checkpointPath, checkpointBeforeCrash);
+      fs.writeFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), '');
+      const decisionBefore = fs.readFileSync(decisionPath, 'utf8');
+      const sessionsBefore = createdConfigs.length;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const boot = vi.spyOn(mgr as any, '_bootAutoloop');
+
+      const [outcome] = await Promise.allSettled([mgr.workflowResume(runId)]);
+      await Promise.resolve();
+
+      expect(outcome).toMatchObject({
+        status: 'rejected',
+        reason: { code: 'AUTOLOOP_RECOVERY_INCOMPLETE', retryable: false },
+      });
+      expect(boot).not.toHaveBeenCalled();
+      expect(createdConfigs).toHaveLength(sessionsBefore);
+      expect(fs.readFileSync(decisionPath, 'utf8')).toBe(decisionBefore);
+    });
+
+    it('coalesces concurrent stored resumes at one recovery boot boundary', async () => {
+      // Mutation caught: independently booting each legacy caller can create
+      // duplicate Planner sessions after both have read the same stored state.
+      const runId = 'legacy-resume-concurrent-recovery';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const checkpoint = path.join(TEST_WF_DIR, runId, 'run.json');
+      const beforeCrash = fs.readFileSync(checkpoint, 'utf8');
+      await reconstructManager(runId);
+      fs.writeFileSync(checkpoint, beforeCrash);
+      fs.writeFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), '');
+
+      let inspected = 0;
+      let bothInspected!: () => void;
+      const bothInspectedBarrier = new Promise<void>((resolve) => {
+        bothInspected = resolve;
+      });
+      let releaseInspections!: () => void;
+      const releaseBarrier = new Promise<void>((resolve) => {
+        releaseInspections = resolve;
+      });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const recover = (mgr as any)._autoloopRecover.bind(mgr);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      vi.spyOn(mgr as any, '_autoloopRecover').mockImplementation(async (...args: unknown[]) => {
+        const options = args[1] as { apply?: boolean } | undefined;
+        if (!options?.apply) {
+          inspected += 1;
+          if (inspected === 2) bothInspected();
+          await releaseBarrier;
+        }
+        return await recover(...args);
+      });
+      const coldBoot = new Error('one coalesced cold boot');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const boot = vi.spyOn(mgr as any, '_resumeAutoloopRun').mockRejectedValue(coldBoot);
+
+      const first = mgr.autoloopResume(runId);
+      const second = mgr.autoloopResume(runId);
+      await bothInspectedBarrier;
+      releaseInspections();
+      const outcomes = await Promise.allSettled([first, second]);
+
+      expect(outcomes).toEqual([
+        { status: 'rejected', reason: coldBoot },
+        { status: 'rejected', reason: coldBoot },
+      ]);
+      expect(boot).toHaveBeenCalledTimes(1);
+      expect(
+        fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .split('\n')
+          .filter((line) => line.includes('autoloop_recovery_receipt')),
+      ).toHaveLength(1);
+    });
+
+    it('passes a stored custom-engine override only to the in-memory recovery boot', async () => {
+      // Mutation caught: recovery boot that drops the supplied custom config
+      // cannot restart this run; persisting it would leak it into durable data.
+      const runId = 'legacy-resume-custom-engine-recovery';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      const customEngine = {
+        name: 'resume-only-custom-engine',
+        bin: 'resume-only-custom-engine-bin',
+        args: { permissionMode: '--permission-mode' },
+      };
+      await mgr.autoloopStart({ runId, workspace, plannerEngine: 'custom', plannerCustomEngine: customEngine });
+      const checkpoint = path.join(TEST_WF_DIR, runId, 'run.json');
+      const beforeCrash = fs.readFileSync(checkpoint, 'utf8');
+      await reconstructManager(runId);
+      fs.writeFileSync(checkpoint, beforeCrash);
+      fs.writeFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), '');
+      const coldBoot = new Error('cold custom-engine boot reached through recovery');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const resume = vi.spyOn(mgr as any, '_resumeAutoloopRun').mockRejectedValue(coldBoot);
+      await expect(mgr.autoloopResume(runId, { plannerCustomEngine: customEngine })).rejects.toBe(coldBoot);
+      expect(resume).toHaveBeenCalledWith(
+        runId,
+        expect.objectContaining({
+          plannerCustomEngine: customEngine,
+        }),
+      );
+      const durableBytes = fs.readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8');
+      expect(durableBytes).not.toContain(customEngine.bin);
+    });
+
+    it('persists an exact public Reviewer envelope before its queue delivery', async () => {
+      const runId = 'recover-public-review-envelope';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      execFileSync('git', ['init', '-q'], { cwd: workspace });
+      execFileSync('git', ['config', 'user.email', 'autoloop-test@example.invalid'], { cwd: workspace });
+      execFileSync('git', ['config', 'user.name', 'Autoloop Test'], { cwd: workspace });
+      fs.writeFileSync(path.join(workspace, 'checkpoint.txt'), 'review checkpoint\n');
+      execFileSync('git', ['add', '--', 'checkpoint.txt'], { cwd: workspace });
+      execFileSync('git', ['commit', '-q', '-m', 'review checkpoint'], { cwd: workspace });
+      const checkpointSha = execFileSync('git', ['rev-parse', '--verify', 'HEAD'], {
+        cwd: workspace,
+        encoding: 'utf8',
+      }).trim();
+      const checkpointPatch = execFileSync(
+        'git',
+        ['show', '--format=', '--unified=3', '--no-renames', checkpointSha, '--'],
+        {
+          cwd: workspace,
+        },
+      );
+      await mgr.autoloopStart({ runId, workspace });
+      seedCompleteLegacyReviewArtifacts(workspace, runId, 0);
+      fs.writeFileSync(
+        path.join(workspace, 'tasks', runId, 'iter', '0', 'directive.json'),
+        `${JSON.stringify({
+          iter: 0,
+          message_id: 'directive-public-review-0',
+          ts: '2026-09-12T00:00:00.000Z',
+          dispatch_id: 'dispatch-public-review-0',
+          goal: 'verify recovered Reviewer provenance',
+          constraints: [],
+          success_criteria: [],
+          max_attempts: 1,
+        })}\n`,
+      );
+      fs.writeFileSync(path.join(workspace, 'tasks', runId, 'iter', '0', 'diff.patch'), checkpointPatch);
+      const handle = mgr.getAutoloop(runId)!;
+      await handle.dispatcher.spawnReviewer();
+      let persisted: unknown;
+      mockSessions[1].sendImplementation = async (message) => {
+        const rows = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as { record_type?: string });
+        persisted = rows.find((row) => row.record_type === 'autoloop_recovery_review_envelope');
+        const text = successfulRoleReplyFromDeliveryPrompt('reviewer', message, 'public envelope persisted');
+        return { text, event: { type: 'result', result: text } };
+      };
+
+      await mgr.autoloopRequestReview(runId, {
+        checkpoint_sha: checkpointSha,
+        source_run_id: runId,
+        source_iter: 0,
+        scope: ['security'],
+        idempotency_key: 'public-review-envelope',
+      });
+
+      expect(persisted).toMatchObject({
+        schema_version: 1,
+        record_type: 'autoloop_recovery_review_envelope',
+        run_id: runId,
+        envelope: {
+          iter: 0,
+          from: 'runner',
+          to: 'reviewer',
+          type: 'review_request',
+          payload: {
+            iter: 0,
+            checkpoint_sha: checkpointSha,
+            source_run_id: runId,
+            source_iter: 0,
+            scope: ['security'],
+            idempotency_key: 'public-review-envelope',
+          },
+        },
+      });
+      expect(createdConfigs.map((config) => config.name).filter((name) => name.endsWith('-coder'))).toEqual([]);
+      expect(createdConfigs.map((config) => config.name).filter((name) => name.endsWith('-reviewer'))).toHaveLength(1);
+      await expect(mgr.autoloopRecover(runId)).resolves.toHaveProperty('assessment');
+    });
+
+    it('blocks cold retry after a real prepared recovery claim loses its effect boundary', async () => {
+      const runId = 'uncertain-recovery-claim';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      seedExactReviewArtifacts(workspace, runId, 0);
+      const handle = mgr.getAutoloop(runId)!;
+      await handle.runner.config.persistReviewEnvelope!(
+        AutoloopMsg.reviewRequest(0, { iter: 0, ledger_path: handle.runner.state.ledger_dir, prior_metrics: [] }),
+      );
+      await reconstructManager(runId);
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const before = fs.readFileSync(decisionPath);
+      const inspection = await mgr.autoloopRecover(runId);
+      // Interrupt the effect only after the real locked transaction has
+      // durably appended its prepared receipt. The fixture never writes it.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const effect = vi.spyOn(mgr as any, '_resumeAutoloopRun').mockRejectedValue(new Error('lost effect boundary'));
+      await expect(
+        mgr.autoloopRecover(runId, { apply: true, recovery_token: inspection.assessment.recovery_token }),
+      ).rejects.toThrow('lost effect boundary');
+      expect(effect).toHaveBeenCalledTimes(1);
+      const prepared = fs.readFileSync(decisionPath);
+      expect(prepared.subarray(0, before.length)).toEqual(before);
+      const receipts = prepared
+        .toString()
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line))
+        .filter((row) => row.record_type === 'autoloop_recovery_receipt');
+      expect(receipts).toEqual([
+        expect.objectContaining({
+          schema_version: 1,
+          status: 'prepared',
+          recovery_token: inspection.assessment.recovery_token,
+        }),
+      ]);
+      effect.mockRestore();
+      await mgr.shutdown();
+      mgr = createManager();
+      const fresh = await mgr.autoloopRecover(runId);
+      const starts = createdConfigs.length;
+      await expect(
+        mgr.autoloopRecover(runId, { apply: true, recovery_token: fresh.assessment.recovery_token }),
+      ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_INCOMPLETE', retryable: false });
+      expect(createdConfigs).toHaveLength(starts);
+      expect(fs.readFileSync(decisionPath)).toEqual(prepared);
+    });
+
+    it('fails closed on a crash-window prepared receipt instead of replaying an unproven effect', async () => {
+      const runId = 'recover-prepared-receipt-window';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const inspection = await mgr.autoloopRecover(runId);
+      const recovered = await (mgr as any)._recoveryInput(runId);
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      fs.appendFileSync(
+        decisionPath,
+        `${JSON.stringify({
+          schema_version: 1,
+          record_type: 'autoloop_recovery_receipt',
+          kind: 'autoloop_recovery_receipt',
+          run_id: runId,
+          recovery_token: inspection.assessment.recovery_token,
+          action_sha256: inspection.assessment.action_sha256,
+          action_snapshot: (mgr as any)._recoveryActionSnapshot(recovered),
+          claim_id: '12345678-1234-1234-1234-123456789abc',
+          phase: inspection.assessment.phase,
+          next_safe_action: inspection.assessment.next_safe_action,
+          status: 'prepared',
+          recorded_at: '2026-09-12T00:00:00.000Z',
+        })}\n`,
+      );
+
+      await expect(
+        mgr.autoloopRecover(runId, { apply: true, recovery_token: inspection.assessment.recovery_token }),
+      ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_INCOMPLETE' });
+      expect(
+        fs
+          .readFileSync(decisionPath, 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as Record<string, unknown>)
+          .filter((row) => row.record_type === 'autoloop_recovery_receipt'),
+      ).toHaveLength(1);
+    });
+
+    it('rejects a cross-bound none receipt pair before graph acceptance or idempotent replay', async () => {
+      const runId = 'recover-cross-bound-none-receipt';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const inspection = await mgr.autoloopRecover(runId);
+      expect(inspection.assessment.next_safe_action).toBe('none');
+      const actionSnapshot = {
+        type: 'none' as const,
+        run_id: 'another-run',
+        iter: 0,
+        phase: 'PLANNING' as const,
+      };
+      const receipt = {
+        schema_version: 1,
+        record_type: 'autoloop_recovery_receipt',
+        kind: 'autoloop_recovery_receipt',
+        run_id: runId,
+        recovery_token: inspection.assessment.recovery_token,
+        action_sha256: recoveryActionDigest(actionSnapshot),
+        action_snapshot: actionSnapshot,
+        claim_id: '12345678-1234-1234-1234-123456789abc',
+        phase: 'PLANNING',
+        next_safe_action: 'none',
+        status: 'prepared',
+        recorded_at: '2026-09-12T00:00:00.000Z',
+      } as const;
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      fs.appendFileSync(
+        decisionPath,
+        `${JSON.stringify(receipt)}\n${JSON.stringify({ ...receipt, status: 'applied' })}\n`,
+      );
+
+      await expect(mgr.autoloopRecover(runId)).rejects.toMatchObject({
+        code: 'AUTOLOOP_RECOVERY_INCOMPLETE',
+        retryable: false,
+      });
+      await expect(
+        mgr.autoloopRecover(runId, {
+          apply: true,
+          recovery_token: inspection.assessment.recovery_token,
+        }),
+      ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_INCOMPLETE', retryable: false });
+    });
+
+    it('blocks an unproven Reviewer recovery before receipt, boot, or queue delivery', async () => {
+      // This fails if request_review is fenced before its exact durable
+      // envelope has been validated: the old path appended `prepared` and
+      // only then discovered that there was no Reviewer message to send.
+      const runId = 'recover-review-missing-envelope';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      seedCompleteLegacyReviewArtifacts(workspace, runId, 0);
+      fs.writeFileSync(
+        path.join(workspace, 'tasks', runId, 'iter', '0', 'directive.json'),
+        `${JSON.stringify({
+          iter: 0,
+          message_id: 'directive-missing-review-envelope',
+          ts: '2026-09-12T00:00:00.000Z',
+          dispatch_id: 'dispatch-missing-review-envelope',
+          goal: 'prove recovery input is validated before effects',
+          constraints: [],
+          success_criteria: [],
+          max_attempts: 1,
+        })}\n`,
+      );
+      const handle = mgr.getAutoloop(runId)!;
+      const queue = vi.spyOn(handle.runner, 'send');
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const before = fs.existsSync(decisionPath) ? fs.readFileSync(decisionPath, 'utf8') : '';
+      const beforeSessions = createdConfigs.length;
+
+      const inspection = await mgr.autoloopRecover(runId);
+
+      expect(inspection.assessment).toMatchObject({
+        phase: 'BLOCKED',
+        next_safe_action: 'manual_resolution',
+      });
+      expect(inspection.assessment.evidence).toContain('ambiguity:recovery:review:missing_exact_envelope');
+      await expect(
+        mgr.autoloopRecover(runId, { apply: true, recovery_token: inspection.assessment.recovery_token }),
+      ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_MANUAL_RESOLUTION_REQUIRED' });
+      expect(fs.existsSync(decisionPath) ? fs.readFileSync(decisionPath, 'utf8') : '').toBe(before);
+      expect(queue).not.toHaveBeenCalled();
+      expect(createdConfigs).toHaveLength(beforeSessions);
+    });
+
+    it('blocks malformed Coder provenance before its recovery receipt or queue delivery', async () => {
+      // A directive artifact alone requests Coder recovery.  Its bytes must be
+      // reconstructed into the exact message before the receipt fence exists.
+      const runId = 'recover-coder-malformed-directive';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const iterDirectory = path.join(workspace, 'tasks', runId, 'iter', '0');
+      fs.mkdirSync(iterDirectory, { recursive: true });
+      fs.writeFileSync(path.join(iterDirectory, 'directive.json'), '{not-json}\n');
+      const handle = mgr.getAutoloop(runId)!;
+      const queue = vi.spyOn(handle.runner, 'send');
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const before = fs.existsSync(decisionPath) ? fs.readFileSync(decisionPath, 'utf8') : '';
+
+      const inspection = await mgr.autoloopRecover(runId);
+
+      expect(inspection.assessment).toMatchObject({ phase: 'BLOCKED', next_safe_action: 'manual_resolution' });
+      expect(inspection.assessment.evidence).toContain('ambiguity:recovery:coder:malformed_exact_directive');
+      await expect(
+        mgr.autoloopRecover(runId, { apply: true, recovery_token: inspection.assessment.recovery_token }),
+      ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_MANUAL_RESOLUTION_REQUIRED' });
+      expect(fs.existsSync(decisionPath) ? fs.readFileSync(decisionPath, 'utf8') : '').toBe(before);
+      expect(queue).not.toHaveBeenCalled();
+    });
+
+    it.each(['coder', 'reviewer'] as const)(
+      'blocks a reconstructed %s action whose envelope does not match the durable intent digest',
+      async (role) => {
+        const runId = `recover-${role}-intent-digest-mismatch`;
+        const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+        await mgr.autoloopStart({ runId, workspace });
+        const handle = mgr.getAutoloop(runId)!;
+        const ledger = handle.dispatcher.secureLedgerCapability;
+        const envelope =
+          role === 'coder'
+            ? AutoloopMsg.directive(0, {
+                goal: 'recover the intent-bound Coder directive',
+                constraints: [],
+                success_criteria: [],
+                max_attempts: 1,
+              })
+            : AutoloopMsg.reviewRequest(0, {
+                iter: 0,
+                ledger_path: handle.runner.state.ledger_dir,
+                prior_metrics: [],
+              });
+        const dispatchId = recoveryDispatchId(runId, envelope as unknown as Record<string, unknown>);
+        if (role === 'coder') {
+          const directiveEnvelope = envelope as Extract<AnyAutoloopMessage, { type: 'directive' }>;
+          const iterDirectory = path.join(workspace, 'tasks', runId, 'iter', '0');
+          fs.mkdirSync(iterDirectory, { recursive: true });
+          fs.writeFileSync(
+            path.join(iterDirectory, 'directive.json'),
+            `${JSON.stringify({
+              iter: 0,
+              message_id: directiveEnvelope.msg_id,
+              ts: directiveEnvelope.ts,
+              dispatch_id: dispatchId,
+              goal: directiveEnvelope.payload.goal,
+              constraints: directiveEnvelope.payload.constraints,
+              success_criteria: directiveEnvelope.payload.success_criteria,
+              max_attempts: directiveEnvelope.payload.max_attempts,
+            })}\n`,
+          );
+        } else {
+          seedExactReviewArtifacts(workspace, runId, 0);
+          await handle.runner.config.persistReviewEnvelope!(
+            envelope as Extract<AnyAutoloopMessage, { type: 'review_request' }>,
+          );
+        }
+        prepareDelivery(ledger, {
+          idempotency_key: dispatchId,
+          kind: role === 'coder' ? 'coder_directive' : 'review_request',
+          target_role: role,
+          target_generation: 1,
+          payload: {
+            prompt: `immutable ${role} delivery`,
+            logical_message_sha256: recoveryLogicalMessageSha256(envelope as unknown as Record<string, unknown>),
+          },
+        });
+
+        if (role === 'coder') {
+          const directivePath = path.join(workspace, 'tasks', runId, 'iter', '0', 'directive.json');
+          const changed = JSON.parse(fs.readFileSync(directivePath, 'utf8')) as { goal: string };
+          changed.goal = 'changed after the durable intent was committed';
+          fs.writeFileSync(directivePath, `${JSON.stringify(changed)}\n`);
+        } else {
+          const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+          const rows = fs
+            .readFileSync(decisionPath, 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as Record<string, unknown>);
+          const persisted = rows.find((row) => row.record_type === 'autoloop_recovery_review_envelope')!;
+          const changed = persisted.envelope as { payload: { prior_metrics: number[] } };
+          changed.payload.prior_metrics = [91];
+          fs.writeFileSync(decisionPath, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+        }
+
+        const inspection = await mgr.autoloopRecover(runId);
+
+        expect(inspection.assessment).toMatchObject({ phase: 'BLOCKED', next_safe_action: 'manual_resolution' });
+        expect(inspection.assessment.evidence).toContain(
+          `ambiguity:recovery:${role === 'coder' ? 'coder' : 'review'}:intent_digest_mismatch`,
+        );
+        const receiptRows = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .split('\n')
+          .filter((line) => line.includes('autoloop_recovery_receipt'));
+        expect(receiptRows).toEqual([]);
+      },
+    );
+
+    it('waits for a foreign live kernel lease before claiming a cold Planner recovery', async () => {
+      // Mutation caught: treating an unchanged foreign lease as sufficient
+      // token evidence appends `prepared` before kernel.resume rejects the
+      // competing owner, permanently wedging recovery after that owner exits.
+      const runId = 'recover-cold-planner-after-foreign-lease-release';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const recoveredState = structuredClone(mgr.autoloopStatus(runId)!);
+      const checkpointPath = path.join(TEST_WF_DIR, runId, 'run.json');
+      const checkpointBeforeRelease = fs.readFileSync(checkpointPath, 'utf8');
+      fs.writeFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), '');
+      const fresh = createManager();
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const receiptRows = (): Record<string, unknown>[] => {
+        const decisions = fs.existsSync(decisionPath) ? fs.readFileSync(decisionPath, 'utf8') : '';
+        return decisions
+          .trim()
+          .split('\n')
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as Record<string, unknown>)
+          .filter((row) => row.record_type === 'autoloop_recovery_receipt');
+      };
+      let booted = false;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const resume = vi.spyOn(fresh as any, '_resumeAutoloopRun').mockImplementation(async () => {
+        booted = true;
+        return recoveredState;
+      });
+      const getAutoloop = fresh.getAutoloop.bind(fresh);
+      vi.spyOn(fresh, 'getAutoloop').mockImplementation((observedRunId) =>
+        booted && observedRunId === runId
+          ? ({ runner: { state: recoveredState }, dispatcher: {} } as ReturnType<typeof fresh.getAutoloop>)
+          : getAutoloop(observedRunId),
+      );
+      const sessionsBefore = createdConfigs.length;
+
+      try {
+        const whileOwned = await fresh.autoloopRecover(runId);
+        expect(whileOwned.assessment).toMatchObject({ phase: 'PLANNING', next_safe_action: 'resume_planner' });
+        await expect(
+          fresh.autoloopRecover(runId, {
+            apply: true,
+            recovery_token: whileOwned.assessment.recovery_token,
+          }),
+        ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_INCOMPLETE', retryable: false });
+        expect(resume).not.toHaveBeenCalled();
+        expect(createdConfigs).toHaveLength(sessionsBefore);
+        expect(receiptRows()).toEqual([]);
+
+        await mgr.shutdown();
+        fs.writeFileSync(checkpointPath, checkpointBeforeRelease);
+        fs.writeFileSync(path.join(workspace, 'tasks', runId, 'agent-generations.jsonl'), '');
+
+        const afterRelease = await fresh.autoloopRecover(runId);
+        expect(afterRelease.assessment).toMatchObject({ phase: 'PLANNING', next_safe_action: 'resume_planner' });
+        const applied = await fresh.autoloopRecover(runId, {
+          apply: true,
+          recovery_token: afterRelease.assessment.recovery_token,
+        });
+
+        expect(applied.receipt).toMatchObject({
+          recovery_token: afterRelease.assessment.recovery_token,
+          next_safe_action: 'resume_planner',
+          status: 'applied',
+        });
+        expect(resume).toHaveBeenCalledTimes(1);
+        expect(createdConfigs).toHaveLength(sessionsBefore);
+        expect(receiptRows().map((row) => row.status)).toEqual(['prepared', 'applied']);
+      } finally {
+        await fresh.shutdown();
+      }
+    });
+
+    it('reconstructs and applies an exact Reviewer request from disk once across concurrent and repeated callers', async () => {
+      const runId = 'recover-review-disk-only';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      seedExactReviewArtifacts(workspace, runId, 0);
+      const original = mgr.getAutoloop(runId)!;
+      const envelope = AutoloopMsg.reviewRequest(0, {
+        iter: 0,
+        ledger_path: original.runner.state.ledger_dir,
+        prior_metrics: [],
+      });
+      await original.runner.config.persistReviewEnvelope!(envelope);
+      await reconstructManager(runId);
+
+      // Configure only the reconstructed manager. A single Reviewer completion
+      // must serve both concurrent apply callers and every later retry.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (mgr as any)._createSession = (_engine: string, config: SessionConfig): ISession => {
+        const mock = new MockSession();
+        if (config.name.endsWith('-reviewer')) {
+          mock.sendImplementation = async (message) => {
+            const text = successfulRoleReplyFromDeliveryPrompt('reviewer', message, 'disk-only recovery review');
+            return { text, event: { type: 'result', result: text } };
+          };
+        }
+        mockSessions.push(mock);
+        createdConfigs.push(config);
+        return mock;
+      };
+
+      const inspection = await mgr.autoloopRecover(runId);
+      expect(inspection.assessment).toMatchObject({
+        phase: 'AWAITING_REVIEW',
+        next_safe_action: 'request_review',
+      });
+      const repeatedInspection = await mgr.autoloopRecover(runId);
+      expect(repeatedInspection.assessment).toEqual(inspection.assessment);
+      const token = inspection.assessment.recovery_token;
+      const valid = mgr.autoloopRecover(runId, { apply: true, recovery_token: token });
+      const stale = mgr.autoloopRecover(runId, { apply: true, recovery_token: 'f'.repeat(64) });
+      const duplicate = mgr.autoloopRecover(runId, { apply: true, recovery_token: token });
+
+      await expect(stale).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_TOKEN_STALE' });
+      const [first, second] = await Promise.all([valid, duplicate]);
+      expect(first.receipt).toEqual(second.receipt);
+      expect(first.receipt).toMatchObject({ status: 'applied', recovery_token: token });
+      expect(mgr.getAutoloop(runId)!.runner.state.iter).toBe(1);
+
+      const reviewerConfigs = createdConfigs.filter((config) => config.name.endsWith('-reviewer'));
+      const reviewerSessions = mockSessions.filter((_session, index) =>
+        createdConfigs[index]?.name.endsWith('-reviewer'),
+      );
+      expect(reviewerConfigs).toHaveLength(1);
+      expect(reviewerSessions[0].sendCalls.filter((call) => call.options?.waitForComplete !== false)).toHaveLength(1);
+
+      const repeated = await mgr.autoloopRecover(runId, { apply: true, recovery_token: token });
+      expect(repeated.receipt).toEqual(first.receipt);
+      expect(createdConfigs.filter((config) => config.name.endsWith('-reviewer'))).toHaveLength(1);
+      const decisions = fs.readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8');
+      expect(decisions.match(/"record_type":"autoloop_recovery_receipt"/g)).toHaveLength(2);
+      expect(decisions.match(/"record_type":"autoloop_recovery_review_envelope"/g)).toHaveLength(1);
+    });
+
+    it('cold-recovers a persisted Reviewer verdict before its missing acknowledgement without another Reviewer', async () => {
+      const runId = 'recover-review-result-before-ack';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      seedExactReviewArtifacts(workspace, runId, 0);
+      const original = mgr.getAutoloop(runId)!;
+      const envelope = AutoloopMsg.reviewRequest(0, {
+        iter: 0,
+        ledger_path: original.runner.state.ledger_dir,
+        prior_metrics: [],
+      });
+      await original.runner.config.persistReviewEnvelope!(envelope);
+      await original.dispatcher.spawnReviewer();
+      const oldReviewerIndex = createdConfigs.findIndex((config) => config.name.endsWith('-reviewer'));
+      mockSessions[oldReviewerIndex].sendImplementation = async (message) => {
+        const text = successfulRoleReplyFromDeliveryPrompt('reviewer', message, 'persisted before acknowledgement');
+        return { text, event: { type: 'result', result: text } };
+      };
+      await expect(original.dispatcher.deliver(envelope)).resolves.toMatchObject([{ type: 'review_verdict' }]);
+
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const rows = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => ({ line, value: JSON.parse(line) as Record<string, unknown> }));
+      expect(rows.filter(({ value }) => typeof value.acknowledged_at === 'string')).toHaveLength(1);
+      fs.writeFileSync(
+        decisionPath,
+        `${rows
+          .filter(({ value }) => typeof value.acknowledged_at !== 'string')
+          .map(({ line }) => line)
+          .join('\n')}\n`,
+      );
+      expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter', '0', 'verdict.json'))).toBe(true);
+      await reconstructManager(runId);
+
+      const freshConfigStart = createdConfigs.length;
+      // Any fresh Reviewer startup is a duplicate physical effect. Planner
+      // reconstruction remains allowed so the recovered verdict can re-enter
+      // the Runner and advance its checkpoint.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (mgr as any)._createSession = (_engine: string, config: SessionConfig): ISession => {
+        if (config.name.endsWith('-reviewer')) throw new Error('duplicate Reviewer startup');
+        const mock = new MockSession();
+        mockSessions.push(mock);
+        createdConfigs.push(config);
+        return mock;
+      };
+
+      const inspection = await mgr.autoloopRecover(runId);
+      expect(inspection.assessment).toMatchObject({
+        phase: 'AWAITING_REVIEW',
+        next_safe_action: 'request_review',
+      });
+      expect(inspection.assessment.evidence).toContain('recovery:review:verdict_unconsumed');
+      const applied = await mgr.autoloopRecover(runId, {
+        apply: true,
+        recovery_token: inspection.assessment.recovery_token,
+      });
+
+      expect(applied.receipt).toMatchObject({ status: 'applied' });
+      expect(mgr.getAutoloop(runId)!.runner.state.iter).toBe(1);
+      expect(createdConfigs.slice(freshConfigStart).filter((config) => config.name.endsWith('-reviewer'))).toEqual([]);
+      const recoveredRows = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(recoveredRows.filter((row) => typeof row.acknowledged_at === 'string')).toHaveLength(1);
+      expect(recoveredRows.filter((row) => row.kind === 'review_request')).toHaveLength(1);
+    });
+
+    it('allows exactly one physical Reviewer recovery effect across independent manager instances', async () => {
+      const runId = 'recover-cross-manager-single-effect';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      seedExactReviewArtifacts(workspace, runId, 0);
+      const original = mgr.getAutoloop(runId)!;
+      const envelope = AutoloopMsg.reviewRequest(0, {
+        iter: 0,
+        ledger_path: original.runner.state.ledger_dir,
+        prior_metrics: [],
+      });
+      await original.runner.config.persistReviewEnvelope!(envelope);
+      const peer = createManager();
+      const installReviewer = (manager: InstanceType<typeof SessionManager>): void => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (manager as any)._createSession = (_engine: string, config: SessionConfig): ISession => {
+          const mock = new MockSession();
+          if (config.name.endsWith('-reviewer')) {
+            mock.sendImplementation = async (message) => {
+              const text = successfulRoleReplyFromDeliveryPrompt('reviewer', message, 'one claimant only');
+              return { text, event: { type: 'result', result: text } };
+            };
+          }
+          mockSessions.push(mock);
+          createdConfigs.push(config);
+          return mock;
+        };
+      };
+      installReviewer(mgr);
+      installReviewer(peer);
+      try {
+        const token = (await mgr.autoloopRecover(runId)).assessment.recovery_token;
+        let readers = 0;
+        let bothRead!: () => void;
+        const bothReadBarrier = new Promise<void>((resolve) => {
+          bothRead = resolve;
+        });
+        let releaseReaders!: () => void;
+        const releaseBarrier = new Promise<void>((resolve) => {
+          releaseReaders = resolve;
+        });
+        const holdAfterRead = (manager: InstanceType<typeof SessionManager>): void => {
+          // Both calls must pass their receipt precheck before either may claim
+          // durable ownership. This is the cross-process crash-window schedule.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const originalInput = (manager as any)._recoveryInput.bind(manager);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (manager as any)._recoveryInput = async (...args: unknown[]) => {
+            const recovered = await originalInput(...args);
+            readers += 1;
+            if (readers === 2) bothRead();
+            await releaseBarrier;
+            return recovered;
+          };
+        };
+        holdAfterRead(mgr);
+        holdAfterRead(peer);
+        const first = mgr.autoloopRecover(runId, { apply: true, recovery_token: token });
+        const second = peer.autoloopRecover(runId, { apply: true, recovery_token: token });
+        await bothReadBarrier;
+        releaseReaders();
+        const outcomes = await Promise.allSettled([first, second]);
+
+        expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1);
+        const rejected = outcomes.filter((outcome) => outcome.status === 'rejected');
+        expect(rejected).toHaveLength(1);
+        const rejectedReason = (rejected[0] as PromiseRejectedResult).reason as {
+          code?: unknown;
+          retryable?: unknown;
+        };
+        expect(['AUTOLOOP_RECOVERY_INCOMPLETE', 'AUTOLOOP_RECOVERY_TOKEN_STALE']).toContain(rejectedReason.code);
+        expect(rejectedReason.retryable).toBe(false);
+        expect(createdConfigs.filter((config) => config.name.endsWith('-reviewer'))).toHaveLength(1);
+        const receipts = fs
+          .readFileSync(decisionPath, 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as Record<string, unknown>)
+          .filter((row) => row.record_type === 'autoloop_recovery_receipt');
+        expect(receipts).toHaveLength(2);
+        const prepared = receipts.find((row) => row.status === 'prepared')!;
+        const applied = receipts.find((row) => row.status === 'applied')!;
+        expect(prepared).toMatchObject({ recovery_token: token, status: 'prepared' });
+        expect(applied).toMatchObject({
+          recovery_token: token,
+          action_sha256: prepared.action_sha256,
+          claim_id: prepared.claim_id,
+          phase: prepared.phase,
+          next_safe_action: prepared.next_safe_action,
+          status: 'applied',
+        });
+      } finally {
+        await peer.shutdown();
+      }
+    });
+
+    it('fences a changed recovery token inside the durable claim transaction across managers', async () => {
+      // This invokes the real locked claim boundary after the point where two
+      // processes could both have observed an empty receipt ledger.  The
+      // transaction itself must reject token B once token A owns an unresolved
+      // prepared claim; an unlocked caller-side precheck cannot provide that
+      // cross-process guarantee.
+      const runId = 'recover-cross-token-atomic-claim';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const recovered = await (mgr as any)._recoveryInput(runId);
+      const peer = createManager();
+      const firstToken = recovered.assessment.recovery_token as string;
+      const secondToken = firstToken === 'e'.repeat(64) ? 'f'.repeat(64) : 'e'.repeat(64);
+      const prepared = {
+        schema_version: 1 as const,
+        record_type: 'autoloop_recovery_receipt' as const,
+        kind: 'autoloop_recovery_receipt' as const,
+        run_id: runId,
+        recovery_token: firstToken,
+        action_sha256: recovered.assessment.action_sha256 as string,
+        action_snapshot: (mgr as any)._recoveryActionSnapshot(recovered),
+        claim_id: '11111111-1111-4111-8111-111111111111',
+        phase: recovered.assessment.phase,
+        next_safe_action: recovered.assessment.next_safe_action,
+        status: 'prepared' as const,
+        recorded_at: '2026-09-12T00:00:00.000Z',
+      };
+
+      try {
+        expect((mgr as any)._appendRecoveryReceipt(recovered.ledger, prepared)).toMatchObject({
+          appended: true,
+          receipt: { recovery_token: firstToken, status: 'prepared' },
+        });
+
+        expect(() =>
+          (peer as any)._appendRecoveryReceipt(recovered.ledger, {
+            ...prepared,
+            recovery_token: secondToken,
+            action_sha256: 'a'.repeat(64),
+            claim_id: '22222222-2222-4222-8222-222222222222',
+            recorded_at: '2026-09-12T00:00:01.000Z',
+          }),
+        ).toThrowError(
+          expect.objectContaining({
+            code: 'AUTOLOOP_RECOVERY_INCOMPLETE',
+            retryable: false,
+          }),
+        );
+
+        const receipts = fs
+          .readFileSync(path.join(workspace, 'tasks', runId, 'decisions.jsonl'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as Record<string, unknown>)
+          .filter((row) => row.record_type === 'autoloop_recovery_receipt');
+        expect(receipts).toEqual([expect.objectContaining({ recovery_token: firstToken, status: 'prepared' })]);
+      } finally {
+        await peer.shutdown();
+      }
+    });
+
+    it('invalidates an inspected recovery token when its exact durable review action changes', async () => {
+      const runId = 'recover-action-digest';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      seedExactReviewArtifacts(workspace, runId, 0);
+      const original = mgr.getAutoloop(runId)!;
+      await original.runner.config.persistReviewEnvelope!(
+        AutoloopMsg.reviewRequest(0, { iter: 0, ledger_path: original.runner.state.ledger_dir, prior_metrics: [] }),
+      );
+      const inspection = await mgr.autoloopRecover(runId);
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const rows = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      const envelope = rows.find((row) => row.record_type === 'autoloop_recovery_review_envelope')!;
+      (envelope.envelope as { payload: { prior_metrics: number[] } }).payload.prior_metrics = [73];
+      fs.writeFileSync(decisionPath, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+
+      await expect(
+        mgr.autoloopRecover(runId, { apply: true, recovery_token: inspection.assessment.recovery_token }),
+      ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_TOKEN_STALE' });
+    });
+
+    it('rejects an exact review action mutated after both token checks but before its locked prepared claim', async () => {
+      const runId = 'recover-action-mutated-at-claim';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      seedExactReviewArtifacts(workspace, runId, 0);
+      const handle = mgr.getAutoloop(runId)!;
+      await handle.runner.config.persistReviewEnvelope!(
+        AutoloopMsg.reviewRequest(0, { iter: 0, ledger_path: handle.runner.state.ledger_dir, prior_metrics: [] }),
+      );
+      const inspection = await mgr.autoloopRecover(runId);
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const appendReceipt = (mgr as any)._appendRecoveryReceipt.bind(mgr);
+      const append = vi.spyOn(mgr as any, '_appendRecoveryReceipt').mockImplementation((ledger, receipt, validate) => {
+        if ((receipt as RecoveryReceipt).status === 'prepared') {
+          const rows = fs
+            .readFileSync(decisionPath, 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as Record<string, unknown>);
+          const envelope = rows.find((row) => row.record_type === 'autoloop_recovery_review_envelope')!;
+          (envelope.envelope as { payload: { prior_metrics: number[] } }).payload.prior_metrics = [73];
+          fs.writeFileSync(decisionPath, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+        }
+        return appendReceipt(ledger, receipt, validate);
+      });
+      const send = vi.spyOn(handle.runner, 'send');
+
+      try {
+        await expect(
+          mgr.autoloopRecover(runId, { apply: true, recovery_token: inspection.assessment.recovery_token }),
+        ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_TOKEN_STALE', retryable: false });
+      } finally {
+        append.mockRestore();
+      }
+
+      const receipts = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((row) => row.record_type === 'autoloop_recovery_receipt');
+      expect(receipts).toEqual([]);
+      expect(send).not.toHaveBeenCalled();
+    });
+
+    it('executes the immutable claimed action when its source changes after locked validation', async () => {
+      const runId = 'recover-action-mutated-after-validation';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      seedExactReviewArtifacts(workspace, runId, 0);
+      const handle = mgr.getAutoloop(runId)!;
+      const originalEnvelope = AutoloopMsg.reviewRequest(0, {
+        iter: 0,
+        ledger_path: handle.runner.state.ledger_dir,
+        prior_metrics: [],
+      });
+      await handle.runner.config.persistReviewEnvelope!(originalEnvelope);
+      const inspection = await mgr.autoloopRecover(runId);
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const validatePrepared = (mgr as any)._validatePreparedRecoveryAction.bind(mgr);
+      const validate = vi
+        .spyOn(mgr as any, '_validatePreparedRecoveryAction')
+        .mockImplementation((ledger, receipt, recovered, digest) => {
+          validatePrepared(ledger, receipt, recovered, digest);
+          const rows = fs
+            .readFileSync(decisionPath, 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as Record<string, unknown>);
+          const envelope = rows.find((row) => row.record_type === 'autoloop_recovery_review_envelope')!;
+          (envelope.envelope as { payload: { prior_metrics: number[] } }).payload.prior_metrics = [73];
+          fs.writeFileSync(decisionPath, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+        });
+      const send = vi.spyOn(handle.runner, 'send').mockResolvedValue(undefined);
+
+      try {
+        await expect(
+          mgr.autoloopRecover(runId, { apply: true, recovery_token: inspection.assessment.recovery_token }),
+        ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_INCOMPLETE', retryable: false });
+      } finally {
+        validate.mockRestore();
+      }
+
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(send.mock.calls[0]?.[0]).toEqual(originalEnvelope);
+      const receipts = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((row) => row.record_type === 'autoloop_recovery_receipt');
+      expect(receipts).toEqual([
+        expect.objectContaining({
+          recovery_token: inspection.assessment.recovery_token,
+          action_sha256: inspection.assessment.action_sha256,
+          action_snapshot: originalEnvelope,
+          status: 'prepared',
+        }),
+      ]);
+    });
+
+    it('blocks a new recovery action while any earlier prepared claim remains unresolved', async () => {
+      const runId = 'recover-stale-prepared-claim';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      seedExactReviewArtifacts(workspace, runId, 0);
+      const handle = mgr.getAutoloop(runId)!;
+      await handle.runner.config.persistReviewEnvelope!(
+        AutoloopMsg.reviewRequest(0, { iter: 0, ledger_path: handle.runner.state.ledger_dir, prior_metrics: [] }),
+      );
+      const firstInspection = await mgr.autoloopRecover(runId);
+      const firstRecovered = await (mgr as any)._recoveryInput(runId);
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      fs.appendFileSync(
+        decisionPath,
+        `${JSON.stringify({
+          schema_version: 1,
+          record_type: 'autoloop_recovery_receipt',
+          kind: 'autoloop_recovery_receipt',
+          run_id: runId,
+          recovery_token: firstInspection.assessment.recovery_token,
+          action_sha256: firstInspection.assessment.action_sha256,
+          action_snapshot: (mgr as any)._recoveryActionSnapshot(firstRecovered),
+          claim_id: '12345678-1234-1234-1234-123456789abc',
+          phase: firstInspection.assessment.phase,
+          next_safe_action: firstInspection.assessment.next_safe_action,
+          status: 'prepared',
+          recorded_at: '2026-09-12T00:00:00.000Z',
+        })}\n`,
+      );
+      const rows = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      const envelope = rows.find((row) => row.record_type === 'autoloop_recovery_review_envelope')!;
+      (envelope.envelope as { payload: { prior_metrics: number[] } }).payload.prior_metrics = [73];
+      fs.writeFileSync(decisionPath, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+      const secondInspection = await mgr.autoloopRecover(runId);
+      expect(secondInspection.assessment.recovery_token).not.toBe(firstInspection.assessment.recovery_token);
+      const send = vi.spyOn(handle.runner, 'send').mockRejectedValue(new Error('new recovery effect executed'));
+
+      await expect(
+        mgr.autoloopRecover(runId, {
+          apply: true,
+          recovery_token: secondInspection.assessment.recovery_token,
+        }),
+      ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_INCOMPLETE', retryable: false });
+
+      expect(send).not.toHaveBeenCalled();
+      const receipts = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((row) => row.record_type === 'autoloop_recovery_receipt');
+      expect(receipts).toHaveLength(1);
+      expect(receipts[0]).toMatchObject({
+        recovery_token: firstInspection.assessment.recovery_token,
+        status: 'prepared',
+      });
+    });
+
+    it('fails closed before recovery effects when the complete outbox ledger graph has an orphan acknowledgement', async () => {
+      const runId = 'recover-outbox-graph';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      fs.appendFileSync(
+        decisionPath,
+        `${JSON.stringify({
+          schema_version: 1,
+          delivery_id: 'orphan-delivery',
+          payload_sha256: 'a'.repeat(64),
+          acknowledged_at: '2026-09-12T00:00:00.000Z',
+        })}\n`,
+      );
+
+      await expect(mgr.autoloopRecover(runId)).rejects.toThrow(/acknowledges no earlier delivery intent/i);
+    });
+
+    it('does not mutate ledger directory or decisions-file metadata during read-only inspection', async () => {
+      const runId = 'recover-read-only-metadata';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const tasksDirectory = path.join(workspace, 'tasks');
+      const runDirectory = path.join(tasksDirectory, runId);
+      const decisionPath = path.join(runDirectory, 'decisions.jsonl');
+      fs.writeFileSync(decisionPath, '');
+      fs.chmodSync(tasksDirectory, 0o777);
+      fs.chmodSync(runDirectory, 0o777);
+      fs.chmodSync(decisionPath, 0o644);
+      const snapshot = (entry: string): { mode: number; ctimeMs: number; mtimeMs: number; bytes?: Buffer } => {
+        const stat = fs.statSync(entry);
+        return {
+          mode: stat.mode,
+          ctimeMs: stat.ctimeMs,
+          mtimeMs: stat.mtimeMs,
+          ...(stat.isFile() ? { bytes: fs.readFileSync(entry) } : {}),
+        };
+      };
+      const before = [tasksDirectory, runDirectory, decisionPath].map((entry) => ({
+        entry,
+        snapshot: snapshot(entry),
+      }));
+
+      await mgr.autoloopRecover(runId);
+
+      for (const entry of before) {
+        expect(snapshot(entry.entry)).toEqual(entry.snapshot);
+      }
+    });
+
+    it('blocks a paused Reviewer recovery before preparing a receipt or parking the delivery', async () => {
+      // A paused Runner accepts legacy review requests into its in-memory
+      // buffer and resolves the sender without any durable delivery intent or
+      // acknowledgement. Recovery must classify that state before claiming an
+      // effect, rather than mistaking the parked message for an applied action.
+      const runId = 'recover-paused-review-before-claim';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      seedExactReviewArtifacts(workspace, runId, 0);
+      const handle = mgr.getAutoloop(runId)!;
+      const envelope = AutoloopMsg.reviewRequest(0, {
+        iter: 0,
+        ledger_path: handle.runner.state.ledger_dir,
+        prior_metrics: [],
+      });
+      await handle.runner.config.persistReviewEnvelope!(envelope);
+      handle.runner.state.status = 'paused';
+      handle.runner.state.status_reason = 'operator-paused-before-recovery';
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const before = fs.readFileSync(decisionPath, 'utf8');
+      const send = vi.spyOn(handle.runner, 'send');
+
+      const inspection = await mgr.autoloopRecover(runId);
+
+      expect(inspection.assessment).toMatchObject({ phase: 'BLOCKED', next_safe_action: 'manual_resolution' });
+      expect(inspection.assessment.evidence).toContain('ambiguity:recovery:runner:paused');
+      await expect(
+        mgr.autoloopRecover(runId, {
+          apply: true,
+          recovery_token: inspection.assessment.recovery_token,
+        }),
+      ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_MANUAL_RESOLUTION_REQUIRED', retryable: false });
+      expect(send).not.toHaveBeenCalled();
+      expect(fs.readFileSync(decisionPath, 'utf8')).toBe(before);
+    });
+
+    it('does not mark a Reviewer recovery applied when it becomes parked after the prepared claim', async () => {
+      // This is the post-precondition race: inspection and token validation see
+      // a runnable state, but the Runner pauses immediately after the durable
+      // claim.  Its legacy queue contract resolves a parked send, so recovery
+      // must require durable acknowledgement evidence before writing `applied`.
+      const runId = 'recover-review-paused-after-claim';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      seedExactReviewArtifacts(workspace, runId, 0);
+      const handle = mgr.getAutoloop(runId)!;
+      const envelope = AutoloopMsg.reviewRequest(0, {
+        iter: 0,
+        ledger_path: handle.runner.state.ledger_dir,
+        prior_metrics: [],
+      });
+      await handle.runner.config.persistReviewEnvelope!(envelope);
+      const inspection = await mgr.autoloopRecover(runId);
+      expect(inspection.assessment).toMatchObject({
+        phase: 'AWAITING_REVIEW',
+        next_safe_action: 'request_review',
+      });
+      const appendReceipt = (mgr as any)._appendRecoveryReceipt.bind(mgr);
+      const append = vi.spyOn(mgr as any, '_appendRecoveryReceipt').mockImplementation((ledger, receipt) => {
+        const typedReceipt = receipt as RecoveryReceipt;
+        const result = appendReceipt(ledger, typedReceipt);
+        if (typedReceipt.status === 'prepared') {
+          handle.runner.state.status = 'paused';
+          handle.runner.state.status_reason = 'paused-after-recovery-claim';
+        }
+        return result;
+      });
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+
+      try {
+        await expect(
+          mgr.autoloopRecover(runId, {
+            apply: true,
+            recovery_token: inspection.assessment.recovery_token,
+          }),
+        ).rejects.toMatchObject({ code: 'AUTOLOOP_RECOVERY_INCOMPLETE', retryable: false });
+      } finally {
+        append.mockRestore();
+      }
+
+      const rows = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(rows.filter((row) => row.record_type === 'autoloop_recovery_receipt')).toEqual([
+        expect.objectContaining({
+          recovery_token: inspection.assessment.recovery_token,
+          status: 'prepared',
+        }),
+      ]);
+      expect(rows.filter((row) => typeof row.delivery_id === 'string' && typeof row.created_at === 'string')).toEqual(
+        [],
+      );
+      expect(rows.filter((row) => typeof row.acknowledged_at === 'string')).toEqual([]);
+      expect(createdConfigs.filter((config) => config.name.endsWith('-reviewer'))).toEqual([]);
+    });
+
+    it('does not mark a Coder recovery applied when it becomes parked after the prepared claim', async () => {
+      const runId = 'recover-coder-paused-after-claim';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const handle = mgr.getAutoloop(runId)!;
+      const envelope = AutoloopMsg.directive(0, {
+        goal: 'recover exact Coder delivery',
+        constraints: [],
+        success_criteria: [],
+        max_attempts: 1,
+      });
+      const dispatchId = recoveryDispatchId(runId, envelope as unknown as Record<string, unknown>);
+      const iterDirectory = path.join(workspace, 'tasks', runId, 'iter', '0');
+      fs.mkdirSync(iterDirectory, { recursive: true });
+      fs.writeFileSync(
+        path.join(iterDirectory, 'directive.json'),
+        `${JSON.stringify({
+          iter: 0,
+          message_id: envelope.msg_id,
+          ts: envelope.ts,
+          dispatch_id: dispatchId,
+          goal: envelope.payload.goal,
+          constraints: envelope.payload.constraints,
+          success_criteria: envelope.payload.success_criteria,
+          max_attempts: envelope.payload.max_attempts,
+        })}\n`,
+      );
+      const historicalIntent = prepareDelivery(handle.dispatcher.secureLedgerCapability, {
+        idempotency_key: dispatchId,
+        kind: 'coder_directive',
+        target_role: 'coder',
+        target_generation: 1,
+        payload: {
+          prompt: 'historical exact Coder delivery',
+          logical_message_sha256: recoveryLogicalMessageSha256(envelope as unknown as Record<string, unknown>),
+        },
+      });
+      acknowledgeDelivery(
+        handle.dispatcher.secureLedgerCapability,
+        historicalIntent.delivery_id,
+        historicalIntent.payload_sha256,
+      );
+      const inspection = await mgr.autoloopRecover(runId);
+      expect(inspection.assessment).toMatchObject({
+        phase: 'PAUSED_RECOVERABLE',
+        next_safe_action: 'dispatch_coder',
+      });
+      const appendReceipt = (mgr as any)._appendRecoveryReceipt.bind(mgr);
+      const append = vi.spyOn(mgr as any, '_appendRecoveryReceipt').mockImplementation((ledger, receipt) => {
+        const typedReceipt = receipt as RecoveryReceipt;
+        const result = appendReceipt(ledger, typedReceipt);
+        if (typedReceipt.status === 'prepared') {
+          handle.runner.state.status = 'paused';
+          handle.runner.state.status_reason = 'paused-after-recovery-claim';
+        }
+        return result;
+      });
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const deliver = vi.spyOn(handle.dispatcher, 'deliver');
+      const beforeDeliveryRows = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((row) => typeof row.delivery_id === 'string');
+
+      let outcome: PromiseSettledResult<Awaited<ReturnType<typeof mgr.autoloopRecover>>>;
+      try {
+        [outcome] = await Promise.allSettled([
+          mgr.autoloopRecover(runId, {
+            apply: true,
+            recovery_token: inspection.assessment.recovery_token,
+          }),
+        ]);
+      } finally {
+        append.mockRestore();
+      }
+
+      const rows = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      const receipts = rows.filter((row) => row.record_type === 'autoloop_recovery_receipt');
+      expect(deliver).not.toHaveBeenCalled();
+      expect(rows.filter((row) => typeof row.delivery_id === 'string')).toEqual(beforeDeliveryRows);
+      expect.soft(receipts).toEqual([
+        expect.objectContaining({
+          recovery_token: inspection.assessment.recovery_token,
+          status: 'prepared',
+        }),
+      ]);
+      expect(outcome!).toMatchObject({
+        status: 'rejected',
+        reason: { code: 'AUTOLOOP_RECOVERY_INCOMPLETE', retryable: false },
+      });
+      expect(createdConfigs.filter((config) => config.name.endsWith('-coder'))).toEqual([]);
+    });
+
+    it('does not treat a pre-existing same-iteration Coder acknowledgement as proof after terminal recovery', async () => {
+      const runId = 'recover-coder-terminal-preexisting-ack';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const handle = mgr.getAutoloop(runId)!;
+      const envelope = AutoloopMsg.directive(0, {
+        goal: 'recover only the exact Coder delivery',
+        constraints: [],
+        success_criteria: [],
+        max_attempts: 1,
+      });
+      const iterDirectory = path.join(workspace, 'tasks', runId, 'iter', '0');
+      fs.mkdirSync(iterDirectory, { recursive: true });
+      fs.writeFileSync(
+        path.join(iterDirectory, 'directive.json'),
+        `${JSON.stringify({
+          iter: 0,
+          message_id: envelope.msg_id,
+          ts: envelope.ts,
+          dispatch_id: recoveryDispatchId(runId, envelope as unknown as Record<string, unknown>),
+          goal: envelope.payload.goal,
+          constraints: envelope.payload.constraints,
+          success_criteria: envelope.payload.success_criteria,
+          max_attempts: envelope.payload.max_attempts,
+        })}\n`,
+      );
+      const historicalIntent = prepareDelivery(handle.dispatcher.secureLedgerCapability, {
+        idempotency_key: recoveryDispatchId(runId, envelope as unknown as Record<string, unknown>),
+        kind: 'coder_directive',
+        target_role: 'coder',
+        target_generation: 1,
+        payload: {
+          prompt: 'historical exact Coder delivery',
+          logical_message_sha256: recoveryLogicalMessageSha256(envelope as unknown as Record<string, unknown>),
+        },
+      });
+      acknowledgeDelivery(
+        handle.dispatcher.secureLedgerCapability,
+        historicalIntent.delivery_id,
+        historicalIntent.payload_sha256,
+      );
+      const inspection = await mgr.autoloopRecover(runId);
+      expect(inspection.assessment).toMatchObject({ next_safe_action: 'dispatch_coder' });
+      const deliver = vi.spyOn(handle.dispatcher, 'deliver');
+      const appendReceipt = (mgr as any)._appendRecoveryReceipt.bind(mgr);
+      const append = vi.spyOn(mgr as any, '_appendRecoveryReceipt').mockImplementation((ledger, receipt, validate) => {
+        const result = appendReceipt(ledger, receipt, validate);
+        if ((receipt as RecoveryReceipt).status === 'prepared') {
+          handle.runner.state.status = 'terminated';
+          handle.runner.state.status_reason = 'terminal-after-recovery-claim';
+        }
+        return result;
+      });
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+
+      let outcome: PromiseSettledResult<Awaited<ReturnType<typeof mgr.autoloopRecover>>>;
+      try {
+        [outcome] = await Promise.allSettled([
+          mgr.autoloopRecover(runId, {
+            apply: true,
+            recovery_token: inspection.assessment.recovery_token,
+          }),
+        ]);
+      } finally {
+        append.mockRestore();
+      }
+
+      expect(deliver).not.toHaveBeenCalled();
+      const receipts = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as { record_type?: string; status?: string })
+        .filter((row) => row.record_type === 'autoloop_recovery_receipt');
+      expect.soft(receipts.map((row) => row.status)).toEqual(['prepared']);
+      expect(outcome!).toMatchObject({
+        status: 'rejected',
+        reason: { code: 'AUTOLOOP_RECOVERY_INCOMPLETE', retryable: false },
+      });
+    });
+
+    it('classifies an already-live planning boundary before any recovery receipt is prepared', async () => {
+      const runId = 'recover-live-planning-already-satisfied';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const handle = mgr.getAutoloop(runId)!;
+      const before = structuredClone(handle.runner.state);
+      const send = vi.spyOn(handle.runner, 'send');
+
+      const inspection = await mgr.autoloopRecover(runId);
+
+      expect(inspection.assessment).toMatchObject({ phase: 'PLANNING', next_safe_action: 'none' });
+      const applied = await mgr.autoloopRecover(runId, {
+        apply: true,
+        recovery_token: inspection.assessment.recovery_token,
+      });
+      expect(applied.receipt?.next_safe_action).toBe('none');
+      expect(handle.runner.state).toEqual(before);
+      expect(send).not.toHaveBeenCalled();
+    });
+
+    it('rebinds a live running Planner boundary to none before any non-none receipt is claimed', async () => {
+      const runId = 'recover-live-running-planner-already-satisfied';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const handle = mgr.getAutoloop(runId)!;
+      const iterDirectory = path.join(workspace, 'tasks', runId, 'iter', '0');
+      fs.mkdirSync(iterDirectory, { recursive: true });
+      fs.writeFileSync(path.join(iterDirectory, 'verdict.json'), `${JSON.stringify({ decision: 'advance' })}\n`);
+      handle.runner.state.iter = 1;
+      handle.runner.state.status = 'running';
+      handle.runner.state.status_reason = null;
+      const send = vi.spyOn(handle.runner, 'send');
+
+      const inspection = await mgr.autoloopRecover(runId);
+
+      expect(inspection.assessment).toMatchObject({ phase: 'PLANNING', next_safe_action: 'none' });
+      const applied = await mgr.autoloopRecover(runId, {
+        apply: true,
+        recovery_token: inspection.assessment.recovery_token,
+      });
+      expect(applied.receipt).toMatchObject({ next_safe_action: 'none', status: 'applied' });
+      expect(send).not.toHaveBeenCalled();
+    });
+
+    it('records resume_planner as applied only after this invocation resumes a paused Planner', async () => {
+      const runId = 'recover-paused-planner-transition';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const handle = mgr.getAutoloop(runId)!;
+      const iterDirectory = path.join(workspace, 'tasks', runId, 'iter', '0');
+      fs.mkdirSync(iterDirectory, { recursive: true });
+      fs.writeFileSync(path.join(iterDirectory, 'verdict.json'), `${JSON.stringify({ decision: 'advance' })}\n`);
+      handle.runner.state.iter = 1;
+      handle.runner.state.status = 'paused';
+      handle.runner.state.status_reason = 'recoverable-planner-pause';
+      const send = vi.spyOn(handle.runner, 'send');
+
+      const inspection = await mgr.autoloopRecover(runId);
+      expect(inspection.assessment).toMatchObject({ phase: 'PLANNING', next_safe_action: 'resume_planner' });
+
+      const applied = await mgr.autoloopRecover(runId, {
+        apply: true,
+        recovery_token: inspection.assessment.recovery_token,
+      });
+
+      expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: 'resume', iter: 1 }));
+      expect(handle.runner.state.status).not.toBe('paused');
+      expect(applied.receipt).toMatchObject({ next_safe_action: 'resume_planner', status: 'applied' });
+    });
+
+    it('inspects read-only, fences apply by the current token, and shares one durable receipt', async () => {
+      const runId = 'recover-inspect-apply-core';
+      const workspace = fs.mkdtempSync(path.join(TEST_WF_DIR, `${runId}-`));
+      await mgr.autoloopStart({ runId, workspace });
+      const handle = mgr.getAutoloop(runId)!;
+      const before = structuredClone(handle.runner.state);
+      const decisionPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+      const beforeDecisions = fs.existsSync(decisionPath) ? fs.readFileSync(decisionPath, 'utf8') : '';
+
+      const inspection = await mgr.autoloopRecover(runId);
+
+      expect(inspection.receipt).toBeUndefined();
+      expect(handle.runner.state).toEqual(before);
+      expect(fs.existsSync(decisionPath) ? fs.readFileSync(decisionPath, 'utf8') : '').toBe(beforeDecisions);
+      await expect(mgr.autoloopRecover(runId, { apply: true })).rejects.toMatchObject({
+        code: 'AUTOLOOP_RECOVERY_TOKEN_REQUIRED',
+      });
+      await expect(mgr.autoloopRecover(runId, { apply: true, recovery_token: '0'.repeat(64) })).rejects.toMatchObject({
+        code: 'AUTOLOOP_RECOVERY_TOKEN_STALE',
+      });
+
+      const [first, second] = await Promise.all([
+        mgr.autoloopRecover(runId, { apply: true, recovery_token: inspection.assessment.recovery_token }),
+        mgr.autoloopRecover(runId, { apply: true, recovery_token: inspection.assessment.recovery_token }),
+      ]);
+
+      expect(first.receipt).toEqual(second.receipt);
+      expect(first.receipt).toMatchObject({
+        schema_version: 1,
+        record_type: 'autoloop_recovery_receipt',
+        status: 'applied',
+        recovery_token: inspection.assessment.recovery_token,
+      });
+      const receipts = fs
+        .readFileSync(decisionPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as { record_type?: string; status?: string })
+        .filter((row) => row.record_type === 'autoloop_recovery_receipt');
+      expect(receipts.map((row) => row.status)).toEqual(['prepared', 'applied']);
+
+      const repeated = await mgr.autoloopRecover(runId, {
+        apply: true,
+        recovery_token: inspection.assessment.recovery_token,
+      });
+      expect(repeated.receipt).toEqual(first.receipt);
+      expect(
+        fs
+          .readFileSync(decisionPath, 'utf8')
+          .split('\n')
+          .filter((line) => line.includes('autoloop_recovery_receipt')),
+      ).toHaveLength(2);
     });
   });
 

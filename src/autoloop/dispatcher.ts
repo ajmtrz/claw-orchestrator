@@ -22,6 +22,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { TextDecoder, types as nodeUtilTypes } from 'node:util';
 
 import type { SessionManager } from '../session-manager.js';
 import type { Logger } from '../logger.js';
@@ -34,30 +35,78 @@ import {
   type EngineType,
 } from '../types.js';
 import { nullLogger } from '../logger.js';
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { capturePatch, changedFilesSince } from '../verify/baseline.js';
 import { runContract } from '../verify/runner.js';
 import { writeEvidence } from '../verify/evidence.js';
 import type { AcceptanceContract } from '../verify/contract.js';
-import { type AnyAutoloopMessage, Msg, type SendTimeoutPayload } from './messages.js';
 import {
+  type AnyAutoloopMessage,
+  type AutoloopOperationErrorCode,
+  canonicalizeExactStringArrayElements,
+  canonicalizeMessage,
+  canonicalizeRequestReviewArgs,
+  type CheckpointReviewRequestPayload,
+  hasExactStringArrayElements,
+  Msg,
+  type RequestReviewArgs,
+  type SendTimeoutPayload,
+} from './messages.js';
+import {
+  AutoloopAgentReleaseOwnerError,
+  DEFAULT_ACTIVITY_LEASE_MS,
+  DEFAULT_PUSH_POLICY,
   DEFAULT_SEND_TIMEOUT_MS,
   LEDGER_SCHEMA_VERSION,
+  isRecoverableAgentOwnerInstanceId,
   validateAutoloopTimeoutConfig,
+  type AgentRuntimeProbe,
+  type AgentRuntimeLiveness,
   type AgentDispatcher,
   type AutoloopRoleName,
   type AutoloopState,
+  type PhysicalAgentGeneration,
   type PushPolicy,
 } from './types.js';
 
 import {
-  applyPlannerToolCalls,
+  applyValidatedPlannerToolCalls,
+  canonicalizePlannerControls,
+  canonicalPlannerControlsJson,
   parsePlannerReply,
+  validatePlannerToolCalls,
   type PlannerArtifactWrite,
+  type PlannerToolCall,
   type PlannerToolEffects,
+  type PlannerToolName,
+  type PreparedReviewRequest,
+  type ReviewRequestPreparationResult,
+  MAX_PLANNER_CONTROL_BATCH_BYTES,
+  type SpawnCoderArgs,
+  type SpawnReviewerArgs,
   type SpawnSubagentsArgs,
 } from './planner-tools.js';
 import { extractIterComplete, extractReviewComplete, parseAgentReply } from './agent-tools.js';
+import {
+  isCommittedSecureLedgerError,
+  SecureAutoloopLedger,
+  type SecureAutoloopLedgerCommitError,
+} from './secure-ledger.js';
+import {
+  acknowledgeDelivery,
+  lookupAcknowledgementByIdempotencyKey,
+  lookupByIdempotencyKey,
+  lookupDeliveryResultByIdempotencyKey,
+  parseOutboxDecisionLedgerRow,
+  persistDeliveryResult,
+  prepareDelivery,
+  validateOutboxDecisionLedgerGraph,
+  AutoloopDeliveryOutboxError,
+} from './outbox.js';
+import type { DeliveryIntent, DeliveryKind, DeliveryTargetRole } from './types.js';
+import type { DeliveryLedgerRow } from './outbox.js';
+
+export { openPrivateAutoloopDecisions, securePrivateAutoloopDecisionLedger } from './secure-ledger.js';
 
 /**
  * Character budget for the replayed transcript handed to engines without native
@@ -65,21 +114,6 @@ import { extractIterComplete, extractReviewComplete, parseAgentReply } from './a
  * long run keeps the recent context instead of growing the prompt forever.
  */
 const REPLAY_CHAR_BUDGET = 24_000;
-
-/**
- * Files inside <ledger>/reviewer_sandbox/ that survive `stageReviewSandbox`.
- * Anything not listed is wiped between iters. `reviewer_memory.md` is also
- * frozen-injected into the Reviewer system prompt at session start, so
- * mid-session edits won't be reread until the next reset.
- */
-const REVIEWER_SANDBOX_PERSIST = new Set(['reviewer_memory.md', 'reviewer_log.jsonl']);
-
-/**
- * Push-policy keys that callers MUST NOT be able to silence at runtime.
- * Prompt-injection could otherwise let a confused/malicious Planner mute the
- * channels we use to surface phase errors and decision points.
- */
-const UNSILENCEABLE_POLICY_KEYS = new Set(['on_phase_error', 'on_decision_needed']);
 
 export interface ClaudeAgentDispatcherConfig {
   manager: SessionManager;
@@ -107,8 +141,18 @@ export interface ClaudeAgentDispatcherConfig {
   reviewerCustomEngine?: CustomEngineConfig;
   /** Per-message wall-clock cap. Default 10 min. */
   sendTimeoutMs?: number;
+  /** Physical-agent lease length. Defaults to the Autoloop activity lease. */
+  agentLeaseMs?: number;
+  /** Runtime/session-registry boundary. Production uses SessionManager. */
+  runtimeProbe?: AgentRuntimeProbe;
+  /** Stable owner identity for this SessionManager process. */
+  ownerInstanceId?: string;
+  /** Deterministic clock seam for lease tests. */
+  now?: () => Date;
   /** Internal failure-atomic resume marker; never accepted from an agent. */
   suppressFailedStartAudit?: boolean;
+  /** Shared capability pinned by SessionManager for every flat run-ledger operation. */
+  secureLedger?: SecureAutoloopLedger;
   /**
    * Optional acceptance contract. When present the Reviewer's `advance` is no
    * longer sufficient on its own: the contract runs against the workspace and a
@@ -137,6 +181,8 @@ export interface ClaudeAgentDispatcherConfig {
   pushPolicyRef?: PushPolicy;
   /** Called when Planner emits spawn_subagents. S4 implements; S3 records the intent. */
   onSpawnSubagents?: (args: SpawnSubagentsArgs) => Promise<void>;
+  /** Called exactly after the durably verified spawn effect commits. */
+  onSpawnSubagentsCommitted?: () => Promise<void> | void;
   /** Persist the effective non-secret role selection after a successful spawn. */
   onRoleSelectionChanged?: (selection: {
     coder: { engine: EngineType; model?: string; effort?: EffortLevel };
@@ -165,8 +211,620 @@ interface SendMessageResult {
   error?: string;
   /** Set when even the recovery retry failed — caller surfaces as phase_error. */
   fatal?: boolean;
+  /** Stable classification when a typed recovery failure made the send fatal. */
+  code?: AutoloopOperationErrorCode;
   /** Genuine send deadlines pause for an explicit resume instead of retrying. */
   recoverable_timeout?: SendTimeoutPayload;
+  /** Effective durable route when reset-once recovery rebound a delivery. */
+  durableDelivery?: DeliveryIntent;
+}
+
+const AUTOLOOP_OPERATION_RETRYABILITY = {
+  AUTOLOOP_EMPTY_REPLY: true,
+  AUTOLOOP_SESSION_NOT_CREATED: true,
+  AUTOLOOP_ENGINE_FAILURE: true,
+  AUTOLOOP_REQUIRED_TOOL_DENIED: true,
+  AUTOLOOP_CONTROL_MALFORMED: false,
+  AUTOLOOP_CONTROL_APPLICATION_FAILED: false,
+  AUTOLOOP_CONTROL_NOT_PERSISTED: true,
+  AUTOLOOP_RESET_POSTCONDITION_FAILED: false,
+  AUTOLOOP_LEDGER_FILE_SYNC_INCOMPLETE: false,
+  AUTOLOOP_LEDGER_DIRECTORY_SYNC_INCOMPLETE: false,
+  AUTOLOOP_LEDGER_DESCRIPTOR_CLOSE_INCOMPLETE: false,
+  AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID: false,
+} as const satisfies Record<AutoloopOperationErrorCode, boolean>;
+
+export class AutoloopOperationError extends Error {
+  readonly retryable: boolean;
+  /** Failures encountered while routing this error; never replace its public identity. */
+  readonly secondaryErrors: Error[] = [];
+
+  constructor(
+    readonly code: AutoloopOperationErrorCode,
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = 'AutoloopOperationError';
+    this.retryable = AUTOLOOP_OPERATION_RETRYABILITY[code];
+  }
+}
+
+/**
+ * A matching control row is already authoritative, but this process cannot
+ * prove whether its effects completed. Keep the ordinary typed failure at the
+ * public boundary while suppressing another decision-log row: moving the tail
+ * would otherwise let a later recovery miss the committed control and replay
+ * it.
+ */
+class CommittedPlannerControlReplayError extends AutoloopOperationError {
+  constructor(
+    message = 'Planner control event is already committed; refusing to repeat effects without a durable application receipt',
+  ) {
+    super('AUTOLOOP_CONTROL_APPLICATION_FAILED', message);
+  }
+}
+
+/** Ledger inspection failed, so even best-effort audit must not write through it. */
+class PlannerControlLedgerInvalidError extends AutoloopOperationError {
+  constructor(message: string, options?: ErrorOptions) {
+    super('AUTOLOOP_CONTROL_NOT_PERSISTED', message, options);
+  }
+}
+
+function normalizePlannerOperationError(error: unknown): AutoloopOperationError | SecureAutoloopLedgerCommitError {
+  if (error instanceof AutoloopOperationError || isCommittedSecureLedgerError(error)) return error;
+  const cause = error instanceof Error ? error : new Error(String(error));
+  return new AutoloopOperationError('AUTOLOOP_ENGINE_FAILURE', `Planner engine transport failed: ${cause.message}`, {
+    cause,
+  });
+}
+
+export type AutoloopResetResult =
+  | {
+      ok: true;
+      agent: AutoloopRoleName;
+      previous_generation?: number;
+      active_generation?: number;
+      reusable: true;
+    }
+  | {
+      ok: false;
+      code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED';
+      agent: AutoloopRoleName;
+      previous_generation?: number;
+      message: string;
+      retryable: false;
+    };
+
+interface PlannerTurnResult {
+  reply: string;
+  generation?: PhysicalAgentGeneration;
+  generationLiveness?: 'live' | 'absent' | 'unknown';
+  requiredToolDenied?: boolean;
+  persistedControl?: PlannerControlEvidence;
+}
+
+interface PlannerTurnExpectation {
+  /** Preliminary engine/generation checks run before control parsing. */
+  requireLogicalResult?: boolean;
+  expectedGeneration?: PhysicalAgentGeneration;
+  expectedControl?: Omit<PlannerControlEvidence, 'control_id' | 'persisted_at'>;
+}
+
+interface PlannerControlEvidence {
+  control_id: string;
+  persisted_at: string;
+  dispatch_id: string;
+  message_id: string;
+  iter: number;
+  generation: number;
+  owner_instance_id: string;
+  session_id?: string;
+  tools: PlannerToolName[];
+  controls: PlannerToolCall[];
+  controls_sha256: string;
+}
+
+function plannerControlsSha256(controls: readonly PlannerToolCall[]): string {
+  return createHash('sha256').update(canonicalPlannerControlsJson(controls)).digest('hex');
+}
+
+function plannerControlClaimMatches(
+  observed: PlannerControlEvidence | undefined,
+  expected: Omit<PlannerControlEvidence, 'control_id' | 'persisted_at'>,
+): observed is PlannerControlEvidence {
+  return Boolean(
+    observed &&
+    observed.dispatch_id === expected.dispatch_id &&
+    observed.message_id === expected.message_id &&
+    observed.iter === expected.iter &&
+    observed.generation === expected.generation &&
+    observed.owner_instance_id === expected.owner_instance_id &&
+    observed.session_id === expected.session_id &&
+    observed.controls_sha256 === expected.controls_sha256 &&
+    plannerControlsSha256(observed.controls) === observed.controls_sha256 &&
+    observed.tools.length === expected.tools.length &&
+    observed.tools.every((tool, index) => tool === expected.tools[index]),
+  );
+}
+
+function plannerControlEvidenceMatches(
+  observed: PlannerControlEvidence | undefined,
+  expected: PlannerControlEvidence,
+): observed is PlannerControlEvidence {
+  return Boolean(
+    observed &&
+    observed.control_id === expected.control_id &&
+    observed.persisted_at === expected.persisted_at &&
+    plannerControlClaimMatches(observed, expected),
+  );
+}
+
+function plannerControlEvidenceFromTail(line: string): PlannerControlEvidence | undefined {
+  if (!line.trim()) return undefined;
+  let row: { kind?: unknown; payload?: unknown };
+  try {
+    row = JSON.parse(line) as { kind?: unknown; payload?: unknown };
+  } catch {
+    return undefined;
+  }
+  return row.kind === 'planner_turn_control' && row.payload && typeof row.payload === 'object'
+    ? (row.payload as PlannerControlEvidence)
+    : undefined;
+}
+
+const MAX_DECISION_LEDGER_BYTES = 64 * 1024 * 1024;
+const MAX_DECISION_LEDGER_ROW_BYTES = MAX_PLANNER_CONTROL_BATCH_BYTES + 256 * 1024;
+const MAX_REVIEW_REQUEST_IDENTITIES = 4_096;
+const MAX_CONCURRENT_REVIEW_REQUEST_PREPARATIONS = 64;
+const REVIEW_REQUEST_DECISION_KEYS = [
+  'checkpoint_sha',
+  'source_run_id',
+  'source_iter',
+  'target_iter',
+  'scope',
+  'idempotency_key',
+  'request_digest',
+] as const;
+type ReviewEvidenceArtifact = 'directive.json' | 'eval_output.json' | 'coder_summary.txt' | 'diff.patch';
+const MAX_GIT_EVIDENCE_STDERR_BYTES = 64 * 1024;
+const MAX_GIT_HEAD_STDOUT_BYTES = 256;
+const GIT_EVIDENCE_TIMEOUT_MS = 10_000;
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+type PersistedReviewVerdictPayload = {
+  decision: string;
+  metric: number | null;
+  audit_notes: string;
+  accepted?: boolean;
+  evidence_id?: string;
+};
+
+const PERSISTED_REVIEW_VERDICT_KEYS = ['decision', 'metric', 'audit_notes', 'accepted', 'evidence_id'] as const;
+const STORED_REVIEW_VERDICT_KEYS = new Set(['schema_version', 'iter', 'ts', ...PERSISTED_REVIEW_VERDICT_KEYS, 'flags']);
+const INCOMING_REVIEW_VERDICT_KEYS = new Set([...PERSISTED_REVIEW_VERDICT_KEYS, 'flags']);
+
+function canonicalPersistedVerdictPayload(
+  payload: PersistedReviewVerdictPayload,
+  storedEnvelope = false,
+): PersistedReviewVerdictPayload {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+    throw new Error('Refusing to persist invalid immutable Reviewer verdict payload');
+  }
+  const allowedKeys = storedEnvelope ? STORED_REVIEW_VERDICT_KEYS : INCOMING_REVIEW_VERDICT_KEYS;
+  const payloadKeys = Reflect.ownKeys(payload);
+  for (let index = 0; index < payloadKeys.length; index += 1) {
+    const key = payloadKeys[index];
+    if (typeof key !== 'string' || !allowedKeys.has(key)) {
+      throw new Error('Refusing to persist immutable Reviewer verdict payload with unsupported fields');
+    }
+  }
+  const decisionDescriptor = Object.getOwnPropertyDescriptor(payload, 'decision');
+  const metricDescriptor = Object.getOwnPropertyDescriptor(payload, 'metric');
+  const auditNotesDescriptor = Object.getOwnPropertyDescriptor(payload, 'audit_notes');
+  const acceptedDescriptor = Object.getOwnPropertyDescriptor(payload, 'accepted');
+  const evidenceIdDescriptor = Object.getOwnPropertyDescriptor(payload, 'evidence_id');
+  const flagsDescriptor = Object.getOwnPropertyDescriptor(payload, 'flags');
+  if (
+    !decisionDescriptor ||
+    !Object.hasOwn(decisionDescriptor, 'value') ||
+    !metricDescriptor ||
+    !Object.hasOwn(metricDescriptor, 'value') ||
+    !auditNotesDescriptor ||
+    !Object.hasOwn(auditNotesDescriptor, 'value') ||
+    (acceptedDescriptor !== undefined && !Object.hasOwn(acceptedDescriptor, 'value')) ||
+    (evidenceIdDescriptor !== undefined && !Object.hasOwn(evidenceIdDescriptor, 'value'))
+  ) {
+    throw new Error('Refusing to persist invalid immutable Reviewer verdict payload');
+  }
+  const decision = decisionDescriptor.value;
+  const metric = metricDescriptor.value;
+  const auditNotes = auditNotesDescriptor.value;
+  const accepted = acceptedDescriptor?.value;
+  const evidenceId = evidenceIdDescriptor?.value;
+  if (
+    (decision !== 'advance' && decision !== 'hold' && decision !== 'rollback') ||
+    (metric !== null && (typeof metric !== 'number' || !Number.isFinite(metric))) ||
+    typeof auditNotes !== 'string' ||
+    (acceptedDescriptor !== undefined && typeof accepted !== 'boolean') ||
+    (evidenceIdDescriptor !== undefined && typeof evidenceId !== 'string') ||
+    (flagsDescriptor !== undefined &&
+      (!Object.hasOwn(flagsDescriptor, 'value') ||
+        (flagsDescriptor.value !== undefined && !hasExactStringArrayElements(flagsDescriptor.value))))
+  ) {
+    throw new Error('Refusing to persist invalid immutable Reviewer verdict payload');
+  }
+
+  const canonical = Object.create(null) as PersistedReviewVerdictPayload;
+  Object.defineProperty(canonical, 'decision', { enumerable: true, value: decision });
+  Object.defineProperty(canonical, 'metric', { enumerable: true, value: metric });
+  Object.defineProperty(canonical, 'audit_notes', { enumerable: true, value: auditNotes });
+  if (acceptedDescriptor !== undefined) {
+    Object.defineProperty(canonical, 'accepted', { enumerable: true, value: accepted });
+  }
+  if (evidenceIdDescriptor !== undefined) {
+    Object.defineProperty(canonical, 'evidence_id', { enumerable: true, value: evidenceId });
+  }
+  Object.freeze(canonical);
+  return canonical;
+}
+
+function serializePersistedVerdictV1(iter: number, ts: string, payload: PersistedReviewVerdictPayload): string {
+  const persisted = Object.create(null) as Record<string, unknown>;
+  persisted.schema_version = LEDGER_SCHEMA_VERSION;
+  persisted.iter = iter;
+  persisted.ts = ts;
+  persisted.decision = payload.decision;
+  persisted.metric = payload.metric;
+  persisted.audit_notes = payload.audit_notes;
+  if (Object.hasOwn(payload, 'accepted')) persisted.accepted = payload.accepted;
+  if (Object.hasOwn(payload, 'evidence_id')) persisted.evidence_id = payload.evidence_id;
+  return JSON.stringify(persisted, null, 2);
+}
+
+function samePersistedVerdictPayload(stored: Record<string, unknown>, payload: PersistedReviewVerdictPayload): boolean {
+  const storedKeys = Reflect.ownKeys(stored);
+  for (let index = 0; index < storedKeys.length; index += 1) {
+    const key = storedKeys[index];
+    if (typeof key !== 'string' || !STORED_REVIEW_VERDICT_KEYS.has(key)) return false;
+  }
+  const flagsDescriptor = Object.getOwnPropertyDescriptor(stored, 'flags');
+  if (
+    flagsDescriptor !== undefined &&
+    (!Object.hasOwn(flagsDescriptor, 'value') || !hasExactStringArrayElements(flagsDescriptor.value))
+  ) {
+    return false;
+  }
+  let canonicalStored: PersistedReviewVerdictPayload;
+  try {
+    canonicalStored = canonicalPersistedVerdictPayload(stored as PersistedReviewVerdictPayload, true);
+  } catch {
+    return false;
+  }
+  for (let index = 0; index < PERSISTED_REVIEW_VERDICT_KEYS.length; index += 1) {
+    const key = PERSISTED_REVIEW_VERDICT_KEYS[index];
+    const storedHasKey = Object.hasOwn(canonicalStored, key);
+    const expectedHasKey = Object.hasOwn(payload, key);
+    if (storedHasKey !== expectedHasKey || (storedHasKey && canonicalStored[key] !== payload[key])) return false;
+  }
+  return true;
+}
+
+function serializeDirectiveV1(env: Extract<AnyAutoloopMessage, { type: 'directive' }>, dispatchId: string): string {
+  const persisted = Object.create(null) as Record<string, unknown>;
+  persisted.schema_version = LEDGER_SCHEMA_VERSION;
+  persisted.iter = env.iter;
+  persisted.ts = env.ts;
+  persisted.message_id = env.msg_id;
+  persisted.dispatch_id = dispatchId;
+  persisted.goal = env.payload.goal;
+  persisted.constraints = env.payload.constraints;
+  persisted.success_criteria = env.payload.success_criteria;
+  persisted.max_attempts = env.payload.max_attempts;
+  return JSON.stringify(persisted, null, 2);
+}
+
+function buildCoderDirectivePrompt(env: Extract<AnyAutoloopMessage, { type: 'directive' }>): string {
+  let prompt = `[directive iter=${env.iter}]\ngoal: ${env.payload.goal}`;
+  const constraints = env.payload.constraints;
+  if (constraints.length > 0) {
+    prompt += '\nconstraints:';
+    for (let index = 0; index < constraints.length; index += 1) prompt += `\n  - ${constraints[index]}`;
+  }
+  const successCriteria = env.payload.success_criteria;
+  if (successCriteria.length > 0) {
+    prompt += '\nsuccess_criteria:';
+    for (let index = 0; index < successCriteria.length; index += 1) prompt += `\n  - ${successCriteria[index]}`;
+  }
+  prompt += `\nmax_attempts: ${env.payload.max_attempts}`;
+  prompt += '\nRead plan.md / goal.json, make the change, run the evaluator, then emit `iter_complete`.';
+  return prompt;
+}
+
+function validatedPlannerControlEvidence(value: unknown): PlannerControlEvidence | undefined {
+  if (!isPlainRecord(value)) return undefined;
+  const controls = value.controls;
+  const tools = value.tools;
+  if (
+    typeof value.control_id !== 'string' ||
+    typeof value.persisted_at !== 'string' ||
+    typeof value.dispatch_id !== 'string' ||
+    typeof value.message_id !== 'string' ||
+    !Number.isSafeInteger(value.iter) ||
+    !Number.isSafeInteger(value.generation) ||
+    typeof value.owner_instance_id !== 'string' ||
+    (value.session_id !== undefined && typeof value.session_id !== 'string') ||
+    !Array.isArray(tools) ||
+    !tools.every((tool) => typeof tool === 'string') ||
+    !Array.isArray(controls) ||
+    !controls.every(
+      (control) => isPlainRecord(control) && typeof control.tool === 'string' && isPlainRecord(control.args),
+    ) ||
+    typeof value.controls_sha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(value.controls_sha256)
+  ) {
+    return undefined;
+  }
+  return value as unknown as PlannerControlEvidence;
+}
+
+function readBoundedDecisionLedger(ledger: SecureAutoloopLedger): Array<{ kind: string; payload?: unknown }> {
+  let handle;
+  try {
+    handle = ledger.openFlatFile('decisions.jsonl', 'read');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+  try {
+    const before = fs.fstatSync(handle.fd);
+    if (before.size > MAX_DECISION_LEDGER_BYTES) {
+      throw new Error(`decisions.jsonl exceeds the ${MAX_DECISION_LEDGER_BYTES}-byte recovery limit`);
+    }
+    if (before.size === 0) return [];
+    const bytes = Buffer.allocUnsafe(before.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = fs.readSync(handle.fd, bytes, offset, bytes.length - offset, offset);
+      if (count <= 0) throw new Error('decisions.jsonl ended before its validated snapshot was complete');
+      offset += count;
+    }
+    const after = fs.fstatSync(handle.fd);
+    if (after.size !== before.size || after.dev !== before.dev || after.ino !== before.ino) {
+      throw new Error('decisions.jsonl changed while its recovery snapshot was being validated');
+    }
+    if (bytes.at(-1) !== 0x0a) throw new Error('decisions.jsonl has an incomplete final record');
+    let text: string;
+    try {
+      // `fatal` rejects replacement-character decoding without allocating a
+      // second full-size Buffer. `ignoreBOM` keeps a leading BOM visible so
+      // the JSON parser rejects it exactly as the previous decoder did.
+      text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+    } catch (error) {
+      throw new Error('decisions.jsonl is not valid UTF-8', { cause: error });
+    }
+    const outboxRows: DeliveryLedgerRow[] = [];
+    const decisions = text
+      .slice(0, -1)
+      .split('\n')
+      .map((line, index) => {
+        const normalized = line.endsWith('\r') ? line.slice(0, -1) : line;
+        if (!normalized || Buffer.byteLength(normalized, 'utf8') > MAX_DECISION_LEDGER_ROW_BYTES) {
+          throw new Error(`decisions.jsonl record ${index + 1} is empty or exceeds its byte limit`);
+        }
+        let row: unknown;
+        try {
+          row = JSON.parse(normalized);
+        } catch (error) {
+          throw new Error(`decisions.jsonl record ${index + 1} is malformed`, { cause: error });
+        }
+        const outboxRow = parseOutboxDecisionLedgerRow(row, index + 1);
+        if (outboxRow !== undefined) {
+          outboxRows.push(outboxRow);
+          return undefined;
+        }
+        if (!isPlainRecord(row) || typeof row.kind !== 'string' || !row.kind) {
+          throw new Error(`decisions.jsonl record ${index + 1} is not a valid decision object`);
+        }
+        if (row.kind === 'planner_turn_control' && !validatedPlannerControlEvidence(row.payload)) {
+          throw new Error(`decisions.jsonl record ${index + 1} has invalid Planner control evidence`);
+        }
+        return { kind: row.kind, payload: row.payload };
+      })
+      .filter((row): row is { kind: string; payload: unknown } => row !== undefined);
+    validateOutboxDecisionLedgerGraph(outboxRows);
+    return decisions;
+  } finally {
+    fs.closeSync(handle.fd);
+  }
+}
+
+function findCommittedPlannerControl(
+  ledger: SecureAutoloopLedger,
+  expected: Omit<PlannerControlEvidence, 'control_id' | 'persisted_at'>,
+): 'none' | 'matching' | 'conflicting' {
+  const claims = readBoundedDecisionLedger(ledger)
+    .filter((row) => row.kind === 'planner_turn_control')
+    .map((row) => validatedPlannerControlEvidence(row.payload)!)
+    .filter((evidence) => evidence.dispatch_id === expected.dispatch_id);
+  if (claims.length === 0) return 'none';
+  if (claims.length === 1 && plannerControlClaimMatches(claims[0], expected)) return 'matching';
+  return 'conflicting';
+}
+
+interface IndexedReviewRequestClaim {
+  signature?: string;
+  conflicting: boolean;
+}
+
+interface CanonicalReviewRequestClaim {
+  identityHash: string;
+  signature?: string;
+}
+
+function reviewRequestClaim(payload: unknown): CanonicalReviewRequestClaim | undefined {
+  if (!isPlainRecord(payload)) return undefined;
+  const idempotencyDescriptor = Object.getOwnPropertyDescriptor(payload, 'idempotency_key');
+  if (
+    !idempotencyDescriptor ||
+    !Object.hasOwn(idempotencyDescriptor, 'value') ||
+    typeof idempotencyDescriptor.value !== 'string'
+  ) {
+    return undefined;
+  }
+  const identityHash = createHash('sha256').update(idempotencyDescriptor.value).digest('hex');
+  const ownKeys = Reflect.ownKeys(payload);
+  if (ownKeys.length !== REVIEW_REQUEST_DECISION_KEYS.length) return { identityHash };
+  for (let index = 0; index < ownKeys.length; index += 1) {
+    const ownKey = ownKeys[index];
+    let allowed = false;
+    for (let allowedIndex = 0; allowedIndex < REVIEW_REQUEST_DECISION_KEYS.length; allowedIndex += 1) {
+      if (ownKey === REVIEW_REQUEST_DECISION_KEYS[allowedIndex]) {
+        allowed = true;
+        break;
+      }
+    }
+    if (!allowed) return { identityHash };
+  }
+
+  const values = Object.create(null) as Record<(typeof REVIEW_REQUEST_DECISION_KEYS)[number], unknown>;
+  for (const key of REVIEW_REQUEST_DECISION_KEYS) {
+    const descriptor = Object.getOwnPropertyDescriptor(payload, key);
+    if (!descriptor || !Object.hasOwn(descriptor, 'value')) return { identityHash };
+    values[key] = descriptor.value;
+  }
+  if (
+    typeof values.checkpoint_sha !== 'string' ||
+    typeof values.source_run_id !== 'string' ||
+    !Number.isSafeInteger(values.source_iter) ||
+    !Number.isSafeInteger(values.target_iter) ||
+    !hasExactStringArrayElements(values.scope) ||
+    typeof values.request_digest !== 'string'
+  ) {
+    return { identityHash };
+  }
+
+  const hash = createHash('sha256');
+  const appendString = (value: string): void => {
+    hash.update(`${Buffer.byteLength(value, 'utf8')}:`);
+    hash.update(value, 'utf8');
+  };
+  appendString(values.checkpoint_sha);
+  appendString(values.source_run_id);
+  hash.update(`n:${values.source_iter};n:${values.target_iter};`);
+  hash.update(`a:${values.scope.length};`);
+  for (let index = 0; index < values.scope.length; index += 1) appendString(values.scope[index]);
+  appendString(idempotencyDescriptor.value);
+  appendString(values.request_digest);
+  return { identityHash, signature: hash.digest('hex') };
+}
+
+function indexReviewRequestClaims(
+  rows: ReadonlyArray<{ kind: string; payload?: unknown }>,
+): Map<string, IndexedReviewRequestClaim> {
+  const index = new Map<string, IndexedReviewRequestClaim>();
+  for (const row of rows) {
+    if (row.kind !== 'request_review') continue;
+    const claim = reviewRequestClaim(row.payload);
+    if (!claim) continue;
+    const existing = index.get(claim.identityHash);
+    if (!existing) {
+      if (index.size >= MAX_REVIEW_REQUEST_IDENTITIES) {
+        throw new Error(
+          `request_review durable identity index reached its ${MAX_REVIEW_REQUEST_IDENTITIES}-entry capacity`,
+        );
+      }
+      index.set(claim.identityHash, {
+        signature: claim.signature,
+        conflicting: claim.signature === undefined,
+      });
+      continue;
+    }
+    if (existing.conflicting || claim.signature === undefined || existing.signature !== claim.signature) {
+      index.set(claim.identityHash, { conflicting: true });
+    }
+  }
+  return index;
+}
+
+function mergeReviewRequestClaimIndexes(
+  loaded: Map<string, IndexedReviewRequestClaim>,
+  cached: ReadonlyMap<string, IndexedReviewRequestClaim> | undefined,
+): Map<string, IndexedReviewRequestClaim> {
+  if (!cached) return loaded;
+  const merged = new Map(loaded);
+  for (const [identityHash, cachedClaim] of cached) {
+    const loadedClaim = merged.get(identityHash);
+    if (!loadedClaim) {
+      merged.set(identityHash, cachedClaim);
+    } else if (loadedClaim.conflicting || cachedClaim.conflicting || loadedClaim.signature !== cachedClaim.signature) {
+      merged.set(identityHash, { conflicting: true });
+    }
+  }
+  return merged;
+}
+
+function reviewRequestDecisionPayload(
+  request: RequestReviewArgs,
+  targetIter: number,
+  digest: string,
+): Readonly<Record<string, unknown>> {
+  const payload = Object.create(null) as Record<string, unknown>;
+  Object.defineProperties(payload, {
+    checkpoint_sha: { enumerable: true, value: request.checkpoint_sha },
+    source_run_id: { enumerable: true, value: request.source_run_id },
+    source_iter: { enumerable: true, value: request.source_iter },
+    target_iter: { enumerable: true, value: targetIter },
+    scope: { enumerable: true, value: request.scope },
+    idempotency_key: { enumerable: true, value: request.idempotency_key },
+    request_digest: { enumerable: true, value: digest },
+  });
+  return Object.freeze(payload);
+}
+
+function assertPlannerTurnSucceeded(result: PlannerTurnResult, expected: PlannerTurnExpectation): void {
+  if (expected.expectedGeneration) {
+    const observed = result.generation;
+    if (
+      !observed ||
+      observed.state !== 'live' ||
+      result.generationLiveness !== 'live' ||
+      observed.generation !== expected.expectedGeneration.generation ||
+      observed.owner_instance_id !== expected.expectedGeneration.owner_instance_id ||
+      observed.session_id !== expected.expectedGeneration.session_id
+    ) {
+      throw new AutoloopOperationError(
+        'AUTOLOOP_SESSION_NOT_CREATED',
+        `Planner generation ${expected.expectedGeneration.generation} was not live after its turn`,
+      );
+    }
+  }
+  if (result.requiredToolDenied) {
+    throw new AutoloopOperationError(
+      'AUTOLOOP_REQUIRED_TOOL_DENIED',
+      'Planner turn completed without the engine accepting its required tool work',
+    );
+  }
+  if (expected.expectedControl) {
+    const persisted = result.persistedControl;
+    if (!plannerControlClaimMatches(persisted, expected.expectedControl)) {
+      throw new AutoloopOperationError(
+        'AUTOLOOP_CONTROL_NOT_PERSISTED',
+        'Planner control claims have no matching persisted event for this physical generation',
+      );
+    }
+  }
+  const hasVerifiedControl = expected.expectedControl !== undefined && result.persistedControl !== undefined;
+  if (expected.requireLogicalResult !== false && !result.reply.trim() && !hasVerifiedControl) {
+    throw new AutoloopOperationError(
+      'AUTOLOOP_EMPTY_REPLY',
+      'Planner transport completed without a non-empty logical reply',
+    );
+  }
 }
 
 type PendingSendTimeout = Omit<SendTimeoutPayload, 'error'>;
@@ -199,8 +857,34 @@ const MAX_RETAINED_DISPATCHES = 64;
  * inputs, so re-delivery in this or another dispatcher derives the same ID.
  */
 function deriveDispatchId(runId: string, env: AnyAutoloopMessage): string {
-  const identity = JSON.stringify([runId, env.msg_id, env.iter, env.from, env.to, env.type]);
-  return `dispatch_${createHash('sha256').update(identity).digest('hex')}`;
+  const identity = [] as unknown[];
+  Object.defineProperty(identity, '0', { enumerable: true, value: runId });
+  Object.defineProperty(identity, '1', { enumerable: true, value: env.msg_id });
+  Object.defineProperty(identity, '2', { enumerable: true, value: env.iter });
+  Object.defineProperty(identity, '3', { enumerable: true, value: env.from });
+  Object.defineProperty(identity, '4', { enumerable: true, value: env.to });
+  Object.defineProperty(identity, '5', { enumerable: true, value: env.type });
+  Object.setPrototypeOf(identity, null);
+  Object.freeze(identity);
+  return `dispatch_${createHash('sha256').update(JSON.stringify(identity)).digest('hex')}`;
+}
+
+/**
+ * Routing identity intentionally excludes message content.  Persist this
+ * separate digest so a replay cannot reuse an acknowledged route for a
+ * different directive, review request, or envelope timestamp.
+ */
+function logicalMessageSha256(env: Extract<AnyAutoloopMessage, { type: 'directive' | 'review_request' }>): string {
+  const material = Object.create(null) as Record<string, unknown>;
+  Object.defineProperty(material, 'msg_id', { enumerable: true, value: env.msg_id });
+  Object.defineProperty(material, 'iter', { enumerable: true, value: env.iter });
+  Object.defineProperty(material, 'from', { enumerable: true, value: env.from });
+  Object.defineProperty(material, 'to', { enumerable: true, value: env.to });
+  Object.defineProperty(material, 'type', { enumerable: true, value: env.type });
+  Object.defineProperty(material, 'ts', { enumerable: true, value: env.ts });
+  Object.defineProperty(material, 'payload', { enumerable: true, value: env.payload });
+  Object.freeze(material);
+  return createHash('sha256').update(JSON.stringify(material), 'utf8').digest('hex');
 }
 
 interface AutoloopRoleSelection extends AgentBinding {
@@ -218,12 +902,77 @@ interface DecisionLogEntry {
     | 'reset_agent'
     | 'update_push_policy'
     | 'compact'
+    | 'spawn_coder'
+    | 'spawn_reviewer'
     | 'spawn_subagents'
+    | 'request_review'
+    | 'planner_turn_control'
     | 'phase_error'
     | 'send_timeout'
     | 'policy_silence_blocked';
   actor: 'planner' | 'runner' | 'dispatcher';
   payload: Record<string, unknown>;
+}
+
+type AgentGenerationEventKind =
+  | 'agent_generation_reserved'
+  | 'agent_generation_started'
+  | 'agent_generation_lease_renewed'
+  | 'agent_generation_orphaned'
+  | 'agent_generation_released';
+
+type AutoloopAgentConflictCode =
+  | 'AUTOLOOP_AGENT_LIVE_CONFLICT'
+  | 'AUTOLOOP_AGENT_LIVENESS_UNKNOWN'
+  | 'AUTOLOOP_AGENT_LEASE_ACTIVE'
+  | 'AUTOLOOP_AGENT_GENERATION_CONFLICT'
+  | 'AUTOLOOP_AGENT_ROLLBACK_POSTCONDITION_FAILED'
+  | 'AUTOLOOP_AGENT_LEDGER_INVALID';
+
+/** Coalesce physical-agent reconciliation across dispatcher handles owned by this process. */
+const AGENT_START_OPERATIONS = new Map<string, Promise<void>>();
+
+export class AutoloopAgentConflictError extends Error {
+  constructor(
+    readonly code: AutoloopAgentConflictCode,
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = 'AutoloopAgentConflictError';
+  }
+}
+
+function isAgentGenerationEventKind(value: unknown): value is AgentGenerationEventKind {
+  return (
+    value === 'agent_generation_reserved' ||
+    value === 'agent_generation_started' ||
+    value === 'agent_generation_lease_renewed' ||
+    value === 'agent_generation_orphaned' ||
+    value === 'agent_generation_released'
+  );
+}
+
+function asPhysicalAgentGeneration(value: unknown): PhysicalAgentGeneration | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const candidate = value as Partial<PhysicalAgentGeneration>;
+  if (
+    (candidate.role !== 'planner' && candidate.role !== 'coder' && candidate.role !== 'reviewer') ||
+    !Number.isInteger(candidate.generation) ||
+    typeof candidate.session_name !== 'string' ||
+    typeof candidate.owner_instance_id !== 'string' ||
+    typeof candidate.created_at !== 'string' ||
+    typeof candidate.last_activity_at !== 'string' ||
+    typeof candidate.lease_expires_at !== 'string' ||
+    (candidate.state !== 'live' &&
+      candidate.state !== 'stale' &&
+      candidate.state !== 'orphaned' &&
+      candidate.state !== 'released') ||
+    (candidate.session_id !== undefined && typeof candidate.session_id !== 'string')
+  ) {
+    return null;
+  }
+  return { ...candidate } as PhysicalAgentGeneration;
 }
 
 export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatcher {
@@ -235,6 +984,8 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   private plannerStarted = false;
   private coderStarted = false;
   private reviewerStarted = false;
+  /** Set synchronously when shutdown begins; no late turn may publish effects. */
+  private terminal = false;
   private plannerSystemPrompt: string;
   private coderSystemPrompt: string;
   private reviewerSystemPrompt: string;
@@ -242,9 +993,14 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   private plannerSelection: AutoloopRoleSelection;
   private coderSelection: AutoloopRoleSelection;
   private reviewerSelection: AutoloopRoleSelection;
+  private readonly runtimeProbe: AgentRuntimeProbe;
+  private readonly ownerInstanceId: string;
+  private readonly now: () => Date;
+  private readonly agentLeaseMs: number;
   /** Where Reviewer reads from. Created lazily by stageReviewSandbox(). */
   private reviewerSandboxDir: string;
   private ledgerDir: string;
+  private readonly secureLedger: SecureAutoloopLedger;
   /**
    * One promise per immutable logical dispatch, so a re-delivered message is
    * coalesced onto the first send instead of spending a second agent turn.
@@ -260,8 +1016,50 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
    * messages of the original, far inside this window — while an entry still
    * in flight is never evicted, so concurrent duplicates always coalesce.
    */
-  private logicalDispatches = new Map<string, Promise<AnyAutoloopMessage[]>>();
+  private logicalDispatches = new Map<
+    string,
+    { logicalMessageSha256?: string; promise: Promise<AnyAutoloopMessage[]> }
+  >();
   private readonly settledDispatches = new Set<string>();
+  /**
+   * Bounded heavy preparation state. Settled entries retain no Promise or
+   * PreparedReviewRequest payload; the durable outbox owns restart recovery.
+   */
+  private readonly reviewRequests = new Map<
+    string,
+    { digest: string; pending?: Promise<PreparedReviewRequest>; settled: boolean }
+  >();
+  /**
+   * Prepared messages whose first in-process queue handoff was interrupted.
+   * The restart-durable outbox owns retries after the current process exits.
+   */
+  private readonly releasedReviewRequests = new Map<
+    string,
+    {
+      digest: string;
+      prepared: PreparedReviewRequest;
+      claimed: boolean;
+      reconcileDecision?: Readonly<Record<string, unknown>>;
+    }
+  >();
+  /**
+   * Run-local accepted identity claims, keyed only by SHA-256(idempotency_key).
+   * At capacity a new identity fails closed so an accepted identity is never
+   * forgotten during this process lifetime. The outbox owns restart durability.
+   */
+  private readonly reviewRequestIdentityHistory = new Map<string, string>();
+  /** Lazy bounded view of durable request_review claims in decisions.jsonl. */
+  private durableReviewRequestClaims: Map<string, IndexedReviewRequestClaim> | undefined;
+  /** Distinct checkpoint preparations currently holding heavyweight process and artifact state. */
+  private activeReviewRequestPreparations = 0;
+  /** Planner's compatibility effect owns its commit hook after the configured handler returns. */
+  private spawnCommitDeferralDepth = 0;
+  /** Failed start errors whose physical generation was reconciled as durable/live. */
+  private readonly reconciledStartFailures = new Map<AutoloopRoleName, unknown>();
+  /** Serializes selection, startup, and rollback as one observable subagent transition. */
+  private subagentSpawnTail: Promise<void> = Promise.resolve();
+  /** Per-run FIFO gate for the Reviewer's one mutable sandbox and session. */
+  private reviewerDispatchTail: Promise<void> = Promise.resolve();
 
   constructor(config: ClaudeAgentDispatcherConfig) {
     super();
@@ -293,12 +1091,500 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       effort: config.reviewerEffort,
       customEngine: config.reviewerCustomEngine,
     };
-    this.ledgerDir = path.join(config.workspace, 'tasks', config.runId);
+    this.runtimeProbe = config.runtimeProbe ?? config.manager;
+    const ownerInstanceId = config.ownerInstanceId ?? config.manager.autoloopOwnerInstanceId;
+    if (!ownerInstanceId || !isRecoverableAgentOwnerInstanceId(ownerInstanceId)) {
+      throw new AutoloopAgentReleaseOwnerError(ownerInstanceId ?? 'missing');
+    }
+    this.ownerInstanceId = ownerInstanceId;
+    this.now = config.now ?? (() => new Date());
+    this.agentLeaseMs = config.agentLeaseMs ?? DEFAULT_ACTIVITY_LEASE_MS;
+    this.secureLedger =
+      config.secureLedger ?? SecureAutoloopLedger.open(config.workspace, config.runId, { create: true });
+    this.ledgerDir = this.secureLedger.directory;
     this.reviewerSandboxDir = path.join(this.ledgerDir, 'reviewer_sandbox');
   }
 
   get sessionNames(): { planner: string; coder: string; reviewer: string } {
     return { planner: this.plannerName, coder: this.coderName, reviewer: this.reviewerName };
+  }
+
+  /** The run-scoped capability pinned when this dispatcher was constructed. */
+  get secureLedgerCapability(): SecureAutoloopLedger {
+    return this.secureLedger;
+  }
+
+  private sessionNameFor(role: AutoloopRoleName): string {
+    return role === 'planner' ? this.plannerName : role === 'coder' ? this.coderName : this.reviewerName;
+  }
+
+  private roleStarted(role: AutoloopRoleName): boolean {
+    return role === 'planner' ? this.plannerStarted : role === 'coder' ? this.coderStarted : this.reviewerStarted;
+  }
+
+  private setRoleStarted(role: AutoloopRoleName, started: boolean): void {
+    if (role === 'planner') this.plannerStarted = started;
+    else if (role === 'coder') this.coderStarted = started;
+    else this.reviewerStarted = started;
+  }
+
+  private takeReconciledStartFailure(role: AutoloopRoleName, error: unknown): boolean {
+    if (!this.reconciledStartFailures.has(role) || this.reconciledStartFailures.get(role) !== error) return false;
+    this.reconciledStartFailures.delete(role);
+    return true;
+  }
+
+  private readGenerationHistory(role: AutoloopRoleName): PhysicalAgentGeneration[] {
+    const history: PhysicalAgentGeneration[] = [];
+    const lines = (this.secureLedger.readFlatFile('agent-generations.jsonl') ?? '').split('\n');
+    for (const line of lines) {
+      if (!line) continue;
+      let entry: { kind?: unknown; payload?: unknown };
+      try {
+        entry = JSON.parse(line) as { kind?: unknown; payload?: unknown };
+      } catch {
+        throw new AutoloopAgentConflictError(
+          'AUTOLOOP_AGENT_LEDGER_INVALID',
+          `Autoloop agent generation ledger for '${this.config.runId}' contains malformed JSON`,
+        );
+      }
+      if (!isAgentGenerationEventKind(entry.kind)) continue;
+      const generation = asPhysicalAgentGeneration(entry.payload);
+      if (!generation) {
+        throw new AutoloopAgentConflictError(
+          'AUTOLOOP_AGENT_LEDGER_INVALID',
+          `Autoloop agent generation ledger for '${this.config.runId}' contains invalid ${String(entry.kind)} evidence`,
+        );
+      }
+      if (generation.role === role && generation.session_name === this.sessionNameFor(role)) {
+        history.push(generation);
+      }
+    }
+    return history;
+  }
+
+  private currentGeneration(role: AutoloopRoleName): PhysicalAgentGeneration | undefined {
+    return this.readGenerationHistory(role).at(-1);
+  }
+
+  private appendGenerationEvent(kind: AgentGenerationEventKind, generation: PhysicalAgentGeneration): void {
+    const line = JSON.stringify({
+      schema_version: LEDGER_SCHEMA_VERSION,
+      ts: this.now().toISOString(),
+      kind,
+      actor: 'dispatcher',
+      payload: { ...generation },
+    });
+    this.secureLedger.appendFlatFile('agent-generations.jsonl', `${line}\n`, true);
+  }
+
+  private conflict(code: AutoloopAgentConflictCode, role: AutoloopRoleName, detail: string): never {
+    const name = this.sessionNameFor(role);
+    throw new AutoloopAgentConflictError(code, `Autoloop session name '${name}' ${detail}`);
+  }
+
+  private nextGeneration(role: AutoloopRoleName): number {
+    return this.readGenerationHistory(role).reduce((highest, entry) => Math.max(highest, entry.generation), 0) + 1;
+  }
+
+  private newGeneration(role: AutoloopRoleName): PhysicalAgentGeneration & { session_id: string } {
+    const now = this.now();
+    const timestamp = now.toISOString();
+    return {
+      role,
+      generation: this.nextGeneration(role),
+      session_name: this.sessionNameFor(role),
+      session_id: randomUUID(),
+      owner_instance_id: this.ownerInstanceId,
+      created_at: timestamp,
+      last_activity_at: timestamp,
+      lease_expires_at: new Date(now.getTime() + this.agentLeaseMs).toISOString(),
+      state: 'stale',
+    };
+  }
+
+  private async releaseGeneration(
+    generation: PhysicalAgentGeneration,
+    orphaned: boolean,
+    onReleaseCommitted?: () => void,
+  ): Promise<void> {
+    const exactCurrentGeneration = (): PhysicalAgentGeneration => {
+      const current = this.currentGeneration(generation.role);
+      if (
+        !current ||
+        current.generation !== generation.generation ||
+        current.owner_instance_id !== generation.owner_instance_id ||
+        current.session_id !== generation.session_id
+      ) {
+        this.conflict(
+          'AUTOLOOP_AGENT_GENERATION_CONFLICT',
+          generation.role,
+          `changed while generation ${generation.generation} was being released`,
+        );
+      }
+      return current;
+    };
+
+    exactCurrentGeneration();
+    const observedAt = this.now().toISOString();
+    const released = await this.runtimeProbe.releaseReservation(generation.session_name, generation.generation, {
+      expectedOwnerInstanceId: generation.owner_instance_id,
+      expectedSessionId: generation.session_id,
+      releaseOwnerInstanceId: this.ownerInstanceId,
+      beforeRelease: () => {
+        const current = exactCurrentGeneration();
+        if (orphaned && current.state !== 'orphaned' && current.state !== 'released') {
+          this.appendGenerationEvent('agent_generation_orphaned', {
+            ...current,
+            last_activity_at: observedAt,
+            state: 'orphaned',
+          });
+        }
+      },
+      persistReleaseEvidence: () => {
+        const current = exactCurrentGeneration();
+        if (current.state === 'released') {
+          // A prior process may have appended this row and crashed (or thrown)
+          // before its durability barrier completed. Re-flush the authoritative
+          // ledger before allowing the registry tombstone to commit.
+          this.secureLedger.flushFlatFile('agent-generations.jsonl');
+          onReleaseCommitted?.();
+          return;
+        }
+        if (orphaned && current.state !== 'orphaned') {
+          this.conflict(
+            'AUTOLOOP_AGENT_GENERATION_CONFLICT',
+            generation.role,
+            `has no durable orphan evidence for generation ${generation.generation}`,
+          );
+        }
+        this.appendGenerationEvent('agent_generation_released', {
+          ...current,
+          last_activity_at: observedAt,
+          state: 'released',
+        });
+        onReleaseCommitted?.();
+      },
+    });
+    if (!released) {
+      this.conflict(
+        'AUTOLOOP_AGENT_GENERATION_CONFLICT',
+        generation.role,
+        `could not compare-and-release generation ${generation.generation}`,
+      );
+    }
+    if (exactCurrentGeneration().state !== 'released') {
+      this.conflict(
+        'AUTOLOOP_AGENT_GENERATION_CONFLICT',
+        generation.role,
+        `has no durable release evidence for generation ${generation.generation}`,
+      );
+    }
+  }
+
+  private async releaseStoppedGeneration(role: AutoloopRoleName): Promise<void> {
+    const current = this.currentGeneration(role);
+    if (!current || current.state === 'released') return;
+    const runtime = await this.runtimeProbe.inspect(current.session_name, current.session_id);
+    if (runtime !== 'absent') {
+      this.conflict(
+        runtime === 'live' ? 'AUTOLOOP_AGENT_LIVE_CONFLICT' : 'AUTOLOOP_AGENT_LIVENESS_UNKNOWN',
+        role,
+        `could not prove generation ${current.generation} absent after stop`,
+      );
+    }
+    await this.releaseGeneration(current, false);
+  }
+
+  private async releaseLegacyReservation(role: AutoloopRoleName): Promise<void> {
+    const sessionName = this.sessionNameFor(role);
+    const observedAt = this.now().toISOString();
+    const legacy: PhysicalAgentGeneration = {
+      role,
+      generation: 0,
+      session_name: sessionName,
+      owner_instance_id: 'legacy-registry',
+      created_at: observedAt,
+      last_activity_at: observedAt,
+      lease_expires_at: observedAt,
+      state: 'orphaned',
+    };
+    const released = await this.runtimeProbe.releaseReservation(sessionName, 0, {
+      expectedOwnerInstanceId: legacy.owner_instance_id,
+      expectedSessionId: legacy.session_id,
+      releaseOwnerInstanceId: this.ownerInstanceId,
+      beforeRelease: () => {
+        const current = this.currentGeneration(role);
+        if (!current) this.appendGenerationEvent('agent_generation_orphaned', legacy);
+      },
+      persistReleaseEvidence: () => {
+        const current = this.currentGeneration(role);
+        if (current?.generation === 0 && current.state === 'released') return;
+        if (current?.generation !== 0 || current.state !== 'orphaned') {
+          this.conflict('AUTOLOOP_AGENT_GENERATION_CONFLICT', role, 'has invalid legacy orphan evidence');
+        }
+        this.appendGenerationEvent('agent_generation_released', { ...current, state: 'released' });
+      },
+    });
+    if (released) {
+      const current = this.currentGeneration(role);
+      if (current?.generation !== 0 || current.state !== 'released') {
+        this.conflict('AUTOLOOP_AGENT_GENERATION_CONFLICT', role, 'has no durable legacy release evidence');
+      }
+    }
+  }
+
+  private async prepareGeneration(
+    role: AutoloopRoleName,
+  ): Promise<{ generation: PhysicalAgentGeneration; reuseLiveSession: boolean }> {
+    const current = this.currentGeneration(role);
+    const sessionName = this.sessionNameFor(role);
+
+    if (current && current.state !== 'released') {
+      // The durable reservation and the physical in-memory session are
+      // separate facts.  SessionManager can evict an idle session while the
+      // dispatcher that owns its still-live durable generation remains in
+      // memory.  In that exact same-owner case, hasSession() is authoritative
+      // evidence that this process no longer has the physical session; treat
+      // it as absent so the fenced generation can be released and recreated.
+      // A foreign owner's generation must still be decided exclusively by the
+      // runtime probe and its lease.
+      const ownedPhysicalSessionMissing =
+        current.owner_instance_id === this.ownerInstanceId &&
+        this.config.manager.hasSession !== undefined &&
+        !this.config.manager.hasSession(sessionName);
+      const runtime = ownedPhysicalSessionMissing
+        ? 'absent'
+        : await this.runtimeProbe.inspect(sessionName, current.session_id);
+      if (runtime === 'unknown') {
+        this.conflict('AUTOLOOP_AGENT_LIVENESS_UNKNOWN', role, 'has unknown runtime liveness');
+      }
+      if (runtime === 'live') {
+        if (current.owner_instance_id !== this.ownerInstanceId) {
+          this.conflict('AUTOLOOP_AGENT_LIVE_CONFLICT', role, 'is already in use by a live owner');
+        }
+        if (!this.config.manager.reserveAgentGeneration(current, this.config.workspace)) {
+          this.conflict(
+            'AUTOLOOP_AGENT_GENERATION_CONFLICT',
+            role,
+            `no longer belongs to generation ${current.generation}`,
+          );
+        }
+        const now = this.now();
+        const renewed: PhysicalAgentGeneration = {
+          ...current,
+          last_activity_at: now.toISOString(),
+          lease_expires_at: new Date(now.getTime() + this.agentLeaseMs).toISOString(),
+          state: 'live',
+        };
+        this.appendGenerationEvent('agent_generation_lease_renewed', renewed);
+        return { generation: renewed, reuseLiveSession: true };
+      }
+
+      const leaseExpiresAt = Date.parse(current.lease_expires_at);
+      if (Number.isNaN(leaseExpiresAt)) {
+        this.conflict('AUTOLOOP_AGENT_LEDGER_INVALID', role, 'has an invalid durable lease expiry');
+      }
+      if (
+        current.state !== 'orphaned' &&
+        current.owner_instance_id !== this.ownerInstanceId &&
+        leaseExpiresAt > this.now().getTime()
+      ) {
+        this.conflict('AUTOLOOP_AGENT_LEASE_ACTIVE', role, 'has an unexpired owner lease');
+      }
+      await this.releaseGeneration(current, true);
+    } else {
+      const runtime = await this.runtimeProbe.inspect(sessionName);
+      if (runtime === 'live') {
+        this.conflict('AUTOLOOP_AGENT_LIVE_CONFLICT', role, 'is already in use by a live owner');
+      }
+      if (runtime === 'unknown') {
+        this.conflict('AUTOLOOP_AGENT_LIVENESS_UNKNOWN', role, 'has unknown runtime liveness');
+      }
+      if (!current) await this.releaseLegacyReservation(role);
+    }
+
+    const generation = this.newGeneration(role);
+    let reserved = this.config.manager.reserveAgentGeneration(generation, this.config.workspace);
+    if (!reserved && current?.state === 'released') {
+      // Release evidence may have survived a crash before the registry's final
+      // tombstone transition. Finish that exact transition, then retry once.
+      await this.releaseGeneration(current, false);
+      reserved = this.config.manager.reserveAgentGeneration(generation, this.config.workspace);
+    }
+    if (!reserved) {
+      this.conflict(
+        'AUTOLOOP_AGENT_GENERATION_CONFLICT',
+        role,
+        `could not reserve generation ${generation.generation}`,
+      );
+    }
+    try {
+      this.appendGenerationEvent('agent_generation_reserved', generation);
+    } catch (err) {
+      // The row is authoritative once its bytes have been written and fsynced,
+      // even if the directory-entry barrier could not be completed. Rolling
+      // back the registry reservation here would contradict durable evidence
+      // and allow a duplicate logical generation on retry.
+      if (isCommittedSecureLedgerError(err)) throw err;
+      let rolledBack = false;
+      let rollbackError: unknown;
+      try {
+        rolledBack = await this.runtimeProbe.releaseReservation(generation.session_name, generation.generation, {
+          expectedOwnerInstanceId: generation.owner_instance_id,
+          expectedSessionId: generation.session_id,
+          rollbackUncommittedReservation: true,
+        });
+      } catch (releaseErr) {
+        rollbackError = releaseErr;
+      }
+      if (!rolledBack) {
+        const appendMessage = err instanceof Error ? err.message : String(err);
+        const rollbackContext =
+          rollbackError === undefined
+            ? ''
+            : `; rollback failed with ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`;
+        throw new AutoloopAgentConflictError(
+          'AUTOLOOP_AGENT_ROLLBACK_POSTCONDITION_FAILED',
+          `Autoloop session name '${generation.session_name}' could not roll back uncommitted generation ${generation.generation} after reservation ledger append failed: ${appendMessage}${rollbackContext}`,
+          { cause: err },
+        );
+      }
+      throw err;
+    }
+    return { generation, reuseLiveSession: false };
+  }
+
+  private async ensureAgentSession(
+    role: AutoloopRoleName,
+    start: (generation: PhysicalAgentGeneration) => Promise<void>,
+  ): Promise<void> {
+    if (this.terminal) return;
+    if (
+      this.roleStarted(role) &&
+      this.currentGeneration(role)?.state === 'live' &&
+      (this.config.manager.hasSession?.(this.sessionNameFor(role)) ?? true)
+    )
+      return;
+    const operationKey = `${this.ownerInstanceId}\0${this.sessionNameFor(role)}`;
+    const existing = AGENT_START_OPERATIONS.get(operationKey);
+    if (existing) {
+      await existing;
+      if (!this.terminal) this.setRoleStarted(role, true);
+      return;
+    }
+
+    const operation = (async () => {
+      const prepared = await this.prepareGeneration(role);
+      if (this.terminal) {
+        if (!prepared.reuseLiveSession) await this.releaseGeneration(prepared.generation, true);
+        return;
+      }
+      if (prepared.reuseLiveSession) {
+        if (!this.terminal) this.setRoleStarted(role, true);
+        return;
+      }
+
+      let physicalStarted = false;
+      try {
+        await start(prepared.generation);
+        physicalStarted = true;
+        if (this.terminal) {
+          await this.config.manager.stopSession(prepared.generation.session_name);
+          await this.releaseGeneration(prepared.generation, true);
+          return;
+        }
+        this.appendGenerationEvent('agent_generation_started', {
+          ...prepared.generation,
+          last_activity_at: this.now().toISOString(),
+          state: 'live',
+        });
+        this.setRoleStarted(role, true);
+      } catch (err) {
+        // start() returned successfully, so this exact generation was
+        // physically created even when its started-event append failed. Freeze
+        // the role before any awaited cleanup so concurrent selection changes
+        // cannot rebind that process while its survival is being determined.
+        if (physicalStarted) this.setRoleStarted(role, true);
+        if (physicalStarted) {
+          try {
+            await this.config.manager.stopSession(prepared.generation.session_name);
+          } catch {
+            // The runtime probe below decides whether release is safe.
+          }
+        }
+        let runtime: AgentRuntimeLiveness = 'unknown';
+        try {
+          runtime = await this.runtimeProbe.inspect(prepared.generation.session_name, prepared.generation.session_id);
+        } catch (cleanupErr) {
+          this.logger.warn?.(
+            `[autoloop] failed to inspect generation ${prepared.generation.generation} after startup error: ${(cleanupErr as Error).message}`,
+          );
+        }
+        if (runtime === 'absent') {
+          try {
+            await this.releaseGeneration(prepared.generation, true);
+            if (physicalStarted) this.setRoleStarted(role, false);
+          } catch (cleanupErr) {
+            this.logger.warn?.(
+              `[autoloop] failed to release generation ${prepared.generation.generation} after startup error: ${(cleanupErr as Error).message}`,
+            );
+          }
+        } else if (physicalStarted) {
+          let reconciled = false;
+          try {
+            const current = this.currentGeneration(role);
+            if (
+              !current ||
+              current.generation !== prepared.generation.generation ||
+              current.owner_instance_id !== prepared.generation.owner_instance_id ||
+              current.session_id !== prepared.generation.session_id
+            ) {
+              this.conflict(
+                'AUTOLOOP_AGENT_GENERATION_CONFLICT',
+                role,
+                `changed while generation ${prepared.generation.generation} startup was being reconciled`,
+              );
+            }
+            if (current.state === 'live') {
+              // A committed append can throw after writing the row. Re-flush
+              // that authoritative row instead of appending duplicate evidence.
+              this.secureLedger.flushFlatFile('agent-generations.jsonl');
+              reconciled = true;
+            } else if (current.state === 'stale') {
+              this.appendGenerationEvent('agent_generation_started', {
+                ...prepared.generation,
+                last_activity_at: this.now().toISOString(),
+                state: 'live',
+              });
+              reconciled = true;
+            } else {
+              this.conflict(
+                'AUTOLOOP_AGENT_GENERATION_CONFLICT',
+                role,
+                `has invalid ${current.state} evidence while generation ${current.generation} startup is surviving`,
+              );
+            }
+          } catch (cleanupErr) {
+            // The original startup error remains the public failure. Keeping
+            // roleStarted=true preserves the exact in-memory selection and
+            // prevents a duplicate or cross-engine rebind until reconciliation
+            // can be completed safely.
+            this.logger.warn?.(
+              `[autoloop] failed to reconcile surviving generation ${prepared.generation.generation} after startup error: ${(cleanupErr as Error).message}`,
+            );
+          }
+          if (reconciled) this.reconciledStartFailures.set(role, err);
+        }
+        throw err;
+      }
+    })();
+    AGENT_START_OPERATIONS.set(operationKey, operation);
+    try {
+      await operation;
+    } finally {
+      if (AGENT_START_OPERATIONS.get(operationKey) === operation) AGENT_START_OPERATIONS.delete(operationKey);
+    }
   }
 
   async init(state: AutoloopState): Promise<void> {
@@ -307,6 +1593,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   }
 
   async shutdown(reason: string, opts: { purge?: boolean } = {}): Promise<void> {
+    this.terminal = true;
     if (!(reason === 'start-failed' && this.config.suppressFailedStartAudit)) {
       this.appendDecisionLog({
         kind: 'terminate',
@@ -318,9 +1605,11 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     // keepPersisted: true keeps the persistedSessions entry on disk so a
     // later /autoloop/<id>/resume can re-attach the Planner's Claude
     // conversation. Only autoloopDelete passes purge:true (real teardown).
-    for (const name of [this.plannerName, this.coderName, this.reviewerName]) {
+    for (const role of ['planner', 'coder', 'reviewer'] as const) {
+      const name = this.sessionNameFor(role);
       try {
         await this.config.manager.stopSession(name, { keepPersisted: !opts.purge });
+        await this.releaseStoppedGeneration(role);
       } catch (err) {
         this.logger.warn?.(`[autoloop] failed to stop ${name}: ${(err as Error).message}`);
       }
@@ -328,18 +1617,79 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   }
 
   async deliver(env: AnyAutoloopMessage): Promise<AnyAutoloopMessage[]> {
-    const dispatchId = deriveDispatchId(this.config.runId, env);
+    // Runner callers validate before enqueueing, but direct/recovery callers
+    // share this boundary. In particular, a forged review payload must not
+    // choose a different iteration after the envelope has been routed.
+    const message = canonicalizeMessage(env);
+    if (this.terminal) return [];
+    const dispatchId = deriveDispatchId(this.config.runId, message);
+    const logicalMessageDigest =
+      message.type === 'directive' || message.type === 'review_request' ? logicalMessageSha256(message) : undefined;
     const existing = this.logicalDispatches.get(dispatchId);
-    if (existing) return await existing;
+    if (existing) {
+      if (logicalMessageDigest !== undefined && existing.logicalMessageSha256 !== logicalMessageDigest) {
+        throw new AutoloopDeliveryOutboxError(
+          'AUTOLOOP_DELIVERY_IDEMPOTENCY_CONFLICT',
+          `Autoloop cached ${message.to} dispatch conflicts with the current logical message`,
+        );
+      }
+      return await existing.promise;
+    }
 
-    const pending = this.deliverOnce(env, dispatchId);
-    this.logicalDispatches.set(dispatchId, pending);
+    const pending = this.deliverOnce(message, dispatchId).catch((error: unknown) => {
+      const operationError = message.to === 'planner' ? normalizePlannerOperationError(error) : error;
+      const shouldAuditOperationFailure =
+        operationError instanceof AutoloopOperationError ||
+        ((message.to === 'coder' || message.to === 'reviewer') && isCommittedSecureLedgerError(operationError));
+      if (
+        shouldAuditOperationFailure &&
+        !(operationError instanceof CommittedPlannerControlReplayError) &&
+        !(operationError instanceof PlannerControlLedgerInvalidError)
+      ) {
+        const committed = isCommittedSecureLedgerError(operationError);
+        const auditFailure = this.appendDecisionLog({
+          kind: 'phase_error',
+          actor: 'dispatcher',
+          payload: {
+            agent: message.to,
+            phase: `${message.to}_turn`,
+            code: operationError.code,
+            ...(committed ? { committed: true, retryable: false } : {}),
+            error: operationError.message,
+          },
+        });
+        if (auditFailure) operationError.secondaryErrors.push(auditFailure);
+      }
+      // A rejected logical-content conflict is never a deduplication result.
+      // Nor is a complete durable result whose acknowledgement failed: an
+      // exact retry can safely finish that missing acknowledgement. Keep every
+      // other rejection and all in-flight promises as their original fences.
+      if (
+        ((operationError instanceof AutoloopDeliveryOutboxError &&
+          operationError.code === 'AUTOLOOP_DELIVERY_IDEMPOTENCY_CONFLICT') ||
+          this.hasUnacknowledgedDurableRecovery(message, dispatchId, logicalMessageDigest)) &&
+        this.logicalDispatches.get(dispatchId)?.promise === pending
+      ) {
+        this.logicalDispatches.delete(dispatchId);
+        this.settledDispatches.delete(dispatchId);
+      }
+      throw operationError;
+    });
+    // A rejected conflicting dispatch can leave its later settle callback
+    // behind after its map entry was removed. A new pending attempt owns this
+    // identity, so it must never inherit that stale settled marker.
+    this.settledDispatches.delete(dispatchId);
+    this.logicalDispatches.set(dispatchId, { logicalMessageSha256: logicalMessageDigest, promise: pending });
     // Mark settled before trimming so eviction can tell an in-flight dispatch
     // from a finished one. A rejection settles too; `deliver` still rethrows it
     // to this caller, and the entry is only a dedup record afterwards.
     void pending.then(
-      () => this.settledDispatches.add(dispatchId),
-      () => this.settledDispatches.add(dispatchId),
+      () => {
+        if (this.logicalDispatches.get(dispatchId)?.promise === pending) this.settledDispatches.add(dispatchId);
+      },
+      () => {
+        if (this.logicalDispatches.get(dispatchId)?.promise === pending) this.settledDispatches.add(dispatchId);
+      },
     );
     try {
       return await pending;
@@ -385,9 +1735,23 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       case 'coder':
         return await this.deliverToCoder(env, dispatchId);
       case 'reviewer':
-        return await this.deliverToReviewer(env, dispatchId);
+        return await this.serializeReviewerDispatch(() => this.deliverToReviewer(env, dispatchId));
       default:
         throw new Error(`[autoloop] unexpected dispatcher target: ${env.to}`);
+    }
+  }
+
+  private async serializeReviewerDispatch<T>(dispatch: () => Promise<T>): Promise<T> {
+    const predecessor = this.reviewerDispatchTail;
+    let release!: () => void;
+    this.reviewerDispatchTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await predecessor;
+    try {
+      return await dispatch();
+    } finally {
+      release();
     }
   }
 
@@ -414,9 +1778,10 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
    * started, which is the safe lie: a later engine change is then rejected
    * instead of silently binding the run to a process that never went away.
    */
-  private async stopRolledBackSession(name: string): Promise<boolean> {
+  private async stopRolledBackSession(role: AutoloopRoleName, name: string): Promise<boolean> {
     try {
       await this.config.manager.stopSession(name);
+      await this.releaseStoppedGeneration(role);
       return true;
     } catch (stopErr) {
       this.logger.error?.(
@@ -461,7 +1826,12 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   private recordTurn(role: AutoloopRoleName, who: 'user' | 'agent', text: string): void {
     if (!text) return;
     const log = this.transcripts[role];
-    log.push({ who, text });
+    Object.defineProperty(log, String(log.length), {
+      configurable: true,
+      enumerable: true,
+      value: { who, text },
+      writable: true,
+    });
     let budget = REPLAY_CHAR_BUDGET;
     let keepFrom = log.length;
     for (let i = log.length - 1; i >= 0; i--) {
@@ -476,8 +1846,12 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     if (this.hasNativeConversation(selection)) return null;
     const log = this.transcripts[role];
     if (log.length === 0) return null;
-    const lines = log.map((entry) => `<${entry.who}>\n${entry.text}\n</${entry.who}>`);
-    return ['<conversation_history>', ...lines, '</conversation_history>'].join('\n');
+    let history = '<conversation_history>';
+    for (let index = 0; index < log.length; index += 1) {
+      const entry = log[index];
+      history += `\n<${entry.who}>\n${entry.text}\n</${entry.who}>`;
+    }
+    return `${history}\n</conversation_history>`;
   }
 
   private withRoleInstructions(
@@ -487,22 +1861,15 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     message: string,
   ): string {
     if (selection.engine === 'claude') return message;
-    const parts = ['<autoloop_role_instructions>', systemPrompt.trim(), '</autoloop_role_instructions>', ''];
+    let prompt = `<autoloop_role_instructions>\n${systemPrompt.trim()}\n</autoloop_role_instructions>\n`;
     const history = this.renderHistory(role, selection);
-    if (history) parts.push(history, '');
-    parts.push('<autoloop_message>', message, '</autoloop_message>');
-    return parts.join('\n');
+    if (history) prompt += `\n${history}\n`;
+    return `${prompt}\n<autoloop_message>\n${message}\n</autoloop_message>`;
   }
 
-  /**
-   * Start Coder + Reviewer sessions. Idempotent. Called in response to a
-   * Planner spawn_subagents tool (the SessionManager wires this via
-   * onSpawnSubagents).
-   */
-  async spawnSubagents(args: SpawnSubagentsArgs = {}): Promise<void> {
+  private nextCoderSelection(args: SpawnCoderArgs): AutoloopRoleSelection {
     const nextCoderEngine = args.coder_engine ?? this.coderSelection.engine;
-    const nextReviewerEngine = args.reviewer_engine ?? this.reviewerSelection.engine;
-    const nextCoder: AutoloopRoleSelection = {
+    return {
       ...this.coderSelection,
       engine: nextCoderEngine,
       model:
@@ -512,7 +1879,11 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
             ? undefined
             : this.coderSelection.model,
     };
-    const nextReviewer: AutoloopRoleSelection = {
+  }
+
+  private nextReviewerSelection(args: SpawnReviewerArgs): AutoloopRoleSelection {
+    const nextReviewerEngine = args.reviewer_engine ?? this.reviewerSelection.engine;
+    return {
       ...this.reviewerSelection,
       engine: nextReviewerEngine,
       model:
@@ -522,48 +1893,564 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
             ? undefined
             : this.reviewerSelection.model,
     };
-    this.validateSelection('coder', nextCoder);
-    this.validateSelection('reviewer', nextReviewer);
+  }
 
-    const coderChanged =
-      nextCoder.engine !== this.coderSelection.engine ||
-      this.roleModel('coder', nextCoder) !== this.roleModel('coder', this.coderSelection);
-    const reviewerChanged =
-      nextReviewer.engine !== this.reviewerSelection.engine ||
-      this.roleModel('reviewer', nextReviewer) !== this.roleModel('reviewer', this.reviewerSelection);
-    if (this.coderStarted && coderChanged) {
+  private assertSelectionCanStart(role: 'coder' | 'reviewer', next: AutoloopRoleSelection): void {
+    this.validateSelection(role, next);
+    const current = role === 'coder' ? this.coderSelection : this.reviewerSelection;
+    const changed = next.engine !== current.engine || this.roleModel(role, next) !== this.roleModel(role, current);
+    if (role === 'coder' && this.coderStarted && changed) {
       throw new Error('Cannot change Coder engine or model after its session has started');
     }
-    if (this.reviewerStarted && reviewerChanged) {
+    if (role === 'reviewer' && this.reviewerStarted && changed) {
       throw new Error('Cannot change Reviewer engine or model after its session has started');
     }
+  }
+
+  private requireLiveGeneration(role: 'coder' | 'reviewer'): PhysicalAgentGeneration {
+    const generation = this.currentGeneration(role);
+    if (!generation || generation.state !== 'live') {
+      throw new Error(`Autoloop ${role} session did not create or reuse a live generation`);
+    }
+    return generation;
+  }
+
+  /**
+   * Persist the exact transport text before the first send. A replay reads the
+   * immutable payload back from the outbox rather than rebuilding it from
+   * mutable conversation state.
+   */
+  private prepareDurableDelivery(
+    kind: DeliveryKind,
+    role: DeliveryTargetRole,
+    generation: PhysicalAgentGeneration,
+    idempotencyKey: string,
+    prompt: string,
+    logicalMessageDigest: string,
+  ): { intent: DeliveryIntent; prompt: string } {
+    const intent = prepareDelivery(this.secureLedger, {
+      idempotency_key: idempotencyKey,
+      kind,
+      target_role: role,
+      target_generation: generation.generation,
+      payload: { prompt, logical_message_sha256: logicalMessageDigest },
+    });
+    if (
+      intent.kind !== kind ||
+      intent.target_role !== role ||
+      intent.target_generation !== generation.generation ||
+      typeof intent.payload !== 'object' ||
+      intent.payload === null ||
+      Array.isArray(intent.payload) ||
+      Object.keys(intent.payload).length !== 2 ||
+      typeof (intent.payload as { prompt?: unknown }).prompt !== 'string' ||
+      (intent.payload as { logical_message_sha256?: unknown }).logical_message_sha256 !== logicalMessageDigest
+    ) {
+      throw new Error(`Autoloop durable ${role} delivery intent does not match its transport route`);
+    }
+    const persistedPrompt = (intent.payload as { prompt: string }).prompt;
+    return {
+      intent,
+      // The immutable payload is the base prompt. Its identity/digest travel
+      // across the actual receiver boundary in a separate deterministic
+      // envelope, avoiding a self-referential hash while still binding the
+      // receiver's completion to the exact persisted payload.
+      prompt:
+        `${persistedPrompt}\n\n<autoloop_delivery delivery_id="${intent.delivery_id}" ` +
+        `payload_sha256="${intent.payload_sha256}">\n` +
+        'Echo both fields unchanged in iter_complete, request_clarification, or review_complete.\n</autoloop_delivery>',
+    };
+  }
+
+  /**
+   * Validate an existing immutable delivery before any role-local effect.
+   * Its acknowledgement is optional because an exact retry can reconcile an
+   * already-persisted result or verdict without repeating role work.
+   */
+  private durableDeliveryState(
+    kind: DeliveryKind,
+    role: DeliveryTargetRole,
+    idempotencyKey: string,
+    logicalMessageDigest: string,
+  ): { intent: DeliveryIntent; acknowledged: boolean } | undefined {
+    const intent = lookupByIdempotencyKey(this.secureLedger, idempotencyKey);
+    if (!intent) return undefined;
+    if (intent.kind !== kind || intent.target_role !== role) {
+      throw new AutoloopDeliveryOutboxError(
+        'AUTOLOOP_DELIVERY_IDEMPOTENCY_CONFLICT',
+        `Autoloop ${role} delivery intent conflicts with the current transport route`,
+      );
+    }
+    const payload = intent.payload;
+    const payloadKeys = isPlainRecord(payload) ? Reflect.ownKeys(payload) : [];
+    const promptDescriptor = isPlainRecord(payload) ? Object.getOwnPropertyDescriptor(payload, 'prompt') : undefined;
+    const logicalDigestDescriptor = isPlainRecord(payload)
+      ? Object.getOwnPropertyDescriptor(payload, 'logical_message_sha256')
+      : undefined;
+    if (
+      !isPlainRecord(payload) ||
+      payloadKeys.length !== 2 ||
+      !payloadKeys.includes('prompt') ||
+      !payloadKeys.includes('logical_message_sha256') ||
+      !promptDescriptor ||
+      !Object.hasOwn(promptDescriptor, 'value') ||
+      typeof promptDescriptor.value !== 'string' ||
+      !logicalDigestDescriptor ||
+      !Object.hasOwn(logicalDigestDescriptor, 'value') ||
+      typeof logicalDigestDescriptor.value !== 'string'
+    ) {
+      throw new AutoloopDeliveryOutboxError(
+        'AUTOLOOP_DELIVERY_LEDGER_INVALID',
+        `Autoloop ${role} delivery intent has an invalid immutable payload`,
+      );
+    }
+    if (logicalDigestDescriptor.value !== logicalMessageDigest) {
+      throw new AutoloopDeliveryOutboxError(
+        'AUTOLOOP_DELIVERY_IDEMPOTENCY_CONFLICT',
+        `Autoloop ${role} delivery conflicts with the current logical message`,
+      );
+    }
+    const acknowledgement = lookupAcknowledgementByIdempotencyKey(this.secureLedger, idempotencyKey);
+    if (!acknowledgement) return { intent, acknowledged: false };
+    if (
+      acknowledgement.delivery_id !== intent.delivery_id ||
+      acknowledgement.payload_sha256 !== intent.payload_sha256
+    ) {
+      throw new Error(`Autoloop acknowledged ${role} delivery has invalid route or payload provenance`);
+    }
+    return { intent, acknowledged: true };
+  }
+
+  /**
+   * A settled rejection is released only when the exact logical dispatch has
+   * already completed a strictly valid durable result but still lacks its ACK.
+   * This is deliberately read-only: a conflict, malformed ledger state, or an
+   * in-flight operation remains fenced rather than becoming a retry.
+   */
+  private hasUnacknowledgedDurableRecovery(
+    message: AnyAutoloopMessage,
+    dispatchId: string,
+    logicalMessageDigest: string | undefined,
+  ): boolean {
+    if (logicalMessageDigest === undefined || (message.to !== 'coder' && message.to !== 'reviewer')) return false;
+    try {
+      const durable = this.durableDeliveryState(
+        message.to === 'coder' ? 'coder_directive' : 'review_request',
+        message.to,
+        dispatchId,
+        logicalMessageDigest,
+      );
+      if (!durable || durable.acknowledged) return false;
+      if (message.to === 'coder') {
+        if (lookupDeliveryResultByIdempotencyKey(this.secureLedger, dispatchId) === undefined) return false;
+        this.recoverDurableCoderDelivery(message.iter, durable.intent);
+      } else {
+        if (this.secureLedger.readIterationArtifact(message.iter, 'verdict.json') === undefined) return false;
+        this.recoverDurableReviewerDelivery(message.iter);
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private recoverDurableCoderDelivery(iter: number, intent: DeliveryIntent): AnyAutoloopMessage[] {
+    const result = lookupDeliveryResultByIdempotencyKey(this.secureLedger, intent.idempotency_key);
+    if (!result || result.delivery_id !== intent.delivery_id || result.payload_sha256 !== intent.payload_sha256) {
+      throw new AutoloopDeliveryOutboxError(
+        'AUTOLOOP_DELIVERY_LEDGER_INVALID',
+        `Autoloop acknowledged Coder delivery for iteration ${iter} has no recoverable durable result`,
+      );
+    }
+    if (result.result_kind === 'directive_ack') {
+      const payload = result.result_payload;
+      if (
+        !isPlainRecord(payload) ||
+        payload.understood !== false ||
+        typeof payload.clarification !== 'string' ||
+        Object.keys(payload).length !== 2
+      ) {
+        throw new AutoloopDeliveryOutboxError(
+          'AUTOLOOP_DELIVERY_LEDGER_INVALID',
+          `Autoloop acknowledged Coder delivery for iteration ${iter} has an invalid durable clarification result`,
+        );
+      }
+      return [Msg.directiveAck(iter, { understood: false, clarification: payload.clarification })];
+    }
+    if (result.result_kind !== 'iter_complete' || result.result_payload !== null) {
+      throw new AutoloopDeliveryOutboxError(
+        'AUTOLOOP_DELIVERY_LEDGER_INVALID',
+        `Autoloop acknowledged Coder delivery for iteration ${iter} has an invalid durable result discriminator`,
+      );
+    }
+    const evalArtifact = this.secureLedger.readIterationArtifact(iter, 'eval_output.json');
+    const diffArtifact = this.secureLedger.readIterationArtifact(iter, 'diff.patch');
+    if (!evalArtifact || !diffArtifact) {
+      throw new AutoloopDeliveryOutboxError(
+        'AUTOLOOP_DELIVERY_LEDGER_INVALID',
+        `Autoloop acknowledged Coder delivery for iteration ${iter} has no recoverable durable result`,
+      );
+    }
+    let stored: unknown;
+    try {
+      stored = JSON.parse(evalArtifact.toString('utf8'));
+    } catch (error) {
+      throw new AutoloopDeliveryOutboxError(
+        'AUTOLOOP_DELIVERY_LEDGER_INVALID',
+        `Autoloop acknowledged Coder delivery for iteration ${iter} has malformed durable result`,
+        { cause: error },
+      );
+    }
+    const storedKeys = isPlainRecord(stored) ? Reflect.ownKeys(stored) : [];
+    if (
+      !isPlainRecord(stored) ||
+      storedKeys.length !== 3 ||
+      !storedKeys.includes('schema_version') ||
+      !storedKeys.includes('iter') ||
+      !storedKeys.includes('eval_output') ||
+      stored.schema_version !== LEDGER_SCHEMA_VERSION ||
+      stored.iter !== iter ||
+      !Object.hasOwn(stored, 'eval_output')
+    ) {
+      throw new AutoloopDeliveryOutboxError(
+        'AUTOLOOP_DELIVERY_LEDGER_INVALID',
+        `Autoloop acknowledged Coder delivery for iteration ${iter} has invalid durable result`,
+      );
+    }
+    try {
+      return [
+        canonicalizeMessage(
+          Msg.iterArtifacts(iter, {
+            diff: diffArtifact.toString('utf8'),
+            eval_output: stored.eval_output,
+            files_changed: [],
+          }),
+        ),
+      ];
+    } catch (error) {
+      throw new AutoloopDeliveryOutboxError(
+        'AUTOLOOP_DELIVERY_LEDGER_INVALID',
+        `Autoloop acknowledged Coder delivery for iteration ${iter} has invalid durable eval output`,
+        { cause: error },
+      );
+    }
+  }
+
+  private recoverDurableReviewerDelivery(iter: number): AnyAutoloopMessage[] {
+    const artifact = this.secureLedger.readIterationArtifact(iter, 'verdict.json');
+    if (!artifact)
+      throw new AutoloopDeliveryOutboxError(
+        'AUTOLOOP_DELIVERY_LEDGER_INVALID',
+        `Autoloop acknowledged Reviewer delivery for iteration ${iter} has no recoverable durable result`,
+      );
+    let stored: unknown;
+    try {
+      stored = JSON.parse(artifact.toString('utf8'));
+    } catch (error) {
+      throw new AutoloopDeliveryOutboxError(
+        'AUTOLOOP_DELIVERY_LEDGER_INVALID',
+        `Autoloop acknowledged Reviewer delivery for iteration ${iter} has malformed durable result`,
+        { cause: error },
+      );
+    }
+    const storedKeys = isPlainRecord(stored) ? Reflect.ownKeys(stored) : [];
+    const acceptedDescriptor = isPlainRecord(stored) ? Object.getOwnPropertyDescriptor(stored, 'accepted') : undefined;
+    const evidenceIdDescriptor = isPlainRecord(stored)
+      ? Object.getOwnPropertyDescriptor(stored, 'evidence_id')
+      : undefined;
+    const hasAccepted = acceptedDescriptor !== undefined;
+    const hasEvidenceId = evidenceIdDescriptor !== undefined;
+    const storedTimestamp = isPlainRecord(stored) ? stored.ts : undefined;
+    const timestampIsCanonical =
+      typeof storedTimestamp === 'string' &&
+      Number.isFinite(Date.parse(storedTimestamp)) &&
+      new Date(storedTimestamp).toISOString() === storedTimestamp;
+    if (
+      !isPlainRecord(stored) ||
+      storedKeys.length !== 6 + (hasAccepted ? 2 : 0) ||
+      !storedKeys.includes('schema_version') ||
+      !storedKeys.includes('iter') ||
+      !storedKeys.includes('ts') ||
+      !storedKeys.includes('decision') ||
+      !storedKeys.includes('metric') ||
+      !storedKeys.includes('audit_notes') ||
+      stored.schema_version !== LEDGER_SCHEMA_VERSION ||
+      stored.iter !== iter ||
+      !timestampIsCanonical ||
+      (stored.decision !== 'advance' && stored.decision !== 'hold' && stored.decision !== 'rollback') ||
+      (stored.metric !== null && (typeof stored.metric !== 'number' || !Number.isFinite(stored.metric))) ||
+      typeof stored.audit_notes !== 'string' ||
+      hasAccepted !== hasEvidenceId ||
+      (hasAccepted &&
+        (stored.decision !== 'advance' ||
+          !Object.hasOwn(acceptedDescriptor!, 'value') ||
+          acceptedDescriptor!.value !== true ||
+          !Object.hasOwn(evidenceIdDescriptor!, 'value') ||
+          typeof evidenceIdDescriptor!.value !== 'string' ||
+          evidenceIdDescriptor!.value !== `iter-${iter}` ||
+          !evidenceIdDescriptor!.value.trim() ||
+          evidenceIdDescriptor!.value.trim() !== evidenceIdDescriptor!.value))
+    ) {
+      throw new AutoloopDeliveryOutboxError(
+        'AUTOLOOP_DELIVERY_LEDGER_INVALID',
+        `Autoloop acknowledged Reviewer delivery for iteration ${iter} has invalid durable result`,
+      );
+    }
+    return [
+      Msg.reviewVerdict(iter, {
+        decision: stored.decision,
+        metric: stored.metric,
+        audit_notes: stored.audit_notes,
+        ...(stored.accepted === true ? { accepted: true as const } : {}),
+        ...(typeof stored.evidence_id === 'string' ? { evidence_id: stored.evidence_id } : {}),
+      }),
+    ];
+  }
+
+  private assertReceiverProvenance(completion: Record<string, unknown> | undefined, intent: DeliveryIntent): void {
+    if (completion && nodeUtilTypes.isProxy(completion)) {
+      throw new AutoloopOperationError(
+        'AUTOLOOP_CONTROL_MALFORMED',
+        `Autoloop receiver completion did not echo delivery '${intent.delivery_id}' and its exact payload digest`,
+      );
+    }
+    const deliveryIdDescriptor = completion ? Object.getOwnPropertyDescriptor(completion, 'delivery_id') : undefined;
+    const payloadSha256Descriptor = completion
+      ? Object.getOwnPropertyDescriptor(completion, 'payload_sha256')
+      : undefined;
+    const deliveryId =
+      deliveryIdDescriptor && deliveryIdDescriptor.enumerable === true && Object.hasOwn(deliveryIdDescriptor, 'value')
+        ? deliveryIdDescriptor.value
+        : undefined;
+    const payloadSha256 =
+      payloadSha256Descriptor &&
+      payloadSha256Descriptor.enumerable === true &&
+      Object.hasOwn(payloadSha256Descriptor, 'value')
+        ? payloadSha256Descriptor.value
+        : undefined;
+    if (deliveryId !== intent.delivery_id || payloadSha256 !== intent.payload_sha256) {
+      throw new AutoloopOperationError(
+        'AUTOLOOP_CONTROL_MALFORMED',
+        `Autoloop receiver completion did not echo delivery '${intent.delivery_id}' and its exact payload digest`,
+      );
+    }
+  }
+
+  /** Only a durable acknowledgement may release an agent result to the runner. */
+  private acknowledgeDurableDelivery(intent: DeliveryIntent): void {
+    const acknowledgement = acknowledgeDelivery(this.secureLedger, intent.delivery_id, intent.payload_sha256);
+    if (
+      acknowledgement.delivery_id !== intent.delivery_id ||
+      acknowledgement.payload_sha256 !== intent.payload_sha256
+    ) {
+      throw new Error(`Autoloop durable delivery acknowledgement does not match '${intent.delivery_id}'`);
+    }
+  }
+
+  private async persistCurrentRoleSelection(): Promise<void> {
+    await this.config.onRoleSelectionChanged?.({
+      coder: { engine: this.coderSelection.engine, model: this.coderSelection.model },
+      reviewer: { engine: this.reviewerSelection.engine, model: this.reviewerSelection.model },
+    });
+  }
+
+  private async persistSurvivingRoleSelection(): Promise<void> {
+    try {
+      await this.persistCurrentRoleSelection();
+    } catch (persistError) {
+      // Rollback has already proved the physical session may still be live, so
+      // retaining the in-memory selection is mandatory. Selection persistence
+      // is secondary to the startup failure that led here and must not replace
+      // that original public error.
+      this.logger.error?.(
+        `[autoloop] failed to persist a surviving role selection after startup error: ${(persistError as Error).message}`,
+      );
+    }
+  }
+
+  private async serializeSubagentSpawn<T>(operation: () => Promise<T>): Promise<T> {
+    const predecessor = this.subagentSpawnTail;
+    let release!: () => void;
+    this.subagentSpawnTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await predecessor;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  private async spawnCoderPrimitive(args: SpawnCoderArgs, record: boolean): Promise<PhysicalAgentGeneration> {
+    if (this.terminal) throw new Error('Cannot start Coder after the Autoloop run became terminal');
+    const nextCoder = this.nextCoderSelection(args);
+    this.assertSelectionCanStart('coder', nextCoder);
+    const previousCoder = this.coderSelection;
+    const coderWasStarted = this.coderStarted;
+    this.coderSelection = nextCoder;
+    let generation: PhysicalAgentGeneration;
+    try {
+      await this.ensureCoder();
+      if (this.terminal) throw new Error('Autoloop terminated while starting Coder');
+      generation = this.requireLiveGeneration('coder');
+    } catch (err) {
+      // Direct primitives clean up their own failed start. The compatibility
+      // wrapper passes record=false and owns every rollback attempt itself.
+      if (record) {
+        let restorePreviousSelection = true;
+        if (!coderWasStarted && this.coderStarted) {
+          if (this.takeReconciledStartFailure('coder', err)) {
+            restorePreviousSelection = false;
+          } else {
+            const stopped = await this.stopRolledBackSession('coder', this.coderName);
+            this.coderStarted = !stopped;
+            restorePreviousSelection = stopped;
+          }
+        }
+        if (restorePreviousSelection) this.coderSelection = previousCoder;
+        else await this.persistSurvivingRoleSelection();
+      }
+      throw err;
+    }
+    if (record && !coderWasStarted) {
+      this.appendDecisionLog({
+        kind: 'spawn_coder',
+        actor: 'planner',
+        payload: {
+          coder_engine: nextCoder.engine,
+          coder_model: this.roleModel('coder', nextCoder),
+        },
+      });
+      await this.persistCurrentRoleSelection();
+    }
+    return generation;
+  }
+
+  private async spawnReviewerPrimitive(args: SpawnReviewerArgs, record: boolean): Promise<PhysicalAgentGeneration> {
+    if (this.terminal) throw new Error('Cannot start Reviewer after the Autoloop run became terminal');
+    const nextReviewer = this.nextReviewerSelection(args);
+    this.assertSelectionCanStart('reviewer', nextReviewer);
+    const previousReviewer = this.reviewerSelection;
+    const reviewerWasStarted = this.reviewerStarted;
+    this.reviewerSelection = nextReviewer;
+    let generation: PhysicalAgentGeneration;
+    try {
+      await this.ensureReviewer();
+      if (this.terminal) throw new Error('Autoloop terminated while starting Reviewer');
+      generation = this.requireLiveGeneration('reviewer');
+    } catch (err) {
+      // Direct primitives clean up their own failed start. The compatibility
+      // wrapper passes record=false and owns every rollback attempt itself.
+      if (record) {
+        let restorePreviousSelection = true;
+        if (!reviewerWasStarted && this.reviewerStarted) {
+          if (this.takeReconciledStartFailure('reviewer', err)) {
+            restorePreviousSelection = false;
+          } else {
+            const stopped = await this.stopRolledBackSession('reviewer', this.reviewerName);
+            this.reviewerStarted = !stopped;
+            restorePreviousSelection = stopped;
+            if (stopped) this.reviewerSessionPrompt = null;
+          }
+        }
+        if (restorePreviousSelection) this.reviewerSelection = previousReviewer;
+        else await this.persistSurvivingRoleSelection();
+      }
+      throw err;
+    }
+    if (record && !reviewerWasStarted) {
+      this.appendDecisionLog({
+        kind: 'spawn_reviewer',
+        actor: 'planner',
+        payload: {
+          reviewer_engine: nextReviewer.engine,
+          reviewer_model: this.roleModel('reviewer', nextReviewer),
+        },
+      });
+      await this.persistCurrentRoleSelection();
+    }
+    return generation;
+  }
+
+  /** Start only the Coder session. */
+  async spawnCoder(args: SpawnCoderArgs = {}): Promise<PhysicalAgentGeneration> {
+    this.assertSelectionCanStart('coder', this.nextCoderSelection(args));
+    return await this.serializeSubagentSpawn(async () => {
+      const wasStarted = this.coderStarted;
+      const generation = await this.spawnCoderPrimitive(args, true);
+      if (!wasStarted && this.spawnCommitDeferralDepth === 0) await this.config.onSpawnSubagentsCommitted?.();
+      return generation;
+    });
+  }
+
+  /** Start only the Reviewer session. */
+  async spawnReviewer(args: SpawnReviewerArgs = {}): Promise<PhysicalAgentGeneration> {
+    this.assertSelectionCanStart('reviewer', this.nextReviewerSelection(args));
+    return await this.serializeSubagentSpawn(async () => {
+      const wasStarted = this.reviewerStarted;
+      const generation = await this.spawnReviewerPrimitive(args, true);
+      if (!wasStarted && this.spawnCommitDeferralDepth === 0) await this.config.onSpawnSubagentsCommitted?.();
+      return generation;
+    });
+  }
+
+  /**
+   * Start Coder + Reviewer sessions. Idempotent compatibility wrapper. Both
+   * selections are validated before either independent primitive may start.
+   */
+  async spawnSubagents(args: SpawnSubagentsArgs = {}): Promise<void> {
+    await this.serializeSubagentSpawn(async () => await this.spawnSubagentsTransaction(args));
+  }
+
+  private async spawnSubagentsTransaction(args: SpawnSubagentsArgs): Promise<void> {
+    if (this.terminal) return;
+    const coderArgs: SpawnCoderArgs = { coder_engine: args.coder_engine, coder_model: args.coder_model };
+    const reviewerArgs: SpawnReviewerArgs = {
+      reviewer_engine: args.reviewer_engine,
+      reviewer_model: args.reviewer_model,
+    };
+    const nextCoder = this.nextCoderSelection(coderArgs);
+    const nextReviewer = this.nextReviewerSelection(reviewerArgs);
+    this.assertSelectionCanStart('coder', nextCoder);
+    this.assertSelectionCanStart('reviewer', nextReviewer);
 
     const previousCoder = this.coderSelection;
     const previousReviewer = this.reviewerSelection;
     const coderWasStarted = this.coderStarted;
     const reviewerWasStarted = this.reviewerStarted;
-    this.coderSelection = nextCoder;
-    this.reviewerSelection = nextReviewer;
     try {
-      await this.ensureCoder();
-      await this.ensureReviewer();
+      await this.spawnCoderPrimitive(coderArgs, false);
+      if (this.terminal) throw new Error('Autoloop terminated while starting subagents');
+      await this.spawnReviewerPrimitive(reviewerArgs, false);
+      if (this.terminal) throw new Error('Autoloop terminated while starting subagents');
     } catch (err) {
-      // Roll back only what THIS call started. Crucially, `<role>Started` may be
-      // cleared only when the stop actually succeeded: SessionManager.startSession
-      // returns the EXISTING session for a name that is still live and ignores the
-      // new engine/model. So if we lied about the session being gone, the next
-      // spawn_subagents would sail past the "engine cannot change after start"
-      // guard, silently reuse the old engine's process, and still record the new
-      // engine in decisions.jsonl and the registry — the exact divergence that
-      // guard exists to prevent.
-      if (!coderWasStarted && this.coderStarted) {
-        this.coderStarted = !(await this.stopRolledBackSession(this.coderName));
+      // Roll back only sessions started by this compatibility call. A failed
+      // stop leaves the role marked started so later selection changes cannot
+      // silently bind to the surviving process under different metadata.
+      let coderSurvivedRollback = false;
+      let reviewerSurvivedRollback = false;
+      const coderReconciled = this.takeReconciledStartFailure('coder', err);
+      const reviewerReconciled = this.takeReconciledStartFailure('reviewer', err);
+      if (coderReconciled || reviewerReconciled) {
+        coderSurvivedRollback = !coderWasStarted && this.coderStarted;
+        reviewerSurvivedRollback = !reviewerWasStarted && this.reviewerStarted;
+      } else {
+        if (!coderWasStarted && this.coderStarted) {
+          const stopped = await this.stopRolledBackSession('coder', this.coderName);
+          this.coderStarted = !stopped;
+          coderSurvivedRollback = !stopped;
+        }
+        if (!reviewerWasStarted && this.reviewerStarted) {
+          const stopped = await this.stopRolledBackSession('reviewer', this.reviewerName);
+          this.reviewerStarted = !stopped;
+          reviewerSurvivedRollback = !stopped;
+          if (stopped) this.reviewerSessionPrompt = null;
+        }
       }
-      if (!reviewerWasStarted && this.reviewerStarted) {
-        this.reviewerStarted = !(await this.stopRolledBackSession(this.reviewerName));
-      }
-      this.coderSelection = previousCoder;
-      this.reviewerSelection = previousReviewer;
+      this.coderSelection = coderSurvivedRollback ? nextCoder : previousCoder;
+      this.reviewerSelection = reviewerSurvivedRollback ? nextReviewer : previousReviewer;
+      if (coderSurvivedRollback || reviewerSurvivedRollback) await this.persistSurvivingRoleSelection();
       throw err;
     }
     const effectiveSelection = {
@@ -583,6 +2470,374 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       },
     });
     await this.config.onRoleSelectionChanged?.(effectiveSelection);
+    if (this.spawnCommitDeferralDepth === 0) await this.config.onSpawnSubagentsCommitted?.();
+  }
+
+  private async assertWorkspaceHead(request: RequestReviewArgs): Promise<void> {
+    const head = await this.runGitEvidence(
+      ['git', 'rev-parse', '--verify', 'HEAD'],
+      MAX_GIT_HEAD_STDOUT_BYTES,
+      'workspace HEAD',
+    );
+    const headDetail = (head.err.length > 0 ? head.err : head.out).toString('utf8').trim().slice(0, 300);
+    if (head.code !== 0) {
+      throw new Error(
+        `Reviewer-only checkpoint could not verify workspace HEAD (code=${head.code}): ${headDetail || 'no output'}`,
+      );
+    }
+    const workspaceHead = head.out.toString('ascii').trim();
+    if (workspaceHead !== request.checkpoint_sha) {
+      throw new Error(
+        `Reviewer-only checkpoint ${request.checkpoint_sha} does not match workspace HEAD ${workspaceHead || '(empty)'}`,
+      );
+    }
+  }
+
+  private async assertCheckpointPatch(request: RequestReviewArgs, importedPatch: Buffer): Promise<void> {
+    const shown = await this.runGitEvidence(
+      [
+        'git',
+        'show',
+        '--no-ext-diff',
+        '--no-textconv',
+        '--format=',
+        '--unified=3',
+        '--no-renames',
+        request.checkpoint_sha,
+        '--',
+      ],
+      importedPatch.length,
+      'checkpoint patch',
+      importedPatch,
+    );
+    const showDetail = (shown.err.length > 0 ? shown.err : shown.out).toString('utf8').trim().slice(0, 300);
+    if (shown.code !== 0) {
+      throw new Error(
+        `Reviewer-only checkpoint patch could not be read (code=${shown.code}): ${showDetail || 'no output'}`,
+      );
+    }
+  }
+
+  private preparedCheckpointReview(request: RequestReviewArgs, targetIter: number): PreparedReviewRequest {
+    const payload = canonicalizeMessage(
+      Msg.reviewRequest(targetIter, {
+        iter: targetIter,
+        ledger_path: this.ledgerDir,
+        prior_metrics: [],
+        ...request,
+      }),
+    ).payload as CheckpointReviewRequestPayload;
+    return Object.freeze({
+      status: 'prepared',
+      target: 'reviewer',
+      idempotency_key: request.idempotency_key,
+      payload,
+    });
+  }
+
+  private async prepareCheckpointReview(
+    request: RequestReviewArgs,
+    targetIter: number,
+    digest: string,
+  ): Promise<PreparedReviewRequest> {
+    if (this.terminal) throw new Error('Cannot request review after the Autoloop run became terminal');
+
+    // Establish repository identity before opening any caller-selected source
+    // run. A wrong checkpoint cannot trigger source-ledger inspection.
+    await this.assertWorkspaceHead(request);
+    if (this.terminal) throw new Error('Autoloop terminated while preparing the Reviewer-only request');
+
+    const sourceLedger =
+      request.source_run_id === this.config.runId
+        ? this.secureLedger
+        : SecureAutoloopLedger.openReadOnly(this.config.workspace, request.source_run_id);
+    const artifacts = new Map<ReviewEvidenceArtifact, Buffer>();
+    const importedPatch = sourceLedger.readIterationArtifact(request.source_iter, 'diff.patch');
+    if (importedPatch === undefined) {
+      throw new Error(
+        `Reviewer-only request requires source run '${request.source_run_id}' iter ${request.source_iter}/diff.patch`,
+      );
+    }
+    await this.assertCheckpointPatch(request, importedPatch);
+    artifacts.set('diff.patch', importedPatch);
+
+    for (const name of ['directive.json', 'eval_output.json', 'coder_summary.txt'] as const) {
+      const content = sourceLedger.readIterationArtifact(request.source_iter, name);
+      if (content === undefined) {
+        throw new Error(
+          `Reviewer-only request requires source run '${request.source_run_id}' iter ${request.source_iter}/${name}`,
+        );
+      }
+      artifacts.set(name, content);
+    }
+    if (this.terminal) throw new Error('Autoloop terminated while preparing the Reviewer-only request');
+
+    const prepared = this.preparedCheckpointReview(request, targetIter);
+
+    // Import exact source bytes into this run's immutable iteration boundary.
+    // This gives the existing Reviewer sandbox staging path a complete local
+    // artifact set without creating or directing a Coder.
+    for (const [name, content] of artifacts) {
+      this.secureLedger.writeIterationArtifact(targetIter, name, content);
+    }
+    const decisionPayload = reviewRequestDecisionPayload(request, targetIter, digest);
+    this.persistReviewRequestDecision(decisionPayload);
+
+    return prepared;
+  }
+
+  private trimReviewRequests(): void {
+    if (this.reviewRequests.size <= MAX_RETAINED_DISPATCHES) return;
+    for (const [key, entry] of this.reviewRequests) {
+      if (this.reviewRequests.size <= MAX_RETAINED_DISPATCHES) break;
+      if (!entry.settled) continue;
+      this.reviewRequests.delete(key);
+    }
+  }
+
+  private reviewRequestIdentityHash(idempotencyKey: string): string {
+    return createHash('sha256').update(idempotencyKey).digest('hex');
+  }
+
+  private loadDurableReviewRequestClaims(forceRefresh = false): Map<string, IndexedReviewRequestClaim> {
+    if (!forceRefresh && this.durableReviewRequestClaims) return this.durableReviewRequestClaims;
+    const index = indexReviewRequestClaims(readBoundedDecisionLedger(this.secureLedger));
+    if (index.size > 0) {
+      // A cold process must establish the file + parent-directory barrier
+      // before treating an existing request_review row as authority.
+      this.secureLedger.flushFlatFile('decisions.jsonl');
+    }
+    const complete = mergeReviewRequestClaimIndexes(index, this.durableReviewRequestClaims);
+    this.durableReviewRequestClaims = complete;
+    return complete;
+  }
+
+  private findDurableReviewRequest(
+    expected: Readonly<Record<string, unknown>>,
+    forceRefresh = false,
+  ): 'none' | 'matching' | 'conflicting' {
+    const wanted = reviewRequestClaim(expected);
+    if (!wanted?.signature) throw new Error('request_review durable claim is not canonical');
+    const observed = this.loadDurableReviewRequestClaims(forceRefresh).get(wanted.identityHash);
+    if (!observed) return 'none';
+    if (observed.conflicting || observed.signature !== wanted.signature) return 'conflicting';
+    return 'matching';
+  }
+
+  private cacheDurableReviewRequest(expected: Readonly<Record<string, unknown>>): void {
+    const claim = reviewRequestClaim(expected);
+    if (!claim?.signature) throw new Error('request_review durable claim is not canonical');
+    const current = this.durableReviewRequestClaims;
+    if (!current) throw new Error('request_review durable claim cache is unavailable');
+    const index = new Map(current);
+    const existing = index.get(claim.identityHash);
+    if (existing && (existing.conflicting || existing.signature !== claim.signature)) {
+      index.set(claim.identityHash, { conflicting: true });
+    } else {
+      index.set(claim.identityHash, { signature: claim.signature, conflicting: false });
+    }
+    this.durableReviewRequestClaims = index;
+  }
+
+  private durableReviewRequestIdentityCount(): number {
+    const durable = this.durableReviewRequestClaims;
+    let count = durable?.size ?? 0;
+    for (const identityHash of this.reviewRequestIdentityHistory.keys()) {
+      if (!durable?.has(identityHash)) count += 1;
+    }
+    return count;
+  }
+
+  private persistReviewRequestDecision(decisionPayload: Readonly<Record<string, unknown>>): void {
+    const decision = {
+      ts: this.now().toISOString(),
+      kind: 'request_review',
+      actor: 'planner',
+      payload: decisionPayload,
+    } satisfies DecisionLogEntry;
+    try {
+      this.secureLedger.appendFlatFile('decisions.jsonl', `${JSON.stringify(decision)}\n`, true);
+      this.cacheDurableReviewRequest(decisionPayload);
+    } catch (error) {
+      if (!isCommittedSecureLedgerError(error) || error.operation !== 'secure_ledger_append') throw error;
+      try {
+        if (this.findDurableReviewRequest(decisionPayload, true) !== 'matching') throw error;
+      } catch (reconciliationError) {
+        if (reconciliationError !== error) {
+          error.secondaryErrors.push(
+            reconciliationError instanceof Error ? reconciliationError : new Error(String(reconciliationError)),
+          );
+        }
+        throw error;
+      }
+    }
+  }
+
+  /** Re-arm one prepared message when its current queue handoff aborts. */
+  private releaseReviewRequest(idempotencyKey: string, payload: CheckpointReviewRequestPayload): void {
+    const identityHash = this.reviewRequestIdentityHash(idempotencyKey);
+    const digest = this.reviewRequestIdentityHistory.get(identityHash);
+    if (digest === undefined) return;
+    const existing = this.releasedReviewRequests.get(identityHash);
+    if (existing) {
+      if (existing.digest === digest) existing.claimed = false;
+      return;
+    }
+    this.releasedReviewRequests.set(identityHash, {
+      digest,
+      prepared: Object.freeze({
+        status: 'prepared',
+        target: 'reviewer',
+        idempotency_key: idempotencyKey,
+        payload,
+      }),
+      claimed: false,
+    });
+  }
+
+  /** Complete the in-process handoff; later same-key calls are duplicates. */
+  private acceptReviewRequest(idempotencyKey: string): void {
+    this.releasedReviewRequests.delete(this.reviewRequestIdentityHash(idempotencyKey));
+  }
+
+  /** Prepare an existing checkpoint for one Runner-routed Reviewer delivery. */
+  async requestReview(args: RequestReviewArgs, targetIter: number): Promise<ReviewRequestPreparationResult> {
+    if (this.terminal) throw new Error('Cannot request review after the Autoloop run became terminal');
+    const request = canonicalizeRequestReviewArgs(args);
+    if (!Number.isSafeInteger(targetIter) || targetIter < 0) {
+      throw new Error('request_review target iteration must be a nonnegative safe integer');
+    }
+    const digestMaterial = Object.create(null) as Record<string, unknown>;
+    Object.defineProperty(digestMaterial, 'target_iter', { enumerable: true, value: targetIter });
+    Object.defineProperty(digestMaterial, 'request', { enumerable: true, value: request });
+    const digest = createHash('sha256').update(JSON.stringify(digestMaterial)).digest('hex');
+    const identityHash = this.reviewRequestIdentityHash(request.idempotency_key);
+    const released = this.releasedReviewRequests.get(identityHash);
+    if (released) {
+      if (released.digest !== digest) {
+        throw new Error(`request_review idempotency key '${request.idempotency_key}' conflicts with another request`);
+      }
+      if (released.reconcileDecision) {
+        const durableClaim = this.findDurableReviewRequest(released.reconcileDecision, true);
+        if (durableClaim === 'conflicting') {
+          throw new Error(`request_review idempotency key '${request.idempotency_key}' conflicts with another request`);
+        }
+        if (durableClaim !== 'matching') {
+          throw new Error(
+            `request_review idempotency key '${request.idempotency_key}' has an unresolved committed decision`,
+          );
+        }
+        delete released.reconcileDecision;
+      }
+      if (!released.claimed) {
+        released.claimed = true;
+        return released.prepared;
+      }
+      return Object.freeze({
+        status: 'duplicate',
+        target: 'reviewer',
+        idempotency_key: request.idempotency_key,
+      });
+    }
+    const inFlight = this.reviewRequests.get(identityHash);
+    if (inFlight && !inFlight.settled && inFlight.pending) {
+      if (inFlight.digest !== digest) {
+        throw new Error(`request_review idempotency key '${request.idempotency_key}' conflicts with another request`);
+      }
+      await inFlight.pending;
+      return Object.freeze({
+        status: 'duplicate',
+        target: 'reviewer',
+        idempotency_key: request.idempotency_key,
+      });
+    }
+
+    const decisionPayload = reviewRequestDecisionPayload(request, targetIter, digest);
+    const durableClaim = this.findDurableReviewRequest(decisionPayload);
+    if (durableClaim === 'matching') {
+      this.reviewRequestIdentityHistory.set(identityHash, digest);
+      return Object.freeze({
+        status: 'duplicate',
+        target: 'reviewer',
+        idempotency_key: request.idempotency_key,
+      });
+    }
+    if (durableClaim === 'conflicting') {
+      throw new Error(`request_review idempotency key '${request.idempotency_key}' conflicts with another request`);
+    }
+    const acceptedDigest = this.reviewRequestIdentityHistory.get(identityHash);
+    if (acceptedDigest !== undefined) {
+      if (acceptedDigest !== digest) {
+        throw new Error(`request_review idempotency key '${request.idempotency_key}' conflicts with another request`);
+      }
+      return Object.freeze({
+        status: 'duplicate',
+        target: 'reviewer',
+        idempotency_key: request.idempotency_key,
+      });
+    }
+    if (this.durableReviewRequestIdentityCount() >= MAX_REVIEW_REQUEST_IDENTITIES) {
+      throw new Error(
+        `request_review identity history reached its ${MAX_REVIEW_REQUEST_IDENTITIES}-entry capacity; refusing a new identity`,
+      );
+    }
+    if (this.activeReviewRequestPreparations >= MAX_CONCURRENT_REVIEW_REQUEST_PREPARATIONS) {
+      throw new Error(
+        `request_review simultaneous preparation capacity is ${MAX_CONCURRENT_REVIEW_REQUEST_PREPARATIONS}; refusing a new identity`,
+      );
+    }
+    if (this.releasedReviewRequests.size >= MAX_RETAINED_DISPATCHES) {
+      throw new Error(
+        `request_review interrupted handoff capacity is ${MAX_RETAINED_DISPATCHES}; retry an existing identity first`,
+      );
+    }
+
+    this.reviewRequestIdentityHistory.set(identityHash, digest);
+    this.activeReviewRequestPreparations += 1;
+    const pending = this.prepareCheckpointReview(request, targetIter, digest);
+    const entry: { digest: string; pending?: Promise<PreparedReviewRequest>; settled: boolean } = {
+      digest,
+      pending,
+      settled: false,
+    };
+    this.reviewRequests.set(identityHash, entry);
+    try {
+      const result = await pending;
+      entry.settled = true;
+      delete entry.pending;
+      this.trimReviewRequests();
+      return result;
+    } catch (error) {
+      if (this.reviewRequests.get(identityHash) === entry) {
+        this.reviewRequests.delete(identityHash);
+      }
+      let retainIdentity = false;
+      let requiresReconciliation = false;
+      if (isCommittedSecureLedgerError(error) && error.operation === 'secure_ledger_append') {
+        try {
+          retainIdentity = this.findDurableReviewRequest(decisionPayload, true) === 'matching';
+        } catch {
+          // A committed decision append with an unreadable ledger remains
+          // ambiguous. Fail closed until a later in-process retry can reconcile it.
+          retainIdentity = true;
+          requiresReconciliation = true;
+        }
+      }
+      if (retainIdentity) {
+        this.releasedReviewRequests.set(identityHash, {
+          digest,
+          prepared: this.preparedCheckpointReview(request, targetIter),
+          claimed: false,
+          ...(requiresReconciliation ? { reconcileDecision: decisionPayload } : {}),
+        });
+      }
+      if (!retainIdentity && this.reviewRequestIdentityHistory.get(identityHash) === digest) {
+        this.reviewRequestIdentityHistory.delete(identityHash);
+      }
+      throw error;
+    } finally {
+      this.activeReviewRequestPreparations -= 1;
+    }
   }
 
   /**
@@ -597,31 +2852,137 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   async resetAgent(
     agent: 'planner' | 'coder' | 'reviewer',
     opts: { force?: boolean; eagerRestart?: boolean } = {},
-  ): Promise<void> {
+  ): Promise<AutoloopResetResult> {
     if (agent === 'planner' && !opts.force) {
-      throw new Error('Refusing to reset Planner without force=true (would discard chat context)');
+      return {
+        ok: false,
+        code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+        agent,
+        message: 'Refusing to reset Planner without force=true (would discard chat context)',
+        retryable: false,
+      };
     }
     const name = agent === 'planner' ? this.plannerName : agent === 'coder' ? this.coderName : this.reviewerName;
+    const previous = this.currentGeneration(agent);
+    const priorStarted = this.roleStarted(agent);
+    const priorReviewerPrompt = this.reviewerSessionPrompt;
+    let previousGenerationReleased = previous?.state === 'released';
+    if (previousGenerationReleased) {
+      this.setRoleStarted(agent, false);
+      if (agent === 'reviewer') this.reviewerSessionPrompt = null;
+    }
     this.appendDecisionLog({
       kind: 'reset_agent',
       actor: 'dispatcher',
       payload: { agent, force: !!opts.force, eagerRestart: !!opts.eagerRestart },
     });
+    let stopError: unknown;
     try {
       await this.config.manager.stopSession(name);
     } catch (err) {
+      stopError = err;
       this.logger.warn?.(`[autoloop] resetAgent stop failed for ${name}: ${(err as Error).message}`);
     }
-    if (agent === 'planner') this.plannerStarted = false;
-    if (agent === 'coder') this.coderStarted = false;
-    if (agent === 'reviewer') {
-      this.reviewerStarted = false;
-      this.reviewerSessionPrompt = null;
-    }
-    if (opts.eagerRestart) {
-      if (agent === 'planner') await this.ensurePlanner();
-      else if (agent === 'coder') await this.ensureCoder();
-      else await this.ensureReviewer();
+
+    const failure = (detail: string, cause?: unknown): AutoloopResetResult => {
+      if (!previousGenerationReleased) {
+        this.setRoleStarted(agent, priorStarted);
+        if (agent === 'reviewer') this.reviewerSessionPrompt = priorReviewerPrompt;
+      }
+      return {
+        ok: false,
+        code: 'AUTOLOOP_RESET_POSTCONDITION_FAILED',
+        agent,
+        previous_generation: previous?.generation,
+        message: cause instanceof Error ? `${detail}: ${cause.message}` : detail,
+        retryable: false,
+      };
+    };
+
+    try {
+      const stoppedLiveness = await this.runtimeProbe.inspect(name, previous?.session_id);
+      if (stoppedLiveness !== 'absent') {
+        return failure(
+          `Autoloop session '${name}' remained ${stoppedLiveness} after reset stop${
+            stopError instanceof Error ? ` (${stopError.message})` : ''
+          }`,
+        );
+      }
+
+      if (previous) {
+        // The release event can be durable while SessionManager's matching
+        // registry tombstone is still pending. Retrying the exact generation is
+        // idempotent and lets releaseReservation finish that existing fence;
+        // skipping it would leave repeated reset calls permanently blocked.
+        await this.releaseGeneration(previous, false, () => {
+          previousGenerationReleased = true;
+          this.setRoleStarted(agent, false);
+          if (agent === 'reviewer') this.reviewerSessionPrompt = null;
+        });
+      }
+
+      const managerProbe = this.config.manager as SessionManager & {
+        probeAgentNameReusable?: (sessionName: string, released?: PhysicalAgentGeneration) => boolean;
+        isAgentGenerationReleased?: (generation: PhysicalAgentGeneration) => boolean;
+      };
+      if (managerProbe.probeAgentNameReusable) {
+        if (!managerProbe.probeAgentNameReusable(name, previous)) {
+          return failure(
+            previous
+              ? `Autoloop session '${name}' retained generation ${previous.generation} after release`
+              : `Autoloop session '${name}' was not reusable after reset`,
+          );
+        }
+      } else if (previous && managerProbe.isAgentGenerationReleased) {
+        if (!managerProbe.isAgentGenerationReleased(previous)) {
+          return failure(`Autoloop session '${name}' retained generation ${previous.generation} after release`);
+        }
+      } else {
+        // Test doubles and legacy SessionManager implementations use the same
+        // fenced reserve/rollback path as startup to prove the name is reusable.
+        const probeGeneration = this.newGeneration(agent);
+        if (!this.config.manager.reserveAgentGeneration(probeGeneration, this.config.workspace)) {
+          return failure(`Autoloop session '${name}' could not reserve a replacement generation`);
+        }
+        const rolledBack = await this.runtimeProbe.releaseReservation(name, probeGeneration.generation, {
+          rollbackUncommittedReservation: true,
+          expectedOwnerInstanceId: probeGeneration.owner_instance_id,
+          expectedSessionId: probeGeneration.session_id,
+        });
+        if (!rolledBack) {
+          return failure(`Autoloop session '${name}' could not roll back its replacement probe`);
+        }
+      }
+
+      // With no durable prior generation, authoritative name reusability is
+      // the first point at which the legacy in-memory flag can be cleared.
+      this.setRoleStarted(agent, false);
+      if (agent === 'reviewer') this.reviewerSessionPrompt = null;
+
+      let activeGeneration: number | undefined;
+      if (opts.eagerRestart) {
+        if (agent === 'planner') await this.ensurePlanner();
+        else if (agent === 'coder') await this.ensureCoder();
+        else await this.ensureReviewer();
+        const active = this.currentGeneration(agent);
+        const activeLiveness = active
+          ? await this.runtimeProbe.inspect(active.session_name, active.session_id)
+          : 'absent';
+        if (!active || active.state !== 'live' || activeLiveness !== 'live') {
+          return failure(`Autoloop session '${name}' did not create a live replacement generation`);
+        }
+        activeGeneration = active.generation;
+      }
+
+      return {
+        ok: true,
+        agent,
+        previous_generation: previous?.generation,
+        active_generation: activeGeneration,
+        reusable: true,
+      };
+    } catch (error) {
+      return failure(`Autoloop session '${name}' reset postcondition failed`, error);
     }
   }
 
@@ -673,6 +3034,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     name: string,
     promptText: string,
     pending: PendingSendTimeout,
+    delivery: DeliveryIntent,
   ): Promise<SendMessageResult> {
     try {
       const result = await this.sendAttempt(name, promptText, pending);
@@ -680,19 +3042,66 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       throw new Error(result.error);
     } catch (err) {
       this.logger.warn?.(`[autoloop] ${agent} send threw, attempting reset+retry: ${(err as Error).message}`);
-      await this.resetAgent(agent, { eagerRestart: true });
+      const reset = await this.resetAgent(agent, { eagerRestart: true });
+      if (!reset.ok) return { output: '', error: reset.message, fatal: true, code: reset.code };
+      const generation = this.requireLiveGeneration(agent);
+      const basePrompt =
+        typeof delivery.payload === 'object' &&
+        delivery.payload !== null &&
+        !Array.isArray(delivery.payload) &&
+        Object.keys(delivery.payload).length === 2 &&
+        typeof (delivery.payload as { prompt?: unknown }).prompt === 'string'
+          ? (delivery.payload as { prompt: string }).prompt
+          : undefined;
+      const logicalMessageDigest =
+        typeof delivery.payload === 'object' && delivery.payload !== null && !Array.isArray(delivery.payload)
+          ? (delivery.payload as { logical_message_sha256?: unknown }).logical_message_sha256
+          : undefined;
+      if (!basePrompt || typeof logicalMessageDigest !== 'string') {
+        return {
+          output: '',
+          error: 'durable delivery has no valid persisted transport payload',
+          fatal: true,
+          code: 'AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID',
+        };
+      }
+      const rebound = this.prepareDurableDelivery(
+        agent === 'coder' ? 'coder_directive' : 'review_request',
+        agent,
+        generation,
+        delivery.idempotency_key,
+        basePrompt,
+        logicalMessageDigest,
+      );
+      if (
+        rebound.intent.delivery_id !== delivery.delivery_id ||
+        rebound.intent.payload_sha256 !== delivery.payload_sha256 ||
+        rebound.intent.target_generation !== generation.generation
+      ) {
+        return {
+          output: '',
+          error: 'durable delivery rebind did not prove the replacement generation route',
+          fatal: true,
+          code: 'AUTOLOOP_LEDGER_COMMITTED_STATE_INVALID',
+        };
+      }
       // Let the freshly-restarted subprocess settle before retrying — an
       // immediate retry routinely hits the same transient failure (e.g. the
       // old socket still in TIME_WAIT → ECONNREFUSED). Small jitter avoids
       // lockstep retries across concurrent runs.
       await new Promise((r) => setTimeout(r, 500 + Math.floor(Math.random() * 250)));
       try {
-        const result = await this.sendAttempt(name, promptText, pending);
-        if (result.recoverable_timeout || !result.error) return result;
+        const result = await this.sendAttempt(name, rebound.prompt, pending);
+        if (result.recoverable_timeout || !result.error) return { ...result, durableDelivery: rebound.intent };
         throw new Error(result.error);
       } catch (err2) {
         this.logger.error?.(`[autoloop] ${agent} second attempt failed after reset: ${(err2 as Error).message}`);
-        return { output: '', error: (err2 as Error).message, fatal: true };
+        return {
+          output: '',
+          error: (err2 as Error).message,
+          fatal: true,
+          code: 'AUTOLOOP_ENGINE_FAILURE',
+        };
       }
     }
   }
@@ -703,13 +3112,161 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
    * push-policy mutations, compact triggers, subagent spawns, phase-error
    * passes, and policy-silence attempts that we rejected.
    */
-  private appendDecisionLog(entry: Omit<DecisionLogEntry, 'ts'>): void {
+  private appendDecisionLog(entry: Omit<DecisionLogEntry, 'ts'>): Error | undefined {
     try {
-      fs.mkdirSync(this.ledgerDir, { recursive: true });
       const line = JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n';
-      fs.appendFileSync(path.join(this.ledgerDir, 'decisions.jsonl'), line);
+      this.secureLedger.appendFlatFile('decisions.jsonl', line);
+      return undefined;
     } catch (err) {
-      this.logger.warn?.(`[autoloop] decisions.jsonl append failed: ${(err as Error).message}`);
+      const error = err instanceof Error ? err : new Error(String(err));
+      this.logger.warn?.(`[autoloop] decisions.jsonl append failed: ${error.message}`);
+      return error;
+    }
+  }
+
+  private syncCreatedControlFileDirectory(filePath: string): void {
+    if (process.platform === 'win32') {
+      // Node does not expose a supported directory handle that can be passed
+      // to FlushFileBuffers on Windows. Keep the platform limitation explicit:
+      // the file contents are flushed, but POSIX directory-entry durability is
+      // not claimed here.
+      this.logger.warn?.(
+        '[autoloop] parent-directory fsync is unavailable on win32; control file contents were flushed without a POSIX directory-entry guarantee',
+      );
+      return;
+    }
+    const directoryFd = fs.openSync(path.dirname(filePath), 'r');
+    try {
+      fs.fsyncSync(directoryFd);
+    } finally {
+      fs.closeSync(directoryFd);
+    }
+  }
+
+  /**
+   * Replace a Planner-owned control artifact without ever following an
+   * attacker-controlled destination. The temp file lives beside the target,
+   * is flushed before rename, and the directory entry is flushed on POSIX.
+   */
+  private writeControlFileAtomically(target: string, content: string): void {
+    let existing: fs.Stats | undefined;
+    try {
+      existing = fs.lstatSync(target);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    if (existing && !existing.isFile()) {
+      throw new Error(`Refusing to replace non-regular Planner control target '${target}'`);
+    }
+
+    const tempPath = path.join(path.dirname(target), `.${path.basename(target)}.${randomUUID()}.tmp`);
+    let renamed = false;
+    let fd: number | undefined;
+    try {
+      fd = fs.openSync(tempPath, 'wx', 0o600);
+      fs.writeFileSync(fd, content, { encoding: 'utf8' });
+      fs.fsyncSync(fd);
+      fs.closeSync(fd);
+      fd = undefined;
+      fs.renameSync(tempPath, target);
+      renamed = true;
+      this.syncCreatedControlFileDirectory(target);
+    } finally {
+      if (fd !== undefined) {
+        try {
+          fs.closeSync(fd);
+        } catch {
+          // Preserve the primary write/flush failure.
+        }
+      }
+      if (!renamed) {
+        try {
+          if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+        } catch {
+          // Preserve the primary materialization failure.
+        }
+      }
+    }
+  }
+
+  private persistPlannerControls(
+    env: AnyAutoloopMessage,
+    dispatchId: string,
+    generation: PhysicalAgentGeneration,
+    controls: readonly PlannerToolCall[],
+    controlsSha256: string,
+  ): PlannerControlEvidence {
+    const canonicalControls = canonicalizePlannerControls(controls);
+    const evidence: PlannerControlEvidence = {
+      control_id: `planner_control_${randomUUID()}`,
+      persisted_at: this.now().toISOString(),
+      dispatch_id: dispatchId,
+      message_id: env.msg_id,
+      iter: env.iter,
+      generation: generation.generation,
+      owner_instance_id: generation.owner_instance_id,
+      session_id: generation.session_id,
+      tools: canonicalizeExactStringArrayElements(canonicalControls.map(({ tool }) => tool)) as PlannerToolName[],
+      controls: canonicalControls,
+      controls_sha256: controlsSha256,
+    };
+    const decision = {
+      ts: evidence.persisted_at,
+      kind: 'planner_turn_control',
+      actor: 'planner',
+      payload: { ...evidence },
+    } satisfies DecisionLogEntry;
+    let committedClaim: ReturnType<typeof findCommittedPlannerControl>;
+    try {
+      committedClaim = findCommittedPlannerControl(this.secureLedger, evidence);
+    } catch (error) {
+      throw new PlannerControlLedgerInvalidError(
+        `Planner control ledger could not be validated: ${(error as Error).message}`,
+        { cause: error },
+      );
+    }
+    if (committedClaim !== 'none') {
+      // Flush the already-committed ledger before treating its claim as an
+      // authoritative recovery boundary. Never append a second claim or run
+      // either the matching or conflicting effect.
+      this.secureLedger.flushFlatFile('decisions.jsonl');
+      throw new CommittedPlannerControlReplayError(
+        committedClaim === 'matching'
+          ? undefined
+          : 'Planner control event conflicts with an already committed claim for this logical dispatch; refusing a second effect',
+      );
+    }
+    const prepared = this.secureLedger.prepareFlatFileAppend('decisions.jsonl', `${JSON.stringify(decision)}\n`);
+    try {
+      // The control intent is a commit boundary, not ordinary best-effort
+      // audit data. Commit through the checked capability and verify the same
+      // opened inode's durable tail before any prepared effect can begin.
+      try {
+        prepared.commitDurable();
+      } catch (error) {
+        if (!isCommittedSecureLedgerError(error) || !prepared.committed) throw error;
+        const committedEvidence = plannerControlEvidenceFromTail(prepared.readLastNonEmptyLine());
+        if (!plannerControlEvidenceMatches(committedEvidence, evidence)) throw error;
+        // Retry only the incomplete barrier; SecureAutoloopLedger remembers
+        // that the control bytes are already committed and cannot append them
+        // again. A persistent incomplete result keeps its original typed code.
+        prepared.commitDurable();
+      }
+      const durableEvidence = plannerControlEvidenceFromTail(prepared.readLastNonEmptyLine());
+      if (!plannerControlEvidenceMatches(durableEvidence, evidence)) {
+        throw new Error('the appended control event did not match the durable tail');
+      }
+      return durableEvidence;
+    } catch (error) {
+      if (isCommittedSecureLedgerError(error)) throw error;
+      if (error instanceof AutoloopOperationError) throw error;
+      throw new AutoloopOperationError(
+        'AUTOLOOP_CONTROL_NOT_PERSISTED',
+        `Planner control event could not be persisted: ${(error as Error).message}`,
+        { cause: error },
+      );
+    } finally {
+      prepared.close();
     }
   }
 
@@ -725,8 +3282,12 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     ts: string;
   }): void {
     try {
-      fs.mkdirSync(this.ledgerDir, { recursive: true });
-      fs.appendFileSync(path.join(this.ledgerDir, 'chat.jsonl'), JSON.stringify(entry) + '\n');
+      const canonical = Object.create(null) as Record<string, unknown>;
+      Object.defineProperty(canonical, 'who', { enumerable: true, value: entry.who });
+      Object.defineProperty(canonical, 'text', { enumerable: true, value: entry.text });
+      Object.defineProperty(canonical, 'ts', { enumerable: true, value: entry.ts });
+      Object.freeze(canonical);
+      this.secureLedger.appendFlatFile('chat.jsonl', JSON.stringify(canonical) + '\n');
     } catch (err) {
       this.logger.warn?.(`[autoloop] chat.jsonl append failed: ${(err as Error).message}`);
     }
@@ -805,28 +3366,47 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   // ─── Planner-specific ────────────────────────────────────────────────────
 
   private async ensurePlanner(): Promise<void> {
-    if (this.plannerStarted && (this.config.manager.hasSession?.(this.plannerName) ?? true)) return;
+    if (
+      this.plannerStarted &&
+      this.currentGeneration('planner')?.state === 'live' &&
+      (this.config.manager.hasSession?.(this.plannerName) ?? true)
+    )
+      return;
     this.validateSelection('planner', this.plannerSelection);
-    await this.config.manager.startSession({
-      name: this.plannerName,
-      cwd: this.config.workspace,
-      engine: this.plannerSelection.engine,
-      model: this.roleModel('planner', this.plannerSelection),
-      ...(this.plannerSelection.effort === undefined ? {} : { effort: this.plannerSelection.effort }),
-      customEngine: this.plannerSelection.engine === 'custom' ? this.plannerSelection.customEngine : undefined,
-      permissionMode: 'manual',
-      sandboxMode: 'read-only',
-      systemPrompt: this.plannerSystemPrompt,
-      // Hard role boundary: Planner must NEVER author content files itself.
-      // Its only writes are plan.md / goal.json via the write_plan /
-      // write_goal autoloop tools. Disallowing the editing tools here is
-      // the load-bearing enforcement — prompt rules alone proved
-      // insufficient (the model would happily produce user-requested
-      // deliverables directly). Read/Glob/Grep/Bash stay enabled so
-      // Planner can still discover, audit, and `git status` the workspace.
-      disallowedTools: ['Write', 'Edit', 'MultiEdit', 'NotebookEdit'],
+    await this.ensureAgentSession('planner', async (generation) => {
+      await this.config.manager.startSession(
+        {
+          name: this.plannerName,
+          cwd: this.config.workspace,
+          engine: this.plannerSelection.engine,
+          model: this.roleModel('planner', this.plannerSelection),
+          ...(this.plannerSelection.effort === undefined ? {} : { effort: this.plannerSelection.effort }),
+          customEngine: this.plannerSelection.engine === 'custom' ? this.plannerSelection.customEngine : undefined,
+          permissionMode: 'manual',
+          sandboxMode: 'read-only',
+          systemPrompt: this.plannerSystemPrompt,
+          // Hard role boundary: Planner must NEVER author content files itself.
+          // Its only writes are plan.md / goal.json via the write_plan /
+          // write_goal autoloop tools. Disallowing the editing tools here is
+          // the load-bearing enforcement — prompt rules alone proved
+          // insufficient (the model would happily produce user-requested
+          // deliverables directly). Read/Glob/Grep/Bash stay enabled so
+          // Planner can still discover, audit, and `git status` the workspace.
+          disallowedTools: ['Write', 'Edit', 'MultiEdit', 'NotebookEdit'],
+        },
+        generation,
+      );
     });
-    this.plannerStarted = true;
+  }
+
+  private plannerTurnCounters(): { turns: number; turnsSucceeded: number } | undefined {
+    try {
+      const stats = this.config.manager.getStatus(this.plannerName).stats;
+      if (!Number.isFinite(stats.turns) || !Number.isFinite(stats.turnsSucceeded)) return undefined;
+      return { turns: stats.turns, turnsSucceeded: stats.turnsSucceeded };
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -839,8 +3419,13 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     const nonce = randomUUID();
     const entries = writes.map((write, index) => {
       const target = path.join(this.config.workspace, write.file);
-      const existed = fs.existsSync(target);
-      const stat = existed ? fs.statSync(target) : undefined;
+      let stat: fs.Stats | undefined;
+      try {
+        stat = fs.lstatSync(target);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      const existed = stat !== undefined;
       if (stat && !stat.isFile()) throw new Error(`${write.file} exists but is not a regular file`);
       return {
         ...write,
@@ -855,13 +3440,20 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
 
     try {
       for (const entry of entries) {
-        fs.writeFileSync(entry.staged, entry.content, { encoding: 'utf-8', flag: 'wx', mode: 0o666 });
+        const fd = fs.openSync(entry.staged, 'wx', 0o600);
+        try {
+          fs.writeFileSync(fd, entry.content, { encoding: 'utf-8' });
+          fs.fsyncSync(fd);
+        } finally {
+          fs.closeSync(fd);
+        }
       }
       for (const entry of entries) {
         fs.renameSync(entry.staged, entry.target);
         replaced.push(entry);
         if (entry.originalMode !== undefined) fs.chmodSync(entry.target, entry.originalMode);
       }
+      if (entries.length > 0) this.syncCreatedControlFileDirectory(entries[0].target);
     } catch (error) {
       const rollbackErrors: string[] = [];
       for (const entry of [...replaced].reverse()) {
@@ -872,7 +3464,13 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
           }
           const restore = `${entry.staged}.restore`;
           try {
-            fs.writeFileSync(restore, entry.original!, { flag: 'wx', mode: entry.originalMode });
+            const fd = fs.openSync(restore, 'wx', entry.originalMode ?? 0o600);
+            try {
+              fs.writeFileSync(fd, entry.original!);
+              fs.fsyncSync(fd);
+            } finally {
+              fs.closeSync(fd);
+            }
             fs.renameSync(restore, entry.target);
             if (entry.originalMode !== undefined) fs.chmodSync(entry.target, entry.originalMode);
           } finally {
@@ -889,6 +3487,13 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
           rollbackErrors.push(`${entry.file} staging cleanup: ${(cleanupError as Error).message}`);
         }
       }
+      if (replaced.length > 0) {
+        try {
+          this.syncCreatedControlFileDirectory(replaced[0].target);
+        } catch (rollbackError) {
+          rollbackErrors.push(`artifact rollback directory sync: ${(rollbackError as Error).message}`);
+        }
+      }
       if (rollbackErrors.length > 0) {
         throw new Error(`${(error as Error).message}; artifact rollback failed: ${rollbackErrors.join('; ')}`);
       }
@@ -897,6 +3502,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   }
 
   private async deliverToPlanner(env: AnyAutoloopMessage, dispatchId: string): Promise<AnyAutoloopMessage[]> {
+    if (this.terminal) return [];
     if (env.type !== 'chat' && env.type !== 'directive_ack' && env.type !== 'iter_done') {
       // Other types (push_user / pause / resume / terminate) are runner-only
       // or planner-emitted; they should never arrive *to* planner.
@@ -904,6 +3510,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     }
 
     await this.ensurePlanner();
+    if (this.terminal) return [];
 
     // Compose the prompt fed into the Planner session. For S2 we only handle
     // user chat; iter_done / directive_ack are wired in S4.
@@ -920,87 +3527,145 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       promptText = `[system] iter ${env.iter} done. verdict=${env.payload.verdict} metric=${env.payload.metric}`;
     }
 
+    const expectedGeneration = this.currentGeneration('planner');
+    const countersBefore = this.plannerTurnCounters();
     const pendingTimeout = this.pendingSendTimeout(env, 'planner', dispatchId);
-    const result = await this.sendAttempt(
-      this.plannerName,
-      this.withRoleInstructions('planner', this.plannerSelection, this.plannerSystemPrompt, promptText),
-      pendingTimeout,
-    );
+    let result: SendMessageResult;
+    try {
+      result = await this.sendAttempt(
+        this.plannerName,
+        this.withRoleInstructions('planner', this.plannerSelection, this.plannerSystemPrompt, promptText),
+        pendingTimeout,
+      );
+    } catch (error) {
+      throw new AutoloopOperationError(
+        'AUTOLOOP_ENGINE_FAILURE',
+        `Planner engine transport failed: ${(error as Error).message}`,
+        { cause: error },
+      );
+    }
 
     if (result.recoverable_timeout) {
+      if (this.terminal) return [];
       return [Msg.sendTimeout(env.iter, result.recoverable_timeout)];
     }
+
+    if (this.terminal) return [];
 
     if (result.error) {
       this.logger.error?.(`[autoloop] planner send error: ${result.error}`);
       this.emit('planner_error', new Error(result.error));
+      throw new AutoloopOperationError('AUTOLOOP_ENGINE_FAILURE', `Planner engine turn failed: ${result.error}`);
     }
 
     const replyText = (result.output ?? '').trim();
-
-    // Feed the transcript that engines without native conversation replay next
-    // turn. Recorded AFTER the send so the current message isn't duplicated in
-    // its own history block.
-    this.recordTurn('planner', 'user', promptText);
-    this.recordTurn('planner', 'agent', replyText);
+    const observedGeneration = this.currentGeneration('planner');
+    const generationLiveness = observedGeneration
+      ? await this.runtimeProbe.inspect(observedGeneration.session_name, observedGeneration.session_id)
+      : 'absent';
+    if (this.terminal) return [];
+    const countersAfter = this.plannerTurnCounters();
+    // AGY reports required-tool denial only through the authoritative success
+    // counter while still returning non-empty text. Missing/non-finite AGY
+    // snapshots therefore cannot prove success. Other engines expose failure
+    // in SendResult.error/is_error and retain that result/transport taxonomy.
+    const counterEvidenceUnavailable = !countersBefore || !countersAfter;
+    const requiredToolDenied =
+      replyText.length > 0 &&
+      (counterEvidenceUnavailable
+        ? this.plannerSelection.engine === 'agy'
+        : countersAfter.turns <= countersBefore.turns || countersAfter.turnsSucceeded <= countersBefore.turnsSucceeded);
+    assertPlannerTurnSucceeded(
+      { reply: replyText, generation: observedGeneration, generationLiveness, requiredToolDenied },
+      { requireLogicalResult: false, expectedGeneration },
+    );
 
     // S3: parse autoloop-fenced tool calls out of the reply, apply effects,
     // and bubble emitted messages back into the runner queue.
     const parsed = parsePlannerReply(replyText);
     if (parsed.parse_errors.length > 0) {
       this.logger.warn?.(`[autoloop] planner emitted ${parsed.parse_errors.length} malformed autoloop block(s)`);
+      throw new AutoloopOperationError(
+        'AUTOLOOP_CONTROL_MALFORMED',
+        `Planner emitted malformed control: ${parsed.parse_errors
+          .map(({ block_index, error }) => `block ${block_index}: ${error}`)
+          .join('; ')}`,
+      );
+    }
+    const validation = validatePlannerToolCalls(parsed.calls);
+    if (validation.errors.length > 0) {
+      throw new AutoloopOperationError(
+        'AUTOLOOP_CONTROL_MALFORMED',
+        `Planner emitted invalid control: ${validation.errors
+          .map(({ tool, error }) => `${tool}: ${error}`)
+          .join('; ')}`,
+      );
+    }
+    if (validation.blocked_policy_silence.length > 0) {
+      for (const key of validation.blocked_policy_silence) {
+        this.logger.warn?.(`[autoloop] refused to set silent=true on critical policy key ${key}`);
+      }
+      this.appendDecisionLog({
+        kind: 'policy_silence_blocked',
+        actor: 'planner',
+        payload: { keys: validation.blocked_policy_silence },
+      });
+    }
+    // This allowlisted batch is the sole source for canonicalization, digest,
+    // persistence, comparison, and application. Raw Planner arguments never
+    // cross the durable control boundary.
+    const normalizedControls = validation.calls;
+    if (parsed.calls.length > 0 && normalizedControls.length === 0 && validation.blocked_policy_silence.length > 0) {
+      throw new AutoloopOperationError(
+        'AUTOLOOP_CONTROL_MALFORMED',
+        'Planner emitted only a prohibited critical policy-silence control',
+      );
     }
     const effects: PlannerToolEffects = {
+      assertActive: () => {
+        if (this.terminal) throw new Error('Autoloop run became terminal during Planner control application');
+      },
+      spawnCoder: async (args) => await this.spawnCoder(args),
+      spawnReviewer: async (args) => await this.spawnReviewer(args),
       spawnSubagents: async (args) => {
+        if (this.terminal) return;
         if (this.config.onSpawnSubagents) {
-          await this.config.onSpawnSubagents(args);
+          this.spawnCommitDeferralDepth += 1;
+          try {
+            await this.config.onSpawnSubagents(args);
+          } finally {
+            this.spawnCommitDeferralDepth -= 1;
+          }
+          if (this.terminal) return;
+          await this.config.onSpawnSubagentsCommitted?.();
         } else {
           this.logger.warn?.('[autoloop] spawn_subagents called but no handler is installed');
         }
       },
+      requestReview: async (args, targetIter) => await this.requestReview(args, targetIter),
+      releaseReviewRequest: (idempotencyKey, payload) => this.releaseReviewRequest(idempotencyKey, payload),
       updatePushPolicy: (delta) => {
+        if (this.terminal) return;
         if (!this.config.pushPolicyRef) return;
-        // Shallow-merge whitelisted keys onto the policy object.
-        const policyKeys = new Set([
-          'on_start',
-          'on_iter_done_ok',
-          'on_target_hit',
-          'on_metric_regression_2',
-          'on_reviewer_reject_2',
-          'on_phase_error',
-          'on_stall_30min',
-          'on_decision_needed',
-        ]);
         const applied: Record<string, unknown> = {};
-        const silenced_blocked: string[] = [];
-        const VALID_LEVELS = new Set(['info', 'warn', 'decision', 'error']);
-        const VALID_CHANNELS = new Set(['auto', 'wechat', 'webchat', 'both', 'email']);
         for (const [k, v] of Object.entries(delta)) {
-          if (!policyKeys.has(k) || typeof v !== 'object' || v === null) continue;
-          // Only accept known, correctly-typed fields — a malformed rule
-          // (wrong types, bogus level/channel) must not enter the live policy.
-          const raw = v as Record<string, unknown>;
-          const rule: Record<string, unknown> = {};
-          if (typeof raw.silent === 'boolean') rule.silent = raw.silent;
-          if (typeof raw.level === 'string' && VALID_LEVELS.has(raw.level)) rule.level = raw.level;
-          if (typeof raw.channel === 'string' && VALID_CHANNELS.has(raw.channel)) rule.channel = raw.channel;
-          // B2: refuse to silence the channels that surface phase errors and
-          // user decisions. Other fields on the same rule still apply, so the
-          // operator can re-target level/channel without going dark.
-          if (UNSILENCEABLE_POLICY_KEYS.has(k) && rule.silent === true) {
-            silenced_blocked.push(k);
-            this.logger.warn?.(`[autoloop] refused to set silent=true on critical policy key ${k}`);
+          const current = (this.config.pushPolicyRef as unknown as Record<string, Record<string, unknown>>)[k];
+          const baseline = (DEFAULT_PUSH_POLICY as unknown as Record<string, Record<string, unknown>>)[k];
+          const critical = k === 'on_phase_error' || k === 'on_decision_needed';
+          const patch = v as Record<string, unknown>;
+          const rule = critical
+            ? { ...baseline, ...current, ...patch }
+            : Object.keys(patch).length === 0
+              ? {}
+              : { ...current, ...patch };
+          if (critical) {
             delete rule.silent;
+            if (k === 'on_phase_error') rule.level = 'error';
+            if (k === 'on_decision_needed' && rule.level !== 'error') rule.level = 'decision';
+            if (rule.channel !== 'auto' && rule.channel !== 'both') rule.channel = baseline.channel;
           }
           (this.config.pushPolicyRef as unknown as Record<string, unknown>)[k] = rule;
           applied[k] = rule;
-        }
-        if (silenced_blocked.length > 0) {
-          this.appendDecisionLog({
-            kind: 'policy_silence_blocked',
-            actor: 'planner',
-            payload: { keys: silenced_blocked },
-          });
         }
         if (Object.keys(applied).length > 0) {
           this.appendDecisionLog({
@@ -1016,127 +3681,185 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         // is the single legitimate authoring path. Materialize the entire set
         // before commit or any spawn effect.
         this.replacePlannerArtifacts(writes);
-        const filenames = writes.map(({ file }) => file).join(', ');
+        const filenames = writes.map(({ file }) => file);
         const commitMessage =
           writes.find(({ commitMessage: candidate }) => candidate)?.commitMessage ??
-          `autoloop: planner writes ${filenames}`;
+          `autoloop: planner writes ${filenames.join(', ')}`;
         await this.gitCommit(filenames, commitMessage);
       },
     };
+    const controlTools = normalizedControls.map(({ tool }) => tool);
+    let persistedControl: PlannerControlEvidence | undefined;
+    let expectedControl: PlannerTurnExpectation['expectedControl'];
+    if (controlTools.length > 0) {
+      if (this.terminal) return [];
+      const controlGeneration = observedGeneration ?? expectedGeneration;
+      if (!controlGeneration) {
+        throw new AutoloopOperationError(
+          'AUTOLOOP_SESSION_NOT_CREATED',
+          'Planner control could not be bound to a physical generation',
+        );
+      }
+      const controlsSha256 = createHash('sha256')
+        .update(validation.controls_json ?? '[]')
+        .digest('hex');
+      expectedControl = {
+        dispatch_id: dispatchId,
+        message_id: env.msg_id,
+        iter: env.iter,
+        generation: controlGeneration.generation,
+        owner_instance_id: controlGeneration.owner_instance_id,
+        session_id: controlGeneration.session_id,
+        tools: controlTools,
+        controls: normalizedControls,
+        controls_sha256: controlsSha256,
+      };
+      persistedControl = this.persistPlannerControls(
+        env,
+        dispatchId,
+        controlGeneration,
+        normalizedControls,
+        controlsSha256,
+      );
+    }
+    assertPlannerTurnSucceeded(
+      {
+        reply: parsed.cleaned_reply,
+        generation: observedGeneration,
+        generationLiveness,
+        persistedControl,
+      },
+      { expectedGeneration, expectedControl },
+    );
+    if (this.terminal) return [];
+    // Persist and verify the complete Planner control claim before invoking
+    // any control handler. A ledger failure must leave every control effect at
+    // zero, even when the reply itself was a successful engine turn.
     // After iter_done(N) the run has advanced to iter N+1 in runner state;
     // any directive Planner emits in response targets the new iter.
     const nextIter = env.type === 'iter_done' ? env.iter + 1 : env.iter;
-    const handlerResult =
-      parsed.parse_errors.length > 0
-        ? {
-            emitted_messages: [],
-            errors: parsed.parse_errors.map(({ block_index, error }) => ({
-              tool: `autoloop block ${block_index}`,
-              error,
-            })),
-          }
-        : await applyPlannerToolCalls(parsed.calls, effects, nextIter);
+    const handlerResult = await applyValidatedPlannerToolCalls(validation, effects, nextIter);
     for (const errEntry of handlerResult.errors) {
       this.logger.warn?.(`[autoloop] tool '${errEntry.tool}' failed: ${errEntry.error}`);
     }
-
-    // Emit cleaned reply (without raw JSON blocks) for the chat tool to surface.
-    if (parsed.cleaned_reply) {
-      this.emit('planner_reply', parsed.cleaned_reply);
-      this.appendChatEntry({ who: 'planner', text: parsed.cleaned_reply, ts: new Date().toISOString() });
+    if (handlerResult.errors.length > 0) {
+      throw new AutoloopOperationError(
+        'AUTOLOOP_CONTROL_APPLICATION_FAILED',
+        `Planner control application failed: ${handlerResult.errors
+          .map(({ tool, error }) => `${tool}: ${error}`)
+          .join('; ')}`,
+      );
     }
-    // Auto-compact after each Planner turn if context is filling up.
-    await this.maybeCompact('planner', this.plannerName);
-    return handlerResult.emitted_messages;
+    const reviewPayloads = handlerResult.emitted_messages
+      .filter((message) => message.type === 'review_request' && 'idempotency_key' in message.payload)
+      .map((message) => message.payload as CheckpointReviewRequestPayload);
+    let handoffAccepted = reviewPayloads.length === 0;
+    try {
+      if (this.terminal) return [];
+      // Replay history is accepted-turn state. Commit both sides together only
+      // after parse, validation, durable evidence, and all control application
+      // have passed; rejected Planner output must not be replayed on retry.
+      this.recordTurn('planner', 'user', promptText);
+      this.recordTurn('planner', 'agent', replyText);
+      // Emit cleaned reply (without raw JSON blocks) for the chat tool to surface.
+      const surfacedReply =
+        parsed.cleaned_reply ||
+        (persistedControl ? `Planner controls persisted: ${persistedControl.tools.join(', ')}` : '');
+      if (surfacedReply) {
+        this.emit('planner_reply', surfacedReply, {
+          message_id: env.msg_id,
+          dispatch_id: dispatchId,
+          iter: env.iter,
+        });
+        this.appendChatEntry({ who: 'planner', text: surfacedReply, ts: new Date().toISOString() });
+      }
+      // Auto-compact after each Planner turn if context is filling up.
+      await this.maybeCompact('planner', this.plannerName);
+      if (this.terminal) return [];
+      for (const payload of reviewPayloads) this.acceptReviewRequest(payload.idempotency_key);
+      handoffAccepted = true;
+      return handlerResult.emitted_messages;
+    } finally {
+      if (!handoffAccepted) {
+        for (const payload of reviewPayloads) this.releaseReviewRequest(payload.idempotency_key, payload);
+      }
+    }
   }
 
   // ─── Coder ──────────────────────────────────────────────────────────────
 
   private async ensureCoder(): Promise<void> {
-    if (this.coderStarted && (this.config.manager.hasSession?.(this.coderName) ?? true)) return;
+    if (
+      this.coderStarted &&
+      this.currentGeneration('coder')?.state === 'live' &&
+      (this.config.manager.hasSession?.(this.coderName) ?? true)
+    )
+      return;
     this.validateSelection('coder', this.coderSelection);
-    await this.config.manager.startSession({
-      name: this.coderName,
-      cwd: this.config.workspace,
-      engine: this.coderSelection.engine,
-      model: this.roleModel('coder', this.coderSelection),
-      ...(this.coderSelection.effort === undefined ? {} : { effort: this.coderSelection.effort }),
-      customEngine: this.coderSelection.engine === 'custom' ? this.coderSelection.customEngine : undefined,
-      permissionMode: 'bypassPermissions',
-      systemPrompt: this.coderSystemPrompt,
+    await this.ensureAgentSession('coder', async (generation) => {
+      await this.config.manager.startSession(
+        {
+          name: this.coderName,
+          cwd: this.config.workspace,
+          engine: this.coderSelection.engine,
+          model: this.roleModel('coder', this.coderSelection),
+          ...(this.coderSelection.effort === undefined ? {} : { effort: this.coderSelection.effort }),
+          customEngine: this.coderSelection.engine === 'custom' ? this.coderSelection.customEngine : undefined,
+          permissionMode: 'bypassPermissions',
+          systemPrompt: this.coderSystemPrompt,
+        },
+        generation,
+      );
     });
-    this.coderStarted = true;
   }
 
   private async deliverToCoder(env: AnyAutoloopMessage, dispatchId: string): Promise<AnyAutoloopMessage[]> {
+    if (this.terminal) return [];
     if (env.type !== 'directive') {
       throw new Error(`[autoloop] coder does not accept message type=${env.type}`);
     }
+
+    const logicalMessageDigest = logicalMessageSha256(env);
+    const durable = this.durableDeliveryState('coder_directive', 'coder', dispatchId, logicalMessageDigest);
+    if (durable) {
+      const result = lookupDeliveryResultByIdempotencyKey(this.secureLedger, dispatchId);
+      if (durable.acknowledged || result !== undefined) {
+        const recovered = this.recoverDurableCoderDelivery(env.iter, durable.intent);
+        if (!durable.acknowledged) this.acknowledgeDurableDelivery(durable.intent);
+        return recovered;
+      }
+    }
+
+    // Persist the complete immutable intent before reserving or starting a
+    // physical Coder, writing its working heartbeat, or sending a prompt.
+    // Preserve the exact schema-v1 byte shape: restart replay compares this
+    // write-once artifact byte-for-byte, so even additive fields require a
+    // versioned migration rather than an in-place serialization change.
+    this.secureLedger.writeIterationArtifact(env.iter, 'directive.json', serializeDirectiveV1(env, dispatchId));
+    if (this.terminal) return [];
     await this.ensureCoder();
+    if (this.terminal) return [];
 
-    // Compose directive prompt + write directive.json to ledger so Reviewer
-    // and history can see exactly what the Coder was asked.
-    const iterDir = path.join(this.ledgerDir, 'iter', String(env.iter));
-    fs.mkdirSync(iterDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(iterDir, 'directive.json'),
-      JSON.stringify(
-        {
-          schema_version: LEDGER_SCHEMA_VERSION,
-          iter: env.iter,
-          ts: env.ts,
-          ...env.payload,
-        },
-        null,
-        2,
-      ),
+    const delivery = this.prepareDurableDelivery(
+      'coder_directive',
+      'coder',
+      this.requireLiveGeneration('coder'),
+      dispatchId,
+      this.withRoleInstructions('coder', this.coderSelection, this.coderSystemPrompt, buildCoderDirectivePrompt(env)),
+      logicalMessageDigest,
     );
-
-    // Defensive: Planner may emit constraints / success_criteria as either
-    // a string or a string[]. Normalise.
-    const constraints: string[] = Array.isArray(env.payload.constraints)
-      ? env.payload.constraints.map(String)
-      : env.payload.constraints
-        ? [String(env.payload.constraints)]
-        : [];
-    const success: string[] = Array.isArray(env.payload.success_criteria)
-      ? env.payload.success_criteria.map(String)
-      : env.payload.success_criteria
-        ? [String(env.payload.success_criteria)]
-        : [];
-
-    const promptText = [
-      `[directive iter=${env.iter}]`,
-      `goal: ${env.payload.goal}`,
-      constraints.length ? `constraints:\n  - ${constraints.join('\n  - ')}` : '',
-      success.length ? `success_criteria:\n  - ${success.join('\n  - ')}` : '',
-      `max_attempts: ${env.payload.max_attempts}`,
-      '',
-      'Read plan.md / goal.json, make the change, run the evaluator, then emit `iter_complete`.',
-    ]
-      .filter(Boolean)
-      .join('\n');
-
-    // Heartbeat so the dashboard's Coder pane shows "iter N started" even
-    // before Coder produces a reply — useful for liveness checks on long
-    // turns, and survives refresh because it's in chat.jsonl.
-    this.appendChatEntry({
-      who: 'coder',
-      text: `🔨 Coder iter ${env.iter} working…`,
-      ts: new Date().toISOString(),
-    });
-
     const result = await this.sendWithRecovery(
       'coder',
       this.coderName,
-      this.withRoleInstructions('coder', this.coderSelection, this.coderSystemPrompt, promptText),
+      delivery.prompt,
       this.pendingSendTimeout(env, 'coder', dispatchId),
+      delivery.intent,
     );
     if (result.recoverable_timeout) {
+      if (this.terminal) return [];
       return [Msg.sendTimeout(env.iter, result.recoverable_timeout)];
     }
-    this.recordTurn('coder', 'user', promptText);
-    this.recordTurn('coder', 'agent', (result.output ?? '').trim());
+    if (this.terminal) return [];
     // A3: subprocess died (recovery retry exhausted). Surface as phase_error
     // rather than silently masquerading as a "clarification request"; the
     // runner's circuit breaker can then trip after enough consecutive failures.
@@ -1144,47 +3867,72 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       this.appendDecisionLog({
         kind: 'phase_error',
         actor: 'dispatcher',
-        payload: { agent: 'coder', phase: 'send', error: result.error ?? 'unknown' },
+        payload: { agent: 'coder', phase: 'send', code: result.code, error: result.error ?? 'unknown' },
       });
       return [
         Msg.phaseError(env.iter, {
           agent: 'coder',
           phase: 'send',
+          code: result.code,
           error: result.error ?? 'unknown send failure',
         }),
       ];
     }
     const replyText = (result.output ?? '').trim();
     const parsed = parseAgentReply(replyText);
-    this.emit('coder_reply', parsed.cleaned_reply);
-    if (parsed.cleaned_reply) {
-      this.appendChatEntry({
-        who: 'coder',
-        text: parsed.cleaned_reply,
-        ts: new Date().toISOString(),
-      });
-    }
 
+    const effectiveDelivery = result.durableDelivery ?? delivery.intent;
+    let completionArgs: Record<string, unknown> | undefined;
+    for (let index = 0; index < parsed.calls.length; index += 1) {
+      if (parsed.calls[index].tool === 'iter_complete') completionArgs = parsed.calls[index].args;
+    }
     const ic = extractIterComplete(parsed.calls);
     if (!ic) {
+      if (!completionArgs) {
+        for (let index = 0; index < parsed.calls.length; index += 1) {
+          if (parsed.calls[index].tool === 'request_clarification') {
+            completionArgs = parsed.calls[index].args;
+            break;
+          }
+        }
+      }
+      this.assertReceiverProvenance(completionArgs, effectiveDelivery);
+      const directiveAck = {
+        understood: false as const,
+        clarification: parsed.cleaned_reply.slice(0, 500),
+      };
+      persistDeliveryResult(this.secureLedger, effectiveDelivery, 'directive_ack', directiveAck);
+      this.acknowledgeDurableDelivery(effectiveDelivery);
       // No iter_complete emitted — could be a clarification request. Return a
       // directive_ack so Planner sees it next turn.
-      await this.maybeCompact('coder', this.coderName);
-      return [
-        Msg.directiveAck(env.iter, {
-          understood: false,
-          clarification: parsed.cleaned_reply.slice(0, 500),
-        }),
-      ];
+      return [Msg.directiveAck(env.iter, directiveAck)];
     }
+    this.assertReceiverProvenance(completionArgs, effectiveDelivery);
+
+    // A live Coder completion has not crossed the public message boundary yet.
+    // Canonicalize its eval output before any durable artifact, Git, result, or
+    // acknowledgement effect so live delivery cannot diverge from cold replay.
+    const canonicalLiveArtifacts = canonicalizeMessage(
+      Msg.iterArtifacts(env.iter, { diff: '', eval_output: ic.eval_output, files_changed: [] }),
+    );
+    if (canonicalLiveArtifacts.type !== 'iter_artifacts') {
+      throw new Error('Autoloop Coder completion did not canonicalize as iter_artifacts');
+    }
+    const canonicalEvalOutput = canonicalLiveArtifacts.payload.eval_output;
 
     // Persist eval output to ledger.
-    fs.writeFileSync(
-      path.join(iterDir, 'eval_output.json'),
-      JSON.stringify({ schema_version: LEDGER_SCHEMA_VERSION, iter: env.iter, eval_output: ic.eval_output }, null, 2),
+    this.secureLedger.writeIterationArtifact(
+      env.iter,
+      'eval_output.json',
+      JSON.stringify(
+        { schema_version: LEDGER_SCHEMA_VERSION, iter: env.iter, eval_output: canonicalEvalOutput },
+        null,
+        2,
+      ),
     );
-    fs.writeFileSync(
-      path.join(iterDir, 'coder_summary.txt'),
+    this.secureLedger.writeIterationArtifact(
+      env.iter,
+      'coder_summary.txt',
       `${ic.summary}\n\n--- coder cleaned reply ---\n${parsed.cleaned_reply}\n`,
     );
 
@@ -1201,7 +3949,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     //     supplied, so the git fallback only ran when the Coder said nothing.
     //     The comment above said we don't trust the claim; now we don't.
     const diffText = await capturePatch(this.config.workspace, 'HEAD');
-    fs.writeFileSync(path.join(iterDir, 'diff.patch'), diffText);
+    this.secureLedger.writeIterationArtifact(env.iter, 'diff.patch', diffText);
     const observed = await changedFilesSince(this.config.workspace, 'HEAD');
     const filesChanged = observed.map((f) => f.path);
     // Commit the iteration so Reviewer's git view is clean for the next iter.
@@ -1225,17 +3973,64 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       ];
     }
 
+    // All replay-sufficient Coder artifacts and the workspace commit now
+    // exist. Only this point may durably acknowledge receiver completion.
+    persistDeliveryResult(this.secureLedger, effectiveDelivery, 'iter_complete', null);
+    this.acknowledgeDurableDelivery(effectiveDelivery);
+    this.recordTurn('coder', 'user', delivery.prompt);
+    this.recordTurn('coder', 'agent', replyText);
+    this.emit('coder_reply', parsed.cleaned_reply);
+    if (parsed.cleaned_reply) {
+      this.appendChatEntry({ who: 'coder', text: parsed.cleaned_reply, ts: new Date().toISOString() });
+    }
     await this.maybeCompact('coder', this.coderName);
     return [
       Msg.iterArtifacts(env.iter, {
         diff: diffText,
-        eval_output: ic.eval_output,
+        eval_output: canonicalEvalOutput,
         files_changed: filesChanged,
       }),
     ];
   }
 
   // ─── Reviewer ───────────────────────────────────────────────────────────
+
+  private readReviewerControlFile(name: 'plan.md' | 'goal.json'): Buffer | undefined {
+    const target = path.join(this.config.workspace, name);
+    let observed: fs.Stats;
+    try {
+      observed = fs.lstatSync(target);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
+    }
+    if (observed.isSymbolicLink() || !observed.isFile() || observed.nlink !== 1) {
+      throw new Error(`Refusing unsafe Reviewer control source '${target}'`);
+    }
+    const fd = fs.openSync(target, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    try {
+      const opened = fs.fstatSync(fd);
+      if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== observed.dev || opened.ino !== observed.ino) {
+        throw new Error(`Reviewer control source identity changed while opening '${target}'`);
+      }
+      const content = fs.readFileSync(fd);
+      const after = fs.lstatSync(target);
+      if (
+        after.isSymbolicLink() ||
+        !after.isFile() ||
+        after.nlink !== 1 ||
+        after.dev !== opened.dev ||
+        after.ino !== opened.ino ||
+        after.size !== opened.size ||
+        after.mtimeMs !== opened.mtimeMs
+      ) {
+        throw new Error(`Reviewer control source identity or contents changed while reading '${target}'`);
+      }
+      return content;
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
 
   /**
    * Compose the Reviewer's system prompt with a frozen snapshot of
@@ -1244,50 +4039,41 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
    * keeps the per-iter prompt prefix stable so Claude's prefix cache hits.
    */
   private buildReviewerSystemPrompt(): string {
-    const memoryPath = path.join(this.reviewerSandboxDir, 'reviewer_memory.md');
-    let memory = '';
-    try {
-      if (fs.existsSync(memoryPath)) {
-        memory = fs.readFileSync(memoryPath, 'utf-8').trim();
-      }
-    } catch (err) {
-      this.logger.warn?.(`[autoloop] failed to read reviewer_memory.md: ${(err as Error).message}`);
-    }
+    const memory = this.secureLedger.readReviewerPersistentFile('reviewer_memory.md')?.trim() ?? '';
     if (!memory) return this.reviewerSystemPrompt;
-    return [
-      this.reviewerSystemPrompt.trimEnd(),
-      '',
-      '<frozen_memory_snapshot>',
-      memory,
-      '</frozen_memory_snapshot>',
-      '',
-      'The snapshot above was injected into your system prompt at session start',
-      'and is frozen for this Reviewer session. Append new fakery patterns or',
-      'observations to reviewer_memory.md on disk; they will be re-injected on',
-      'the next Reviewer reset, not mid-session.',
-    ].join('\n');
+    return `${this.reviewerSystemPrompt.trimEnd()}\n\n<frozen_memory_snapshot>\n${memory}\n</frozen_memory_snapshot>\n\nThe snapshot above was injected into your system prompt at session start\nand is frozen for this Reviewer session. Append new fakery patterns or\nobservations to reviewer_memory.md on disk; they will be re-injected on\nthe next Reviewer reset, not mid-session.`;
   }
 
   private async ensureReviewer(): Promise<void> {
-    if (this.reviewerStarted && (this.config.manager.hasSession?.(this.reviewerName) ?? true)) return;
+    if (
+      this.reviewerStarted &&
+      this.currentGeneration('reviewer')?.state === 'live' &&
+      (this.config.manager.hasSession?.(this.reviewerName) ?? true)
+    )
+      return;
     this.validateSelection('reviewer', this.reviewerSelection);
-    fs.mkdirSync(this.reviewerSandboxDir, { recursive: true });
+    this.secureLedger.ensureReviewerSandbox();
     const sessionPrompt = this.buildReviewerSystemPrompt();
+    this.secureLedger.ensureReviewerSandbox();
     this.reviewerSessionPrompt = sessionPrompt;
     try {
-      await this.config.manager.startSession({
-        name: this.reviewerName,
-        cwd: this.reviewerSandboxDir,
-        engine: this.reviewerSelection.engine,
-        model: this.roleModel('reviewer', this.reviewerSelection),
-        ...(this.reviewerSelection.effort === undefined ? {} : { effort: this.reviewerSelection.effort }),
-        customEngine: this.reviewerSelection.engine === 'custom' ? this.reviewerSelection.customEngine : undefined,
-        permissionMode: 'bypassPermissions',
-        systemPrompt: sessionPrompt,
+      await this.ensureAgentSession('reviewer', async (generation) => {
+        await this.config.manager.startSession(
+          {
+            name: this.reviewerName,
+            cwd: this.reviewerSandboxDir,
+            engine: this.reviewerSelection.engine,
+            model: this.roleModel('reviewer', this.reviewerSelection),
+            ...(this.reviewerSelection.effort === undefined ? {} : { effort: this.reviewerSelection.effort }),
+            customEngine: this.reviewerSelection.engine === 'custom' ? this.reviewerSelection.customEngine : undefined,
+            permissionMode: 'bypassPermissions',
+            systemPrompt: sessionPrompt,
+          },
+          generation,
+        );
       });
-      this.reviewerStarted = true;
     } catch (err) {
-      this.reviewerSessionPrompt = null;
+      if (!this.reviewerStarted) this.reviewerSessionPrompt = null;
       throw err;
     }
   }
@@ -1297,132 +4083,136 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
    * persistent session whose cwd is fixed at <ledger>/reviewer_sandbox/, so
    * every review must rewrite the sandbox to "this iter's view".
    */
-  private stageReviewSandbox(iter: number): void {
-    fs.mkdirSync(this.reviewerSandboxDir, { recursive: true });
-    // Wipe top-level files but preserve the Reviewer's cross-iter memory and
-    // append-only audit log (see REVIEWER_SANDBOX_PERSIST). The Reviewer prompt
-    // promises both survive across iters; the wipe used to break the log.
-    for (const ent of fs.readdirSync(this.reviewerSandboxDir)) {
-      if (REVIEWER_SANDBOX_PERSIST.has(ent)) continue;
-      const full = path.join(this.reviewerSandboxDir, ent);
-      try {
-        fs.rmSync(full, { recursive: true, force: true });
-      } catch (err) {
-        // A stale file the Reviewer then reads as "this iter" causes silent
-        // context corruption — surface anything that isn't an already-gone file.
-        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-          this.logger.warn?.(`[autoloop] failed to clear sandbox entry ${ent}: ${(err as Error).message}`);
-        }
-      }
-    }
-    const iterSrc = path.join(this.ledgerDir, 'iter', String(iter));
-    if (!fs.existsSync(iterSrc)) return;
-    const dest = path.join(this.reviewerSandboxDir, `iter-${iter}`);
-    fs.mkdirSync(dest, { recursive: true });
-    for (const ent of fs.readdirSync(iterSrc)) {
-      fs.copyFileSync(path.join(iterSrc, ent), path.join(dest, ent));
-    }
-    // Also surface goal.json + plan.md if they exist at the workspace root.
-    for (const f of ['plan.md', 'goal.json']) {
-      const src = path.join(this.config.workspace, f);
-      if (fs.existsSync(src)) fs.copyFileSync(src, path.join(this.reviewerSandboxDir, f));
-    }
-    // Last iter's verdict for context (if exists).
-    if (iter > 0) {
-      const prior = path.join(this.ledgerDir, 'iter', String(iter - 1), 'verdict.json');
-      if (fs.existsSync(prior)) {
-        fs.copyFileSync(prior, path.join(this.reviewerSandboxDir, 'prior_verdict.json'));
-      }
-    }
+  private stageReviewSandbox(iter: number): { priorVerdict: boolean } {
+    const staged = this.secureLedger.stageReviewerSandbox(iter, {
+      plan: this.readReviewerControlFile('plan.md'),
+      goal: this.readReviewerControlFile('goal.json'),
+    });
+    return { priorVerdict: staged.priorVerdict };
   }
 
   private async deliverToReviewer(env: AnyAutoloopMessage, dispatchId: string): Promise<AnyAutoloopMessage[]> {
+    if (this.terminal) return [];
     if (env.type !== 'review_request') {
       throw new Error(`[autoloop] reviewer does not accept message type=${env.type}`);
     }
+    const iter = env.iter;
+    const logicalMessageDigest = logicalMessageSha256(env);
+    const durable = this.durableDeliveryState('review_request', 'reviewer', dispatchId, logicalMessageDigest);
+    if (durable) {
+      const verdict = this.secureLedger.readIterationArtifact(iter, 'verdict.json');
+      if (durable.acknowledged || verdict !== undefined) {
+        const recovered = this.recoverDurableReviewerDelivery(iter);
+        if (!durable.acknowledged) this.acknowledgeDurableDelivery(durable.intent);
+        return recovered;
+      }
+    }
+    const staged = this.stageReviewSandbox(iter);
     await this.ensureReviewer();
-    this.stageReviewSandbox(env.payload.iter);
+    if (this.terminal) return [];
 
-    const promptText = [
-      `[review_request iter=${env.payload.iter}]`,
-      `Artifacts staged at: iter-${env.payload.iter}/ (directive.json, diff.patch, eval_output.json)`,
-      `prior_verdict: ${fs.existsSync(path.join(this.reviewerSandboxDir, 'prior_verdict.json')) ? 'prior_verdict.json' : '(none)'}`,
-      `prior_metrics: ${JSON.stringify(env.payload.prior_metrics ?? [])}`,
-      '',
-      'Audit and emit `review_complete`.',
-    ].join('\n');
-
-    // Heartbeat so the dashboard's Reviewer pane shows "auditing" the moment
-    // a review_request lands, instead of staying blank until the verdict.
-    this.appendChatEntry({
-      who: 'reviewer',
-      text: `🔍 Reviewer iter ${env.payload.iter} auditing…`,
-      ts: new Date().toISOString(),
-    });
-
-    const result = await this.sendWithRecovery(
+    const promptText =
+      'checkpoint_sha' in env.payload
+        ? [
+            `[review_request iter=${iter}]`,
+            `Artifacts staged from run ${env.payload.source_run_id} iter ${env.payload.source_iter} at: iter-${iter}/ (directive.json, diff.patch, eval_output.json)`,
+            `checkpoint_sha: ${env.payload.checkpoint_sha}`,
+            `scope: ${JSON.stringify(env.payload.scope)}`,
+            `prior_verdict: ${staged.priorVerdict ? 'prior_verdict.json' : '(none)'}`,
+            `prior_metrics: ${JSON.stringify(env.payload.prior_metrics)}`,
+            '',
+            'Audit and emit `review_complete`.',
+          ].join('\n')
+        : `[review_request iter=${iter}]\nArtifacts staged at: iter-${iter}/ (directive.json, diff.patch, eval_output.json)\nprior_verdict: ${staged.priorVerdict ? 'prior_verdict.json' : '(none)'}\nprior_metrics: ${JSON.stringify(env.payload.prior_metrics)}\n\nAudit and emit \`review_complete\`.`;
+    const delivery = this.prepareDurableDelivery(
+      'review_request',
       'reviewer',
-      this.reviewerName,
+      this.requireLiveGeneration('reviewer'),
+      dispatchId,
       this.withRoleInstructions(
         'reviewer',
         this.reviewerSelection,
         this.reviewerSessionPrompt ?? this.reviewerSystemPrompt,
         promptText,
       ),
+      logicalMessageDigest,
+    );
+    const result = await this.sendWithRecovery(
+      'reviewer',
+      this.reviewerName,
+      delivery.prompt,
       this.pendingSendTimeout(env, 'reviewer', dispatchId),
+      delivery.intent,
     );
     if (result.recoverable_timeout) {
+      if (this.terminal) return [];
       return [Msg.sendTimeout(env.iter, result.recoverable_timeout)];
     }
-    this.recordTurn('reviewer', 'user', promptText);
-    this.recordTurn('reviewer', 'agent', (result.output ?? '').trim());
+    if (this.terminal) return [];
     if (result.fatal) {
       this.appendDecisionLog({
         kind: 'phase_error',
         actor: 'dispatcher',
-        payload: { agent: 'reviewer', phase: 'send', error: result.error ?? 'unknown' },
+        payload: { agent: 'reviewer', phase: 'send', code: result.code, error: result.error ?? 'unknown' },
       });
       return [
-        Msg.phaseError(env.payload.iter, {
+        Msg.phaseError(iter, {
           agent: 'reviewer',
           phase: 'send',
+          code: result.code,
           error: result.error ?? 'unknown send failure',
         }),
       ];
     }
     const replyText = (result.output ?? '').trim();
     const parsed = parseAgentReply(replyText);
-    this.emit('reviewer_reply', parsed.cleaned_reply);
-    if (parsed.cleaned_reply) {
-      this.appendChatEntry({
-        who: 'reviewer',
-        text: parsed.cleaned_reply,
-        ts: new Date().toISOString(),
-      });
-    }
 
+    const effectiveDelivery = result.durableDelivery ?? delivery.intent;
+    let completionArgs: Record<string, unknown> | undefined;
+    for (let index = 0; index < parsed.calls.length; index += 1) {
+      if (parsed.calls[index].tool === 'review_complete') completionArgs = parsed.calls[index].args;
+    }
+    this.assertReceiverProvenance(completionArgs, effectiveDelivery);
     const rc = extractReviewComplete(parsed.calls);
     if (!rc) {
       // Reviewer didn't emit a verdict — treat as 'hold' with the cleaned
       // reply as audit notes so the loop doesn't stall silently.
-      const verdict = Msg.reviewVerdict(env.payload.iter, {
+      const verdict = Msg.reviewVerdict(iter, {
         decision: 'hold',
         metric: null,
         audit_notes: `[no verdict emitted] ${parsed.cleaned_reply.slice(0, 500)}`,
       });
-      this.persistVerdict(env.payload.iter, {
+      this.persistVerdict(iter, {
         decision: 'hold',
         metric: null,
         audit_notes: verdict.payload.audit_notes,
       });
-      await this.maybeCompact('reviewer', this.reviewerName);
+      this.acknowledgeDurableDelivery(effectiveDelivery);
       return [verdict];
     }
 
-    const gated = await this.gateVerdict(env.payload.iter, rc);
-    this.persistVerdict(env.payload.iter, gated);
+    const reviewPayload = {
+      decision: rc.decision,
+      metric: rc.metric,
+      audit_notes: rc.audit_notes,
+      ...(rc.flags === undefined ? {} : { flags: rc.flags }),
+    };
+    const gated = await this.gateVerdict(iter, reviewPayload);
+    this.persistVerdict(iter, gated);
+    // The immutable Reviewer verdict is the recovery source for an
+    // acknowledged replay; persist it before publishing the acknowledgement.
+    this.acknowledgeDurableDelivery(effectiveDelivery);
+    if (gated.accepted === true && typeof gated.evidence_id === 'string') {
+      this.emit('target_hit', { iter, evidenceId: gated.evidence_id });
+    }
+    this.recordTurn('reviewer', 'user', delivery.prompt);
+    this.recordTurn('reviewer', 'agent', replyText);
+    this.emit('reviewer_reply', parsed.cleaned_reply);
+    if (parsed.cleaned_reply) {
+      this.appendChatEntry({ who: 'reviewer', text: parsed.cleaned_reply, ts: new Date().toISOString() });
+    }
     await this.maybeCompact('reviewer', this.reviewerName);
-    return [Msg.reviewVerdict(env.payload.iter, gated)];
+    return [Msg.reviewVerdict(iter, gated)];
   }
 
   /**
@@ -1438,7 +4228,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   private async gateVerdict<T extends { decision: string; metric: number | null; audit_notes: string }>(
     iter: number,
     rc: T,
-  ): Promise<T & { accepted?: boolean; evidence_id?: string }> {
+  ): Promise<T & { accepted?: true; evidence_id?: string }> {
     const contract = this.config.contract;
     if (!contract || rc.decision !== 'advance') return rc;
 
@@ -1462,10 +4252,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       logger: this.logger,
     });
 
-    if (passed) {
-      this.emit('target_hit', { iter, evidenceId });
-      return { ...rc, accepted: true, evidence_id: evidenceId };
-    }
+    if (passed) return { ...rc, accepted: true, evidence_id: evidenceId };
     const failed = results.filter((r) => r.required && !r.passed).map((r) => r.detail);
     this.appendDecisionLog({
       kind: 'phase_error',
@@ -1479,19 +4266,36 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     };
   }
 
-  private persistVerdict(
-    iter: number,
-    payload: { decision: string; metric: number | null; audit_notes: string },
-  ): void {
-    const iterDir = path.join(this.ledgerDir, 'iter', String(iter));
-    fs.mkdirSync(iterDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(iterDir, 'verdict.json'),
-      JSON.stringify(
-        { schema_version: LEDGER_SCHEMA_VERSION, iter, ts: new Date().toISOString(), ...payload },
-        null,
-        2,
-      ),
+  private persistVerdict(iter: number, payload: PersistedReviewVerdictPayload): void {
+    const canonical = canonicalPersistedVerdictPayload(payload);
+    const existing = this.secureLedger.readIterationArtifact(iter, 'verdict.json');
+    if (existing !== undefined) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(existing.toString('utf8'));
+      } catch (error) {
+        throw new Error(`Refusing to replay malformed immutable Reviewer verdict for iteration ${iter}`, {
+          cause: error,
+        });
+      }
+      if (
+        isPlainRecord(parsed) &&
+        Object.hasOwn(parsed, 'schema_version') &&
+        parsed.schema_version === LEDGER_SCHEMA_VERSION &&
+        Object.hasOwn(parsed, 'iter') &&
+        parsed.iter === iter &&
+        Object.hasOwn(parsed, 'ts') &&
+        typeof parsed.ts === 'string' &&
+        samePersistedVerdictPayload(parsed, canonical)
+      ) {
+        return;
+      }
+      throw new Error(`Refusing to overwrite conflicting immutable Reviewer verdict for iteration ${iter}`);
+    }
+    this.secureLedger.writeIterationArtifact(
+      iter,
+      'verdict.json',
+      serializePersistedVerdictV1(iter, new Date().toISOString(), canonical),
     );
   }
 
@@ -1511,14 +4315,158 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     });
   }
 
+  /** Internal deterministic test seam; production always uses argv-safe spawn. */
+  private spawnGitEvidenceProcess(argv: string[]): ChildProcess {
+    const environment = Object.create(null) as NodeJS.ProcessEnv;
+    for (const [name, value] of Object.entries(process.env)) {
+      if (!name.toUpperCase().startsWith('GIT_')) environment[name] = value;
+    }
+    return spawn(argv[0], argv.slice(1), {
+      cwd: this.config.workspace,
+      detached: process.platform !== 'win32',
+      env: environment,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+  }
+
+  /** Kill the complete evidence command tree, not merely its immediate shell-free child. */
+  private killGitEvidenceProcess(child: ChildProcess): void {
+    const pid = child.pid;
+    if (pid !== undefined && process.platform !== 'win32') {
+      try {
+        process.kill(-pid, 'SIGKILL');
+        return;
+      } catch {
+        // The group may already have exited; fall through to the child handle.
+      }
+    } else if (pid !== undefined) {
+      try {
+        const killer = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], {
+          detached: false,
+          stdio: 'ignore',
+          windowsHide: true,
+        });
+        killer.unref();
+      } catch {
+        // Fall through to ChildProcess.kill when taskkill could not start.
+      }
+    }
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      // Best effort after the promise has already been deterministically settled.
+    }
+  }
+
+  /**
+   * Run one bounded read-only Git evidence command. When expectedStdout is
+   * provided, stdout is compared chunk-by-chunk and never accumulated.
+   */
+  private async runGitEvidence(
+    argv: string[],
+    maxStdoutBytes: number,
+    label: string,
+    expectedStdout?: Buffer,
+  ): Promise<{ code: number; out: Buffer; err: Buffer }> {
+    return await new Promise((resolve, reject) => {
+      const child = this.spawnGitEvidenceProcess(argv);
+      const stdout: Buffer[] = [];
+      const stderr: Buffer[] = [];
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      let comparedBytes = 0;
+      let settled = false;
+
+      const cleanup = (): void => {
+        clearTimeout(timeout);
+        child.stdout?.removeListener('data', onStdout);
+        child.stderr?.removeListener('data', onStderr);
+        child.removeListener('error', onError);
+        child.removeListener('close', onClose);
+      };
+      const fail = (error: Error): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        this.killGitEvidenceProcess(child);
+        reject(error);
+      };
+      const onStdout = (value: Buffer | string): void => {
+        if (settled) return;
+        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        stdoutBytes += chunk.length;
+        if (stdoutBytes > maxStdoutBytes) {
+          fail(
+            new Error(
+              expectedStdout
+                ? `Reviewer-only checkpoint Git ${label} output is longer than source diff.patch (${maxStdoutBytes} bytes)`
+                : `Reviewer-only Git ${label} output is longer than the ${maxStdoutBytes}-byte limit`,
+            ),
+          );
+          return;
+        }
+        if (expectedStdout) {
+          if (
+            comparedBytes + chunk.length > expectedStdout.length ||
+            !chunk.equals(expectedStdout.subarray(comparedBytes, comparedBytes + chunk.length))
+          ) {
+            fail(new Error(`Reviewer-only source diff.patch does not match checkpoint Git ${label} output`));
+            return;
+          }
+          comparedBytes += chunk.length;
+          return;
+        }
+        stdout.push(chunk);
+      };
+      const onStderr = (value: Buffer | string): void => {
+        if (settled) return;
+        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        stderrBytes += chunk.length;
+        if (stderrBytes > MAX_GIT_EVIDENCE_STDERR_BYTES) {
+          fail(new Error(`Reviewer-only Git ${label} stderr exceeds the ${MAX_GIT_EVIDENCE_STDERR_BYTES}-byte limit`));
+          return;
+        }
+        stderr.push(chunk);
+      };
+      const onError = (error: Error): void => {
+        fail(new Error(`Reviewer-only Git ${label} could not start: ${error.message}`, { cause: error }));
+      };
+      const onClose = (code: number | null, signal: NodeJS.Signals | null): void => {
+        if (settled) return;
+        const exitCode = code ?? (signal ? 1 : 0);
+        if (exitCode === 0 && expectedStdout && comparedBytes !== expectedStdout.length) {
+          fail(new Error(`Reviewer-only source diff.patch does not match checkpoint Git ${label} output`));
+          return;
+        }
+        settled = true;
+        cleanup();
+        resolve({
+          code: exitCode,
+          out: expectedStdout ? Buffer.alloc(0) : Buffer.concat(stdout, stdoutBytes),
+          err: Buffer.concat(stderr, stderrBytes),
+        });
+      };
+      const timeout = setTimeout(() => {
+        fail(new Error(`Reviewer-only Git evidence ${label} timed out after ${GIT_EVIDENCE_TIMEOUT_MS}ms`));
+      }, GIT_EVIDENCE_TIMEOUT_MS);
+      timeout.unref();
+
+      child.stdout?.on('data', onStdout);
+      child.stderr?.on('data', onStderr);
+      child.once('error', onError);
+      child.once('close', onClose);
+    });
+  }
+
   // ─── git helper for write_plan_committed / write_goal_committed ──────────
 
-  private async gitCommit(filename: string, message: string): Promise<void> {
-    const run = (argv: string[]): Promise<{ code: number; out: string; err: string }> =>
+  private async gitCommit(filenames: readonly string[], message: string): Promise<void> {
+    const run = (argv: string[], input?: string): Promise<{ code: number; out: string; err: string }> =>
       new Promise((resolve) => {
         const child = spawn(argv[0], argv.slice(1), {
           cwd: this.config.workspace,
-          stdio: ['ignore', 'pipe', 'pipe'],
+          stdio: ['pipe', 'pipe', 'pipe'],
         });
         let out = '';
         let err = '';
@@ -1526,28 +4474,59 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         child.stderr?.on('data', (b) => (err += b.toString()));
         child.on('error', (e) => resolve({ code: 127, out: '', err: (e as Error).message }));
         child.on('exit', (code) => resolve({ code: code ?? 0, out, err }));
+        child.stdin?.end(input);
       });
 
-    // Allow either a workspace-rooted plan.md or one inside tasks/<run_id>/.
-    // We don't know which; best-effort `git add -A` keeps it simple and the
-    // commit message captures the intent. Empty diff → skip (no error).
-    const status = await run(['git', 'status', '--porcelain']);
+    const detailFor = (result: { code: number; out: string; err: string }): string =>
+      (result.err || result.out || `exit ${result.code}`).trim().slice(0, 300);
+    const label = filenames.join(', ');
+    const repository = await run(['git', 'rev-parse', '--is-inside-work-tree']);
+    if (repository.code !== 0) {
+      if (/not a git repository/i.test(repository.err + repository.out)) {
+        this.logger.info?.(`[autoloop] commit_${label}: workspace is not a git repository`);
+        return;
+      }
+      throw new Error(`git rev-parse failed for ${label} (code=${repository.code}): ${detailFor(repository)}`);
+    }
+    if (repository.out.trim() !== 'true') {
+      throw new Error(`git rev-parse did not confirm a work tree for ${label}`);
+    }
+
+    // Planner owns exactly this validated artifact set. Scope every git
+    // operation to those paths so unrelated staged or dirty product work
+    // remains untouched.
+    const status = await run(['git', 'status', '--porcelain', '--', ...filenames]);
     if (status.code !== 0) {
-      this.logger.warn?.(`[autoloop] git status failed: ${status.err.slice(0, 200)}`);
-      return;
+      throw new Error(`git status failed for ${label} (code=${status.code}): ${detailFor(status)}`);
     }
     if (status.out.trim() === '') {
-      this.logger.info?.(`[autoloop] commit_${filename}: no changes to commit`);
+      this.logger.info?.(`[autoloop] commit_${label}: no changes to commit`);
       return;
     }
-    await run(['git', 'add', '-A']);
-    const commit = await run(['git', 'commit', '-m', message]);
+    const priorIndex = await run(['git', 'ls-files', '--stage', '--', ...filenames]);
+    if (priorIndex.code !== 0) {
+      throw new Error(`git ls-files failed for ${label} (code=${priorIndex.code}): ${detailFor(priorIndex)}`);
+    }
+    const add = await run(['git', 'add', '--', ...filenames]);
+    if (add.code !== 0) {
+      throw new Error(`git add failed for ${label} (code=${add.code}): ${detailFor(add)}`);
+    }
+    const commit = await run(['git', 'commit', '--only', '-m', message, '--', ...filenames]);
     if (commit.code !== 0) {
-      const detail = commit.err.slice(0, 200);
+      const detail = detailFor(commit);
+      const removeCurrent = await run(['git', 'update-index', '--force-remove', '--', ...filenames]);
+      let restoreError = removeCurrent.code === 0 ? '' : detailFor(removeCurrent);
+      if (!restoreError && priorIndex.out.length > 0) {
+        const restore = await run(['git', 'update-index', '--index-info'], priorIndex.out);
+        if (restore.code !== 0) restoreError = detailFor(restore);
+      }
       // Surface, don't just log: a silent commit failure leaves the file on disk
       // but uncommitted, so the next Coder iter sees inconsistent git state.
-      this.logger.error?.(`[autoloop] git commit failed for ${filename}: ${detail}`);
-      this.emit('planner_error', new Error(`git commit failed for ${filename}: ${detail}`));
+      const failure = `git commit failed for ${label} (code=${commit.code}): ${detail}`;
+      const surfaced = restoreError ? `${failure}; index restoration failed: ${restoreError}` : failure;
+      this.logger.error?.(`[autoloop] ${surfaced}`);
+      this.emit('planner_error', new Error(surfaced));
+      throw new Error(surfaced);
     }
   }
 }

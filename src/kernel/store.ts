@@ -39,7 +39,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { Logger } from '../logger.js';
-import { withFileLock, type LockResult } from './file-lock.js';
+import { isFileLockReleaseError, withFileLock, type LockResult } from './file-lock.js';
 import type { KernelEvent, NodeRecord, RunRecord, RunState, WorkflowSpec } from './types.js';
 
 export function wfDir(): string {
@@ -435,14 +435,16 @@ export interface CommitBatch {
  * opposite responses: `superseded` means stop permanently, `blocked` means this
  * attempt did not get through and the run is still ours.
  */
-export type CommitOutcome = 'committed' | 'superseded' | 'blocked';
+export type CommitOutcome = 'committed' | 'superseded' | 'blocked' | 'cleanup_failed';
 
 export interface CommitResult {
   outcome: CommitOutcome;
   reason?: string;
+  /** The callback returned, so the transaction may already have reached its commit point. */
+  possiblyCommitted?: boolean;
 }
 
-export type ReleaseOutcome = 'released' | 'not-ours' | 'blocked';
+export type ReleaseOutcome = 'released' | 'not-ours' | 'blocked' | 'cleanup_failed';
 
 function leaseFile(runId: string): string {
   return path.join(runDir(runId), 'lease.json');
@@ -700,8 +702,15 @@ export function recoverPending(runId: string, logger?: Logger): boolean {
   // turn a healthy commit into a read error, which is the same conflation this
   // module exists to avoid.
   for (let attempt = 0; attempt < 3; attempt++) {
-    const locked = withRunLock(runId, () => undefined, logger);
+    let locked: LockResult<void>;
+    try {
+      locked = withRunLock(runId, () => undefined, logger);
+    } catch (error) {
+      if (isFileLockReleaseError(error)) return false;
+      throw error;
+    }
     if (locked.ok) break;
+    if (locked.reason === 'cleanup_failed') return false;
     if (!fs.existsSync(path.join(runDir(runId), TX_COMMITTED))) return true;
   }
   // `recoverPendingLocked` deliberately leaves a committed transaction in
@@ -808,17 +817,23 @@ function guardIsCurrentLocked(guard: RunGuard): boolean {
 }
 
 /** Heartbeat. Best-effort: losing a renewal must not break the run. */
-export function renewLease(guard: RunGuard): void {
-  if (!runDirExists(guard.runId)) return;
-  withRunLock(guard.runId, () => {
-    if (!guardIsCurrentLocked(guard)) return;
-    const existing = readLease(guard.runId)!;
-    try {
-      atomicWriteJson(leaseFile(guard.runId), { ...existing, renewedAt: new Date().toISOString() });
-    } catch {
-      // The next renewal will try again.
-    }
-  });
+export function renewLease(guard: RunGuard): 'renewed' | 'skipped' | 'cleanup_failed' {
+  if (!runDirExists(guard.runId)) return 'skipped';
+  try {
+    const locked = withRunLock(guard.runId, () => {
+      if (!guardIsCurrentLocked(guard)) return;
+      const existing = readLease(guard.runId)!;
+      try {
+        atomicWriteJson(leaseFile(guard.runId), { ...existing, renewedAt: new Date().toISOString() });
+      } catch {
+        // The next renewal will try again.
+      }
+    });
+    return locked.ok ? 'renewed' : locked.reason === 'cleanup_failed' ? 'cleanup_failed' : 'skipped';
+  } catch (error) {
+    if (isFileLockReleaseError(error)) return 'cleanup_failed';
+    throw error;
+  }
 }
 
 /**
@@ -839,49 +854,61 @@ export function commit(guard: RunGuard, batch: CommitBatch, logger?: Logger): Co
   if (!runDirExists(guard.runId)) {
     return { outcome: 'superseded', reason: `run '${guard.runId}' no longer exists` };
   }
-  const locked = withRunLock(
-    guard.runId,
-    (): CommitResult => {
-      if (!guardIsCurrentLocked(guard)) {
-        const current = readLease(guard.runId);
-        return {
-          outcome: 'superseded',
-          reason: current
-            ? `run is now held by ${current.ownerId} at fence ${current.fence}`
-            : `run '${guard.runId}' no longer exists, or its claim was released`,
-        };
-      }
-      try {
-        stageLocked(guard.runId, batch);
-      } catch (err) {
-        try {
-          fs.rmSync(path.join(runDir(guard.runId), TX_STAGING), { recursive: true, force: true });
-        } catch {
-          // Debris only; nothing was published.
+  let locked: LockResult<CommitResult>;
+  try {
+    locked = withRunLock(
+      guard.runId,
+      (): CommitResult => {
+        if (!guardIsCurrentLocked(guard)) {
+          const current = readLease(guard.runId);
+          return {
+            outcome: 'superseded',
+            reason: current
+              ? `run is now held by ${current.ownerId} at fence ${current.fence}`
+              : `run '${guard.runId}' no longer exists, or its claim was released`,
+          };
         }
-        return { outcome: 'blocked', reason: `could not stage the change: ${(err as Error).message}` };
-      }
-      // Past the commit point. Application is replayable, so a failure here is a
-      // delay, not a loss — and reporting it as "not committed" would be wrong.
-      try {
-        applyTxLocked(guard.runId, logger);
-      } catch (err) {
-        logger?.warn?.(
-          `[kernel-store] ${guard.runId}: change is committed but not yet applied ` +
-            `(${(err as Error).message}); it will be applied on the next lock`,
-        );
-      }
-      try {
-        const lease = readLease(guard.runId)!;
-        atomicWriteJson(leaseFile(guard.runId), { ...lease, renewedAt: new Date().toISOString() });
-      } catch {
-        // The heartbeat is not part of the commitment.
-      }
-      return { outcome: 'committed' };
-    },
-    logger,
-  );
-  return locked.ok ? locked.value : { outcome: 'blocked', reason: locked.error };
+        try {
+          stageLocked(guard.runId, batch);
+        } catch (err) {
+          try {
+            fs.rmSync(path.join(runDir(guard.runId), TX_STAGING), { recursive: true, force: true });
+          } catch {
+            // Debris only; nothing was published.
+          }
+          return { outcome: 'blocked', reason: `could not stage the change: ${(err as Error).message}` };
+        }
+        // Past the commit point. Application is replayable, so a failure here is a
+        // delay, not a loss — and reporting it as "not committed" would be wrong.
+        try {
+          applyTxLocked(guard.runId, logger);
+        } catch (err) {
+          logger?.warn?.(
+            `[kernel-store] ${guard.runId}: change is committed but not yet applied ` +
+              `(${(err as Error).message}); it will be applied on the next lock`,
+          );
+        }
+        try {
+          const lease = readLease(guard.runId)!;
+          atomicWriteJson(leaseFile(guard.runId), { ...lease, renewedAt: new Date().toISOString() });
+        } catch {
+          // The heartbeat is not part of the commitment.
+        }
+        return { outcome: 'committed' };
+      },
+      logger,
+    );
+  } catch (error) {
+    if (isFileLockReleaseError(error)) {
+      return { outcome: 'cleanup_failed', reason: error.message, possiblyCommitted: true };
+    }
+    throw error;
+  }
+  if (locked.ok) return locked.value;
+  return {
+    outcome: locked.reason === 'cleanup_failed' ? 'cleanup_failed' : 'blocked',
+    reason: locked.error,
+  };
 }
 
 /**
@@ -894,12 +921,17 @@ export function commit(guard: RunGuard, batch: CommitBatch, logger?: Logger): Co
  */
 export function releaseLease(guard: RunGuard): ReleaseOutcome {
   if (!runDirExists(guard.runId)) return 'not-ours';
-  const locked = withRunLock(guard.runId, (): ReleaseOutcome => {
-    if (!guardIsCurrentLocked(guard)) return 'not-ours';
-    fs.rmSync(leaseFile(guard.runId), { force: true });
-    return 'released';
-  });
-  return locked.ok ? locked.value : 'blocked';
+  try {
+    const locked = withRunLock(guard.runId, (): ReleaseOutcome => {
+      if (!guardIsCurrentLocked(guard)) return 'not-ours';
+      fs.rmSync(leaseFile(guard.runId), { force: true });
+      return 'released';
+    });
+    return locked.ok ? locked.value : locked.reason === 'cleanup_failed' ? 'cleanup_failed' : 'blocked';
+  } catch (error) {
+    if (isFileLockReleaseError(error)) return 'cleanup_failed';
+    throw error;
+  }
 }
 
 // ─── Cross-process listing ──────────────────────────────────────────────────

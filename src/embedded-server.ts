@@ -12,10 +12,12 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
-import { SessionManager } from './session-manager.js';
+import { SessionManager, toPublicAutoloopFailure } from './session-manager.js';
 import { sanitizeCwd, validateRegex } from './validation.js';
 import { resolveSecretRefs } from './kernel/secrets.js';
 import { validateAutoloopTimeoutConfig } from './autoloop/types.js';
+import { AutoloopRecoveryError } from './autoloop/types.js';
+import { canonicalizeRequestReviewArgs } from './autoloop/messages.js';
 import type { EffortLevel, EngineType } from './types.js';
 import { handleChatCompletion } from './openai-compat.js';
 import { getModelList } from './models.js';
@@ -32,10 +34,40 @@ import {
 // SSE/keep-alive sockets are force-dropped (otherwise close() hangs forever).
 const SERVER_CLOSE_GRACE_MS = 5000;
 
+function safeOwnErrorMessage(error: unknown): string {
+  if (typeof error === 'string') return error;
+  if ((typeof error !== 'object' || error === null) && typeof error !== 'function') {
+    return 'unknown error';
+  }
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(error, 'message');
+    return descriptor && Object.hasOwn(descriptor, 'value') && typeof descriptor.value === 'string'
+      ? descriptor.value
+      : 'unknown error';
+  } catch {
+    return 'unknown error';
+  }
+}
+
 function autoloopErrorStatus(error: unknown): number {
-  const message = error instanceof Error ? error.message : String(error);
+  if (error instanceof AutoloopRecoveryError) {
+    switch (error.code) {
+      case 'AUTOLOOP_RECOVERY_TOKEN_REQUIRED':
+        return 400;
+      case 'AUTOLOOP_RECOVERY_TOKEN_STALE':
+      case 'AUTOLOOP_RECOVERY_MANUAL_RESOLUTION_REQUIRED':
+      case 'AUTOLOOP_RECOVERY_INCOMPLETE':
+        return 409;
+    }
+  }
+  const message = safeOwnErrorMessage(error);
+  if (/^Autoloop run '.+' not found$/.test(message)) return 404;
   if (/^Autoloop run '.+' not found in registry$/.test(message)) return 404;
   if (/^Autoloop with id '.+' (?:already exists|is being deleted|is still starting)$/.test(message)) return 409;
+  if (/^Autoloop run '.+' is being deleted$/.test(message)) return 409;
+  if (/^Autoloop run '.+' is paused; resume it before requesting review$/.test(message)) return 409;
+  if (/^Autoloop run '.+' became paused before Reviewer-only queue delivery$/.test(message)) return 409;
+  if (/^Autoloop run '.+' is .+ and not running in this process/.test(message)) return 409;
   if (/^Autoloop session name '.+' is already in use$/.test(message)) return 409;
   if (/^(?:Planner|Coder|Reviewer) engine '.+' is not supported$/.test(message)) return 400;
   if (/^(?:Planner|Coder|Reviewer) effort\b/.test(message)) return 400;
@@ -48,6 +80,25 @@ function autoloopErrorStatus(error: unknown): number {
   if (/^(?:sendTimeoutMs|activityLeaseMs|autoloopHardTimeoutMs|pendingDispatchId)\b/.test(message)) return 400;
   if (/^(?:allow_decrease|activity_lease_ms|autoloop_hard_timeout_ms) is not supported\b/.test(message)) return 400;
   if (/^pending dispatch\b/.test(message)) return 400;
+  if (/^(?:request_review|Invalid request_review)\b/i.test(message)) return 400;
+  if (/^recover (?:contains unsupported field|apply\b|recovery_token\b)/.test(message)) return 400;
+  if (/^autoloop_spawn_(?:coder|reviewer) run_id\b/.test(message)) return 400;
+  if (/^Cannot request review after the Autoloop run became terminal$/.test(message)) return 400;
+  if (/^Autoloop run '.+' is terminal and cannot accept a review request$/.test(message)) return 400;
+  if (
+    /^Cannot (?:change (?:Coder|Reviewer) engine or model after its session has started|start (?:Coder|Reviewer) after the Autoloop run became terminal)$/.test(
+      message,
+    )
+  )
+    return 400;
+  if (/^Reviewer-only checkpoint .+ does not match workspace HEAD .+$/.test(message)) return 400;
+  if (/^Reviewer-only request requires source run '.+' iter \d+\/.+$/.test(message)) return 400;
+  if (/^Reviewer-only checkpoint (?:could not verify workspace HEAD|patch could not be read)\b/.test(message))
+    return 400;
+  if (/^Autoloop terminated while preparing the Reviewer-only request$/.test(message)) return 400;
+  if (/^Autoloop run became terminal before Reviewer-only queue delivery$/.test(message)) return 400;
+  if (/^Autoloop terminated while starting (?:Coder|Reviewer)$/.test(message)) return 400;
+  if (/^autoloop_spawn_(?:coder|reviewer)\b/.test(message)) return 400;
   if (/^Autoloop run '.+' (?:has no pending dispatch|is not awaiting a recoverable send timeout)/.test(message)) {
     return 400;
   }
@@ -149,7 +200,10 @@ export const __rejectCustomEngineOverHttpForTest = rejectCustomEngineOverHttp;
  * hardened for exactly this and the other three were not, so the guard lives in
  * one place now rather than in each closure that remembers to have it.
  */
-function sseSender(res: http.ServerResponse): (event: string, data: unknown) => void {
+function sseSender(
+  res: http.ServerResponse,
+  serialize: (data: unknown) => string = JSON.stringify,
+): (event: string, data: unknown) => void {
   let closed = false;
   res.on('close', () => {
     closed = true;
@@ -158,7 +212,7 @@ function sseSender(res: http.ServerResponse): (event: string, data: unknown) => 
     if (closed || res.writableEnded || !res.writable) return;
     try {
       res.write(`event: ${event}\n`);
-      res.write(`data: ${JSON.stringify(data)}\n\n`);
+      res.write(`data: ${serialize(data)}\n\n`);
     } catch {
       // Connection broke mid-write; stop sending. The route's own `close`
       // handler detaches listeners and ends the response.
@@ -169,6 +223,55 @@ function sseSender(res: http.ServerResponse): (event: string, data: unknown) => 
 
 /** Test seam: the guard is invisible from outside, and an unguarded write throws where nothing catches it. */
 export const __sseSenderForTest = sseSender;
+
+/**
+ * Snapshot the public Autoloop state boundary without invoking inherited
+ * `toJSON` hooks or own accessors. Detached failures are already canonical
+ * data, but the surrounding persisted state and HTTP/SSE envelopes are plain
+ * objects and would otherwise let a polluted Object.prototype replace them.
+ */
+export function snapshotAutoloopPublicJsonValue(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (value === null || typeof value !== 'object') return typeof value === 'function' ? undefined : value;
+  if (seen.has(value)) return undefined;
+  seen.add(value);
+
+  let descriptors: PropertyDescriptorMap;
+  try {
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    seen.delete(value);
+    return undefined;
+  }
+
+  if (Array.isArray(value)) {
+    const snapshot: unknown[] = [];
+    Object.defineProperty(snapshot, 'toJSON', { value: undefined });
+    const length = descriptors.length;
+    const arrayLength = length && Object.hasOwn(length, 'value') && typeof length.value === 'number' ? length.value : 0;
+    snapshot.length = arrayLength;
+    for (let index = 0; index < arrayLength; index += 1) {
+      const descriptor = descriptors[String(index)];
+      snapshot[index] =
+        descriptor && descriptor.enumerable && Object.hasOwn(descriptor, 'value')
+          ? snapshotAutoloopPublicJsonValue(descriptor.value, seen)
+          : undefined;
+    }
+    seen.delete(value);
+    return Object.freeze(snapshot);
+  }
+
+  const snapshot = Object.create(null) as Record<string, unknown>;
+  for (const [key, descriptor] of Object.entries(descriptors)) {
+    if (!descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) continue;
+    snapshot[key] = snapshotAutoloopPublicJsonValue(descriptor.value, seen);
+  }
+  seen.delete(value);
+  return Object.freeze(snapshot);
+}
+
+function stringifyAutoloopPublicJson(value: unknown): string {
+  return JSON.stringify(snapshotAutoloopPublicJsonValue(value));
+}
 
 export class EmbeddedServer {
   private server: http.Server | null = null;
@@ -478,10 +581,10 @@ export class EmbeddedServer {
           res.end(JSON.stringify({ ok: false, error: 'Invalid JSON' }));
           return;
         }
-        this.route(path, parsed, url.searchParams, res, req.headers);
+        this.route(path, parsed, url.searchParams, res, req.headers, req.method);
       });
     } else {
-      this.route(path, {}, url.searchParams, res, req.headers);
+      this.route(path, {}, url.searchParams, res, req.headers, req.method);
     }
   }
 
@@ -491,6 +594,7 @@ export class EmbeddedServer {
     query: URLSearchParams,
     res: http.ServerResponse,
     headers: http.IncomingHttpHeaders = {},
+    method = 'GET',
   ): Promise<void> {
     try {
       const json = (status: number, data: unknown) => {
@@ -990,7 +1094,8 @@ export class EmbeddedServer {
       // Front-end contract used by the dashboard's 3-pane Orchestrator view.
 
       if (path === '/autoloop/list') {
-        json(200, { ok: true, runs: this.manager.autoloopList() });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(stringifyAutoloopPublicJson({ ok: true, runs: this.manager.autoloopList() }));
         return;
       }
 
@@ -1070,9 +1175,11 @@ export class EmbeddedServer {
         const state = this.manager.autoloopStatus(id);
         const live = Boolean(this.manager.getAutoloop(id));
         if (!state) {
-          json(404, { ok: false, error: 'run not found' });
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(stringifyAutoloopPublicJson({ ok: false, error: 'run not found' }));
         } else {
-          json(200, { ok: true, state, live });
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(stringifyAutoloopPublicJson({ ok: true, state, live }));
         }
         return;
       }
@@ -1155,10 +1262,15 @@ export class EmbeddedServer {
             Connection: 'keep-alive',
           });
           res.write('retry: 864000000\n');
-          res.write(`event: snapshot\ndata: ${JSON.stringify({ state: histState })}\n\n`);
-          res.write(
-            `event: terminated\ndata: ${JSON.stringify({ reason: histState.status_reason ?? 'historical' })}\n\n`,
-          );
+          const safeHistState = snapshotAutoloopPublicJsonValue(histState);
+          const safeStatusReason =
+            typeof safeHistState === 'object' &&
+            safeHistState !== null &&
+            typeof (safeHistState as Record<string, unknown>).status_reason === 'string'
+              ? ((safeHistState as Record<string, unknown>).status_reason as string)
+              : 'historical';
+          res.write(`event: snapshot\ndata: ${stringifyAutoloopPublicJson({ state: safeHistState })}\n\n`);
+          res.write(`event: terminated\ndata: ${stringifyAutoloopPublicJson({ reason: safeStatusReason })}\n\n`);
           res.end();
           return;
         }
@@ -1167,7 +1279,7 @@ export class EmbeddedServer {
           'Cache-Control': 'no-cache',
           Connection: 'keep-alive',
         });
-        const send = sseSender(res);
+        const send = sseSender(res, stringifyAutoloopPublicJson);
         send('snapshot', { state: ctx.runner.state });
 
         if (ctx.runner.state.status === 'terminated' || ctx.runner.state.status === 'crashed') {
@@ -1191,11 +1303,11 @@ export class EmbeddedServer {
           cleanup();
         };
         const onPlannerReply = (text: unknown): void => send('planner_reply', { text });
-        const onPlannerError = (err: unknown): void =>
-          send('planner_error', { message: err instanceof Error ? err.message : String(err) });
+        const onPlannerError = (err: unknown): void => send('planner_error', { message: safeOwnErrorMessage(err) });
         const onCoderReply = (text: unknown): void => send('coder_reply', { text });
         const onReviewerReply = (text: unknown): void => send('reviewer_reply', { text });
         const onCompact = (e: unknown): void => send('compact', e);
+        const onAutoloopFailure = (failure: unknown): void => send('autoloop_failure', failure);
         const cleanup = (): void => {
           // sseSender stops writing on its own `close` listener; this just
           // detaches the emitters so a long-lived run stops feeding a dead
@@ -1210,6 +1322,7 @@ export class EmbeddedServer {
           ctx.dispatcher.off('coder_reply', onCoderReply);
           ctx.dispatcher.off('reviewer_reply', onReviewerReply);
           ctx.dispatcher.off('compact', onCompact);
+          ctx.runner.off('autoloop_failure', onAutoloopFailure);
           try {
             res.end();
           } catch {
@@ -1226,6 +1339,7 @@ export class EmbeddedServer {
         ctx.dispatcher.on('coder_reply', onCoderReply);
         ctx.dispatcher.on('reviewer_reply', onReviewerReply);
         ctx.dispatcher.on('compact', onCompact);
+        ctx.runner.on('autoloop_failure', onAutoloopFailure);
         res.on('close', cleanup);
         return;
       }
@@ -1245,7 +1359,8 @@ export class EmbeddedServer {
         const id = v2ChatMatch[1];
         const text = (body as { text?: string }).text;
         if (typeof text !== 'string' || !text.trim()) {
-          json(400, { ok: false, error: 'text (non-empty string) required' });
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(stringifyAutoloopPublicJson({ ok: false, error: 'text (non-empty string) required' }));
           return;
         }
         // Validate run exists synchronously so 404 surfaces cleanly. After
@@ -1260,21 +1375,153 @@ export class EmbeddedServer {
           } catch {
             // A malformed id is refused by the store; that is "not found" too.
           }
-          json(404, {
-            ok: false,
-            error: persisted
-              ? `Autoloop run '${id}' is not running in this process; resume it with POST /autoloop/${id}/resume`
-              : `Autoloop run '${id}' not found`,
-          });
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(
+            stringifyAutoloopPublicJson({
+              ok: false,
+              error: persisted
+                ? `Autoloop run '${id}' is not running in this process; resume it with POST /autoloop/${id}/resume`
+                : `Autoloop run '${id}' not found`,
+            }),
+          );
           return;
         }
-        this.manager.autoloopChat(id, text).catch((err) => {
-          // Late failures (planner errors, runner shutdown mid-dispatch) flow
-          // to SSE as planner_error events; this catch only exists to keep
-          // unhandled rejection from crashing the server.
-          console.warn(`[autoloop/${id}] chat dispatch failed: ${(err as Error).message}`);
-        });
-        json(202, { ok: true, queued: true });
+        void this.manager
+          .autoloopChat(id, text)
+          .catch((err) => this.manager.recordDetachedAutoloopChatFailure(id, err))
+          .catch((recordError) => {
+            try {
+              console.warn(
+                `[autoloop/${id}] failed to record detached chat rejection: ${safeOwnErrorMessage(recordError)}`,
+              );
+            } catch {
+              // This is the terminal containment boundary for the detached
+              // chain. Logging must never manufacture a replacement rejection.
+            }
+          });
+        res.writeHead(202, { 'Content-Type': 'application/json' });
+        res.end(stringifyAutoloopPublicJson({ ok: true, queued: true }));
+        return;
+      }
+
+      const v2RequestReviewMatch = path.match(/^\/autoloop\/([^/]+)\/request_review$/);
+      if (v2RequestReviewMatch) {
+        if (method !== 'POST') {
+          res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'POST' });
+          res.end(stringifyAutoloopPublicJson({ ok: false, error: 'Method not allowed' }));
+          return;
+        }
+        if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(stringifyAutoloopPublicJson({ ok: false, error: 'Request_review payload is invalid' }));
+          return;
+        }
+        try {
+          const descriptors = Object.getOwnPropertyDescriptors(body);
+          const allowedKeys = new Set([
+            'run_id',
+            'checkpoint_sha',
+            'source_run_id',
+            'source_iter',
+            'scope',
+            'idempotency_key',
+          ]);
+          for (const key of Reflect.ownKeys(body)) {
+            if (typeof key !== 'string' || !allowedKeys.has(key)) {
+              throw new Error(`request_review contains unsupported field '${String(key)}'`);
+            }
+          }
+          if (descriptors.run_id && !Object.hasOwn(descriptors.run_id, 'value')) {
+            throw new Error('request_review run_id must be an own data property');
+          }
+          if (descriptors.run_id?.value !== undefined && descriptors.run_id.value !== v2RequestReviewMatch[1]) {
+            throw new Error('request_review run_id must match the route run id');
+          }
+          const requestBody = Object.create(null) as Record<string, unknown>;
+          for (const key of ['checkpoint_sha', 'source_run_id', 'source_iter', 'scope', 'idempotency_key']) {
+            const descriptor = descriptors[key];
+            if (!descriptor) continue;
+            if (!Object.hasOwn(descriptor, 'value')) {
+              throw new Error(`request_review ${key} must be an own data property`);
+            }
+            Object.defineProperty(requestBody, key, { enumerable: true, value: descriptor.value });
+          }
+          const request = canonicalizeRequestReviewArgs(requestBody);
+          const result = await this.manager.autoloopRequestReview(v2RequestReviewMatch[1], request);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(stringifyAutoloopPublicJson({ ok: true, ...result }));
+        } catch (error) {
+          const status = autoloopErrorStatus(error);
+          const publicFailure = toPublicAutoloopFailure(error);
+          res.writeHead(status, { 'Content-Type': 'application/json' });
+          res.end(
+            stringifyAutoloopPublicJson({
+              ok: false,
+              error: publicFailure ?? safeOwnErrorMessage(error),
+            }),
+          );
+        }
+        return;
+      }
+
+      // ─── Autoloop — inspect or apply durable recovery ─────────
+      //
+      // POST /autoloop/<run_id>/recover
+      //
+      // The SessionManager owns every recovery decision. This adapter only
+      // validates the public shape and passes its explicitly supplied options
+      // through without normalizing the recovery token.
+      const v2RecoverMatch = path.match(/^\/autoloop\/([^/]+)\/recover$/);
+      if (v2RecoverMatch) {
+        if (method !== 'POST') {
+          res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'POST' });
+          res.end(stringifyAutoloopPublicJson({ ok: false, error: 'Method not allowed' }));
+          return;
+        }
+        if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(stringifyAutoloopPublicJson({ ok: false, error: 'Recovery payload is invalid' }));
+          return;
+        }
+        try {
+          const descriptors = Object.getOwnPropertyDescriptors(body);
+          const allowedKeys = new Set(['apply', 'recovery_token']);
+          for (const key of Reflect.ownKeys(body)) {
+            if (typeof key !== 'string' || !allowedKeys.has(key)) {
+              throw new Error(`recover contains unsupported field '${String(key)}'`);
+            }
+          }
+          const applyDescriptor = descriptors.apply;
+          if (applyDescriptor && !Object.hasOwn(applyDescriptor, 'value')) {
+            throw new Error('recover apply must be an own data property');
+          }
+          const tokenDescriptor = descriptors.recovery_token;
+          if (tokenDescriptor && !Object.hasOwn(tokenDescriptor, 'value')) {
+            throw new Error('recover recovery_token must be an own data property');
+          }
+          if (applyDescriptor && applyDescriptor.value !== undefined && typeof applyDescriptor.value !== 'boolean') {
+            throw new Error('recover apply must be a boolean');
+          }
+          if (tokenDescriptor && tokenDescriptor.value !== undefined && typeof tokenDescriptor.value !== 'string') {
+            throw new Error('recover recovery_token must be a string');
+          }
+          const options: { apply?: boolean; recovery_token?: string } = {};
+          if (applyDescriptor?.value !== undefined) options.apply = applyDescriptor.value as boolean;
+          if (tokenDescriptor?.value !== undefined) options.recovery_token = tokenDescriptor.value as string;
+          const result = await this.manager.autoloopRecover(v2RecoverMatch[1], options);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(stringifyAutoloopPublicJson({ ok: true, ...result }));
+        } catch (error) {
+          const status = autoloopErrorStatus(error);
+          const publicFailure = toPublicAutoloopFailure(error);
+          res.writeHead(status, { 'Content-Type': 'application/json' });
+          res.end(
+            stringifyAutoloopPublicJson({
+              ok: false,
+              error: publicFailure ?? safeOwnErrorMessage(error),
+            }),
+          );
+        }
         return;
       }
 
@@ -1365,7 +1612,8 @@ export class EmbeddedServer {
           if (sendTimeoutMs !== undefined) resumeOptions.sendTimeoutMs = sendTimeoutMs;
           if (pendingDispatchId !== undefined) resumeOptions.pendingDispatchId = pendingDispatchId;
           const state = await this.manager.autoloopResume(id, resumeOptions);
-          json(200, { ok: true, state });
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(stringifyAutoloopPublicJson({ ok: true, state }));
         } catch (err) {
           json(autoloopErrorStatus(err), { ok: false, error: (err as Error).message });
         }

@@ -11,6 +11,9 @@
  * Reviewer tools: review_complete, reviewer_log
  */
 
+import { types as nodeUtilTypes } from 'node:util';
+import { canonicalizeExactStringArrayElements } from './messages.js';
+
 export type CoderToolName = 'iter_complete' | 'request_clarification' | 'coder_log';
 export type ReviewerToolName = 'review_complete' | 'reviewer_log';
 
@@ -55,6 +58,9 @@ export interface IterCompletePayload {
   summary: string;
   eval_output: unknown;
   files_changed?: string[];
+  /** Receiver echo for a durable Coder delivery. */
+  delivery_id?: string;
+  payload_sha256?: string;
 }
 
 export interface ReviewCompletePayload {
@@ -62,6 +68,37 @@ export interface ReviewCompletePayload {
   metric: number | null;
   audit_notes: string;
   flags?: string[];
+  /** Receiver echo for a durable Reviewer delivery. */
+  delivery_id?: string;
+  payload_sha256?: string;
+}
+
+function deliveryProvenance(
+  args: Record<string, unknown>,
+): Pick<IterCompletePayload, 'delivery_id' | 'payload_sha256'> {
+  if (nodeUtilTypes.isProxy(args)) return {};
+  const deliveryIdDescriptor = Object.getOwnPropertyDescriptor(args, 'delivery_id');
+  const payloadSha256Descriptor = Object.getOwnPropertyDescriptor(args, 'payload_sha256');
+  const deliveryId =
+    deliveryIdDescriptor && deliveryIdDescriptor.enumerable === true && Object.hasOwn(deliveryIdDescriptor, 'value')
+      ? deliveryIdDescriptor.value
+      : undefined;
+  const payloadSha256 =
+    payloadSha256Descriptor &&
+    payloadSha256Descriptor.enumerable === true &&
+    Object.hasOwn(payloadSha256Descriptor, 'value')
+      ? payloadSha256Descriptor.value
+      : undefined;
+  if (
+    typeof deliveryId !== 'string' ||
+    !deliveryId.trim() ||
+    deliveryId.trim() !== deliveryId ||
+    typeof payloadSha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(payloadSha256)
+  ) {
+    return {};
+  }
+  return { delivery_id: deliveryId, payload_sha256: payloadSha256 };
 }
 
 /** Find the *last* iter_complete block (per coder prompt: at most one expected). */
@@ -69,26 +106,44 @@ export function extractIterComplete(calls: AgentToolCall[]): IterCompletePayload
   const matches = calls.filter((c) => c.tool === 'iter_complete');
   if (matches.length === 0) return null;
   const last = matches[matches.length - 1];
+  if (nodeUtilTypes.isProxy(last.args)) return null;
   const summary = String(last.args.summary ?? '');
   const eval_output = last.args.eval_output ?? {};
   const filesRaw = last.args.files_changed;
   const files_changed = Array.isArray(filesRaw) ? filesRaw.filter((x) => typeof x === 'string') : undefined;
-  return { summary, eval_output, files_changed };
+  return { summary, eval_output, files_changed, ...deliveryProvenance(last.args) };
 }
 
 export function extractReviewComplete(calls: AgentToolCall[]): ReviewCompletePayload | null {
-  const matches = calls.filter((c) => c.tool === 'review_complete');
-  if (matches.length === 0) return null;
-  const last = matches[matches.length - 1];
+  let last: AgentToolCall | undefined;
+  for (let index = 0; index < calls.length; index += 1) {
+    if (calls[index].tool === 'review_complete') last = calls[index];
+  }
+  if (!last) return null;
+  if (nodeUtilTypes.isProxy(last.args)) return null;
   const dec = String(last.args.decision ?? '');
   if (dec !== 'advance' && dec !== 'hold' && dec !== 'rollback') return null;
   const metricRaw = last.args.metric;
   const metric =
     typeof metricRaw === 'number' && Number.isFinite(metricRaw) ? metricRaw : metricRaw === null ? null : null;
   const audit_notes = String(last.args.audit_notes ?? '');
-  const flagsRaw = last.args.flags;
-  const flags = Array.isArray(flagsRaw) ? flagsRaw.filter((x) => typeof x === 'string') : undefined;
-  return { decision: dec as ReviewCompletePayload['decision'], metric, audit_notes, flags };
+  const flagsDescriptor = Object.getOwnPropertyDescriptor(last.args, 'flags');
+  let flags: string[] | undefined;
+  if (flagsDescriptor !== undefined) {
+    if (!Object.hasOwn(flagsDescriptor, 'value') || flagsDescriptor.value === undefined) return null;
+    try {
+      flags = canonicalizeExactStringArrayElements(flagsDescriptor.value);
+    } catch {
+      return null;
+    }
+  }
+  return {
+    decision: dec as ReviewCompletePayload['decision'],
+    metric,
+    audit_notes,
+    flags,
+    ...deliveryProvenance(last.args),
+  };
 }
 
 /** Convenience: find first request_clarification, if any. */
