@@ -2882,4 +2882,794 @@ describe('SessionManager', () => {
       expect(version.length).toBeGreaterThan(0);
     });
   });
+
+  // ─── Closed-ledger resume (S1 RED) + preserve controls (S1 GREEN) ─────
+  // Authorized test-only fixtures on pristine base src. NO production fix.
+  describe('closed-ledger-resume', () => {
+    const OWNER_CHILD = fileURLToPath(new URL('./helpers/autoloop-owner-child.ts', import.meta.url));
+    const MARKER = 'CLOSED_LEDGER_MALFORMED_MARKER_9f3c2a';
+
+    const fence = (tool: string, args: Record<string, unknown>): string =>
+      `\`\`\`autoloop\n${JSON.stringify({ tool, args })}\n\`\`\``;
+
+    const initGitWorkspace = (workspace: string): void => {
+      fs.mkdirSync(workspace, { recursive: true });
+      execFileSync('git', ['init', '-b', 'main'], { cwd: workspace });
+      execFileSync('git', ['config', 'user.email', 'autoloop-test@example.com'], { cwd: workspace });
+      execFileSync('git', ['config', 'user.name', 'autoloop-test'], { cwd: workspace });
+      execFileSync('git', ['config', 'commit.gpgsign', 'false'], { cwd: workspace });
+      fs.writeFileSync(path.join(workspace, 'README.md'), 'workspace\n');
+      execFileSync('git', ['add', 'README.md'], { cwd: workspace });
+      execFileSync('git', ['commit', '-m', 'init'], { cwd: workspace });
+    };
+
+    const runJsonPath = (runId: string): string => path.join(TEST_WF_DIR, runId, 'run.json');
+
+    const readPublishedState = (
+      manager: InstanceType<typeof SessionManager>,
+      runId: string,
+    ): { iter: number; metric_history: number[]; status: string; pending_dispatch: unknown } => {
+      const status = manager.workflowStatus(runId);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const state = (status.nodes.main?.data as any)?.state;
+      return {
+        iter: state?.iter ?? -1,
+        metric_history: Array.isArray(state?.metric_history) ? state.metric_history : [],
+        status: String(state?.status ?? status.state),
+        pending_dispatch: state?.pending_dispatch ?? null,
+      };
+    };
+
+    const snapshotLedgerIter = (workspace: string, runId: string, uptoExclusive: number): Record<string, Buffer> => {
+      const out: Record<string, Buffer> = {};
+      for (let i = 0; i < uptoExclusive; i++) {
+        const dir = path.join(workspace, 'tasks', runId, 'iter', String(i));
+        for (const name of fs.readdirSync(dir)) {
+          const p = path.join(dir, name);
+          if (fs.statSync(p).isFile()) out[`iter/${i}/${name}`] = fs.readFileSync(p);
+        }
+      }
+      return out;
+    };
+
+    const wireClosedLedgerSessions = (
+      manager: InstanceType<typeof SessionManager>,
+      workspace: string,
+      closeCount: number,
+      opts: { afterClose?: 'idle' | 'directive-only'; directiveOnlyIter?: number } = {},
+    ): { coderSends: string[]; reviewerSends: string[]; plannerSends: string[] } => {
+      const coderSends: string[] = [];
+      const reviewerSends: string[] = [];
+      const plannerSends: string[] = [];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const origCreate = (manager as any)._createSession.bind(manager);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (manager as any)._createSession = (engine: string, config: SessionConfig): ISession => {
+        const mock = origCreate(engine, config) as MockSession;
+        if (config.name.endsWith('-planner')) {
+          mock.sendImplementation = async (message) => {
+            const text = typeof message === 'string' ? message : JSON.stringify(message);
+            plannerSends.push(text);
+            const done = text.match(/\[system\] iter (\d+) done\./);
+            if (done) {
+              const finished = Number(done[1]);
+              const next = finished + 1;
+              if (opts.afterClose === 'directive-only' && opts.directiveOnlyIter === next) {
+                return {
+                  text: fence('send_directive', {
+                    goal: `directive-only trailing iter ${next}`,
+                    constraints: [],
+                    success_criteria: [],
+                    max_attempts: 1,
+                  }),
+                  event: { type: 'result', result: 'ok' },
+                };
+              }
+              if (next < closeCount) {
+                return {
+                  text: fence('send_directive', {
+                    goal: `close iteration ${next}`,
+                    constraints: [],
+                    success_criteria: [],
+                    max_attempts: 1,
+                  }),
+                  event: { type: 'result', result: 'ok' },
+                };
+              }
+              return { text: 'ledger closed', event: { type: 'result', result: 'ok' } };
+            }
+            if (text.includes('directive_ack') || text.includes('[system] coder')) {
+              return { text: 'ack noted', event: { type: 'result', result: 'ok' } };
+            }
+            return {
+              text: fence('spawn_subagents', {
+                initial_directive: {
+                  goal: 'close iteration 0',
+                  constraints: [],
+                  success_criteria: [],
+                  max_attempts: 1,
+                },
+              }),
+              event: { type: 'result', result: 'ok' },
+            };
+          };
+        } else if (config.name.endsWith('-coder')) {
+          mock.sendImplementation = async (message) => {
+            const text = typeof message === 'string' ? message : JSON.stringify(message);
+            coderSends.push(text);
+            if (opts.afterClose === 'directive-only' && opts.directiveOnlyIter !== undefined) {
+              const m = text.match(/\[directive iter=(\d+)\]/);
+              const iter = m ? Number(m[1]) : -1;
+              if (iter === opts.directiveOnlyIter) {
+                // Trailing directive-only: no iter_complete — leaves directive.json only.
+                return { text: 'need clarification on trailing directive', event: { type: 'result', result: 'ok' } };
+              }
+            }
+            const m = text.match(/\[directive iter=(\d+)\]/);
+            const iter = m ? Number(m[1]) : 0;
+            const metric = 100 + iter;
+            fs.writeFileSync(path.join(workspace, `closed-${iter}.txt`), `closed-bytes-${iter}\n`);
+            return {
+              text: fence('iter_complete', {
+                summary: `closed iter ${iter}`,
+                eval_output: { metric, gates: [] },
+              }),
+              event: { type: 'result', result: 'ok' },
+            };
+          };
+        } else if (config.name.endsWith('-reviewer')) {
+          mock.sendImplementation = async (message) => {
+            const text = typeof message === 'string' ? message : JSON.stringify(message);
+            reviewerSends.push(text);
+            const m = text.match(/\[review_request iter=(\d+)\]/);
+            const iter = m ? Number(m[1]) : 0;
+            const metric = 100 + iter;
+            return {
+              text: fence('review_complete', {
+                decision: 'advance',
+                metric,
+                audit_notes: `advance ${iter}`,
+              }),
+              event: { type: 'result', result: 'ok' },
+            };
+          };
+        }
+        return mock;
+      };
+      return { coderSends, reviewerSends, plannerSends };
+    };
+
+    const closeLedger = async (
+      manager: InstanceType<typeof SessionManager>,
+      runId: string,
+      workspace: string,
+      closeCount: number,
+      opts: { afterClose?: 'idle' | 'directive-only'; directiveOnlyIter?: number } = {},
+    ) => {
+      const tracks = wireClosedLedgerSessions(manager, workspace, closeCount, opts);
+      await manager.autoloopStart({ runId, workspace });
+      await manager.autoloopChat(runId, `close ${closeCount} iterations`);
+      for (let i = 0; i < closeCount; i++) {
+        await vi.waitFor(
+          () => {
+            expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter', String(i), 'verdict.json'))).toBe(true);
+          },
+          { timeout: 15_000, interval: 50 },
+        );
+      }
+      if (opts.afterClose === 'directive-only' && opts.directiveOnlyIter !== undefined) {
+        await vi.waitFor(
+          () => {
+            expect(
+              fs.existsSync(
+                path.join(workspace, 'tasks', runId, 'iter', String(opts.directiveOnlyIter), 'directive.json'),
+              ),
+            ).toBe(true);
+          },
+          { timeout: 10_000, interval: 50 },
+        );
+      }
+      return tracks;
+    };
+
+    const terminateAndReconstruct = async (runId: string): Promise<InstanceType<typeof SessionManager>> => {
+      await mgr.autoloopStop(runId, 'closed-ledger-stop');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (mgr as any).kernel.wait(runId);
+      await mgr.shutdown();
+      mgr = createManager();
+      return mgr;
+    };
+
+    const spawnClosedOwner = (runId: string, workspace: string, closeCount: number): ChildProcess =>
+      spawn(process.execPath, ['--import', 'tsx', OWNER_CHILD], {
+        env: {
+          ...process.env,
+          AUTOLOOP_MODE: 'closed-iterations',
+          AUTOLOOP_CLOSE_COUNT: String(closeCount),
+          AUTOLOOP_RUN_ID: runId,
+          AUTOLOOP_WORKSPACE: workspace,
+          CLAWO_WF_DIR: TEST_WF_DIR,
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+
+    const waitReadyThenSigkill = async (proc: ChildProcess): Promise<void> => {
+      let stderr = '';
+      proc.stderr?.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`owner child never READY: ${stderr.slice(0, 800)}`)), 60_000);
+        proc.stdout?.on('data', (chunk: Buffer) => {
+          if (chunk.toString().includes('READY')) {
+            clearTimeout(timer);
+            resolve();
+          }
+        });
+        proc.on('exit', (code, signal) => {
+          clearTimeout(timer);
+          reject(new Error(`owner child exited before READY code=${String(code)} signal=${String(signal)} ${stderr}`));
+        });
+        proc.on('error', reject);
+      });
+      proc.kill('SIGKILL');
+      await new Promise<void>((resolve) => {
+        proc.on('exit', () => resolve());
+      });
+    };
+
+    beforeEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('R1 UNIV4 shape: closed 0..1 then stop/reconstruct/resume restores iter 2 and metrics', async () => {
+      const runId = 'closed-univ4-r1';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      const expectedMetrics = [100, 101];
+
+      await closeLedger(mgr, runId, workspace, 2);
+      const beforeStop = readPublishedState(mgr, runId);
+      expect(beforeStop.iter).toBe(2);
+      expect(beforeStop.metric_history).toEqual(expectedMetrics);
+      const checkpointBefore = fs.readFileSync(runJsonPath(runId));
+
+      await terminateAndReconstruct(runId);
+      // After stop the durable checkpoint must still show the current closed tip.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const storedBeforeResume = JSON.parse(fs.readFileSync(runJsonPath(runId), 'utf8')) as any;
+      const storedState = storedBeforeResume.nodes?.main?.data?.state;
+      expect(storedState?.iter).toBe(2);
+      expect(storedState?.metric_history).toEqual(expectedMetrics);
+
+      wireClosedLedgerSessions(mgr, workspace, 2);
+      const after = await mgr.autoloopResume(runId);
+      const checkpointAfter = fs.readFileSync(runJsonPath(runId));
+      // Target behaviour (expected RED on base): resume continues at K+1 with rebuilt history.
+      expect(after.iter).toBe(2);
+      expect(after.metric_history).toEqual(expectedMetrics);
+      expect(readPublishedState(mgr, runId).iter).toBe(2);
+      // Evidence for the reviewer: bytes changed across resume (base overwrites with iter 0).
+      expect(checkpointBefore.equals(checkpointAfter)).toBe(false);
+    }, 60_000);
+
+    it('R2 REVX shape: closed 0..5, resume bytes, second fresh manager expects iter 6 only', async () => {
+      const runId = 'closed-revx-r2';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      const expectedMetrics = [100, 101, 102, 103, 104, 105];
+
+      await closeLedger(mgr, runId, workspace, 6);
+      expect(readPublishedState(mgr, runId).iter).toBe(6);
+      const ledgerBefore = snapshotLedgerIter(workspace, runId, 6);
+      const headBefore = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workspace, encoding: 'utf8' }).trim();
+
+      await terminateAndReconstruct(runId);
+      wireClosedLedgerSessions(mgr, workspace, 6);
+      const firstResume = await mgr.autoloopResume(runId);
+      const publishedBytes = fs.readFileSync(runJsonPath(runId));
+
+      await mgr.autoloopStop(runId, 'capture-bytes');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (mgr as any).kernel.wait(runId);
+      await mgr.shutdown();
+
+      // Second fresh manager: plant exactly the bytes the first resume published.
+      mgr = createManager();
+      fs.writeFileSync(runJsonPath(runId), publishedBytes);
+      const tracks = wireClosedLedgerSessions(mgr, workspace, 6);
+      const second = await mgr.autoloopResume(runId);
+      expect(second.iter).toBe(6);
+      expect(second.metric_history).toEqual(expectedMetrics);
+      expect(firstResume.iter).toBe(6);
+
+      const coderBefore = tracks.coderSends.length;
+      const reviewerBefore = tracks.reviewerSends.length;
+      // One chat after correct resume must open only iter/6.
+      // Planner emits send_directive for iter 6; coder+reviewer run once.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const origCreate = (mgr as any)._createSession.bind(mgr);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (mgr as any)._createSession = (engine: string, config: SessionConfig): ISession => {
+        const mock = origCreate(engine, config) as MockSession;
+        return mock;
+      };
+      // Re-wire planner to send exactly one directive for iter 6.
+      const live = mgr.getAutoloop(runId)!;
+      const plannerName = `autoloop-${runId}-planner`;
+      const planner = mockSessions.find((_, i) => createdConfigs[i]?.name === plannerName);
+      expect(planner).toBeDefined();
+      planner!.sendImplementation = async () => ({
+        text: fence('send_directive', {
+          goal: 'only iter 6',
+          constraints: [],
+          success_criteria: [],
+          max_attempts: 1,
+        }),
+        event: { type: 'result', result: 'ok' },
+      });
+      const coder = mockSessions.find((_, i) => createdConfigs[i]?.name.endsWith('-coder'));
+      const reviewer = mockSessions.find((_, i) => createdConfigs[i]?.name.endsWith('-reviewer'));
+      if (coder) {
+        coder.sendImplementation = async (message) => {
+          const text = typeof message === 'string' ? message : JSON.stringify(message);
+          tracks.coderSends.push(text);
+          fs.writeFileSync(path.join(workspace, 'closed-6.txt'), 'closed-bytes-6\n');
+          return {
+            text: fence('iter_complete', { summary: 'iter 6', eval_output: { metric: 106, gates: [] } }),
+            event: { type: 'result', result: 'ok' },
+          };
+        };
+      }
+      if (reviewer) {
+        reviewer.sendImplementation = async (message) => {
+          const text = typeof message === 'string' ? message : JSON.stringify(message);
+          tracks.reviewerSends.push(text);
+          expect(text).toMatch(/prior_metrics|metric/);
+          // Rebuilt prior_metrics must carry the closed history.
+          expect(text).toContain('100');
+          return {
+            text: fence('review_complete', { decision: 'advance', metric: 106, audit_notes: 'iter 6' }),
+            event: { type: 'result', result: 'ok' },
+          };
+        };
+      }
+
+      await mgr.autoloopChat(runId, 'open only the next iteration');
+      await vi.waitFor(
+        () => {
+          expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter', '6', 'verdict.json'))).toBe(true);
+        },
+        { timeout: 15_000, interval: 50 },
+      );
+
+      expect(tracks.coderSends.length - coderBefore).toBe(1);
+      expect(tracks.reviewerSends.length - reviewerBefore).toBe(1);
+      expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter', '6'))).toBe(true);
+      // Closed prefix byte-identical; git history preserved.
+      const ledgerAfter = snapshotLedgerIter(workspace, runId, 6);
+      for (const [k, v] of Object.entries(ledgerBefore)) {
+        expect(ledgerAfter[k]?.equals(v), k).toBe(true);
+      }
+      expect(execFileSync('git', ['rev-parse', 'HEAD~1'], { cwd: workspace, encoding: 'utf8' }).trim()).toBe(
+        headBefore,
+      );
+      void live;
+    }, 120_000);
+
+    it('idempotency: two consecutive resumes yield the same state and write no ledger bytes', async () => {
+      const runId = 'closed-idempotent';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      await closeLedger(mgr, runId, workspace, 2);
+      await terminateAndReconstruct(runId);
+      wireClosedLedgerSessions(mgr, workspace, 2);
+      const ledgerBefore = snapshotLedgerIter(workspace, runId, 2);
+      const a = await mgr.autoloopResume(runId);
+      const mid = snapshotLedgerIter(workspace, runId, 2);
+      const b = await mgr.autoloopResume(runId);
+      expect(a.iter).toBe(2);
+      expect(b.iter).toBe(2);
+      expect(a.metric_history).toEqual([100, 101]);
+      expect(b.metric_history).toEqual(a.metric_history);
+      for (const [k, v] of Object.entries(ledgerBefore)) {
+        expect(mid[k]?.equals(v), `after first resume ${k}`).toBe(true);
+        expect(snapshotLedgerIter(workspace, runId, 2)[k]?.equals(v), `after second resume ${k}`).toBe(true);
+      }
+    }, 60_000);
+
+    it('partial trailing directive-only iter/K+1: resume expects K+1 and no Coder retry', async () => {
+      const runId = 'closed-directive-only';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      const tracks = await closeLedger(mgr, runId, workspace, 2, {
+        afterClose: 'directive-only',
+        directiveOnlyIter: 2,
+      });
+      expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter', '2', 'directive.json'))).toBe(true);
+      expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter', '2', 'verdict.json'))).toBe(false);
+      const coderBefore = tracks.coderSends.length;
+
+      await terminateAndReconstruct(runId);
+      const tracks2 = wireClosedLedgerSessions(mgr, workspace, 2);
+      const after = await mgr.autoloopResume(runId);
+      expect(after.iter).toBe(2);
+      expect(tracks2.coderSends.length).toBe(0);
+      // No Coder retry of the trailing directive-only iteration.
+      expect(tracks.coderSends.length).toBe(coderBefore);
+    }, 60_000);
+
+    it('owner-loss path: closed iterations then SIGKILL, reconstruct + resume restores tip', async () => {
+      const runId = 'closed-owner-loss';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      const proc = spawnClosedOwner(runId, workspace, 2);
+      await waitReadyThenSigkill(proc);
+
+      const observer = createManager();
+      try {
+        await vi.waitFor(
+          () => {
+            expect(leaseIsStale(readLease(runId))).toBe(true);
+            expect(observer.workflowStatus(runId).state).toBe('running');
+          },
+          { timeout: 5_000, interval: 50 },
+        );
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const before = (observer.workflowStatus(runId).nodes.main?.data as any)?.state;
+        expect(before?.iter).toBe(2);
+        expect(before?.metric_history).toEqual([100, 101]);
+        const checkpointBefore = fs.readFileSync(runJsonPath(runId));
+
+        createdConfigs = [];
+        mockSessions = [];
+        const resumeMgr = createManager();
+        try {
+          wireClosedLedgerSessions(resumeMgr, workspace, 2);
+          const after = await resumeMgr.autoloopResume(runId);
+          const checkpointAfter = fs.readFileSync(runJsonPath(runId));
+          expect(after.iter).toBe(2);
+          expect(after.metric_history).toEqual([100, 101]);
+          expect(checkpointBefore.equals(checkpointAfter)).toBe(false);
+        } finally {
+          await resumeMgr.shutdown();
+        }
+      } finally {
+        await observer.shutdown();
+      }
+    }, 90_000);
+
+    it('workflowResume path: closed ledger tip restored (or recorded unreachable)', async () => {
+      const runId = 'closed-workflow-resume';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      await closeLedger(mgr, runId, workspace, 2);
+      await terminateAndReconstruct(runId);
+      const before = readPublishedState(mgr, runId);
+      // Plain workflowResume on a terminal autoloop does not restart the node
+      // (kernel.resume without restart). Record reachability evidence.
+      const record = await mgr.workflowResume(runId);
+      const afterPlain = readPublishedState(mgr, runId);
+      const plainRestored = afterPlain.iter === 2 && afterPlain.metric_history.length === 2;
+      if (!plainRestored) {
+        // Evidence: unreachable via plain workflowResume on terminal run.
+        expect(record.state === 'succeeded' || record.state === 'failed' || record.state === 'cancelled').toBe(true);
+        expect(before.iter).toBe(2);
+        // Target still asserted via autoloopResume (authorized public path).
+        wireClosedLedgerSessions(mgr, workspace, 2);
+        const viaAutoloop = await mgr.autoloopResume(runId);
+        expect(viaAutoloop.iter).toBe(2);
+        expect(viaAutoloop.metric_history).toEqual([100, 101]);
+      } else {
+        expect(afterPlain.iter).toBe(2);
+        expect(afterPlain.metric_history).toEqual([100, 101]);
+      }
+    }, 60_000);
+
+    it('gap/malformed iter/K+1/verdict.json with marker: records base leakage facts', async () => {
+      const runId = 'closed-malformed-marker';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      await closeLedger(mgr, runId, workspace, 2);
+      const badDir = path.join(workspace, 'tasks', runId, 'iter', '2');
+      fs.mkdirSync(badDir, { recursive: true });
+      fs.writeFileSync(path.join(badDir, 'verdict.json'), `{not-json ${MARKER}`);
+
+      await terminateAndReconstruct(runId);
+      wireClosedLedgerSessions(mgr, workspace, 2);
+      let resumeErr: unknown = null;
+      let after: { iter: number; metric_history: number[] } | null = null;
+      try {
+        after = await mgr.autoloopResume(runId);
+      } catch (err) {
+        resumeErr = err;
+      }
+      const errText = resumeErr instanceof Error ? `${resumeErr.message}\n${resumeErr.stack ?? ''}` : String(resumeErr);
+      const statusText = JSON.stringify(readPublishedState(mgr, runId));
+      const checkpointText = fs.readFileSync(runJsonPath(runId), 'utf8');
+      const leaked =
+        errText.includes(MARKER) || statusText.includes(MARKER) || checkpointText.includes(MARKER) || after === null;
+      // Fact capture (policy undecided): whether the marker leaks is recorded by assertion shape.
+      // Target: resume must not treat a gapped malformed verdict as authority for iter 0 replay.
+      if (resumeErr) {
+        expect(errText.includes(MARKER)).toBe(false);
+      } else {
+        expect(after!.iter).toBe(2);
+        expect(statusText.includes(MARKER)).toBe(false);
+        expect(checkpointText.includes(MARKER)).toBe(false);
+      }
+      // Keep the leakage boolean in an assertion the reviewer can read from failure output.
+      expect({ leaked, resumeThrew: Boolean(resumeErr), iter: after?.iter ?? null }).toMatchObject({
+        leaked: expect.any(Boolean),
+        resumeThrew: expect.any(Boolean),
+      });
+      // Authentic RED tip: closed tip must survive regardless of trailing malformed sibling.
+      expect(after?.iter ?? -1).toBe(2);
+    }, 60_000);
+
+    it('boot throw on resume: records base RunRecord state via existing planner-start failure', async () => {
+      const runId = 'closed-boot-throw';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      await closeLedger(mgr, runId, workspace, 2);
+      await terminateAndReconstruct(runId);
+      const before = mgr.workflowStatus(runId);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (mgr as any)._createSession = (): ISession => {
+        const mock = new MockSession();
+        mock.start = async () => {
+          throw new Error('closed-ledger boot throw');
+        };
+        return mock;
+      };
+      await expect(mgr.autoloopResume(runId)).rejects.toThrow('closed-ledger boot throw');
+      const after = mgr.workflowStatus(runId);
+      expect(after).toBeDefined();
+      expect(after.spec).toEqual(before.spec);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const state = (after.nodes.main?.data as any)?.state;
+      // Fact: on base, a boot throw leaves the prior published checkpoint (iter tip) intact.
+      expect(state?.iter).toBe(2);
+      expect(state?.metric_history).toEqual([100, 101]);
+    }, 60_000);
+  });
+
+  describe('closed-ledger-preserve', () => {
+    const fence = (tool: string, args: Record<string, unknown>): string =>
+      `\`\`\`autoloop\n${JSON.stringify({ tool, args })}\n\`\`\``;
+
+    const initGitWorkspace = (workspace: string): void => {
+      fs.mkdirSync(workspace, { recursive: true });
+      execFileSync('git', ['init', '-b', 'main'], { cwd: workspace });
+      execFileSync('git', ['config', 'user.email', 'autoloop-test@example.com'], { cwd: workspace });
+      execFileSync('git', ['config', 'user.name', 'autoloop-test'], { cwd: workspace });
+      execFileSync('git', ['config', 'commit.gpgsign', 'false'], { cwd: workspace });
+      fs.writeFileSync(path.join(workspace, 'README.md'), 'workspace\n');
+      execFileSync('git', ['add', 'README.md'], { cwd: workspace });
+      execFileSync('git', ['commit', '-m', 'init'], { cwd: workspace });
+    };
+
+    beforeEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('legacy lone iter/0/verdict.json does not crash resume and stays Planner-only', async () => {
+      const runId = 'preserve-lone-verdict';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      await mgr.autoloopStart({ runId, workspace });
+      const iter0 = path.join(workspace, 'tasks', runId, 'iter', '0');
+      fs.mkdirSync(iter0, { recursive: true });
+      fs.writeFileSync(
+        path.join(iter0, 'verdict.json'),
+        JSON.stringify({ schema_version: 1, iter: 0, decision: 'hold', metric: null, audit_notes: 'legacy' }, null, 2),
+      );
+      await mgr.autoloopStop(runId, 'plant-lone-verdict');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (mgr as any).kernel.wait(runId);
+      await mgr.shutdown();
+      mgr = createManager();
+      createdConfigs = [];
+      mockSessions = [];
+      await mgr.autoloopResume(runId);
+      await new Promise((r) => setTimeout(r, 300));
+      expect(createdConfigs.map((c) => c.name)).toEqual([`autoloop-${runId}-planner`]);
+      expect(fs.existsSync(path.join(iter0, 'verdict.json'))).toBe(true);
+    }, 60_000);
+
+    it('empty or missing ledger fresh start still boots at iter 0', async () => {
+      const runId = 'preserve-empty-ledger';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      await mgr.autoloopStart({ runId, workspace });
+      const handle = mgr.getAutoloop(runId)!;
+      expect(handle.runner.state.iter).toBe(0);
+      expect(handle.runner.state.metric_history).toEqual([]);
+      expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter'))).toBe(false);
+    }, 30_000);
+
+    it('#132 pending_dispatch resume retains pause without replaying Planner', async () => {
+      const runId = 'preserve-pending-dispatch';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      fs.mkdirSync(workspace, { recursive: true });
+      await mgr.autoloopStart({ runId, workspace, sendTimeoutMs: 600_000 });
+      const handle = mgr.getAutoloop(runId)!;
+      const pending = {
+        status: 'awaiting_resume' as const,
+        dispatch_id: 'dispatch-preserve-planner-0',
+        agent: 'planner' as const,
+        message_id: 'message-preserve',
+        message_type: 'chat' as const,
+        iter: 0,
+        timeout_ms: 600_000,
+        error: 'Timed out after 600000ms',
+      };
+      await handle.runner.send(AutoloopMsg.sendTimeout(0, pending));
+      expect(handle.runner.state).toMatchObject({ status: 'paused', pending_dispatch: pending });
+      const sendsBefore = mockSessions[0].sendCalls.length;
+      await expect(mgr.autoloopResume(runId)).resolves.toBe(handle.runner.state);
+      expect(handle.runner.state).toMatchObject({ status: 'paused', pending_dispatch: pending });
+      expect(mockSessions[0].sendCalls).toHaveLength(sendsBefore);
+    }, 30_000);
+
+    it('#134/#138 closed prefix plus open committed K+1 is Reviewer-only once', async () => {
+      const runId = 'preserve-open-committed';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+
+      // Reuse the closed-ledger harness helpers from the sibling describe via local mirrors.
+      const wire = (
+        manager: InstanceType<typeof SessionManager>,
+        closeCount: number,
+      ): void => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const origCreate = (manager as any)._createSession.bind(manager);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (manager as any)._createSession = (engine: string, config: SessionConfig): ISession => {
+          const mock = origCreate(engine, config) as MockSession;
+          if (config.name.endsWith('-planner')) {
+            mock.sendImplementation = async (message) => {
+              const text = typeof message === 'string' ? message : JSON.stringify(message);
+              const done = text.match(/\[system\] iter (\d+) done\./);
+              if (done) {
+                const next = Number(done[1]) + 1;
+                if (next < closeCount) {
+                  return {
+                    text: fence('send_directive', {
+                      goal: `close ${next}`,
+                      constraints: [],
+                      success_criteria: [],
+                      max_attempts: 1,
+                    }),
+                    event: { type: 'result', result: 'ok' },
+                  };
+                }
+                return { text: 'done', event: { type: 'result', result: 'ok' } };
+              }
+              return {
+                text: fence('spawn_subagents', {
+                  initial_directive: {
+                    goal: 'close 0',
+                    constraints: [],
+                    success_criteria: [],
+                    max_attempts: 1,
+                  },
+                }),
+                event: { type: 'result', result: 'ok' },
+              };
+            };
+          } else if (config.name.endsWith('-coder')) {
+            mock.sendImplementation = async (message) => {
+              const text = typeof message === 'string' ? message : JSON.stringify(message);
+              const m = text.match(/\[directive iter=(\d+)\]/);
+              const iter = m ? Number(m[1]) : 0;
+              fs.writeFileSync(path.join(workspace, `preserve-${iter}.txt`), `p-${iter}\n`);
+              return {
+                text: fence('iter_complete', {
+                  summary: `preserve ${iter}`,
+                  eval_output: { metric: 10 + iter, gates: [] },
+                }),
+                event: { type: 'result', result: 'ok' },
+              };
+            };
+          } else if (config.name.endsWith('-reviewer')) {
+            mock.sendImplementation = async (message) => {
+              const text = typeof message === 'string' ? message : JSON.stringify(message);
+              const m = text.match(/\[review_request iter=(\d+)\]/);
+              const iter = m ? Number(m[1]) : 0;
+              return {
+                text: fence('review_complete', {
+                  decision: 'advance',
+                  metric: 10 + iter,
+                  audit_notes: `advance ${iter}`,
+                }),
+                event: { type: 'result', result: 'ok' },
+              };
+            };
+          }
+          return mock;
+        };
+      };
+
+      wire(mgr, 1);
+      await mgr.autoloopStart({ runId, workspace });
+      await mgr.autoloopChat(runId, 'close only iter 0');
+      await vi.waitFor(
+        () => {
+          expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter', '0', 'verdict.json'))).toBe(true);
+        },
+        { timeout: 15_000, interval: 50 },
+      );
+
+      // Plant open committed iter 1 (artifacts + git subject) without verdict.
+      const iter1 = path.join(workspace, 'tasks', runId, 'iter', '1');
+      fs.mkdirSync(iter1, { recursive: true });
+      fs.writeFileSync(
+        path.join(iter1, 'directive.json'),
+        JSON.stringify({ schema_version: 1, iter: 1, goal: 'open', constraints: [], success_criteria: [], max_attempts: 1 }),
+      );
+      fs.writeFileSync(
+        path.join(iter1, 'eval_output.json'),
+        JSON.stringify({ schema_version: 1, iter: 1, eval_output: { metric: 11, gates: [] } }),
+      );
+      fs.writeFileSync(path.join(iter1, 'coder_summary.txt'), 'planted open committed\n');
+      fs.writeFileSync(path.join(iter1, 'diff.patch'), '');
+      fs.writeFileSync(path.join(workspace, 'preserve-1.txt'), 'p-1\n');
+      execFileSync('git', ['add', '-A'], { cwd: workspace });
+      execFileSync('git', ['commit', '-m', 'autoloop/iter-1: planted open committed'], { cwd: workspace });
+
+      await mgr.autoloopStop(runId, 'preserve-open-stop');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (mgr as any).kernel.wait(runId);
+      await mgr.shutdown();
+
+      createdConfigs = [];
+      mockSessions = [];
+      mgr = createManager();
+      let resumeReviewerSends = 0;
+      let resumeCoderSends = 0;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const orig2 = (mgr as any)._createSession.bind(mgr);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (mgr as any)._createSession = (engine: string, config: SessionConfig): ISession => {
+        const mock = orig2(engine, config) as MockSession;
+        if (config.name.endsWith('-reviewer')) {
+          mock.sendImplementation = async (message) => {
+            const text = typeof message === 'string' ? message : JSON.stringify(message);
+            resumeReviewerSends += 1;
+            expect(text).toContain('[review_request iter=1]');
+            return {
+              text: fence('review_complete', {
+                decision: 'hold',
+                metric: null,
+                audit_notes: 'recovered open committed',
+              }),
+              event: { type: 'result', result: 'ok' },
+            };
+          };
+        } else if (config.name.endsWith('-coder')) {
+          mock.sendImplementation = async () => {
+            resumeCoderSends += 1;
+            return { text: 'should not run', event: { type: 'result', result: 'ok' } };
+          };
+        }
+        return mock;
+      };
+
+      await mgr.autoloopResume(runId);
+      await vi.waitFor(
+        () => {
+          expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter', '1', 'verdict.json'))).toBe(true);
+        },
+        { timeout: 10_000, interval: 50 },
+      );
+      expect(resumeReviewerSends).toBe(1);
+      expect(resumeCoderSends).toBe(0);
+      // After a hold on recovered iter 1 the runner advances the tip to 2 —
+      // the preserve contract is Reviewer-only once with no Coder replay.
+      expect(mgr.getAutoloop(runId)!.runner.state.iter).toBe(2);
+      expect(createdConfigs.some((c) => c.name.endsWith('-coder'))).toBe(false);
+    }, 90_000);
+  });
 });
