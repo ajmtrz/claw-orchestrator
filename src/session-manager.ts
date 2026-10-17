@@ -908,6 +908,8 @@ function readClosedLedgerRestore(ledgerDir: string): ClosedLedgerRestore | null 
   for (;;) {
     const iterDir = path.join(iterRoot, String(i));
     if (!fs.existsSync(iterDir)) {
+      // K=-1 / no valid closed prefix: never refuse on higher dirs (base Planner-only).
+      if (i === 0) return null;
       for (const j of present) {
         if (j > i) throw new Error(AUTOLOOP_CLOSED_LEDGER_REFUSAL);
       }
@@ -925,6 +927,8 @@ function readClosedLedgerRestore(ledgerDir: string): ClosedLedgerRestore | null 
         if (i === 0) return null;
         throw new Error(AUTOLOOP_CLOSED_LEDGER_REFUSAL);
       }
+      // Empty/non-closed at 0: prefixless compat before any gap check.
+      if (i === 0) return null;
       for (const j of present) {
         if (j > i) throw new Error(AUTOLOOP_CLOSED_LEDGER_REFUSAL);
       }
@@ -933,11 +937,11 @@ function readClosedLedgerRestore(ledgerDir: string): ClosedLedgerRestore | null 
 
     if (!hasVerdict) {
       // Open / directive-only / committed-without-review tail at i.
+      // No closed prefix yet: return null before gap checks (open0+lateriter1 compat).
+      if (i === 0) return null;
       for (const j of present) {
         if (j > i) throw new Error(AUTOLOOP_CLOSED_LEDGER_REFUSAL);
       }
-      // No closed prefix yet: do not "restore" iter 0 from a sole open directive.
-      if (i === 0) return null;
       const history =
         metrics.length > MAX_METRIC_HISTORY ? metrics.slice(metrics.length - MAX_METRIC_HISTORY) : metrics.slice();
       return { iter: i, metric_history: history };

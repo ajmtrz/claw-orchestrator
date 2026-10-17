@@ -16,11 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matching `iter` and a supported Reviewer decision). Finite metrics stay in
   order and are capped at `MAX_METRIC_HISTORY` (20). Checkpoint `iter` is never
   progress authority. Fresh starts skip the read. Legacy lone-verdict / empty
-  ledgers, pending_dispatch pause, and committed-open Reviewer-only recovery
-  (`#134`/`#138`) keep their prior behaviour. A gap or malformed closed tail
-  after a valid prefix refuses with a fixed generic error before any new session
-  or effect (ledger text is not echoed). Terminal plain `workflowResume` still
-  does not restart a stopped autoloop.
+  ledgers, and any ledger with no valid closed prefix (including missing or
+  open/malformed `iter/0` plus a later numeric directory), pending_dispatch
+  pause, and committed-open Reviewer-only recovery (`#134`/`#138`) keep their
+  prior Planner-only behaviour. A gap or malformed closed tail after a valid
+  prefix refuses with a fixed generic error before any new session or effect
+  (ledger text is not echoed). Terminal plain `workflowResume` still does not
+  restart a stopped autoloop.
 
 - **`autoloop_start` and a fresh workflow `autoloop` node share one workspace
   boundary.** The dirty-worktree refusal and run-local ledger isolation

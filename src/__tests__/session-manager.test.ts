@@ -9,6 +9,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -2894,7 +2895,7 @@ describe('SessionManager', () => {
 
     const sha256Hex = (data: Buffer | string): string => {
       const input = typeof data === 'string' ? Buffer.from(data) : data;
-      return execFileSync('sha256sum', [], { input }).toString('utf8').split(/\s+/)[0];
+      return createHash('sha256').update(input).digest('hex');
     };
 
     /** Observation-only fact line; must print before the first failing assertion. */
@@ -3985,69 +3986,51 @@ describe('SessionManager', () => {
       expect(fs.existsSync(badDir)).toBe(false);
     }, 90_000);
 
-    it('prefixless malformed invalidJSON at iter/0: no restore no refusal (compat)', async () => {
-      const runId = 'closed-prefixless-malformed0';
-      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
-      initGitWorkspace(workspace);
-      await mgr.autoloopStart({ runId, workspace });
-      const iter0 = path.join(workspace, 'tasks', runId, 'iter', '0');
-      fs.mkdirSync(iter0, { recursive: true });
-      fs.writeFileSync(
-        path.join(iter0, 'directive.json'),
-        JSON.stringify({
-          schema_version: 1,
-          iter: 0,
-          goal: 'prefixless',
-          constraints: [],
-          success_criteria: [],
-          max_attempts: 1,
-        }),
-      );
-      fs.writeFileSync(path.join(iter0, 'verdict.json'), `{not-json ${MARKER}`);
-      await terminateAndReconstruct(runId);
-      createdConfigs = [];
-      mockSessions = [];
-      wireClosedLedgerSessions(mgr, workspace, 0);
-      let resumeErr: unknown = null;
-      let after: { iter: number; metric_history: number[] } | null = null;
-      try {
-        after = await mgr.autoloopResume(runId);
-      } catch (err) {
-        resumeErr = err;
-      }
-      expect(resumeErr).toBeNull();
-      expect(after?.iter).toBe(0);
-      expect(after?.metric_history).toEqual([]);
-      expect(createdConfigs.map((c) => c.name)).toEqual([`autoloop-${runId}-planner`]);
-    }, 60_000);
-
-    it('prefixless directive-only iter/0: no restore (null prefix) boots Planner-only', async () => {
-      const runId = 'closed-prefixless-directive0';
-      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
-      initGitWorkspace(workspace);
-      await mgr.autoloopStart({ runId, workspace });
-      const iter0 = path.join(workspace, 'tasks', runId, 'iter', '0');
-      fs.mkdirSync(iter0, { recursive: true });
-      fs.writeFileSync(
-        path.join(iter0, 'directive.json'),
-        JSON.stringify({
-          schema_version: 1,
-          iter: 0,
-          goal: 'open-only',
-          constraints: [],
-          success_criteria: [],
-          max_attempts: 1,
-        }),
-      );
-      await terminateAndReconstruct(runId);
-      createdConfigs = [];
-      mockSessions = [];
-      wireClosedLedgerSessions(mgr, workspace, 0);
-      const after = await mgr.autoloopResume(runId);
-      expect(after.iter).toBe(0);
-      expect(after.metric_history).toEqual([]);
-      expect(createdConfigs.map((c) => c.name)).toEqual([`autoloop-${runId}-planner`]);
-    }, 60_000);
+    // K=-1 / no-valid-closed-prefix: missing or open (or malformed) iter/0 plus a
+    // later canonical dir must Planner-only resume — same as exact base — before
+    // any gap refusal. Valid-prefix gap/malformed fixtures above stay refuse.
+    for (const mode of ['missing-zero', 'open-zero', 'malformed-zero'] as const) {
+      it(`prefixless ${mode} with later iter/1: no restore no refusal (Planner-only)`, async () => {
+        const runId = `closed-prefixless-${mode}-later1`;
+        const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+        initGitWorkspace(workspace);
+        await mgr.autoloopStart({ runId, workspace });
+        const iterRoot = path.join(workspace, 'tasks', runId, 'iter');
+        fs.mkdirSync(path.join(iterRoot, '1'), { recursive: true });
+        if (mode !== 'missing-zero') {
+          fs.mkdirSync(path.join(iterRoot, '0'), { recursive: true });
+          fs.writeFileSync(
+            path.join(iterRoot, '0', 'directive.json'),
+            JSON.stringify({
+              schema_version: 1,
+              iter: 0,
+              goal: mode,
+              constraints: [],
+              success_criteria: [],
+              max_attempts: 1,
+            }),
+          );
+          if (mode === 'malformed-zero') {
+            fs.writeFileSync(path.join(iterRoot, '0', 'verdict.json'), `{not-json ${MARKER}`);
+          }
+        }
+        await terminateAndReconstruct(runId);
+        createdConfigs = [];
+        mockSessions = [];
+        wireClosedLedgerSessions(mgr, workspace, 0);
+        let resumeErr: unknown = null;
+        let after: { iter: number; metric_history: number[] } | null = null;
+        try {
+          after = await mgr.autoloopResume(runId);
+        } catch (err) {
+          resumeErr = err;
+        }
+        expect(resumeErr).toBeNull();
+        expect(after?.iter).toBe(0);
+        expect(after?.metric_history).toEqual([]);
+        expect(createdConfigs.map((c) => c.name)).toEqual([`autoloop-${runId}-planner`]);
+      }, 60_000);
+    }
 
     it('boot throw on resume: records base RunRecord state via existing planner-start failure', async () => {
       const test = 'boot-throw';
