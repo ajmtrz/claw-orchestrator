@@ -2972,7 +2972,9 @@ describe('SessionManager', () => {
       runId: string,
     ): { iter: number; metric_history: number[]; bytes: Buffer; sha256: string; len: number } => {
       const bytes = fs.existsSync(runJsonPath(runId)) ? fs.readFileSync(runJsonPath(runId)) : Buffer.alloc(0);
-      const published = manager ? readPublishedState(manager, runId) : { iter: -1, metric_history: [], status: 'n/a', pending_dispatch: null };
+      const published = manager
+        ? readPublishedState(manager, runId)
+        : { iter: -1, metric_history: [], status: 'n/a', pending_dispatch: null };
       // Prefer live published state when a manager is attached; fall back to durable bytes.
       let iter = published.iter;
       let metric_history = published.metric_history;
@@ -3022,6 +3024,59 @@ describe('SessionManager', () => {
       for (const [k, v] of Object.entries(snap)) out[k] = sha256Hex(v);
       return out;
     };
+
+    /** Exact fixed refusal message (message property, not substring). */
+    const CLOSED_LEDGER_REFUSAL_MSG = 'Autoloop resume refused: ledger closed-prefix is incomplete or malformed';
+
+    const snapshotLedgerAll = (workspace: string, runId: string): Record<string, Buffer> => {
+      const root = path.join(workspace, 'tasks', runId);
+      const out: Record<string, Buffer> = {};
+      if (!fs.existsSync(root)) return out;
+      const walk = (dir: string, rel: string): void => {
+        for (const name of fs.readdirSync(dir).sort()) {
+          const p = path.join(dir, name);
+          const r = rel ? `${rel}/${name}` : name;
+          const st = fs.statSync(p);
+          if (st.isDirectory()) walk(p, r);
+          else if (st.isFile()) out[r] = fs.readFileSync(p);
+        }
+      };
+      walk(root, '');
+      return out;
+    };
+
+    const assertLedgerInventoryEqual = (before: Record<string, Buffer>, workspace: string, runId: string): void => {
+      const after = snapshotLedgerAll(workspace, runId);
+      expect(Object.keys(after).sort()).toEqual(Object.keys(before).sort());
+      for (const [k, v] of Object.entries(before)) {
+        expect(after[k]?.equals(v)).toBe(true);
+      }
+    };
+
+    type CheckpointProgress = {
+      iter: number | undefined;
+      metric_history: number[];
+      pending_dispatch: unknown;
+    };
+
+    const readCheckpointProgress = (runId: string): CheckpointProgress => {
+      const p = runJsonPath(runId);
+      if (!fs.existsSync(p)) return { iter: undefined, metric_history: [], pending_dispatch: null };
+      const rec = JSON.parse(fs.readFileSync(p, 'utf8')) as {
+        nodes?: { main?: { data?: { state?: Record<string, unknown> } } };
+      };
+      const state = rec.nodes?.main?.data?.state;
+      return {
+        iter: typeof state?.iter === 'number' ? state.iter : undefined,
+        metric_history: Array.isArray(state?.metric_history) ? (state.metric_history as number[]) : [],
+        pending_dispatch: state?.pending_dispatch ?? null,
+      };
+    };
+
+    const worktreeGitSnapshot = (workspace: string): { head: string; porcelain: string } => ({
+      head: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workspace }).toString('utf8').trim(),
+      porcelain: execFileSync('git', ['status', '--porcelain'], { cwd: workspace }).toString('utf8'),
+    });
 
     type WireMode = 'auto-continue' | 'chat-driven';
 
@@ -3534,14 +3589,20 @@ describe('SessionManager', () => {
       const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
       initGitWorkspace(workspace);
       await closeLedger(mgr, runId, workspace, 2);
-      const ledger01Shas = ledgerFileShas(workspace, runId, 2);
       // Gap: no iter/2; correctly shaped closed iter/3 with marker in a string field.
       expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter', '2'))).toBe(false);
       const iter3 = path.join(workspace, 'tasks', runId, 'iter', '3');
       fs.mkdirSync(iter3, { recursive: true });
       fs.writeFileSync(
         path.join(iter3, 'directive.json'),
-        JSON.stringify({ schema_version: 1, iter: 3, goal: 'gap', constraints: [], success_criteria: [], max_attempts: 1 }),
+        JSON.stringify({
+          schema_version: 1,
+          iter: 3,
+          goal: 'gap',
+          constraints: [],
+          success_criteria: [],
+          max_attempts: 1,
+        }),
       );
       fs.writeFileSync(
         path.join(iter3, 'eval_output.json'),
@@ -3558,9 +3619,30 @@ describe('SessionManager', () => {
       };
       fs.writeFileSync(path.join(iter3, 'verdict.json'), JSON.stringify(verdict3, null, 2));
       const markerLedgerSha = sha256Hex(fs.readFileSync(path.join(iter3, 'verdict.json')));
-      s1Fact({ test, path: `tasks/${runId}/iter/3/verdict.json`, phase: 'planted', sha256: markerLedgerSha, has_marker: true });
+      s1Fact({
+        test,
+        path: `tasks/${runId}/iter/3/verdict.json`,
+        phase: 'planted',
+        sha256: markerLedgerSha,
+        has_marker: true,
+      });
+
+      const acceptedHistoryBefore = snapshotLedgerIter(workspace, runId, 2);
+      const sessionsBeforeReset = createdConfigs.length;
+      const specPath = path.join(TEST_WF_DIR, runId, 'spec.json');
 
       await terminateAndReconstruct(runId);
+      createdConfigs = [];
+      mockSessions = [];
+      const sessionsAfterReset = createdConfigs.length;
+      // Snapshot immediately before refusal attempt (after stop/reconstruct).
+      const ledgerAllBefore = snapshotLedgerAll(workspace, runId);
+      const progressBefore = readCheckpointProgress(runId);
+      const checkpointEnvelopeBefore = fs.existsSync(runJsonPath(runId))
+        ? fs.readFileSync(runJsonPath(runId))
+        : Buffer.alloc(0);
+      const specBefore = fs.existsSync(specPath) ? fs.readFileSync(specPath) : Buffer.alloc(0);
+      const gitBefore = worktreeGitSnapshot(workspace);
       wireClosedLedgerSessions(mgr, workspace, 2);
       const { result: resumeOutcome, logText } = await withCapturedConsoleLogs(async () => {
         let resumeErr: unknown = null;
@@ -3573,19 +3655,25 @@ describe('SessionManager', () => {
         return { resumeErr, after };
       });
       const { resumeErr, after } = resumeOutcome;
+      const sessionsAfterResumeAttempt = createdConfigs.length;
 
-      const errText = resumeErr instanceof Error ? `${resumeErr.message}\n${resumeErr.stack ?? ''}` : String(resumeErr ?? '');
-      const statusObj = mgr.autoloopStatus(runId);
-      const statusText = JSON.stringify(statusObj ?? null);
-      const checkpointText = fs.existsSync(runJsonPath(runId)) ? fs.readFileSync(runJsonPath(runId), 'utf8') : '';
+      const errMessage = resumeErr instanceof Error ? resumeErr.message : '';
+      const errText =
+        resumeErr instanceof Error ? `${resumeErr.message}\n${resumeErr.stack ?? ''}` : String(resumeErr ?? '');
+      const statusText = JSON.stringify(mgr.autoloopStatus(runId) ?? null);
+      const checkpointEnvelopeAfter = fs.existsSync(runJsonPath(runId))
+        ? fs.readFileSync(runJsonPath(runId))
+        : Buffer.alloc(0);
+      const progressImmediate = readCheckpointProgress(runId);
+      const specAfter = fs.existsSync(specPath) ? fs.readFileSync(specPath) : Buffer.alloc(0);
+      const gitImmediate = worktreeGitSnapshot(workspace);
       const markerStillInLedger = fs.readFileSync(path.join(iter3, 'verdict.json'), 'utf8').includes(MARKER);
       const markerShaUnchanged = sha256Hex(fs.readFileSync(path.join(iter3, 'verdict.json'))) === markerLedgerSha;
 
-      // Marker checks BEFORE any iter assertion (includes console.log logger channel).
       const markerInError = errText.includes(MARKER);
       const markerInLogs = logText.includes(MARKER);
       const markerInStatus = statusText.includes(MARKER);
-      const markerInCheckpoint = checkpointText.includes(MARKER);
+      const markerInCheckpoint = checkpointEnvelopeAfter.toString('utf8').includes(MARKER);
       s1Fact({
         test,
         path: 'marker-checks',
@@ -3599,6 +3687,9 @@ describe('SessionManager', () => {
         markerShaUnchanged,
         captured_console_log: true,
         returned_iter: after?.iter ?? null,
+        sessions_before_reset: sessionsBeforeReset,
+        sessions_after_reset: sessionsAfterReset,
+        sessions_after_resume_attempt: sessionsAfterResumeAttempt,
       });
       expect(markerInError).toBe(false);
       expect(markerInLogs).toBe(false);
@@ -3607,15 +3698,103 @@ describe('SessionManager', () => {
       expect(markerStillInLedger).toBe(true);
       expect(markerShaUnchanged).toBe(true);
 
-      // Policy-neutral target: not reset to iter 0; iter/0..1 unchanged; nothing written below K+1 (=2).
-      const tip = after?.iter ?? readPublishedState(mgr, runId).iter;
-      expect(tip).not.toBe(0);
-      const after01 = ledgerFileShas(workspace, runId, 2);
-      for (const [k, v] of Object.entries(ledger01Shas)) {
-        expect(after01[k]).toBe(v);
+      expect(resumeErr).toBeInstanceOf(Error);
+      expect(errMessage).toBe(CLOSED_LEDGER_REFUSAL_MSG);
+      expect(sessionsAfterReset).toBe(0);
+      expect(sessionsAfterResumeAttempt).toBe(0);
+      expect(createdConfigs.length).toBe(0);
+      expect(specAfter.equals(specBefore)).toBe(true);
+      expect(gitImmediate).toEqual(gitBefore);
+      assertLedgerInventoryEqual(ledgerAllBefore, workspace, runId);
+      // Checkpoint PROGRESS preserved (envelope lifecycle may rewrite run.json).
+      expect(progressImmediate).toEqual(progressBefore);
+      s1Fact({
+        test,
+        path: 'preservation',
+        phase: 'immediate-after-refusal',
+        progress_before: progressBefore,
+        progress_immediate: progressImmediate,
+        progress_equal: JSON.stringify(progressImmediate) === JSON.stringify(progressBefore),
+        envelope_bytes_equal: checkpointEnvelopeAfter.equals(checkpointEnvelopeBefore),
+        envelope_lifecycle_rewrite_without_progress_loss:
+          !checkpointEnvelopeAfter.equals(checkpointEnvelopeBefore) &&
+          JSON.stringify(progressImmediate) === JSON.stringify(progressBefore),
+        spec_bytes_equal: specAfter.equals(specBefore),
+        worktree_git_equal: gitImmediate.head === gitBefore.head && gitImmediate.porcelain === gitBefore.porcelain,
+        sessions_after_resume_attempt: sessionsAfterResumeAttempt,
+      });
+
+      await vi.waitFor(
+        () => {
+          expect(['failed', 'cancelled', 'succeeded']).toContain(mgr.workflowStatus(runId).state);
+        },
+        { timeout: 15_000, interval: 50 },
+      );
+      const settled = mgr.workflowStatus(runId);
+      const progressSettled = readCheckpointProgress(runId);
+      const checkpointEnvelopeSettled = fs.existsSync(runJsonPath(runId))
+        ? fs.readFileSync(runJsonPath(runId))
+        : Buffer.alloc(0);
+      const specSettled = fs.existsSync(specPath) ? fs.readFileSync(specPath) : Buffer.alloc(0);
+      const gitSettled = worktreeGitSnapshot(workspace);
+      s1Fact({
+        test,
+        path: 'record',
+        phase: 'settled-after-refusal',
+        record_state: settled.state,
+        main_node_state: settled.nodes?.main?.state,
+        progress_before: progressBefore,
+        progress_settled: progressSettled,
+        progress_equal: JSON.stringify(progressSettled) === JSON.stringify(progressBefore),
+        envelope_bytes_equal: checkpointEnvelopeSettled.equals(checkpointEnvelopeBefore),
+        envelope_lifecycle_rewrite_without_progress_loss:
+          !checkpointEnvelopeSettled.equals(checkpointEnvelopeBefore) &&
+          JSON.stringify(progressSettled) === JSON.stringify(progressBefore),
+        spec_unchanged: specBefore.equals(specSettled),
+      });
+      expect(settled.state).toBe('failed');
+      expect(settled.nodes?.main?.state).toBe('failed');
+      expect(progressSettled).toEqual(progressBefore);
+      expect(specSettled.equals(specBefore)).toBe(true);
+      expect(gitSettled).toEqual(gitBefore);
+      assertLedgerInventoryEqual(ledgerAllBefore, workspace, runId);
+
+      // Temp-fixture repair only: remove gapped iter/3, then fresh-manager retry restores tip.
+      fs.rmSync(path.join(workspace, 'tasks', runId, 'iter', '3'), { recursive: true, force: true });
+      const acceptedAfterRepairPlant = snapshotLedgerIter(workspace, runId, 2);
+      expect(Object.keys(acceptedAfterRepairPlant).sort()).toEqual(Object.keys(acceptedHistoryBefore).sort());
+      for (const [k, v] of Object.entries(acceptedHistoryBefore)) {
+        expect(acceptedAfterRepairPlant[k]?.equals(v)).toBe(true);
+      }
+      await mgr.shutdown();
+      mgr = createManager();
+      createdConfigs = [];
+      mockSessions = [];
+      const tracks = wireClosedLedgerSessions(mgr, workspace, 2);
+      const repaired = await mgr.autoloopResume(runId);
+      await new Promise((r) => setTimeout(r, 300));
+      s1Fact({
+        test,
+        path: 'record',
+        phase: 'after-repaired-retry',
+        resumed_iter: repaired.iter,
+        resumed_metrics: repaired.metric_history,
+        coder_sends: tracks.coderSends.length,
+        reviewer_sends: tracks.reviewerSends.length,
+        planner_directives: tracks.plannerDirectives,
+      });
+      expect(repaired.iter).toBe(2);
+      expect(repaired.metric_history).toEqual([100, 101]);
+      expect(tracks.coderSends).toEqual([]);
+      expect(tracks.reviewerSends).toEqual([]);
+      expect(tracks.plannerDirectives).toBe(0);
+      const acceptedAfterRetry = snapshotLedgerIter(workspace, runId, 2);
+      for (const [k, v] of Object.entries(acceptedHistoryBefore)) {
+        expect(acceptedAfterRetry[k]?.equals(v)).toBe(true);
       }
       expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter', '2'))).toBe(false);
-    }, 60_000);
+      expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter', '3'))).toBe(false);
+    }, 90_000);
 
     it('malformed fixture: closed 0..1 with invalid JSON verdict marker at iter/2', async () => {
       const test = 'malformed-marker';
@@ -3623,19 +3802,39 @@ describe('SessionManager', () => {
       const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
       initGitWorkspace(workspace);
       await closeLedger(mgr, runId, workspace, 2);
-      const ledger01Shas = ledgerFileShas(workspace, runId, 2);
       const badDir = path.join(workspace, 'tasks', runId, 'iter', '2');
       fs.mkdirSync(badDir, { recursive: true });
       fs.writeFileSync(
         path.join(badDir, 'directive.json'),
-        JSON.stringify({ schema_version: 1, iter: 2, goal: 'malformed', constraints: [], success_criteria: [], max_attempts: 1 }),
+        JSON.stringify({
+          schema_version: 1,
+          iter: 2,
+          goal: 'malformed',
+          constraints: [],
+          success_criteria: [],
+          max_attempts: 1,
+        }),
       );
       const badVerdict = `{not-json ${MARKER}`;
       fs.writeFileSync(path.join(badDir, 'verdict.json'), badVerdict);
       const markerLedgerSha = sha256Hex(Buffer.from(badVerdict));
       s1Fact({ test, path: `tasks/${runId}/iter/2/verdict.json`, phase: 'planted', sha256: markerLedgerSha });
 
+      const acceptedHistoryBefore = snapshotLedgerIter(workspace, runId, 2);
+      const sessionsBeforeReset = createdConfigs.length;
+      const specPath = path.join(TEST_WF_DIR, runId, 'spec.json');
+
       await terminateAndReconstruct(runId);
+      createdConfigs = [];
+      mockSessions = [];
+      const sessionsAfterReset = createdConfigs.length;
+      const ledgerAllBefore = snapshotLedgerAll(workspace, runId);
+      const progressBefore = readCheckpointProgress(runId);
+      const checkpointEnvelopeBefore = fs.existsSync(runJsonPath(runId))
+        ? fs.readFileSync(runJsonPath(runId))
+        : Buffer.alloc(0);
+      const specBefore = fs.existsSync(specPath) ? fs.readFileSync(specPath) : Buffer.alloc(0);
+      const gitBefore = worktreeGitSnapshot(workspace);
       wireClosedLedgerSessions(mgr, workspace, 2);
       const { result: resumeOutcome, logText } = await withCapturedConsoleLogs(async () => {
         let resumeErr: unknown = null;
@@ -3648,17 +3847,25 @@ describe('SessionManager', () => {
         return { resumeErr, after };
       });
       const { resumeErr, after } = resumeOutcome;
+      const sessionsAfterResumeAttempt = createdConfigs.length;
 
-      const errText = resumeErr instanceof Error ? `${resumeErr.message}\n${resumeErr.stack ?? ''}` : String(resumeErr ?? '');
+      const errMessage = resumeErr instanceof Error ? resumeErr.message : '';
+      const errText =
+        resumeErr instanceof Error ? `${resumeErr.message}\n${resumeErr.stack ?? ''}` : String(resumeErr ?? '');
       const statusText = JSON.stringify(mgr.autoloopStatus(runId) ?? null);
-      const checkpointText = fs.existsSync(runJsonPath(runId)) ? fs.readFileSync(runJsonPath(runId), 'utf8') : '';
+      const checkpointEnvelopeAfter = fs.existsSync(runJsonPath(runId))
+        ? fs.readFileSync(runJsonPath(runId))
+        : Buffer.alloc(0);
+      const progressImmediate = readCheckpointProgress(runId);
+      const specAfter = fs.existsSync(specPath) ? fs.readFileSync(specPath) : Buffer.alloc(0);
+      const gitImmediate = worktreeGitSnapshot(workspace);
       const markerStillInLedger = fs.readFileSync(path.join(badDir, 'verdict.json'), 'utf8').includes(MARKER);
       const markerShaUnchanged = sha256Hex(fs.readFileSync(path.join(badDir, 'verdict.json'))) === markerLedgerSha;
 
       const markerInError = errText.includes(MARKER);
       const markerInLogs = logText.includes(MARKER);
       const markerInStatus = statusText.includes(MARKER);
-      const markerInCheckpoint = checkpointText.includes(MARKER);
+      const markerInCheckpoint = checkpointEnvelopeAfter.toString('utf8').includes(MARKER);
       s1Fact({
         test,
         path: 'marker-checks',
@@ -3672,6 +3879,9 @@ describe('SessionManager', () => {
         markerShaUnchanged,
         captured_console_log: true,
         returned_iter: after?.iter ?? null,
+        sessions_before_reset: sessionsBeforeReset,
+        sessions_after_reset: sessionsAfterReset,
+        sessions_after_resume_attempt: sessionsAfterResumeAttempt,
       });
       expect(markerInError).toBe(false);
       expect(markerInLogs).toBe(false);
@@ -3680,12 +3890,163 @@ describe('SessionManager', () => {
       expect(markerStillInLedger).toBe(true);
       expect(markerShaUnchanged).toBe(true);
 
-      const tip = after?.iter ?? readPublishedState(mgr, runId).iter;
-      expect(tip).not.toBe(0);
-      const after01 = ledgerFileShas(workspace, runId, 2);
-      for (const [k, v] of Object.entries(ledger01Shas)) {
-        expect(after01[k]).toBe(v);
+      // Independent early-refusal evidence for the malformed fixture (not inferred from gap).
+      expect(resumeErr).toBeInstanceOf(Error);
+      expect(errMessage).toBe(CLOSED_LEDGER_REFUSAL_MSG);
+      expect(sessionsAfterReset).toBe(0);
+      expect(sessionsAfterResumeAttempt).toBe(0);
+      expect(createdConfigs.length).toBe(0);
+      expect(specAfter.equals(specBefore)).toBe(true);
+      expect(gitImmediate).toEqual(gitBefore);
+      assertLedgerInventoryEqual(ledgerAllBefore, workspace, runId);
+      expect(fs.readFileSync(path.join(badDir, 'verdict.json'), 'utf8')).toBe(badVerdict);
+      expect(progressImmediate).toEqual(progressBefore);
+      s1Fact({
+        test,
+        path: 'preservation',
+        phase: 'immediate-after-refusal',
+        progress_before: progressBefore,
+        progress_immediate: progressImmediate,
+        progress_equal: JSON.stringify(progressImmediate) === JSON.stringify(progressBefore),
+        envelope_bytes_equal: checkpointEnvelopeAfter.equals(checkpointEnvelopeBefore),
+        envelope_lifecycle_rewrite_without_progress_loss:
+          !checkpointEnvelopeAfter.equals(checkpointEnvelopeBefore) &&
+          JSON.stringify(progressImmediate) === JSON.stringify(progressBefore),
+        spec_bytes_equal: specAfter.equals(specBefore),
+        worktree_git_equal: gitImmediate.head === gitBefore.head && gitImmediate.porcelain === gitBefore.porcelain,
+        sessions_after_resume_attempt: sessionsAfterResumeAttempt,
+      });
+
+      await vi.waitFor(
+        () => {
+          expect(['failed', 'cancelled', 'succeeded']).toContain(mgr.workflowStatus(runId).state);
+        },
+        { timeout: 15_000, interval: 50 },
+      );
+      const settled = mgr.workflowStatus(runId);
+      const progressSettled = readCheckpointProgress(runId);
+      const checkpointEnvelopeSettled = fs.readFileSync(runJsonPath(runId));
+      const specSettled = fs.existsSync(specPath) ? fs.readFileSync(specPath) : Buffer.alloc(0);
+      const gitSettled = worktreeGitSnapshot(workspace);
+      s1Fact({
+        test,
+        path: 'record',
+        phase: 'settled-after-refusal',
+        record_state: settled.state,
+        main_node_state: settled.nodes?.main?.state,
+        progress_before: progressBefore,
+        progress_settled: progressSettled,
+        progress_equal: JSON.stringify(progressSettled) === JSON.stringify(progressBefore),
+        envelope_bytes_equal: checkpointEnvelopeSettled.equals(checkpointEnvelopeBefore),
+        envelope_lifecycle_rewrite_without_progress_loss:
+          !checkpointEnvelopeSettled.equals(checkpointEnvelopeBefore) &&
+          JSON.stringify(progressSettled) === JSON.stringify(progressBefore),
+        spec_unchanged: specBefore.equals(specSettled),
+      });
+      expect(settled.state).toBe('failed');
+      expect(settled.nodes?.main?.state).toBe('failed');
+      expect(progressSettled).toEqual(progressBefore);
+      expect(specSettled.equals(specBefore)).toBe(true);
+      expect(gitSettled).toEqual(gitBefore);
+      assertLedgerInventoryEqual(ledgerAllBefore, workspace, runId);
+
+      // Temp-fixture repair: remove malformed iter/2, fresh-manager retry restores tip.
+      fs.rmSync(badDir, { recursive: true, force: true });
+      const acceptedAfterRepairPlant = snapshotLedgerIter(workspace, runId, 2);
+      for (const [k, v] of Object.entries(acceptedHistoryBefore)) {
+        expect(acceptedAfterRepairPlant[k]?.equals(v)).toBe(true);
       }
+      await mgr.shutdown();
+      mgr = createManager();
+      createdConfigs = [];
+      mockSessions = [];
+      const tracks = wireClosedLedgerSessions(mgr, workspace, 2);
+      const repaired = await mgr.autoloopResume(runId);
+      await new Promise((r) => setTimeout(r, 300));
+      s1Fact({
+        test,
+        path: 'record',
+        phase: 'after-repaired-retry',
+        resumed_iter: repaired.iter,
+        resumed_metrics: repaired.metric_history,
+        coder_sends: tracks.coderSends.length,
+        reviewer_sends: tracks.reviewerSends.length,
+        planner_directives: tracks.plannerDirectives,
+      });
+      expect(repaired.iter).toBe(2);
+      expect(repaired.metric_history).toEqual([100, 101]);
+      expect(tracks.coderSends).toEqual([]);
+      expect(tracks.reviewerSends).toEqual([]);
+      expect(tracks.plannerDirectives).toBe(0);
+      const acceptedAfterRetry = snapshotLedgerIter(workspace, runId, 2);
+      for (const [k, v] of Object.entries(acceptedHistoryBefore)) {
+        expect(acceptedAfterRetry[k]?.equals(v)).toBe(true);
+      }
+      expect(fs.existsSync(badDir)).toBe(false);
+    }, 90_000);
+
+    it('prefixless malformed invalidJSON at iter/0: no restore no refusal (compat)', async () => {
+      const runId = 'closed-prefixless-malformed0';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      await mgr.autoloopStart({ runId, workspace });
+      const iter0 = path.join(workspace, 'tasks', runId, 'iter', '0');
+      fs.mkdirSync(iter0, { recursive: true });
+      fs.writeFileSync(
+        path.join(iter0, 'directive.json'),
+        JSON.stringify({
+          schema_version: 1,
+          iter: 0,
+          goal: 'prefixless',
+          constraints: [],
+          success_criteria: [],
+          max_attempts: 1,
+        }),
+      );
+      fs.writeFileSync(path.join(iter0, 'verdict.json'), `{not-json ${MARKER}`);
+      await terminateAndReconstruct(runId);
+      createdConfigs = [];
+      mockSessions = [];
+      wireClosedLedgerSessions(mgr, workspace, 0);
+      let resumeErr: unknown = null;
+      let after: { iter: number; metric_history: number[] } | null = null;
+      try {
+        after = await mgr.autoloopResume(runId);
+      } catch (err) {
+        resumeErr = err;
+      }
+      expect(resumeErr).toBeNull();
+      expect(after?.iter).toBe(0);
+      expect(after?.metric_history).toEqual([]);
+      expect(createdConfigs.map((c) => c.name)).toEqual([`autoloop-${runId}-planner`]);
+    }, 60_000);
+
+    it('prefixless directive-only iter/0: no restore (null prefix) boots Planner-only', async () => {
+      const runId = 'closed-prefixless-directive0';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      await mgr.autoloopStart({ runId, workspace });
+      const iter0 = path.join(workspace, 'tasks', runId, 'iter', '0');
+      fs.mkdirSync(iter0, { recursive: true });
+      fs.writeFileSync(
+        path.join(iter0, 'directive.json'),
+        JSON.stringify({
+          schema_version: 1,
+          iter: 0,
+          goal: 'open-only',
+          constraints: [],
+          success_criteria: [],
+          max_attempts: 1,
+        }),
+      );
+      await terminateAndReconstruct(runId);
+      createdConfigs = [];
+      mockSessions = [];
+      wireClosedLedgerSessions(mgr, workspace, 0);
+      const after = await mgr.autoloopResume(runId);
+      expect(after.iter).toBe(0);
+      expect(after.metric_history).toEqual([]);
+      expect(createdConfigs.map((c) => c.name)).toEqual([`autoloop-${runId}-planner`]);
     }, 60_000);
 
     it('boot throw on resume: records base RunRecord state via existing planner-start failure', async () => {
@@ -3772,13 +4133,10 @@ describe('SessionManager', () => {
         main_node_state: laterStatus?.nodes?.main?.state,
         checkpoint_iter: laterFact.iter,
         checkpoint_metrics: laterFact.metric_history,
-        // Base defect: a successful later resume may publish iter 0; that is a fact, not tip preservation.
-        tip_reset_on_later_resume:
-          !laterErr && typeof later?.iter === 'number' ? later.iter === 0 : null,
+        tip_reset_on_later_resume: !laterErr && typeof later?.iter === 'number' ? later.iter === 0 : null,
       });
 
-      // Assertions that hold regardless of eventual fix: tip at throw / settlement is not lost.
-      // Do NOT claim tip preservation after a later successful resume (may reset to 0 on base).
+      // Tip at throw / settlement is not lost; later resume after settlement restores tip.
       expect(rejectText).toContain('closed-ledger boot throw');
       expect(immediate).toBeDefined();
       expect(settled).toBeDefined();
@@ -3789,6 +4147,67 @@ describe('SessionManager', () => {
       expect(immediateFact.metric_history).toEqual([100, 101]);
       expect(settledFact.iter).toBe(2);
       expect(settledFact.metric_history).toEqual([100, 101]);
+      expect(laterErr).toBeNull();
+      expect(later?.iter).toBe(2);
+      expect(later?.metric_history).toEqual([100, 101]);
+      expect(laterFact.iter).toBe(2);
+    }, 90_000);
+
+    it('ordered finite metrics restore caps at MAX_METRIC_HISTORY (20) via public resume', async () => {
+      const test = 'cap20-metrics';
+      const runId = 'closed-cap20';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      // Provenance: public autoloopStart creates the durable run; contiguous closed
+      // prefix 0..21 is written as real ledger bytes (directive+verdict, metric=100+i)
+      // after stop — not invented runner state. Live auto-continue close of 22 hits
+      // default maxDispatchDepth before the tip; public autoloopResume is still the
+      // sole restore path under test (reader → runner.state before runner.start).
+      await mgr.autoloopStart({ runId, workspace });
+      await terminateAndReconstruct(runId);
+      for (let i = 0; i < 22; i++) {
+        const iterDir = path.join(workspace, 'tasks', runId, 'iter', String(i));
+        fs.mkdirSync(iterDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(iterDir, 'directive.json'),
+          JSON.stringify({
+            schema_version: 1,
+            iter: i,
+            goal: `cap20 ${i}`,
+            constraints: [],
+            success_criteria: [],
+            max_attempts: 1,
+          }),
+        );
+        fs.writeFileSync(
+          path.join(iterDir, 'verdict.json'),
+          JSON.stringify(
+            {
+              schema_version: 1,
+              iter: i,
+              decision: 'advance',
+              metric: 100 + i,
+              audit_notes: `cap20 ${i}`,
+            },
+            null,
+            2,
+          ),
+        );
+      }
+      s1Fact({
+        test,
+        path: `tasks/${runId}/iter`,
+        phase: 'planted-closed-prefix',
+        closed_count: 22,
+        metric_first: 100,
+        metric_last: 121,
+        provenance: 'ledger-bytes-after-public-start-stop',
+      });
+      wireClosedLedgerSessions(mgr, workspace, 22);
+      const after = await mgr.autoloopResume(runId);
+      recordCheckpointFact(test, 'after-resume', mgr, runId);
+      expect(after.iter).toBe(22);
+      expect(after.metric_history).toEqual(Array.from({ length: 20 }, (_, i) => 100 + (22 - 20 + i)));
     }, 90_000);
   });
 
@@ -3876,10 +4295,7 @@ describe('SessionManager', () => {
       initGitWorkspace(workspace);
 
       // Reuse the closed-ledger harness helpers from the sibling describe via local mirrors.
-      const wire = (
-        manager: InstanceType<typeof SessionManager>,
-        closeCount: number,
-      ): void => {
+      const wire = (manager: InstanceType<typeof SessionManager>, closeCount: number): void => {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const origCreate = (manager as any)._createSession.bind(manager);
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -3964,7 +4380,14 @@ describe('SessionManager', () => {
       fs.mkdirSync(iter1, { recursive: true });
       fs.writeFileSync(
         path.join(iter1, 'directive.json'),
-        JSON.stringify({ schema_version: 1, iter: 1, goal: 'open', constraints: [], success_criteria: [], max_attempts: 1 }),
+        JSON.stringify({
+          schema_version: 1,
+          iter: 1,
+          goal: 'open',
+          constraints: [],
+          success_criteria: [],
+          max_attempts: 1,
+        }),
       );
       fs.writeFileSync(
         path.join(iter1, 'eval_output.json'),
