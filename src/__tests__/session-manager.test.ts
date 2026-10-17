@@ -2903,6 +2903,38 @@ describe('SessionManager', () => {
       console.log(`S1_FACT ${JSON.stringify(fields)}`);
     };
 
+    /**
+     * Capture logger console channels used by the default Logger (info/debug →
+     * console.log). Forward every call to the originals so S1_FACT stdout
+     * emission and vitest tee keep working.
+     */
+    const withCapturedConsoleLogs = async <T>(fn: () => Promise<T>): Promise<{ result: T; logText: string }> => {
+      const logChunks: string[] = [];
+      const origLog = console.log;
+      const origInfo = console.info;
+      const origWarn = console.warn;
+      const origError = console.error;
+      const captureAndForward =
+        (orig: (...a: unknown[]) => void) =>
+        (...args: unknown[]) => {
+          logChunks.push(args.map(String).join(' '));
+          orig(...args);
+        };
+      console.log = captureAndForward(origLog) as typeof console.log;
+      console.info = captureAndForward(origInfo) as typeof console.info;
+      console.warn = captureAndForward(origWarn) as typeof console.warn;
+      console.error = captureAndForward(origError) as typeof console.error;
+      try {
+        const result = await fn();
+        return { result, logText: logChunks.join('\n') };
+      } finally {
+        console.log = origLog;
+        console.info = origInfo;
+        console.warn = origWarn;
+        console.error = origError;
+      }
+    };
+
     const initGitWorkspace = (workspace: string): void => {
       fs.mkdirSync(workspace, { recursive: true });
       execFileSync('git', ['init', '-b', 'main'], { cwd: workspace });
@@ -3528,40 +3560,28 @@ describe('SessionManager', () => {
       const markerLedgerSha = sha256Hex(fs.readFileSync(path.join(iter3, 'verdict.json')));
       s1Fact({ test, path: `tasks/${runId}/iter/3/verdict.json`, phase: 'planted', sha256: markerLedgerSha, has_marker: true });
 
-      const logChunks: string[] = [];
-      const origInfo = console.info;
-      const origWarn = console.warn;
-      const origError = console.error;
-      const capture = (...args: unknown[]) => {
-        logChunks.push(args.map(String).join(' '));
-      };
-      console.info = capture as typeof console.info;
-      console.warn = capture as typeof console.warn;
-      console.error = capture as typeof console.error;
-
       await terminateAndReconstruct(runId);
       wireClosedLedgerSessions(mgr, workspace, 2);
-      let resumeErr: unknown = null;
-      let after: { iter: number; metric_history: number[] } | null = null;
-      try {
-        after = await mgr.autoloopResume(runId);
-      } catch (err) {
-        resumeErr = err;
-      } finally {
-        console.info = origInfo;
-        console.warn = origWarn;
-        console.error = origError;
-      }
+      const { result: resumeOutcome, logText } = await withCapturedConsoleLogs(async () => {
+        let resumeErr: unknown = null;
+        let after: { iter: number; metric_history: number[] } | null = null;
+        try {
+          after = await mgr.autoloopResume(runId);
+        } catch (err) {
+          resumeErr = err;
+        }
+        return { resumeErr, after };
+      });
+      const { resumeErr, after } = resumeOutcome;
 
       const errText = resumeErr instanceof Error ? `${resumeErr.message}\n${resumeErr.stack ?? ''}` : String(resumeErr ?? '');
       const statusObj = mgr.autoloopStatus(runId);
       const statusText = JSON.stringify(statusObj ?? null);
       const checkpointText = fs.existsSync(runJsonPath(runId)) ? fs.readFileSync(runJsonPath(runId), 'utf8') : '';
-      const logText = logChunks.join('\n');
       const markerStillInLedger = fs.readFileSync(path.join(iter3, 'verdict.json'), 'utf8').includes(MARKER);
       const markerShaUnchanged = sha256Hex(fs.readFileSync(path.join(iter3, 'verdict.json'))) === markerLedgerSha;
 
-      // Marker checks BEFORE any iter assertion.
+      // Marker checks BEFORE any iter assertion (includes console.log logger channel).
       const markerInError = errText.includes(MARKER);
       const markerInLogs = logText.includes(MARKER);
       const markerInStatus = statusText.includes(MARKER);
@@ -3577,6 +3597,7 @@ describe('SessionManager', () => {
         markerInCheckpoint,
         markerStillInLedger,
         markerShaUnchanged,
+        captured_console_log: true,
         returned_iter: after?.iter ?? null,
       });
       expect(markerInError).toBe(false);
@@ -3614,35 +3635,23 @@ describe('SessionManager', () => {
       const markerLedgerSha = sha256Hex(Buffer.from(badVerdict));
       s1Fact({ test, path: `tasks/${runId}/iter/2/verdict.json`, phase: 'planted', sha256: markerLedgerSha });
 
-      const logChunks: string[] = [];
-      const capture = (...args: unknown[]) => {
-        logChunks.push(args.map(String).join(' '));
-      };
-      const origInfo = console.info;
-      const origWarn = console.warn;
-      const origError = console.error;
-      console.info = capture as typeof console.info;
-      console.warn = capture as typeof console.warn;
-      console.error = capture as typeof console.error;
-
       await terminateAndReconstruct(runId);
       wireClosedLedgerSessions(mgr, workspace, 2);
-      let resumeErr: unknown = null;
-      let after: { iter: number; metric_history: number[] } | null = null;
-      try {
-        after = await mgr.autoloopResume(runId);
-      } catch (err) {
-        resumeErr = err;
-      } finally {
-        console.info = origInfo;
-        console.warn = origWarn;
-        console.error = origError;
-      }
+      const { result: resumeOutcome, logText } = await withCapturedConsoleLogs(async () => {
+        let resumeErr: unknown = null;
+        let after: { iter: number; metric_history: number[] } | null = null;
+        try {
+          after = await mgr.autoloopResume(runId);
+        } catch (err) {
+          resumeErr = err;
+        }
+        return { resumeErr, after };
+      });
+      const { resumeErr, after } = resumeOutcome;
 
       const errText = resumeErr instanceof Error ? `${resumeErr.message}\n${resumeErr.stack ?? ''}` : String(resumeErr ?? '');
       const statusText = JSON.stringify(mgr.autoloopStatus(runId) ?? null);
       const checkpointText = fs.existsSync(runJsonPath(runId)) ? fs.readFileSync(runJsonPath(runId), 'utf8') : '';
-      const logText = logChunks.join('\n');
       const markerStillInLedger = fs.readFileSync(path.join(badDir, 'verdict.json'), 'utf8').includes(MARKER);
       const markerShaUnchanged = sha256Hex(fs.readFileSync(path.join(badDir, 'verdict.json'))) === markerLedgerSha;
 
@@ -3661,6 +3670,7 @@ describe('SessionManager', () => {
         markerInCheckpoint,
         markerStillInLedger,
         markerShaUnchanged,
+        captured_console_log: true,
         returned_iter: after?.iter ?? null,
       });
       expect(markerInError).toBe(false);
@@ -3702,48 +3712,84 @@ describe('SessionManager', () => {
       } catch (err) {
         rejectText = err instanceof Error ? err.message : String(err);
       }
-      const afterFail = mgr.workflowStatus(runId);
-      const afterFailFact = recordCheckpointFact(test, 'after-boot-throw', null, runId);
+
+      // Immediate observation: base may still show running/running while failure settles async.
+      const immediate = mgr.workflowStatus(runId);
+      const immediateFact = recordCheckpointFact(test, 'immediate-after-boot-throw', null, runId);
       s1Fact({
         test,
         path: 'record',
-        phase: 'after-boot-throw',
+        phase: 'immediate-after-boot-throw',
         rejectText,
-        record_state: afterFail?.state,
-        main_node_state: afterFail?.nodes?.main?.state,
-        tip_iter: afterFailFact.iter,
-        tip_metrics: afterFailFact.metric_history,
+        record_state: immediate?.state,
+        main_node_state: immediate?.nodes?.main?.state,
+        tip_iter: immediateFact.iter,
+        tip_metrics: immediateFact.metric_history,
       });
 
-      // Remove injected failure; try resume again — record capability as fact.
-      patchCreateSession(mgr);
-      wireClosedLedgerSessions(mgr, workspace, 2);
-      let secondErr: unknown = null;
-      let second: { iter: number; metric_history: number[] } | null = null;
-      try {
-        second = await mgr.autoloopResume(runId);
-      } catch (err) {
-        secondErr = err;
-      }
-      recordCheckpointFact(test, 'after-second-resume-attempt', mgr, runId);
+      // Deterministic settled-state observation (do not race a retry against running).
+      await vi.waitFor(
+        () => {
+          const st = mgr.workflowStatus(runId);
+          expect(['failed', 'cancelled', 'succeeded']).toContain(st.state);
+        },
+        { timeout: 15_000, interval: 50 },
+      );
+      const settled = mgr.workflowStatus(runId);
+      const settledFact = recordCheckpointFact(test, 'settled-after-boot-throw', null, runId);
       s1Fact({
         test,
         path: 'record',
-        phase: 'after-reinjected-cleared-resume',
-        resumed: !secondErr,
-        resumed_iter: second?.iter ?? null,
-        second_error: secondErr instanceof Error ? secondErr.message : secondErr ? String(secondErr) : null,
+        phase: 'settled-after-boot-throw',
+        record_state: settled?.state,
+        main_node_state: settled?.nodes?.main?.state,
+        tip_iter: settledFact.iter,
+        tip_metrics: settledFact.metric_history,
       });
 
-      // Assertions that hold regardless of eventual fix: prior tip not lost on boot throw.
+      // Later resume after settlement, on a fresh manager (optional but clearer isolation).
+      await mgr.shutdown();
+      mgr = createManager();
+      wireClosedLedgerSessions(mgr, workspace, 2);
+      let laterErr: unknown = null;
+      let later: { iter: number; metric_history: number[] } | null = null;
+      try {
+        later = await mgr.autoloopResume(runId);
+      } catch (err) {
+        laterErr = err;
+      }
+      const laterFact = recordCheckpointFact(test, 'after-settled-resume-attempt', mgr, runId);
+      const laterStatus = mgr.workflowStatus(runId);
+      s1Fact({
+        test,
+        path: 'record',
+        phase: 'after-settled-resume-attempt',
+        resumed: !laterErr,
+        resumed_iter: later?.iter ?? null,
+        resumed_metrics: later?.metric_history ?? null,
+        later_error: laterErr instanceof Error ? laterErr.message : laterErr ? String(laterErr) : null,
+        record_state: laterStatus?.state,
+        main_node_state: laterStatus?.nodes?.main?.state,
+        checkpoint_iter: laterFact.iter,
+        checkpoint_metrics: laterFact.metric_history,
+        // Base defect: a successful later resume may publish iter 0; that is a fact, not tip preservation.
+        tip_reset_on_later_resume:
+          !laterErr && typeof later?.iter === 'number' ? later.iter === 0 : null,
+      });
+
+      // Assertions that hold regardless of eventual fix: tip at throw / settlement is not lost.
+      // Do NOT claim tip preservation after a later successful resume (may reset to 0 on base).
       expect(rejectText).toContain('closed-ledger boot throw');
-      expect(afterFail).toBeDefined();
-      expect(afterFail.spec).toEqual(before.spec);
-      expect(afterFailFact.iter).toBe(beforeFact.iter);
-      expect(afterFailFact.metric_history).toEqual(beforeFact.metric_history);
+      expect(immediate).toBeDefined();
+      expect(settled).toBeDefined();
+      expect(settled.spec).toEqual(before.spec);
       expect(beforeFact.iter).toBe(2);
       expect(beforeFact.metric_history).toEqual([100, 101]);
-    }, 60_000);
+      expect(immediateFact.iter).toBe(2);
+      expect(immediateFact.metric_history).toEqual([100, 101]);
+      expect(settledFact.iter).toBe(2);
+      expect(settledFact.metric_history).toEqual([100, 101]);
+    }, 90_000);
   });
 
   describe('closed-ledger-preserve', () => {
