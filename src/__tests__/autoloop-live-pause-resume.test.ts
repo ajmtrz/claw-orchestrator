@@ -208,7 +208,7 @@ describe('Autoloop live pause resume regressions', () => {
   let mgr: InstanceType<typeof SessionManager>;
 
   beforeEach(() => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.useFakeTimers({ shouldAdvanceTime: false });
     mockSessions = [];
     createdConfigs = [];
     fs.rmSync(TEST_WF_DIR, { recursive: true, force: true });
@@ -216,8 +216,21 @@ describe('Autoloop live pause resume regressions', () => {
     mgr = createManager();
   });
 
+  const settleShutdown = async (target: InstanceType<typeof SessionManager>): Promise<void> => {
+    const done = target.shutdown();
+    let settled = false;
+    void done.finally(() => {
+      settled = true;
+    });
+    for (let step = 0; step < 120 && !settled; step += 1) {
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    if (!settled) throw new Error('shutdown did not settle after advancing fake timers');
+    await done;
+  };
+
   afterEach(async () => {
-    await mgr.shutdown();
+    await settleShutdown(mgr);
     vi.useRealTimers();
   });
 
@@ -227,9 +240,19 @@ describe('Autoloop live pause resume regressions', () => {
     return workspace;
   };
 
+  // Exact fake-time moves. shouldAdvanceTime is off, so a 1ms boundary
+  // cannot be walked past by the 20ms auto-advance interval.
   const advanceTo = async (absoluteMs: number): Promise<void> => {
     const delta = absoluteMs - Date.now();
     if (delta > 0) await vi.advanceTimersByTimeAsync(delta);
+  };
+
+  const flushUntil = async (ready: () => boolean): Promise<void> => {
+    for (let i = 0; i < 30; i++) {
+      if (ready()) return;
+      await Promise.resolve();
+    }
+    expect(ready()).toBe(true);
   };
 
   async function startPaused(runId: string): Promise<{ planner: MockSession }> {
@@ -349,6 +372,7 @@ describe('Autoloop live pause resume regressions', () => {
     await mgr.autoloopChat(runId, 'PARKED');
     expect(textsIncluding(planner, 'PARKED')).toEqual([]);
     vi.setSystemTime(Date.parse(handle.runner.state.started_at) + hardTimeoutMs);
+    expect(Date.now()).toBe(Date.parse(handle.runner.state.started_at) + hardTimeoutMs);
     const resumed = await mgr.autoloopResume(runId);
     expect(resumed).toMatchObject({ status: 'terminated', status_reason: 'hard_timeout_exceeded' });
     expect(planner.sendCalls).toHaveLength(sendsAtPark);
@@ -366,6 +390,8 @@ describe('Autoloop live pause resume regressions', () => {
     });
     const handle = mgr.getAutoloop(runId)!;
     const planner = mockSessions[0];
+    const startedAt = Date.parse(handle.runner.state.started_at);
+    const hardAt = startedAt + 600_000;
     const timeouts: string[] = [];
     handle.runner.on('timeout', (event: { kind: string }) => timeouts.push(event.kind));
     let release!: (value: TurnResult) => void;
@@ -374,7 +400,7 @@ describe('Autoloop live pause resume regressions', () => {
         release = resolve;
       });
     const chat = mgr.autoloopChat(runId, 'hold-for-lease');
-    await vi.waitFor(() => expect(planner.sendCalls).toHaveLength(1));
+    await flushUntil(() => planner.sendCalls.length === 1);
     await advanceTo(handle.runner.state.last_activity_at + activityLeaseMs);
     expect(handle.runner.state).toMatchObject({ status: 'paused', status_reason: 'activity_lease_expired' });
     expect(timeouts).toEqual(['activity_lease_expired']);
@@ -383,11 +409,21 @@ describe('Autoloop live pause resume regressions', () => {
     expect(handle.runner.state).toMatchObject({ status: 'planning', status_reason: null, pending_dispatch: null });
     const renewed = handle.runner.state.last_activity_at + activityLeaseMs;
     await advanceTo(renewed - 1);
+    expect(Date.now()).toBe(renewed - 1);
     expect(handle.runner.state.status).toBe('planning');
     expect(timeouts).toEqual(['activity_lease_expired']);
     await advanceTo(renewed);
+    expect(Date.now()).toBe(renewed);
     expect(handle.runner.state.status_reason).toBe('activity_lease_expired');
     expect(timeouts).toEqual(['activity_lease_expired', 'activity_lease_expired']);
+    await advanceTo(hardAt - 1);
+    expect(handle.runner.state.status_reason).toBe('activity_lease_expired');
+    await advanceTo(hardAt);
+    expect(handle.runner.state).toMatchObject({
+      status: 'terminated',
+      status_reason: 'hard_timeout_exceeded',
+    });
+    expect(Date.parse(handle.runner.state.started_at)).toBe(startedAt);
   });
 
   it('(f) the lease expiring during an in-flight Planner turn, then resume, gives no duplicate delivery', async () => {
@@ -407,7 +443,7 @@ describe('Autoloop live pause resume regressions', () => {
         release = resolve;
       });
     const chat = mgr.autoloopChat(runId, 'INFLIGHT');
-    await vi.waitFor(() => expect(planner.sendCalls).toHaveLength(1));
+    await flushUntil(() => planner.sendCalls.length === 1);
     await advanceTo(handle.runner.state.last_activity_at + activityLeaseMs);
     expect(handle.runner.state.status_reason).toBe('activity_lease_expired');
     release({ text: 'ack', event: { type: 'result', result: 'ok' } });
@@ -431,7 +467,7 @@ describe('Autoloop live pause resume regressions', () => {
       expect(observed?.status_reason).toBe(resumed.status_reason);
       expect(observed?.pending_dispatch).toEqual(resumed.pending_dispatch);
     } finally {
-      await observer.shutdown();
+      await settleShutdown(observer);
     }
   });
 

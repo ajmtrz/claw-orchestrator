@@ -121,7 +121,8 @@ Opening a run whose `status` is `terminated` (because its process has
 exited, or because you're viewing it cross-process) fetches
 `/autoloop/<id>/chat_history`, replays the conversation into the Planner pane,
 and shows a green **Resume run** button in the topbar. The same button is shown
-for any live paused run. Timeout fields are included only when
+for any live paused run, and it follows later SSE state: a pause adds it, and
+returning to an active status removes it. Timeout fields are included only when
 `pending_dispatch` exists; an ordinary or activity-lease pause resumes with
 an empty timeout body. Clicking it POSTs `/autoloop/<id>/resume`;
 the orchestrator re-attaches the Planner (reusing the persisted Claude

@@ -4550,11 +4550,16 @@ describe('SessionManager', () => {
       ]);
 
       const renewedDeadline = handle.runner.state.last_activity_at + activityLeaseMs;
-      await advanceTo(renewedDeadline - 1);
+      // Synchronous move. advanceTo() awaits advanceTimersByTimeAsync, and the
+      // parent beforeEach keeps shouldAdvanceTime on, so its real 20ms interval
+      // can tick the clock past this 1ms boundary before the assertion runs.
+      vi.advanceTimersByTime(renewedDeadline - 1 - Date.now());
+      expect(Date.now()).toBe(renewedDeadline - 1);
       expect(handle.runner.state.status).toBe('planning');
       expect(handle.runner.state.status_reason).toBeNull();
       expect(timeouts).toEqual(['activity_lease_expired']);
-      await advanceTo(renewedDeadline);
+      vi.advanceTimersByTime(renewedDeadline - Date.now());
+      expect(Date.now()).toBe(renewedDeadline);
       expect(handle.runner.state).toMatchObject({
         status: 'paused',
         status_reason: 'activity_lease_expired',
