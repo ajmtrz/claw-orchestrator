@@ -317,7 +317,7 @@ async function waitUntil(check: () => void, steps = 2000, stepMs = 1): Promise<v
 }
 
 /** Drain a promise under fake timers without sleeping on the wall clock. */
-async function drainPromise<T>(pending: Promise<T>, maxMs = 20_000): Promise<T> {
+async function drainPromise<T>(pending: Promise<T>, maxSteps = 20_000, stepMs = 1): Promise<T> {
   let settled = false;
   let value: T | undefined;
   let error: unknown;
@@ -331,8 +331,8 @@ async function drainPromise<T>(pending: Promise<T>, maxMs = 20_000): Promise<T> 
       error = e;
     },
   );
-  for (let i = 0; i < maxMs && !settled; i++) await tick(1);
-  if (!settled) throw new Error(`drainPromise exhausted after ${maxMs}ms fake time`);
+  for (let i = 0; i < maxSteps && !settled; i++) await tick(stepMs);
+  if (!settled) throw new Error(`drainPromise exhausted after ${maxSteps} steps`);
   if (error !== undefined) throw error;
   return value as T;
 }
@@ -511,15 +511,18 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
         {
           action: 'custom',
           run: (proc) => {
-            fs.writeFileSync(path.join(workspace, 'o1-proof.txt'), 'o1-proof' + NL);
-            feedAssistant(
-              proc,
-              fence('iter_complete', {
-                summary: 'O1 before deadline',
-                eval_output: { metric: 1, gates: [] },
-              }),
-            );
-            closeProc(proc, 0);
+            // Close just before the Coder send deadline (margin avoids racing SIGTERM).
+            setTimeout(() => {
+              fs.writeFileSync(path.join(workspace, 'o1-proof.txt'), 'o1-proof' + NL);
+              feedAssistant(
+                proc,
+                fence('iter_complete', {
+                  summary: 'O1 before deadline',
+                  eval_output: { metric: 1, gates: [] },
+                }),
+              );
+              closeProc(proc, 0);
+            }, SEND_MS - 10);
           },
         },
       ],
@@ -538,7 +541,17 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
     const handle = await startCursorAutoloop(runId, workspace);
     const chatP = mgr.autoloopChat(runId, 'O1 start');
     const iterDir = path.join(ledgerDir(workspace, runId), 'iter', '0');
-    await drainPromise(chatP);
+    await waitUntil(() => expect(coderSpawns().length).toBe(1));
+    await tick(1); // installSpawnMock defers script by 1ms
+    // Boundary: child still open before deadline.
+    expect(coderSpawns()[0].closed).toBe(false);
+    expect(coderSpawns()[0].killSignal).toBeNull();
+    await vi.advanceTimersByTimeAsync(SEND_MS - 10);
+    await waitUntil(() => expect(coderSpawns()[0].closed).toBe(true), 500, 0);
+    expect(coderSpawns()[0].killSignal).toBeNull();
+    expect(coderSpawns()[0].closeCode).toBe(0);
+    // Coder already closed before SEND_MS; small advances finish reviewer/git without racing the open child.
+    await drainPromise(chatP, 20_000, 1);
     expect(fs.existsSync(path.join(iterDir, 'eval_output.json'))).toBe(true);
     expect(fs.existsSync(path.join(iterDir, 'coder_summary.txt'))).toBe(true);
     expect(fs.existsSync(path.join(iterDir, 'diff.patch'))).toBe(true);
@@ -546,9 +559,9 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
 
     expect(coderSpawns()).toHaveLength(1);
     expect(countGitLog(workspace, 'autoloop/iter-0')).toBe(1);
+    expect(reviewerSpawns()).toHaveLength(1);
     const chat = fs.readFileSync(path.join(ledgerDir(workspace, runId), 'chat.jsonl'), 'utf8');
     expect(chat).toMatch(/review_request|Reviewer|review/i);
-    expect(reviewerSpawns().length).toBeGreaterThanOrEqual(1);
     expect(sha256File(sentinels.work)).toBe(before.workSha);
     expect(sha256File(sentinels.evidence)).toBe(before.evidenceSha);
     expect(handle.runner.state.status).not.toBe('paused');
@@ -613,7 +626,7 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
     };
   });
 
-  it('O3: late post-deadline effects are not accepted twice', async () => {
+  it('O3: late post-deadline effects are not accepted twice (kill-then-close)', async () => {
     const runId = 'phaseA-o3';
     const workspace = path.join(TEST_WF_DIR, 'ws-o3');
     initGitWorkspace(workspace);
@@ -637,6 +650,7 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
           }),
         },
       ],
+      // hang-then-late: after adapter kill, emit late iter_complete and close (same helper).
       coder: [{ action: 'hang-then-late', text: lateText }],
     };
 
@@ -648,18 +662,22 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
     await waitUntil(() => expect(coderSpawns().length).toBe(1));
     await vi.advanceTimersByTimeAsync(SEND_MS);
     await chatP;
-    // Allow late close microtasks after kill.
-    await Promise.resolve();
-    await Promise.resolve();
+    // Fixture precondition: kill happened, then late output+close actually ran.
+    await waitUntil(() => expect(coderSpawns()[0].killSignal).toBe('SIGTERM'));
+    await tick(1);
+    await waitUntil(() => {
+      expect(coderSpawns()[0].closed).toBe(true);
+      expect(coderSpawns()[0].closeCode).toBe(0);
+    });
 
     const pending = handle.runner.state.pending_dispatch!;
+    // Public no-duplicate contract only (settled promise stays rejected; no fabricated resolve).
     expect(handle.runner.state.status).toBe('paused');
     expect(timeouts).toHaveLength(1);
     expect(coderSpawns()).toHaveLength(1);
     expect(countGitLog(workspace, 'autoloop/iter-0')).toBe(0);
     expect(fs.existsSync(path.join(ledgerDir(workspace, runId), 'iter', '0', 'eval_output.json'))).toBe(false);
 
-    // Replay resolved timeout message separately.
     const { Msg } = await import('../autoloop/messages.js');
     await handle.runner.send(Msg.sendTimeout(0, pending));
     expect(handle.runner.state.status).toBe('paused');
@@ -667,11 +685,15 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
     expect(coderSpawns()).toHaveLength(1);
     expect(readDecisionRows(workspace, runId).filter((r) => r.kind === 'send_timeout')).toHaveLength(1);
 
+    const acceptedIters = countGitLog(workspace, 'autoloop/iter-0');
+    const evalPresent = fs.existsSync(path.join(ledgerDir(workspace, runId), 'iter', '0', 'eval_output.json'));
     observations.D2 = {
-      lateAcceptedIterations: countGitLog(workspace, 'autoloop/iter-0'),
-      evalPresent: fs.existsSync(path.join(ledgerDir(workspace, runId), 'iter', '0', 'eval_output.json')),
-      note: '0 = not accepted; 1 would mean accepted once — observation only',
+      lateAcceptedIterations: acceptedIters,
+      evalPresent,
+      killThenClose: true,
+      note: 'D2 records 0-or-1 acceptance of late post-deadline output; observed ' + String(acceptedIters),
     };
+    expect(acceptedIters === 0 || acceptedIters === 1).toBe(true);
   });
 
   it('O4: no-option resume is no-op; invalid overrides refuse atomically', async () => {
@@ -768,7 +790,12 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
       coder: [{ action: 'hang' }],
     };
 
-    const handle = await startCursorAutoloop(runId, workspace);
+    const LEASE_MS = 60_000;
+    const handle = await startCursorAutoloop(runId, workspace, {
+      sendTimeoutMs: SEND_MS,
+      activityLeaseMs: LEASE_MS,
+      autoloopHardTimeoutMs: 86_400_000,
+    });
     const chatP = mgr.autoloopChat(runId, 'O5');
     await waitUntil(() => expect(coderSpawns().length).toBe(1));
     await vi.advanceTimersByTimeAsync(SEND_MS);
@@ -783,7 +810,19 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
     const specBefore = fs.readFileSync(specPath, 'utf8');
     const coderBefore = coderSpawns().length;
     const iter0 = path.join(ledgerDir(workspace, runId), 'iter', '0');
-    const iterBefore = fs.existsSync(iter0) ? execFileSync('find', [iter0, '-type', 'f'], { encoding: 'utf8' }) : '';
+    const hashTree = (dir: string): Record<string, string> => {
+      const out: Record<string, string> = {};
+      if (!fs.existsSync(dir)) return out;
+      for (const name of fs.readdirSync(dir)) {
+        const full = path.join(dir, name);
+        if (fs.statSync(full).isFile()) out[name] = sha256File(full);
+      }
+      return out;
+    };
+    const evidenceBefore = hashTree(iter0);
+    const directiveBefore = fs.existsSync(path.join(iter0, 'directive.json'))
+      ? fs.readFileSync(path.join(iter0, 'directive.json'), 'utf8')
+      : '';
 
     const resumed = await mgr.autoloopResume(runId, {
       sendTimeoutMs: RAISED_MS,
@@ -816,15 +855,20 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
     });
     expect(fs.readFileSync(chatPath, 'utf8')).toBe(chatBefore);
     expect(fs.readFileSync(specPath, 'utf8')).toBe(specBefore);
-    const iterAfter = fs.existsSync(iter0) ? execFileSync('find', [iter0, '-type', 'f'], { encoding: 'utf8' }) : '';
-    expect(iterAfter).toBe(iterBefore);
+    expect(hashTree(iter0)).toEqual(evidenceBefore);
+    if (directiveBefore) {
+      expect(fs.readFileSync(path.join(iter0, 'directive.json'), 'utf8')).toBe(directiveBefore);
+    }
 
-    // D3: idle after exact resume until activity lease (shortened for observation).
-    // Use a dedicated short-lease follow-up observation via fake time without asserting RED.
+    // D3: advance past activity lease expiry and record outcome (observation only).
+    await vi.advanceTimersByTimeAsync(LEASE_MS + 1);
+    await tick(0);
     observations.D3 = {
-      statusImmediatelyAfterResume: handle.runner.state.status,
-      pendingAfterResume: handle.runner.state.pending_dispatch,
-      note: 'idle-until-lease uses long lease in this case; see O5b-style note — not RED',
+      statusAfterLease: handle.runner.state.status,
+      status_reason: handle.runner.state.status_reason,
+      pending_dispatch: handle.runner.state.pending_dispatch,
+      leaseMs: LEASE_MS,
+      note: 'advanced past activityLeaseMs after exact resume; observation only',
     };
   });
 
@@ -1008,15 +1052,60 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
       expect(handle.runner.state.status_reason).toBe(
         terminalCause === 'hard timeout' ? 'hard_timeout_exceeded' : 'operator-stop-during-send',
       );
-
-      observations.D4 = {
-        terminalCause,
-        killSignal: coderSpawns()[0]?.killSignal ?? null,
-        closed: coderSpawns()[0]?.closed ?? null,
-        note: 'late adapter timeout after terminal; no send_timeout event',
-      };
     },
   );
+
+  it('D4: stop while awaiting_resume then late child close', async () => {
+    const runId = 'phaseA-d4';
+    const workspace = path.join(TEST_WF_DIR, 'ws-d4');
+    initGitWorkspace(workspace);
+    scriptedByKind = {
+      planner: [
+        {
+          action: 'complete',
+          text: fence('spawn_subagents', {
+            initial_directive: { goal: 'D4', constraints: [], success_criteria: [], max_attempts: 1 },
+          }),
+        },
+      ],
+      coder: [
+        {
+          action: 'custom',
+          run: (proc) => {
+            // After kill, delay close so stop can run while awaiting_resume.
+            const prevKill = proc.kill;
+            proc.kill = vi.fn((signal?: string) => {
+              prevKill(signal);
+              setTimeout(() => {
+                feedAssistant(proc, 'late close after awaiting_resume stop');
+                closeProc(proc, 0);
+              }, 50);
+            });
+          },
+        },
+      ],
+    };
+    const handle = await startCursorAutoloop(runId, workspace);
+    const chatP = mgr.autoloopChat(runId, 'D4');
+    await waitUntil(() => expect(coderSpawns().length).toBe(1));
+    await vi.advanceTimersByTimeAsync(SEND_MS);
+    await chatP;
+    expect(handle.runner.state.status).toBe('paused');
+    expect(handle.runner.state.status_reason).toMatch(/^awaiting_resume:send_timeout:coder:/);
+    expect(coderSpawns()[0].closed).toBe(false);
+    await mgr.autoloopStop(runId, 'stop-while-awaiting-resume');
+    expect(handle.runner.state.status).toBe('terminated');
+    await tick(50);
+    await waitUntil(() => expect(coderSpawns()[0].closed).toBe(true));
+    observations.D4 = {
+      stoppedWhileAwaitingResume: true,
+      lateClosed: coderSpawns()[0].closed,
+      closeCode: coderSpawns()[0].closeCode,
+      killSignal: coderSpawns()[0].killSignal,
+      finalStatus: handle.runner.state.status,
+      note: 'stop WHILE awaiting_resume, then late close — distinct from O8 stop-during-send',
+    };
+  });
 
   it('O9: Reviewer timeout/resume variants on Cursor engine', async () => {
     const runId = 'phaseA-o9';
@@ -1075,20 +1164,59 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
     expect(readDecisionRows(workspace, runId).filter((r) => r.kind === 'reset_agent')).toHaveLength(0);
 
     // O4a for reviewer: no-option resume is no-op
+    const auditPath = path.join(ledgerDir(workspace, runId), 'decisions.jsonl');
+    const chatPath = path.join(ledgerDir(workspace, runId), 'chat.jsonl');
+    const specPath = path.join(TEST_WF_DIR, runId, 'spec.json');
+    const sentinels = sentinelPaths(workspace);
     const before = {
       status: handle.runner.state.status,
       reason: handle.runner.state.status_reason,
-      pending: JSON.stringify(pending),
+      pending: JSON.stringify(handle.runner.state.pending_dispatch),
       timeout: handle.dispatcher.config.sendTimeoutMs,
+      sends: reviewerSpawns().length,
+      audit: fs.readFileSync(auditPath, 'utf8'),
+      chat: fs.readFileSync(chatPath, 'utf8'),
+      spec: fs.existsSync(specPath) ? fs.readFileSync(specPath, 'utf8') : '',
+      work: sha256File(sentinels.work),
+      evidence: sha256File(sentinels.evidence),
+      activity: handle.runner.state.last_activity_at,
     };
     await expect(mgr.autoloopResume(runId)).resolves.toBe(handle.runner.state);
     expect(handle.runner.state.status).toBe(before.status);
     expect(handle.runner.state.status_reason).toBe(before.reason);
     expect(JSON.stringify(handle.runner.state.pending_dispatch)).toBe(before.pending);
+    expect(handle.runner.state.last_activity_at).toBe(before.activity);
+    expect(fs.readFileSync(auditPath, 'utf8')).toBe(before.audit);
+
+    const resumeWith = (opts: Record<string, unknown>) =>
+      mgr.autoloopResume(
+        runId,
+        opts as unknown as Parameters<InstanceType<typeof SessionManager>['autoloopResume']>[1],
+      );
+    // O4b refusals with byte-level atomicity (equal/decreased/out-of-range/stale-id).
+    for (const override of [
+      { sendTimeoutMs: SEND_MS, pendingDispatchId: pending.dispatch_id },
+      { sendTimeoutMs: SEND_MS - 1, pendingDispatchId: pending.dispatch_id },
+      { sendTimeoutMs: 4_999, pendingDispatchId: pending.dispatch_id },
+      { sendTimeoutMs: 7_200_001, pendingDispatchId: pending.dispatch_id },
+      { sendTimeoutMs: RAISED_MS, pendingDispatchId: 'dispatch_stale_identity' },
+    ]) {
+      await expect(resumeWith(override)).rejects.toThrow();
+      expect(handle.runner.state.status).toBe(before.status);
+      expect(handle.runner.state.status_reason).toBe(before.reason);
+      expect(JSON.stringify(handle.runner.state.pending_dispatch)).toBe(before.pending);
+      expect(handle.dispatcher.config.sendTimeoutMs).toBe(before.timeout);
+      expect(reviewerSpawns()).toHaveLength(before.sends);
+      expect(fs.readFileSync(auditPath, 'utf8')).toBe(before.audit);
+      expect(fs.readFileSync(chatPath, 'utf8')).toBe(before.chat);
+      if (before.spec) expect(fs.readFileSync(specPath, 'utf8')).toBe(before.spec);
+      expect(sha256File(sentinels.work)).toBe(before.work);
+      expect(sha256File(sentinels.evidence)).toBe(before.evidence);
+    }
 
     // O5 for reviewer
-    const auditBefore = fs.readFileSync(path.join(ledgerDir(workspace, runId), 'decisions.jsonl'), 'utf8');
-    const reviewerBefore = reviewerSpawns().length;
+    const auditBefore = before.audit;
+    const reviewerBefore = before.sends;
     await mgr.autoloopResume(runId, {
       sendTimeoutMs: RAISED_MS,
       pendingDispatchId: pending.dispatch_id,
