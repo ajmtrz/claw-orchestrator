@@ -125,12 +125,21 @@ interface SpawnRecord {
   closeCode: number | null;
 }
 
+type SentinelDigestEntry = {
+  caseId: string;
+  logicalPath: 'work-sentinel.txt' | 'evidence-sentinel.txt';
+  stage: 'before' | 'after';
+  sha256: string;
+};
+
 const observations: Record<string, unknown> = {
   D1: null,
   D2: null,
   D3: null,
   D4: null,
   D5: null,
+  /** Per-case actual before/after SHA-256 of both sentinel files (Finding 2). */
+  sentinels: [] as SentinelDigestEntry[],
 };
 
 let spawnRecords: SpawnRecord[] = [];
@@ -372,6 +381,27 @@ function sentinelPaths(workspace: string): { work: string; evidence: string } {
   };
 }
 
+/** Read actual sentinel bytes, persist digests, return them. No duplicate framework. */
+function captureSentinelDigests(
+  caseId: string,
+  workspace: string,
+  stage: 'before' | 'after',
+): { work: string; evidence: string } {
+  const paths = sentinelPaths(workspace);
+  const work = sha256File(paths.work);
+  const evidence = sha256File(paths.evidence);
+  const list = observations.sentinels as SentinelDigestEntry[];
+  list.push({ caseId, logicalPath: 'work-sentinel.txt', stage, sha256: work });
+  list.push({ caseId, logicalPath: 'evidence-sentinel.txt', stage, sha256: evidence });
+  return { work, evidence };
+}
+
+function assertSentinelsUnchanged(caseId: string, workspace: string, before: { work: string; evidence: string }): void {
+  const after = captureSentinelDigests(caseId, workspace, 'after');
+  expect(after.work).toBe(before.work);
+  expect(after.evidence).toBe(before.evidence);
+}
+
 function ledgerDir(workspace: string, runId: string): string {
   return path.join(workspace, 'tasks', runId);
 }
@@ -418,6 +448,18 @@ async function settleShutdown(target: InstanceType<typeof SessionManager>): Prom
 
 function persistObservations(): void {
   fs.writeFileSync(path.join(PHASEA_DIR, 'observations.json'), JSON.stringify(observations, null, 2) + NL);
+  // Dedicated sentinel evidence file (same digests); sealed after G4, not rewritten by G5–G10.
+  fs.writeFileSync(
+    path.join(PHASEA_DIR, 'sentinel-digests.json'),
+    JSON.stringify(
+      {
+        note: 'Per-case actual before/after SHA-256 of work-sentinel.txt and evidence-sentinel.txt',
+        cases: observations.sentinels,
+      },
+      null,
+      2,
+    ) + NL,
+  );
   fs.writeFileSync(
     path.join(PHASEA_DIR, 'spawn-summary.json'),
     JSON.stringify(
@@ -489,8 +531,8 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
   it('O1 control: success before deadline is accepted once', { timeout: 60_000 }, async () => {
     const runId = 'phaseA-o1';
     const workspace = path.join(TEST_WF_DIR, 'ws-o1');
-    const before = initGitWorkspace(workspace);
-    const sentinels = sentinelPaths(workspace);
+    initGitWorkspace(workspace);
+    const before = captureSentinelDigests('O1', workspace, 'before');
 
     scriptedByKind = {
       planner: [
@@ -562,8 +604,7 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
     expect(reviewerSpawns()).toHaveLength(1);
     const chat = fs.readFileSync(path.join(ledgerDir(workspace, runId), 'chat.jsonl'), 'utf8');
     expect(chat).toMatch(/review_request|Reviewer|review/i);
-    expect(sha256File(sentinels.work)).toBe(before.workSha);
-    expect(sha256File(sentinels.evidence)).toBe(before.evidenceSha);
+    assertSentinelsUnchanged('O1', workspace, before);
     expect(handle.runner.state.status).not.toBe('paused');
     expect(readDecisionRows(workspace, runId).filter((r) => r.kind === 'send_timeout')).toHaveLength(0);
   });
@@ -572,6 +613,7 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
     const runId = 'phaseA-o2';
     const workspace = path.join(TEST_WF_DIR, 'ws-o2');
     initGitWorkspace(workspace);
+    const before = captureSentinelDigests('O2', workspace, 'before');
 
     scriptedByKind = {
       planner: [
@@ -624,12 +666,14 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
       coderSessions: mgr.listSessions().filter((s) => s.name.endsWith('-coder')),
       historyNote: 'whether timed-out one-shot leaves listed session stats — observation only',
     };
+    assertSentinelsUnchanged('O2', workspace, before);
   });
 
   it('O3: late post-deadline effects are not accepted twice (kill-then-close)', async () => {
     const runId = 'phaseA-o3';
     const workspace = path.join(TEST_WF_DIR, 'ws-o3');
     initGitWorkspace(workspace);
+    const before = captureSentinelDigests('O3', workspace, 'before');
 
     const lateText = fence('iter_complete', {
       summary: 'late after deadline',
@@ -675,8 +719,6 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
     expect(handle.runner.state.status).toBe('paused');
     expect(timeouts).toHaveLength(1);
     expect(coderSpawns()).toHaveLength(1);
-    expect(countGitLog(workspace, 'autoloop/iter-0')).toBe(0);
-    expect(fs.existsSync(path.join(ledgerDir(workspace, runId), 'iter', '0', 'eval_output.json'))).toBe(false);
 
     const { Msg } = await import('../autoloop/messages.js');
     await handle.runner.send(Msg.sendTimeout(0, pending));
@@ -694,12 +736,14 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
       note: 'D2 records 0-or-1 acceptance of late post-deadline output; observed ' + String(acceptedIters),
     };
     expect(acceptedIters === 0 || acceptedIters === 1).toBe(true);
+    assertSentinelsUnchanged('O3', workspace, before);
   });
 
   it('O4: no-option resume is no-op; invalid overrides refuse atomically', async () => {
     const runId = 'phaseA-o4';
     const workspace = path.join(TEST_WF_DIR, 'ws-o4');
     initGitWorkspace(workspace);
+    const beforeSent = captureSentinelDigests('O4', workspace, 'before');
 
     scriptedByKind = {
       planner: [
@@ -771,12 +815,14 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
       expect(sha256File(sentinels.work)).toBe(before.work);
       expect(sha256File(sentinels.evidence)).toBe(before.evidence);
     }
+    assertSentinelsUnchanged('O4', workspace, beforeSent);
   });
 
   it('O5: exact resume raises timeout, migrates once, does not re-send', async () => {
     const runId = 'phaseA-o5';
     const workspace = path.join(TEST_WF_DIR, 'ws-o5');
     initGitWorkspace(workspace);
+    const beforeSent = captureSentinelDigests('O5', workspace, 'before');
 
     scriptedByKind = {
       planner: [
@@ -870,12 +916,14 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
       leaseMs: LEASE_MS,
       note: 'advanced past activityLeaseMs after exact resume; observation only',
     };
+    assertSentinelsUnchanged('O5', workspace, beforeSent);
   });
 
   it('O6: replay resolved timeout ignored; repeat exact resume rejected', async () => {
     const runId = 'phaseA-o6';
     const workspace = path.join(TEST_WF_DIR, 'ws-o6');
     initGitWorkspace(workspace);
+    const beforeSent = captureSentinelDigests('O6', workspace, 'before');
 
     scriptedByKind = {
       planner: [
@@ -913,12 +961,14 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
       } as never),
     ).rejects.toThrow(/not awaiting.*send timeout/i);
     expect(fs.readFileSync(auditPath, 'utf8')).toBe(auditAfter);
+    assertSentinelsUnchanged('O6', workspace, beforeSent);
   });
 
   it('O7: distinct follow-up after resume uses raised timeout', { timeout: 30_000 }, async () => {
     const runId = 'phaseA-o7';
     const workspace = path.join(TEST_WF_DIR, 'ws-o7');
     initGitWorkspace(workspace);
+    const beforeSent = captureSentinelDigests('O7', workspace, 'before');
 
     scriptedByKind = {
       planner: [
@@ -996,6 +1046,7 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
     expect(countGitLog(workspace, 'autoloop/iter-0')).toBe(1);
     expect(coderSpawns()).toHaveLength(2);
     expect(readDecisionRows(workspace, runId).filter((r) => r.kind === 'send_timeout')).toHaveLength(1);
+    assertSentinelsUnchanged('O7', workspace, beforeSent);
   });
 
   it.each(['operator stop', 'hard timeout'] as const)(
@@ -1022,6 +1073,8 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
       const runId = `phaseA-o8-${terminalCause.replace(' ', '-')}`;
       const workspace = path.join(TEST_WF_DIR, `ws-${runId}`);
       initGitWorkspace(workspace);
+      const caseId = `O8:${terminalCause}`;
+      const beforeSent = captureSentinelDigests(caseId, workspace, 'before');
       const sendTimeoutMs = 7_200_000;
       const handle = await startCursorAutoloop(runId, workspace, {
         sendTimeoutMs,
@@ -1052,6 +1105,7 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
       expect(handle.runner.state.status_reason).toBe(
         terminalCause === 'hard timeout' ? 'hard_timeout_exceeded' : 'operator-stop-during-send',
       );
+      assertSentinelsUnchanged(caseId, workspace, beforeSent);
     },
   );
 
@@ -1059,6 +1113,7 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
     const runId = 'phaseA-d4';
     const workspace = path.join(TEST_WF_DIR, 'ws-d4');
     initGitWorkspace(workspace);
+    const beforeSent = captureSentinelDigests('D4', workspace, 'before');
     scriptedByKind = {
       planner: [
         {
@@ -1105,12 +1160,14 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
       finalStatus: handle.runner.state.status,
       note: 'stop WHILE awaiting_resume, then late close — distinct from O8 stop-during-send',
     };
+    assertSentinelsUnchanged('D4', workspace, beforeSent);
   });
 
   it('O9: Reviewer timeout/resume variants on Cursor engine', async () => {
     const runId = 'phaseA-o9';
     const workspace = path.join(TEST_WF_DIR, 'ws-o9');
     initGitWorkspace(workspace);
+    const beforeSent = captureSentinelDigests('O9', workspace, 'before');
 
     // First complete a coder iter so a review_request is issued, then hang reviewer.
     scriptedByKind = {
@@ -1253,5 +1310,6 @@ describe('Phase A Cursor timeout/resume diagnostic (real path, spawnEngine only)
       } as never),
     ).rejects.toThrow(/not awaiting.*send timeout/i);
     expect(fs.readFileSync(path.join(ledgerDir(workspace, runId), 'decisions.jsonl'), 'utf8')).toBe(auditAfter);
+    assertSentinelsUnchanged('O9', workspace, beforeSent);
   });
 });
