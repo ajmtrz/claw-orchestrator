@@ -1132,7 +1132,7 @@ const plugin = {
             type: 'array',
             maxItems: 16,
             description:
-              'Agent specs: { name, engine?, model?, effort?, prompt?, persona?, baseUrl?, permissionMode?, customEngine? }.',
+              'Agent specs: { name, engine?, model?, effort?, prompt?, persona?, baseUrl?, permissionMode?, sandboxMode?, customEngine? }. permissionMode plan binds Claude only; sandboxMode is engine-agnostic.',
             items: {
               type: 'object',
               properties: {
@@ -1153,6 +1153,18 @@ const plugin = {
                     'Per-agent role instructions prepended to the shared task when no non-empty prompt is supplied.',
                 },
                 baseUrl: { type: 'string' },
+                permissionMode: {
+                  type: 'string',
+                  enum: ['acceptEdits', 'bypassPermissions', 'default', 'manual', 'dontAsk', 'plan', 'auto'],
+                  description:
+                    'Per-agent permission mode (same values as session_start). plan binds Claude only; other engines keep their mapping via permissionModes / defaults.',
+                },
+                sandboxMode: {
+                  type: 'string',
+                  enum: ['read-only', 'workspace-write', 'danger-full-access'],
+                  description:
+                    "Engine-agnostic sandbox policy (same values as session_start). read-only maps to each built-in engine's native plan/read-only mode.",
+                },
               },
               required: ['name'],
             },
