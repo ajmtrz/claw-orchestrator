@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`fanout_start` agents declare `permissionMode` and `sandboxMode`.** Same enums as
+  `session_start`. `permissionMode: plan` binds Claude only; `sandboxMode` is
+  forwarded into each worker session using the selected engine's existing mapping.
+  Synthesis is unchanged and is not constrained by these worker fields.
+
 ## [7.14.0] - 2026-10-25
 
 ### Added

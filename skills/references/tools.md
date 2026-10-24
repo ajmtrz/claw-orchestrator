@@ -359,7 +359,7 @@ Run one task across N engine/model agents **in parallel** and collect their answ
 | ------------------------------------ | ------- | -------- | --------------------------------------------------------------------------------------------------------- |
 | `task`                               | string  | yes      | Shared task sent to every agent, optionally after its `persona`.                                          |
 | `projectDir`                         | string  | yes      | Working directory all agents run in.                                                                      |
-| `agents`                             | array   | yes      | Specs: `{ name, engine?, model?, effort?, prompt?, persona?, baseUrl?, permissionMode?, customEngine? }`. |
+| `agents`                             | array   | yes      | Specs: `{ name, engine?, model?, effort?, prompt?, persona?, baseUrl?, permissionMode?, sandboxMode?, customEngine? }`. |
 | `synthesize`                         | boolean |          | Run a final synthesis pass over the successful results (needs ≥2).                                        |
 | `synthesisModel` / `synthesisEngine` | string  |          | Model/engine for the synthesis pass (default engine `claude`).                                            |
 | `agentTimeoutMs`                     | number  |          | Per-agent timeout (default 600000).                                                                       |
@@ -371,6 +371,14 @@ Each agent's optional `effort` accepts `low`, `medium`, `high`, `xhigh`, `max`,
 `ultra`, or `auto`. Omit it to keep the session default. The selected adapter
 applies or clamps the value as documented for `session_start`; legacy adapters
 that do not map effort retain their existing behavior.
+
+Per-agent `permissionMode` uses the same enum as `session_start`. `plan` binds
+Claude only. Per-agent `sandboxMode` (`read-only` \| `workspace-write` \|
+`danger-full-access`) is forwarded into each worker session (omit to keep the
+session default). Support depends on the selected engine's existing sandbox
+mapping; this is not a universal filesystem isolation guarantee. These worker
+fields do not constrain optional synthesis, and `fanout_start` does not expose a
+synthesis permission override.
 
 Per-agent `persona` provides role instructions without replacing the shared
 task. Fan-out sends `<persona>\n\n## Shared task\n\n<task>`. A non-empty

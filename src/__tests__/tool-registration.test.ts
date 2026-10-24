@@ -340,6 +340,82 @@ describe('plugin tool registration', () => {
       description: expect.stringMatching(/replace.*shared task/i),
     });
   });
+
+  it('exposes permissionMode and sandboxMode on fanout_start agents with session_start enums', () => {
+    const sessionProps = (byName.get('session_start')!.parameters.properties ?? {}) as Record<
+      string,
+      Record<string, unknown>
+    >;
+    const fanoutProps = (
+      byName.get('fanout_start')!.parameters as {
+        properties: {
+          agents: {
+            items: {
+              properties: Record<string, { type?: string; enum?: string[]; description?: string }>;
+            };
+          };
+        };
+      }
+    ).properties.agents.items.properties;
+
+    expect(fanoutProps.permissionMode?.enum).toEqual(sessionProps.permissionMode?.enum);
+    expect(fanoutProps.sandboxMode?.enum).toEqual(sessionProps.sandboxMode?.enum);
+    expect(fanoutProps.permissionMode?.description).toEqual(expect.stringMatching(/claude|plan/i));
+    expect(fanoutProps.sandboxMode?.description).toEqual(expect.stringMatching(/engine-agnostic|read-only/i));
+    expect(
+      String(
+        (byName.get('fanout_start')!.parameters as { properties: { agents: { description?: string } } }).properties
+          .agents.description,
+      ),
+    ).toMatch(/sandboxMode/);
+  });
+
+  it('fanout_start execute forwards per-agent permissionMode and sandboxMode', async () => {
+    const registration = collectRegistration();
+    const tool = registration.tools.find((candidate) => candidate.name === 'fanout_start');
+    expect(tool).toBeDefined();
+    const start = vi.spyOn(SessionManager.prototype, 'fanoutStart').mockResolvedValue({
+      id: 'fanout-perm',
+      status: 'running',
+      results: [],
+    } as never);
+    const previousNoServer = process.env.CLAWO_NO_EMBEDDED_SERVER;
+    process.env.CLAWO_NO_EMBEDDED_SERVER = '1';
+    const projectDir = fs.realpathSync(os.tmpdir());
+    try {
+      await tool!.execute('fanout-perm-contract', {
+        task: 'answer once',
+        projectDir,
+        agents: [
+          {
+            name: 'ro',
+            engine: 'codex',
+            permissionMode: 'plan',
+            sandboxMode: 'read-only',
+          },
+        ],
+      });
+      expect(start).toHaveBeenCalledWith(
+        expect.objectContaining({
+          task: 'answer once',
+          projectDir,
+          agents: [
+            expect.objectContaining({
+              name: 'ro',
+              engine: 'codex',
+              permissionMode: 'plan',
+              sandboxMode: 'read-only',
+            }),
+          ],
+        }),
+      );
+    } finally {
+      registration.services[0]?.stop();
+      start.mockRestore();
+      if (previousNoServer === undefined) delete process.env.CLAWO_NO_EMBEDDED_SERVER;
+      else process.env.CLAWO_NO_EMBEDDED_SERVER = previousNoServer;
+    }
+  });
 });
 
 // The OpenClaw plugin manifest declares the tool contract separately from the
