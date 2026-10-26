@@ -38,6 +38,13 @@ export interface DirectivePayload {
 export interface DirectiveAckPayload {
   understood: boolean;
   clarification?: string;
+  /**
+   * When true on an incomplete-turn ack, Planner handoff must reference the
+   * current-turn `coder_reply.txt` but must not interpolate its body (used when
+   * a structured clarification existed but was oversized/unsafe to reflect).
+   * Optional — absent for ordinary incomplete turns and for safe clarifications.
+   */
+  reply_body_omitted?: boolean;
 }
 
 export interface IterArtifactsPayload {

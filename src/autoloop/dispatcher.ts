@@ -64,7 +64,7 @@ import {
   extractReviewComplete,
   parseAgentReply,
 } from './agent-tools.js';
-import { boundAutoloopReflectedText } from '../sanitize.js';
+import { AUTOLOOP_CLARIFICATION_MAX, AUTOLOOP_CONCLUSION_MAX, boundAutoloopReflectedText } from './reflected-text.js';
 
 /**
  * Character budget for the replayed transcript handed to engines without native
@@ -1001,56 +1001,62 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     }
   }
 
-  /**
-   * Last non-heartbeat Coder row from chat.jsonl, if present. Used only to
-   * surface a bounded conclusion on incomplete turns; the file remains the
-   * durable full-reply reference.
-   */
-  private readLastCoderChatReply(): string | null {
-    try {
-      const chatPath = path.join(this.ledgerDir, 'chat.jsonl');
-      if (!fs.existsSync(chatPath)) return null;
-      const rows = fs.readFileSync(chatPath, 'utf-8').trim().split('\n').filter(Boolean);
-      for (let i = rows.length - 1; i >= 0; i--) {
-        let row: { who?: string; text?: string };
-        try {
-          row = JSON.parse(rows[i]) as { who?: string; text?: string };
-        } catch {
-          continue;
-        }
-        if (row.who !== 'coder' || typeof row.text !== 'string') continue;
-        if (/^🔨 Coder iter \d+ working…$/.test(row.text)) continue;
-        return row.text;
-      }
-    } catch (err) {
-      this.logger.warn?.(`[autoloop] chat.jsonl read for handoff failed: ${(err as Error).message}`);
-    }
-    return null;
+  /** Authoritative current-turn Coder reply path for incomplete / fallback handoffs. */
+  private coderReplyPath(iter: number): string {
+    return path.join(this.ledgerDir, 'iter', String(iter), 'coder_reply.txt');
   }
 
   /**
-   * Planner prompt for directive_ack. Genuine clarifications keep the historical
-   * JSON line. Incomplete turns (understood:false, no clarification field) get
-   * an explicit system handoff plus a bounded conclusion and/or chat.jsonl ref.
+   * Persist the completed Coder turn's authoritative text for handoff. Never
+   * inferred from historical chat rows — callers pass the text from this send.
+   */
+  private writeCurrentCoderReply(iter: number, text: string): string {
+    const replyPath = this.coderReplyPath(iter);
+    fs.mkdirSync(path.dirname(replyPath), { recursive: true });
+    fs.writeFileSync(replyPath, text);
+    return replyPath;
+  }
+
+  /**
+   * Planner prompt for directive_ack. Safe short clarifications keep the
+   * historical JSON line. Incomplete turns (and clarifications that could not
+   * be safely reflected) get an explicit system handoff plus a bounded
+   * conclusion from the current-turn `coder_reply.txt` only.
    */
   private composeDirectiveAckPrompt(iter: number, payload: DirectiveAckPayload): string {
     if (payload.understood === false && payload.clarification === undefined) {
-      const chatAbs = path.join(this.ledgerDir, 'chat.jsonl');
-      const chatRel = path.join('tasks', this.config.runId, 'chat.jsonl');
-      const fullReply = this.readLastCoderChatReply();
-      const bounded = fullReply ? boundAutoloopReflectedText(fullReply) : null;
+      const replyAbs = this.coderReplyPath(iter);
+      const replyRel = path.join('tasks', this.config.runId, 'iter', String(iter), 'coder_reply.txt');
+      let fullReply: string | null = null;
+      try {
+        if (fs.existsSync(replyAbs)) fullReply = fs.readFileSync(replyAbs, 'utf-8');
+      } catch (err) {
+        this.logger.warn?.(`[autoloop] coder_reply.txt read for handoff failed: ${(err as Error).message}`);
+      }
+      const bounded =
+        payload.reply_body_omitted || !fullReply
+          ? null
+          : boundAutoloopReflectedText(fullReply, AUTOLOOP_CONCLUSION_MAX);
       const lines = [
         `[system] Coder turn ended without a valid iter_complete (iter=${iter}). No review was requested and the iteration was not advanced.`,
         'You may: (1) send_directive for the same iteration to continue the existing Coder, (2) ask the user, or (3) stop.',
-        `directive_ack: ${JSON.stringify(payload)}`,
+        `directive_ack: ${JSON.stringify({ understood: payload.understood })}`,
       ];
       if (bounded) {
         lines.push('Coder conclusion (bounded, validated):', bounded);
       } else {
-        lines.push('Coder conclusion omitted (unavailable, oversized, or unsafe to reflect).');
+        lines.push(
+          payload.reply_body_omitted
+            ? 'Coder reply body omitted from prompt (details unsafe or oversized to reflect); use the current-turn reference.'
+            : 'Coder conclusion omitted (unavailable, oversized, or unsafe to reflect).',
+        );
       }
-      lines.push(`Full coder reply reference (readable on disk): ${chatAbs}`);
-      lines.push(`Workspace-relative: ${chatRel}`);
+      if (fullReply !== null) {
+        lines.push(`Full current-turn coder reply reference (readable on disk): ${replyAbs}`);
+        lines.push(`Workspace-relative: ${replyRel}`);
+      } else {
+        lines.push('Full current-turn coder reply reference unavailable (no coder_reply.txt for this turn).');
+      }
       return lines.join('\n');
     }
     return `[system] coder directive_ack iter=${iter}: ${JSON.stringify(payload)}`;
@@ -1341,20 +1347,37 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
 
     const ic = extractIterComplete(parsed.calls);
     if (!ic) {
-      // No valid iter_complete. A structured request_clarification stays on the
-      // historical clarification ack shape. Any other non-empty reply is an
-      // incomplete turn: omit model-sourced clarification so deliverToPlanner
-      // can compose an explicit handoff (and reuse chat.jsonl for the full text).
+      // No valid iter_complete. Persist this send's authoritative text (cleaned
+      // when present, otherwise the raw reply) so handoff never consults a
+      // prior chat row. Malformed tool-only turns still leave identifiable
+      // current-turn evidence even when cleaned_reply is empty.
       await this.maybeCompact('coder', this.coderName);
       const clarificationQ = extractClarification(parsed.calls);
       if (clarificationQ) {
-        const safe = boundAutoloopReflectedText(clarificationQ, 500);
-        return [
-          Msg.directiveAck(env.iter, {
-            understood: false,
-            clarification: safe ?? 'Coder requested clarification (details omitted).',
-          }),
-        ];
+        // Persist the question itself as current-turn details (not the raw fence).
+        this.writeCurrentCoderReply(env.iter, clarificationQ);
+        if (!parsed.cleaned_reply) {
+          this.appendChatEntry({
+            who: 'coder',
+            text: clarificationQ,
+            ts: new Date().toISOString(),
+          });
+        }
+        const safe = boundAutoloopReflectedText(clarificationQ, AUTOLOOP_CLARIFICATION_MAX);
+        if (safe) {
+          return [Msg.directiveAck(env.iter, { understood: false, clarification: safe })];
+        }
+        // Rejected/oversized: incomplete handoff with ref only (no body interpolation).
+        return [Msg.directiveAck(env.iter, { understood: false, reply_body_omitted: true })];
+      }
+      const currentTurnText = parsed.cleaned_reply || replyText;
+      this.writeCurrentCoderReply(env.iter, currentTurnText);
+      if (!parsed.cleaned_reply) {
+        this.appendChatEntry({
+          who: 'coder',
+          text: replyText,
+          ts: new Date().toISOString(),
+        });
       }
       return [Msg.directiveAck(env.iter, { understood: false })];
     }

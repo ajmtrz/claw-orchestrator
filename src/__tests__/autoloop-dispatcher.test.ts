@@ -1160,19 +1160,6 @@ describe('ClaudeAgentDispatcher — partial Coder terminal handoff', () => {
       .map((c) => c[1] as string);
   }
 
-  function lastCoderChatText(ledgerDir: string): string | undefined {
-    const chatPath = path.join(ledgerDir, 'chat.jsonl');
-    if (!fs.existsSync(chatPath)) return undefined;
-    const rows = fs
-      .readFileSync(chatPath, 'utf-8')
-      .trim()
-      .split('\n')
-      .filter(Boolean)
-      .map((l) => JSON.parse(l) as { who: string; text: string });
-    const coderRows = rows.filter((r) => r.who === 'coder' && !/^🔨 Coder iter \d+ working…$/.test(r.text));
-    return coderRows[coderRows.length - 1]?.text;
-  }
-
   it('G1/G2: Planner prompt retains terminal conclusion or readable full-reply ref after incomplete Coder turn', async () => {
     const reply = longIncompleteCoderReply();
     expect(reply.indexOf(TERMINAL_MARKER)).toBeGreaterThan(500);
@@ -1200,21 +1187,13 @@ describe('ClaudeAgentDispatcher — partial Coder terminal handoff', () => {
     expect(plannerPrompt).toMatch(/ask (the )?user/i);
     expect(plannerPrompt).toMatch(/\bstop\b/i);
 
-    const chatPath = path.join(ledgerDir, 'chat.jsonl');
-    expect(fs.existsSync(chatPath)).toBe(true);
-    const persisted = lastCoderChatText(ledgerDir);
-    expect(persisted).toContain(TERMINAL_MARKER);
+    const replyPath = path.join(ledgerDir, 'iter', '0', 'coder_reply.txt');
+    expect(fs.existsSync(replyPath)).toBe(true);
+    expect(fs.readFileSync(replyPath, 'utf-8')).toContain(TERMINAL_MARKER);
 
     const hasInlineConclusion = plannerPrompt.includes(TERMINAL_MARKER);
-    const hasReadableRef =
-      plannerPrompt.includes('chat.jsonl') &&
-      (plannerPrompt.includes(ledgerDir) || plannerPrompt.includes(path.join('tasks', 'r1')));
+    const hasReadableRef = plannerPrompt.includes('coder_reply.txt') && plannerPrompt.includes(replyPath);
     expect(hasInlineConclusion || hasReadableRef).toBe(true);
-
-    if (hasReadableRef && !hasInlineConclusion) {
-      // Reference must resolve to the real persisted reply (not a dangling path).
-      expect(fs.readFileSync(chatPath, 'utf-8')).toContain(TERMINAL_MARKER);
-    }
     // Prefix-only truncation must not be presented as the full conclusion.
     if (plannerPrompt.includes(TERMINAL_MARKER)) {
       expect(plannerPrompt).not.toMatch(new RegExp(`${'A'.repeat(500)}\\s*$`));
@@ -1290,9 +1269,124 @@ describe('ClaudeAgentDispatcher — partial Coder terminal handoff', () => {
       expect(prompt).not.toContain('CONTROL_BEL_MARKER');
       // Full oversized body must not appear; a bounded/generic path + readable ref is required.
       expect(prompt.includes('B'.repeat(12_000))).toBe(false);
-      expect(prompt).toMatch(/chat\.jsonl/);
-      expect(fs.existsSync(path.join(ledgerDir, 'chat.jsonl'))).toBe(true);
+      const replyPath = path.join(ledgerDir, 'iter', '0', 'coder_reply.txt');
+      expect(prompt).toContain('coder_reply.txt');
+      expect(fs.existsSync(replyPath)).toBe(true);
+      expect(fs.readFileSync(replyPath, 'utf-8')).toBe(toxic);
     }
+  });
+
+  it('does not attribute a prior conclusion when the current turn is malformed tool-only (empty cleaned_reply)', async () => {
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: 'OLD_CONCLUSION_UNIQUE' });
+    await dispatcher.spawnSubagents();
+    const d = () => Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 });
+    await dispatcher.deliver(d());
+
+    const malformedOnly =
+      '```autoloop\n' +
+      JSON.stringify({ tool: 'iter_complete', args: null, summary: 'CURRENT_FAILURE_UNIQUE' }) +
+      '\n```';
+    calls.sendMessage.mockResolvedValueOnce({ output: malformedOnly, error: undefined });
+    const acks = await dispatcher.deliver(d());
+    await dispatcher.deliver(acks[0]);
+    const prompt = plannerPrompts(calls).at(-1) ?? '';
+    const replyPath = path.join(ledgerDir, 'iter', '0', 'coder_reply.txt');
+    expect(fs.existsSync(replyPath)).toBe(true);
+    expect(fs.readFileSync(replyPath, 'utf-8')).toContain('CURRENT_FAILURE_UNIQUE');
+    expect(
+      prompt.includes('CURRENT_FAILURE_UNIQUE') ||
+        fs.readFileSync(replyPath, 'utf-8').includes('CURRENT_FAILURE_UNIQUE'),
+    ).toBe(true);
+    expect(prompt).not.toContain('OLD_CONCLUSION_UNIQUE');
+  });
+
+  it('first-turn malformed tool-only handoff never claims a missing current-turn reply', async () => {
+    const malformedOnly =
+      '```autoloop\n' +
+      JSON.stringify({ tool: 'iter_complete', args: null, summary: 'FIRST_TURN_CURRENT_UNIQUE' }) +
+      '\n```';
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: malformedOnly });
+    await dispatcher.spawnSubagents();
+    const acks = await dispatcher.deliver(
+      Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }),
+    );
+    await dispatcher.deliver(acks[0]);
+    const prompt = plannerPrompts(calls).at(-1) ?? '';
+    const replyPath = path.join(ledgerDir, 'iter', '0', 'coder_reply.txt');
+    expect(fs.readFileSync(replyPath, 'utf-8')).toContain('FIRST_TURN_CURRENT_UNIQUE');
+    expect(prompt).toContain('coder_reply.txt');
+    expect(prompt).toContain(replyPath);
+    expect(prompt).not.toMatch(/Full current-turn coder reply reference unavailable/i);
+  });
+
+  it('preserves a short multiline genuine clarification through whitespace normalization', async () => {
+    const question = 'Should I edit the source?\nOr only document it?';
+    const { dispatcher, calls } = makeDispatcher(
+      {},
+      {
+        sendOutput: [question, plannerControl('request_clarification', { question })].join('\n'),
+      },
+    );
+    await dispatcher.spawnSubagents();
+    const acks = await dispatcher.deliver(
+      Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }),
+    );
+    expect(acks[0]).toMatchObject({
+      type: 'directive_ack',
+      payload: {
+        understood: false,
+        clarification: 'Should I edit the source? Or only document it?',
+      },
+    });
+    await dispatcher.deliver(acks[0]);
+    const prompt = plannerPrompts(calls).at(-1) ?? '';
+    expect(prompt).toContain('Should I edit the source?');
+    expect(prompt).not.toMatch(/without (a )?valid iter_complete/i);
+  });
+
+  it('G5 exact bounds, Cf and lone-surrogate rejection for reflected handoff text', async () => {
+    const { boundAutoloopReflectedText, AUTOLOOP_CLARIFICATION_MAX, AUTOLOOP_CONCLUSION_MAX } =
+      await import('../autoloop/reflected-text.js');
+
+    expect(boundAutoloopReflectedText('x'.repeat(AUTOLOOP_CLARIFICATION_MAX), AUTOLOOP_CLARIFICATION_MAX)?.length).toBe(
+      AUTOLOOP_CLARIFICATION_MAX,
+    );
+    expect(
+      boundAutoloopReflectedText('x'.repeat(AUTOLOOP_CLARIFICATION_MAX + 1), AUTOLOOP_CLARIFICATION_MAX),
+    ).toBeNull();
+    expect(boundAutoloopReflectedText('y'.repeat(AUTOLOOP_CONCLUSION_MAX), AUTOLOOP_CONCLUSION_MAX)?.length).toBe(
+      AUTOLOOP_CONCLUSION_MAX,
+    );
+    expect(boundAutoloopReflectedText('y'.repeat(AUTOLOOP_CONCLUSION_MAX + 1), AUTOLOOP_CONCLUSION_MAX)).toBeNull();
+    expect(boundAutoloopReflectedText('ok\u200Bcf')).toBeNull();
+    expect(boundAutoloopReflectedText('ok\u0007bel')).toBeNull();
+    expect(boundAutoloopReflectedText('\uD800')).toBeNull();
+    expect(boundAutoloopReflectedText('ok\uD800')).toBe('ok');
+
+    const oversizedQ = 'Q'.repeat(AUTOLOOP_CLARIFICATION_MAX + 1);
+    const { dispatcher, calls, ledgerDir } = makeDispatcher(
+      {},
+      {
+        sendOutput: plannerControl('request_clarification', { question: oversizedQ }),
+      },
+    );
+    await dispatcher.spawnSubagents();
+    const acks = await dispatcher.deliver(
+      Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }),
+    );
+    expect(acks[0]).toMatchObject({
+      type: 'directive_ack',
+      payload: { understood: false, reply_body_omitted: true },
+    });
+    expect((acks[0] as { payload: { clarification?: string } }).payload.clarification).toBeUndefined();
+    await dispatcher.deliver(acks[0]);
+    const prompt = plannerPrompts(calls).at(-1) ?? '';
+    expect(prompt).not.toContain(oversizedQ);
+    expect(prompt).toMatch(/without (a )?valid iter_complete/i);
+    expect(prompt).toMatch(/omitted from prompt/i);
+    const replyPath = path.join(ledgerDir, 'iter', '0', 'coder_reply.txt');
+    expect(fs.readFileSync(replyPath, 'utf-8')).toBe(oversizedQ);
+    expect(prompt).toContain(replyPath);
   });
 
   it('G4: runner-backed incomplete handoff does not review/advance/duplicate; explicit continuation sends once', async () => {

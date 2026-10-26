@@ -353,14 +353,21 @@ Coder reply is also a phase error. A non-empty Coder reply without a valid
 review or advance the iteration:
 
 - Structured `request_clarification` keeps the historical short clarification
-  ack (`understood: false` + `clarification` question).
+  ack (`understood: false` + `clarification` question). Multiline questions are
+  whitespace-normalized before reflection. If the question is oversized or still
+  contains disallowed controls after normalization, the ack omits `clarification`
+  and uses the incomplete-turn handoff so Planner still gets a readable
+  current-turn reference.
 - Any other incomplete turn builds an explicit Planner handoff: the turn ended
   without `iter_complete`, no review/advance occurred, Planner may
   `send_directive` for the same iteration / ask the user / stop, a bounded
-  validated conclusion when safe to reflect, and a readable ledger
-  `chat.jsonl` reference for the full reply. Oversized or control-bearing text
-  is omitted from the new prompt interpolation (generic wording + reference)
-  rather than truncated and presented as complete.
+  validated conclusion when safe to reflect, and a readable
+  `<ledger>/iter/<n>/coder_reply.txt` written from **this** send (cleaned reply
+  when present, otherwise the raw reply — including malformed tool-only turns
+  with empty `cleaned_reply`). The handoff does not scan `chat.jsonl` for a
+  conclusion. Oversized or control-bearing text is omitted from the new prompt
+  interpolation (generic wording + reference) rather than truncated and
+  presented as complete.
 
 The runner counts consecutive `phase_error`s and:
 
