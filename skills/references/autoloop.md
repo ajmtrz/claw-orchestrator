@@ -348,9 +348,21 @@ compact, through the app-server's own thread compaction.
 Subprocess deaths (Claude session lost), failed `git commit` in an iter, and
 other phase-bound failures surface as `phase_error` messages instead of
 silently masquerading as a "clarification request". An empty or whitespace-only
-Coder reply is also a phase error. Only a non-empty reply without
-`iter_complete` is treated as a clarification request. The runner counts
-consecutive `phase_error`s and:
+Coder reply is also a phase error. A non-empty Coder reply without a valid
+`iter_complete` returns `directive_ack` to Planner and does **not** request
+review or advance the iteration:
+
+- Structured `request_clarification` keeps the historical short clarification
+  ack (`understood: false` + `clarification` question).
+- Any other incomplete turn builds an explicit Planner handoff: the turn ended
+  without `iter_complete`, no review/advance occurred, Planner may
+  `send_directive` for the same iteration / ask the user / stop, a bounded
+  validated conclusion when safe to reflect, and a readable ledger
+  `chat.jsonl` reference for the full reply. Oversized or control-bearing text
+  is omitted from the new prompt interpolation (generic wording + reference)
+  rather than truncated and presented as complete.
+
+The runner counts consecutive `phase_error`s and:
 
 1. Fires `on_phase_error` on each one (defaults to error / both channels).
 2. After `phaseErrorCircuit` consecutive errors (default **3**) emits a

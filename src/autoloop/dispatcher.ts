@@ -39,7 +39,7 @@ import { capturePatch, changedFilesSince } from '../verify/baseline.js';
 import { runContract } from '../verify/runner.js';
 import { writeEvidence } from '../verify/evidence.js';
 import type { AcceptanceContract } from '../verify/contract.js';
-import { type AnyAutoloopMessage, Msg, type SendTimeoutPayload } from './messages.js';
+import { type AnyAutoloopMessage, Msg, type DirectiveAckPayload, type SendTimeoutPayload } from './messages.js';
 import {
   DEFAULT_SEND_TIMEOUT_MS,
   LEDGER_SCHEMA_VERSION,
@@ -57,7 +57,14 @@ import {
   type PlannerToolEffects,
   type SpawnSubagentsArgs,
 } from './planner-tools.js';
-import { extractIterComplete, extractLogMessages, extractReviewComplete, parseAgentReply } from './agent-tools.js';
+import {
+  extractClarification,
+  extractIterComplete,
+  extractLogMessages,
+  extractReviewComplete,
+  parseAgentReply,
+} from './agent-tools.js';
+import { boundAutoloopReflectedText } from '../sanitize.js';
 
 /**
  * Character budget for the replayed transcript handed to engines without native
@@ -994,6 +1001,61 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     }
   }
 
+  /**
+   * Last non-heartbeat Coder row from chat.jsonl, if present. Used only to
+   * surface a bounded conclusion on incomplete turns; the file remains the
+   * durable full-reply reference.
+   */
+  private readLastCoderChatReply(): string | null {
+    try {
+      const chatPath = path.join(this.ledgerDir, 'chat.jsonl');
+      if (!fs.existsSync(chatPath)) return null;
+      const rows = fs.readFileSync(chatPath, 'utf-8').trim().split('\n').filter(Boolean);
+      for (let i = rows.length - 1; i >= 0; i--) {
+        let row: { who?: string; text?: string };
+        try {
+          row = JSON.parse(rows[i]) as { who?: string; text?: string };
+        } catch {
+          continue;
+        }
+        if (row.who !== 'coder' || typeof row.text !== 'string') continue;
+        if (/^🔨 Coder iter \d+ working…$/.test(row.text)) continue;
+        return row.text;
+      }
+    } catch (err) {
+      this.logger.warn?.(`[autoloop] chat.jsonl read for handoff failed: ${(err as Error).message}`);
+    }
+    return null;
+  }
+
+  /**
+   * Planner prompt for directive_ack. Genuine clarifications keep the historical
+   * JSON line. Incomplete turns (understood:false, no clarification field) get
+   * an explicit system handoff plus a bounded conclusion and/or chat.jsonl ref.
+   */
+  private composeDirectiveAckPrompt(iter: number, payload: DirectiveAckPayload): string {
+    if (payload.understood === false && payload.clarification === undefined) {
+      const chatAbs = path.join(this.ledgerDir, 'chat.jsonl');
+      const chatRel = path.join('tasks', this.config.runId, 'chat.jsonl');
+      const fullReply = this.readLastCoderChatReply();
+      const bounded = fullReply ? boundAutoloopReflectedText(fullReply) : null;
+      const lines = [
+        `[system] Coder turn ended without a valid iter_complete (iter=${iter}). No review was requested and the iteration was not advanced.`,
+        'You may: (1) send_directive for the same iteration to continue the existing Coder, (2) ask the user, or (3) stop.',
+        `directive_ack: ${JSON.stringify(payload)}`,
+      ];
+      if (bounded) {
+        lines.push('Coder conclusion (bounded, validated):', bounded);
+      } else {
+        lines.push('Coder conclusion omitted (unavailable, oversized, or unsafe to reflect).');
+      }
+      lines.push(`Full coder reply reference (readable on disk): ${chatAbs}`);
+      lines.push(`Workspace-relative: ${chatRel}`);
+      return lines.join('\n');
+    }
+    return `[system] coder directive_ack iter=${iter}: ${JSON.stringify(payload)}`;
+  }
+
   private async deliverToPlanner(env: AnyAutoloopMessage, dispatchId: string): Promise<AnyAutoloopMessage[]> {
     if (env.type !== 'chat' && env.type !== 'directive_ack' && env.type !== 'iter_done') {
       // Other types (push_user / pause / resume / terminate) are runner-only
@@ -1012,7 +1074,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       // refresh / cross-process / terminated-run reopen.
       this.appendChatEntry({ who: 'user', text: env.payload.text, ts: env.ts });
     } else if (env.type === 'directive_ack') {
-      promptText = `[system] coder directive_ack iter=${env.iter}: ${JSON.stringify(env.payload)}`;
+      promptText = this.composeDirectiveAckPrompt(env.iter, env.payload);
     } else {
       // iter_done
       promptText = `[system] iter ${env.iter} done. verdict=${env.payload.verdict} metric=${env.payload.metric}`;
@@ -1279,15 +1341,22 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
 
     const ic = extractIterComplete(parsed.calls);
     if (!ic) {
-      // No iter_complete emitted — could be a clarification request. Return a
-      // directive_ack so Planner sees it next turn.
+      // No valid iter_complete. A structured request_clarification stays on the
+      // historical clarification ack shape. Any other non-empty reply is an
+      // incomplete turn: omit model-sourced clarification so deliverToPlanner
+      // can compose an explicit handoff (and reuse chat.jsonl for the full text).
       await this.maybeCompact('coder', this.coderName);
-      return [
-        Msg.directiveAck(env.iter, {
-          understood: false,
-          clarification: parsed.cleaned_reply.slice(0, 500),
-        }),
-      ];
+      const clarificationQ = extractClarification(parsed.calls);
+      if (clarificationQ) {
+        const safe = boundAutoloopReflectedText(clarificationQ, 500);
+        return [
+          Msg.directiveAck(env.iter, {
+            understood: false,
+            clarification: safe ?? 'Coder requested clarification (details omitted).',
+          }),
+        ];
+      }
+      return [Msg.directiveAck(env.iter, { understood: false })];
     }
 
     // Persist eval output to ledger.

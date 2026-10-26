@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Incomplete Coder turns without `iter_complete` hand off explicitly to Planner.** A
+  non-empty Coder reply that lacks a valid `iter_complete` no longer arrives as a
+  truncated `clarification` prefix only. Planner receives system wording that the turn
+  ended without `iter_complete`, that review/iteration did not advance, the choices to
+  `send_directive` for the same iteration / ask the user / stop, a bounded validated
+  conclusion when safe, and a readable `chat.jsonl` reference for the full reply.
+  Structured `request_clarification` keeps the existing short clarification ack shape.
+
 ### Added
 
 - **`fanout_start` agents declare `permissionMode` and `sandboxMode`.** Same enums as

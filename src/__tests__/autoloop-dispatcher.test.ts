@@ -1134,3 +1134,239 @@ describe('ClaudeAgentDispatcher — evicted role sessions', () => {
     expect([starts('coder'), starts('reviewer')]).toEqual([2, 2]);
   });
 });
+
+/**
+ * CLAWO-BUG-PARTIAL-CODER-TERMINAL-HANDOFF-20261025
+ *
+ * Authentic offline regression: real ClaudeAgentDispatcher + mocked manager.
+ * Desired Planner prompt semantics must fail on base (lost text after 500 /
+ * missing incomplete-turn handoff) and pass once the handoff is fixed.
+ */
+describe('ClaudeAgentDispatcher — partial Coder terminal handoff', () => {
+  const TERMINAL_MARKER = 'TERMINAL_PARTIAL_NO_FREEZE_CONCLUSION_UNIQUE_9f3c';
+  const PREFIX_PAD = 'A'.repeat(520);
+
+  function longIncompleteCoderReply(): string {
+    return `${PREFIX_PAD}\n${TERMINAL_MARKER}\nPlanner must see this after char 500.`;
+  }
+
+  function coderSendCount(calls: StubCalls): number {
+    return calls.sendMessage.mock.calls.filter((c) => (c[0] as string) === 'autoloop-r1-coder').length;
+  }
+
+  function plannerPrompts(calls: StubCalls): string[] {
+    return calls.sendMessage.mock.calls
+      .filter((c) => (c[0] as string) === 'autoloop-r1-planner')
+      .map((c) => c[1] as string);
+  }
+
+  function lastCoderChatText(ledgerDir: string): string | undefined {
+    const chatPath = path.join(ledgerDir, 'chat.jsonl');
+    if (!fs.existsSync(chatPath)) return undefined;
+    const rows = fs
+      .readFileSync(chatPath, 'utf-8')
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as { who: string; text: string });
+    const coderRows = rows.filter((r) => r.who === 'coder' && !/^🔨 Coder iter \d+ working…$/.test(r.text));
+    return coderRows[coderRows.length - 1]?.text;
+  }
+
+  it('G1/G2: Planner prompt retains terminal conclusion or readable full-reply ref after incomplete Coder turn', async () => {
+    const reply = longIncompleteCoderReply();
+    expect(reply.indexOf(TERMINAL_MARKER)).toBeGreaterThan(500);
+
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: reply });
+    await dispatcher.spawnSubagents();
+
+    const coderReplies = await dispatcher.deliver(
+      Msg.directive(0, { goal: 'ship handoff', constraints: [], success_criteria: [], max_attempts: 1 }),
+    );
+    expect(coderReplies).toHaveLength(1);
+    expect(coderReplies[0].type).toBe('directive_ack');
+    if (coderReplies[0].type !== 'directive_ack') throw new Error('expected directive_ack');
+    expect(coderReplies[0].payload.understood).toBe(false);
+
+    // Deliver the ack through the real Planner prompt path and inspect it.
+    await dispatcher.deliver(coderReplies[0]);
+    const prompts = plannerPrompts(calls);
+    expect(prompts.length).toBeGreaterThanOrEqual(1);
+    const plannerPrompt = prompts[prompts.length - 1];
+
+    expect(plannerPrompt).toMatch(/without (a )?valid iter_complete/i);
+    expect(plannerPrompt).toMatch(/send_directive/i);
+    expect(plannerPrompt).toMatch(/same iter/i);
+    expect(plannerPrompt).toMatch(/ask (the )?user/i);
+    expect(plannerPrompt).toMatch(/\bstop\b/i);
+
+    const chatPath = path.join(ledgerDir, 'chat.jsonl');
+    expect(fs.existsSync(chatPath)).toBe(true);
+    const persisted = lastCoderChatText(ledgerDir);
+    expect(persisted).toContain(TERMINAL_MARKER);
+
+    const hasInlineConclusion = plannerPrompt.includes(TERMINAL_MARKER);
+    const hasReadableRef =
+      plannerPrompt.includes('chat.jsonl') &&
+      (plannerPrompt.includes(ledgerDir) || plannerPrompt.includes(path.join('tasks', 'r1')));
+    expect(hasInlineConclusion || hasReadableRef).toBe(true);
+
+    if (hasReadableRef && !hasInlineConclusion) {
+      // Reference must resolve to the real persisted reply (not a dangling path).
+      expect(fs.readFileSync(chatPath, 'utf-8')).toContain(TERMINAL_MARKER);
+    }
+    // Prefix-only truncation must not be presented as the full conclusion.
+    if (plannerPrompt.includes(TERMINAL_MARKER)) {
+      expect(plannerPrompt).not.toMatch(new RegExp(`${'A'.repeat(500)}\\s*$`));
+    }
+  });
+
+  it('G3: short request_clarification stays a clarification ack without incomplete-turn framing', async () => {
+    const question = 'Should I touch the eval script?';
+    const { dispatcher, calls } = makeDispatcher(
+      {},
+      {
+        sendOutput: ['Need a decision before editing.', plannerControl('request_clarification', { question })].join(
+          '\n',
+        ),
+      },
+    );
+    await dispatcher.spawnSubagents();
+    const acks = await dispatcher.deliver(
+      Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }),
+    );
+    expect(acks[0]).toMatchObject({
+      type: 'directive_ack',
+      payload: { understood: false, clarification: question },
+    });
+    await dispatcher.deliver(acks[0]);
+    const prompt = plannerPrompts(calls).at(-1) ?? '';
+    expect(prompt).toContain(question);
+    expect(prompt).not.toMatch(/without (a )?valid iter_complete/i);
+  });
+
+  it('G3: valid iter_complete still emits iter_artifacts (not an incomplete handoff)', async () => {
+    const { dispatcher, workspace } = makeDispatcher(
+      {},
+      {
+        sendOutput: [
+          'done',
+          plannerControl('iter_complete', {
+            summary: 'noop',
+            eval_output: { metric: 1, gates: [] },
+            files_changed: [],
+          }),
+        ].join('\n'),
+      },
+    );
+    // Workspace must be a git repo for the iter_complete commit path.
+    const { execFileSync } = await import('node:child_process');
+    execFileSync('git', ['init'], { cwd: workspace });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: workspace });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: workspace });
+    execFileSync('git', ['commit', '--allow-empty', '-m', 'base'], { cwd: workspace });
+
+    await dispatcher.spawnSubagents();
+    const out = await dispatcher.deliver(
+      Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }),
+    );
+    expect(out.some((m) => m.type === 'iter_artifacts')).toBe(true);
+    expect(out.some((m) => m.type === 'directive_ack' && m.payload.understood === false)).toBe(false);
+  });
+
+  it('G5: oversized and control-bearing coder text is not newly interpolated into the Planner prompt', async () => {
+    const controlPayload = `safe-prefix\u0007CONTROL_BEL_MARKER\nsuffix`;
+    const oversized = `${'B'.repeat(12_000)}\n${TERMINAL_MARKER}\noversized-tail`;
+
+    for (const toxic of [controlPayload, oversized]) {
+      const { dispatcher, calls, ledgerDir } = makeDispatcher({}, { sendOutput: toxic });
+      await dispatcher.spawnSubagents();
+      const acks = await dispatcher.deliver(
+        Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }),
+      );
+      await dispatcher.deliver(acks[0]);
+      const prompt = plannerPrompts(calls).at(-1) ?? '';
+      expect(prompt).not.toContain('\u0007');
+      expect(prompt).not.toContain('CONTROL_BEL_MARKER');
+      // Full oversized body must not appear; a bounded/generic path + readable ref is required.
+      expect(prompt.includes('B'.repeat(12_000))).toBe(false);
+      expect(prompt).toMatch(/chat\.jsonl/);
+      expect(fs.existsSync(path.join(ledgerDir, 'chat.jsonl'))).toBe(true);
+    }
+  });
+
+  it('G4: runner-backed incomplete handoff does not review/advance/duplicate; explicit continuation sends once', async () => {
+    const { manager, calls } = makeStubManager();
+    const workspace = tmpRoot;
+    const ledgerDir = path.join(workspace, 'tasks', 'r1');
+    const dispatcher = new ClaudeAgentDispatcher({ manager, runId: 'r1', workspace });
+
+    let coderTurns = 0;
+    calls.sendMessage.mockImplementation(async (name: string) => {
+      if (name === 'autoloop-r1-coder') {
+        coderTurns += 1;
+        // Both turns stay incomplete so the runner never enters review/advance;
+        // the assertion is that the second send targets the same pending iter.
+        return {
+          output: `${longIncompleteCoderReply()}\n(coder turn ${coderTurns})`,
+          error: undefined,
+        };
+      }
+      if (name === 'autoloop-r1-planner') {
+        // No tools: incomplete ack must not fabricate progress.
+        return { output: 'acknowledged incomplete handoff', error: undefined };
+      }
+      return { output: '', error: undefined };
+    });
+
+    const deliveredTypes: string[] = [];
+    const runner = new AutoloopRunner({
+      run_id: 'r1',
+      workspace,
+      ledger_dir: ledgerDir,
+      dispatcher,
+      notifyUser: vi.fn(async () => undefined),
+      stallCheckIntervalMs: 24 * 60 * 60 * 1000,
+    });
+    runner.on('message', (env: AnyAutoloopMessage) => {
+      deliveredTypes.push(`${env.from}->${env.to}:${env.type}`);
+    });
+
+    await runner.start();
+    await dispatcher.spawnSubagents();
+
+    await runner.send(
+      Msg.directive(0, { goal: 'incomplete path', constraints: [], success_criteria: [], max_attempts: 1 }),
+    );
+
+    expect(coderSendCount(calls)).toBe(1);
+    expect(deliveredTypes.some((t) => t.includes('review_request'))).toBe(false);
+    expect(deliveredTypes.some((t) => t.includes('iter_artifacts'))).toBe(false);
+    expect(deliveredTypes.some((t) => t.includes('iter_done'))).toBe(false);
+    expect(runner.state.iter).toBe(0);
+    expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'eval_output.json'))).toBe(false);
+
+    const prompts = plannerPrompts(calls);
+    expect(prompts.some((p) => /without (a )?valid iter_complete/i.test(p))).toBe(true);
+
+    const sendsBefore = coderSendCount(calls);
+    const continueDirective = Msg.directive(0, {
+      goal: 'continue same iter',
+      constraints: [],
+      success_criteria: [],
+      max_attempts: 1,
+    });
+    expect(continueDirective.iter).toBe(runner.state.iter);
+    await runner.send(continueDirective);
+    expect(coderSendCount(calls)).toBe(sendsBefore + 1);
+    expect(coderTurns).toBe(2);
+    expect(runner.state.iter).toBe(0);
+    expect(deliveredTypes.filter((t) => t.includes('review_request'))).toEqual([]);
+    // Second incomplete handoff remains resolvable on the Planner path.
+    expect(
+      plannerPrompts(calls).filter((p) => /without (a )?valid iter_complete/i.test(p)).length,
+    ).toBeGreaterThanOrEqual(2);
+
+    runner.stop();
+  });
+});

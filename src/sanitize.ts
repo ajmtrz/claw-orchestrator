@@ -59,6 +59,32 @@ export function boundedErrorReason(err: unknown): string {
   return text;
 }
 
+/**
+ * Max UTF-16 length for untrusted text newly reflected into an Autoloop
+ * Planner handoff prompt. Oversized content is omitted (null) rather than
+ * silently truncated and presented as complete.
+ */
+export const AUTOLOOP_REFLECTED_TEXT_MAX = 2000;
+
+/**
+ * Validate untrusted text before interpolating it into Autoloop prompts/logs.
+ * Returns the redacted string when it is non-empty, within `maxChars`, and free
+ * of Unicode Cc/Cf controls; otherwise null so the caller can use a generic
+ * system message plus a persisted reference.
+ */
+export function boundAutoloopReflectedText(
+  text: string,
+  maxChars: number = AUTOLOOP_REFLECTED_TEXT_MAX,
+): string | null {
+  let t = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  t = sanitizeSecrets(t);
+  if (/[\uD800-\uDBFF]$/.test(t)) t = t.slice(0, -1);
+  if (!t.trim()) return null;
+  if (/[\p{Cc}\p{Cf}]/u.test(t)) return null;
+  if (t.length > maxChars) return null;
+  return t;
+}
+
 export interface SanitizerOptions {
   extraPatterns?: string[];
   label?: string;
