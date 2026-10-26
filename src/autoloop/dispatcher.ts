@@ -64,7 +64,12 @@ import {
   extractReviewComplete,
   parseAgentReply,
 } from './agent-tools.js';
-import { AUTOLOOP_CLARIFICATION_MAX, AUTOLOOP_CONCLUSION_MAX, boundAutoloopReflectedText } from './reflected-text.js';
+import {
+  AUTOLOOP_CLARIFICATION_MAX,
+  AUTOLOOP_CONCLUSION_MAX,
+  AUTOLOOP_EVIDENCE_READ_MAX_BYTES,
+  boundAutoloopReflectedText,
+} from './reflected-text.js';
 
 /**
  * Character budget for the replayed transcript handed to engines without native
@@ -1001,42 +1006,85 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     }
   }
 
-  /** Authoritative current-turn Coder reply path for incomplete / fallback handoffs. */
-  private coderReplyPath(iter: number): string {
-    return path.join(this.ledgerDir, 'iter', String(iter), 'coder_reply.txt');
+  /** Sanitize a system msg_id for use as a single path segment. */
+  private safeReplyFileId(msgId: string): string {
+    const cleaned = msgId.replace(/[^A-Za-z0-9._-]/g, '_');
+    return cleaned.length > 0 ? cleaned.slice(0, 120) : 'unknown';
   }
 
   /**
-   * Persist the completed Coder turn's authoritative text for handoff. Never
-   * inferred from historical chat rows — callers pass the text from this send.
+   * Persist this directive send's authoritative reply under a msg_id-keyed
+   * immutable path so a later same-iteration send cannot overwrite it before
+   * the acknowledgement is consumed.
    */
-  private writeCurrentCoderReply(iter: number, text: string): string {
-    const replyPath = this.coderReplyPath(iter);
-    fs.mkdirSync(path.dirname(replyPath), { recursive: true });
-    fs.writeFileSync(replyPath, text);
-    return replyPath;
+  private writeCurrentCoderReply(iter: number, msgId: string, text: string): string {
+    const rel = path.join(
+      'tasks',
+      this.config.runId,
+      'iter',
+      String(iter),
+      `coder_reply_${this.safeReplyFileId(msgId)}.txt`,
+    );
+    const abs = path.join(this.config.workspace, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, text);
+    return rel;
+  }
+
+  /**
+   * Resolve and validate a system-authored reply_ref. Rejects absolute paths,
+   * traversal, and names outside the send-bound coder_reply_<id>.txt pattern.
+   */
+  private resolveValidatedReplyRef(replyRef: string | undefined): { abs: string; rel: string } | null {
+    if (typeof replyRef !== 'string' || !replyRef) return null;
+    if (path.isAbsolute(replyRef)) return null;
+    const normalized = path.normalize(replyRef);
+    if (normalized.startsWith('..') || normalized.includes(`${path.sep}..`)) return null;
+    const base = path.basename(normalized);
+    if (!/^coder_reply_[A-Za-z0-9._-]{1,120}\.txt$/.test(base)) return null;
+    const abs = path.resolve(this.config.workspace, normalized);
+    const iterRoot = path.resolve(this.ledgerDir, 'iter') + path.sep;
+    if (!abs.startsWith(iterRoot)) return null;
+    return { abs, rel: normalized };
+  }
+
+  /**
+   * Bounded evidence read for prompt reflection. Files larger than the byte
+   * cap are not loaded; the caller keeps the validated reply_ref instead.
+   */
+  private readBoundedReplyEvidence(abs: string): { text: string | null; tooLarge: boolean } {
+    try {
+      if (!fs.existsSync(abs)) return { text: null, tooLarge: false };
+      const size = fs.statSync(abs).size;
+      if (size > AUTOLOOP_EVIDENCE_READ_MAX_BYTES) return { text: null, tooLarge: true };
+      const fd = fs.openSync(abs, 'r');
+      try {
+        const buf = Buffer.alloc(Math.min(size, AUTOLOOP_EVIDENCE_READ_MAX_BYTES));
+        const n = fs.readSync(fd, buf, 0, buf.length, 0);
+        return { text: buf.subarray(0, n).toString('utf8'), tooLarge: false };
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch (err) {
+      this.logger.warn?.(`[autoloop] coder reply evidence read failed: ${(err as Error).message}`);
+      return { text: null, tooLarge: false };
+    }
   }
 
   /**
    * Planner prompt for directive_ack. Safe short clarifications keep the
    * historical JSON line. Incomplete turns (and clarifications that could not
    * be safely reflected) get an explicit system handoff plus a bounded
-   * conclusion from the current-turn `coder_reply.txt` only.
+   * conclusion from this send's msg_id-keyed reply file only.
    */
   private composeDirectiveAckPrompt(iter: number, payload: DirectiveAckPayload): string {
     if (payload.understood === false && payload.clarification === undefined) {
-      const replyAbs = this.coderReplyPath(iter);
-      const replyRel = path.join('tasks', this.config.runId, 'iter', String(iter), 'coder_reply.txt');
-      let fullReply: string | null = null;
-      try {
-        if (fs.existsSync(replyAbs)) fullReply = fs.readFileSync(replyAbs, 'utf-8');
-      } catch (err) {
-        this.logger.warn?.(`[autoloop] coder_reply.txt read for handoff failed: ${(err as Error).message}`);
-      }
+      const resolved = this.resolveValidatedReplyRef(payload.reply_ref);
+      const evidence = resolved ? this.readBoundedReplyEvidence(resolved.abs) : { text: null, tooLarge: false };
       const bounded =
-        payload.reply_body_omitted || !fullReply
+        payload.reply_body_omitted || evidence.tooLarge || !evidence.text
           ? null
-          : boundAutoloopReflectedText(fullReply, AUTOLOOP_CONCLUSION_MAX);
+          : boundAutoloopReflectedText(evidence.text, AUTOLOOP_CONCLUSION_MAX);
       const lines = [
         `[system] Coder turn ended without a valid iter_complete (iter=${iter}). No review was requested and the iteration was not advanced.`,
         'You may: (1) send_directive for the same iteration to continue the existing Coder, (2) ask the user, or (3) stop.',
@@ -1046,16 +1094,16 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         lines.push('Coder conclusion (bounded, validated):', bounded);
       } else {
         lines.push(
-          payload.reply_body_omitted
-            ? 'Coder reply body omitted from prompt (details unsafe or oversized to reflect); use the current-turn reference.'
+          payload.reply_body_omitted || evidence.tooLarge
+            ? 'Coder reply body omitted from prompt (details unsafe, oversized, or too large to load); use the send-bound reference.'
             : 'Coder conclusion omitted (unavailable, oversized, or unsafe to reflect).',
         );
       }
-      if (fullReply !== null) {
-        lines.push(`Full current-turn coder reply reference (readable on disk): ${replyAbs}`);
-        lines.push(`Workspace-relative: ${replyRel}`);
+      if (resolved && fs.existsSync(resolved.abs)) {
+        lines.push(`Full send-bound coder reply reference (readable on disk): ${resolved.abs}`);
+        lines.push(`Workspace-relative: ${resolved.rel}`);
       } else {
-        lines.push('Full current-turn coder reply reference unavailable (no coder_reply.txt for this turn).');
+        lines.push('Full send-bound coder reply reference unavailable for this acknowledgement.');
       }
       return lines.join('\n');
     }
@@ -1354,8 +1402,8 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       await this.maybeCompact('coder', this.coderName);
       const clarificationQ = extractClarification(parsed.calls);
       if (clarificationQ) {
-        // Persist the question itself as current-turn details (not the raw fence).
-        this.writeCurrentCoderReply(env.iter, clarificationQ);
+        // Persist the question itself under this directive's msg_id (not the raw fence).
+        const replyRef = this.writeCurrentCoderReply(env.iter, env.msg_id, clarificationQ);
         if (!parsed.cleaned_reply) {
           this.appendChatEntry({
             who: 'coder',
@@ -1365,13 +1413,19 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         }
         const safe = boundAutoloopReflectedText(clarificationQ, AUTOLOOP_CLARIFICATION_MAX);
         if (safe) {
-          return [Msg.directiveAck(env.iter, { understood: false, clarification: safe })];
+          return [Msg.directiveAck(env.iter, { understood: false, clarification: safe, reply_ref: replyRef })];
         }
-        // Rejected/oversized: incomplete handoff with ref only (no body interpolation).
-        return [Msg.directiveAck(env.iter, { understood: false, reply_body_omitted: true })];
+        // Rejected/oversized: incomplete handoff with send-bound ref only.
+        return [
+          Msg.directiveAck(env.iter, {
+            understood: false,
+            reply_body_omitted: true,
+            reply_ref: replyRef,
+          }),
+        ];
       }
       const currentTurnText = parsed.cleaned_reply || replyText;
-      this.writeCurrentCoderReply(env.iter, currentTurnText);
+      const replyRef = this.writeCurrentCoderReply(env.iter, env.msg_id, currentTurnText);
       if (!parsed.cleaned_reply) {
         this.appendChatEntry({
           who: 'coder',
@@ -1379,7 +1433,16 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
           ts: new Date().toISOString(),
         });
       }
-      return [Msg.directiveAck(env.iter, { understood: false })];
+      // Validate the in-memory send text: UTF-8 persistence may coerce unpaired
+      // surrogates, so omit body whenever this send's text is not reflectable.
+      const reflectable = boundAutoloopReflectedText(currentTurnText, AUTOLOOP_CONCLUSION_MAX);
+      return [
+        Msg.directiveAck(env.iter, {
+          understood: false,
+          reply_ref: replyRef,
+          ...(reflectable ? {} : { reply_body_omitted: true }),
+        }),
+      ];
     }
 
     // Persist eval output to ledger.

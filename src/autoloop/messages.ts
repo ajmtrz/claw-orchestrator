@@ -40,11 +40,17 @@ export interface DirectiveAckPayload {
   clarification?: string;
   /**
    * When true on an incomplete-turn ack, Planner handoff must reference the
-   * current-turn `coder_reply.txt` but must not interpolate its body (used when
-   * a structured clarification existed but was oversized/unsafe to reflect).
+   * send-bound reply file but must not interpolate its body (used when a
+   * structured clarification existed but was oversized/unsafe to reflect).
    * Optional — absent for ordinary incomplete turns and for safe clarifications.
    */
   reply_body_omitted?: boolean;
+  /**
+   * Workspace-relative path to this send's immutable reply evidence
+   * (`tasks/<run>/iter/<n>/coder_reply_<msg_id>.txt`). Written by the dispatcher
+   * from the directive's system `msg_id`; optional so historical consumers ignore it.
+   */
+  reply_ref?: string;
 }
 
 export interface IterArtifactsPayload {
