@@ -17,7 +17,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Structured `request_clarification` keeps the short clarification ack.
 
 ### Added
-### Added
 
 - **`fanout_start` agents declare `permissionMode` and `sandboxMode`.** Same enums as
   `session_start`. `permissionMode` uses each engine's own permission handling as in
