@@ -1006,25 +1006,15 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     }
   }
 
-  /** Sanitize a system msg_id for use as a single path segment. */
-  private safeReplyFileId(msgId: string): string {
-    const cleaned = msgId.replace(/[^A-Za-z0-9._-]/g, '_');
-    return cleaned.length > 0 ? cleaned.slice(0, 120) : 'unknown';
-  }
-
   /**
-   * Persist this directive send's authoritative reply under a msg_id-keyed
-   * immutable path so a later same-iteration send cannot overwrite it before
-   * the acknowledgement is consumed.
+   * Persist this directive send's authoritative reply under the existing
+   * collision-resistant dispatchId so distinct accepted msg_ids (e.g.
+   * `logical:turn` vs `logical/turn`) never share evidence, and a later
+   * same-iteration send cannot overwrite an earlier acknowledgement's file.
    */
-  private writeCurrentCoderReply(iter: number, msgId: string, text: string): string {
-    const rel = path.join(
-      'tasks',
-      this.config.runId,
-      'iter',
-      String(iter),
-      `coder_reply_${this.safeReplyFileId(msgId)}.txt`,
-    );
+  private writeCurrentCoderReply(iter: number, dispatchId: string, text: string): string {
+    // dispatchId is already `dispatch_` + hex — filesystem-safe, injective.
+    const rel = path.join('tasks', this.config.runId, 'iter', String(iter), `coder_reply_${dispatchId}.txt`);
     const abs = path.join(this.config.workspace, rel);
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, text);
@@ -1033,7 +1023,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
 
   /**
    * Resolve and validate a system-authored reply_ref. Rejects absolute paths,
-   * traversal, and names outside the send-bound coder_reply_<id>.txt pattern.
+   * traversal, and names outside the send-bound coder_reply_<dispatch_id>.txt pattern.
    */
   private resolveValidatedReplyRef(replyRef: string | undefined): { abs: string; rel: string } | null {
     if (typeof replyRef !== 'string' || !replyRef) return null;
@@ -1041,7 +1031,8 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     const normalized = path.normalize(replyRef);
     if (normalized.startsWith('..') || normalized.includes(`${path.sep}..`)) return null;
     const base = path.basename(normalized);
-    if (!/^coder_reply_[A-Za-z0-9._-]{1,120}\.txt$/.test(base)) return null;
+    // dispatch_<64 hex> → coder_reply_dispatch_<64hex>.txt
+    if (!/^coder_reply_dispatch_[a-f0-9]{64}\.txt$/.test(base)) return null;
     const abs = path.resolve(this.config.workspace, normalized);
     const iterRoot = path.resolve(this.ledgerDir, 'iter') + path.sep;
     if (!abs.startsWith(iterRoot)) return null;
@@ -1049,25 +1040,28 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   }
 
   /**
-   * Bounded evidence read for prompt reflection. Files larger than the byte
-   * cap are not loaded; the caller keeps the validated reply_ref instead.
+   * Bounded evidence access for prompt reflection. Distinguishes intentional
+   * oversized omission (stat succeeded) from missing or unreadable files —
+   * existence alone is not treated as proof of readability.
    */
-  private readBoundedReplyEvidence(abs: string): { text: string | null; tooLarge: boolean } {
+  private readBoundedReplyEvidence(
+    abs: string,
+  ): { status: 'loaded'; text: string } | { status: 'too_large' } | { status: 'missing' } | { status: 'unreadable' } {
     try {
-      if (!fs.existsSync(abs)) return { text: null, tooLarge: false };
+      if (!fs.existsSync(abs)) return { status: 'missing' };
       const size = fs.statSync(abs).size;
-      if (size > AUTOLOOP_EVIDENCE_READ_MAX_BYTES) return { text: null, tooLarge: true };
+      if (size > AUTOLOOP_EVIDENCE_READ_MAX_BYTES) return { status: 'too_large' };
       const fd = fs.openSync(abs, 'r');
       try {
         const buf = Buffer.alloc(Math.min(size, AUTOLOOP_EVIDENCE_READ_MAX_BYTES));
         const n = fs.readSync(fd, buf, 0, buf.length, 0);
-        return { text: buf.subarray(0, n).toString('utf8'), tooLarge: false };
+        return { status: 'loaded', text: buf.subarray(0, n).toString('utf8') };
       } finally {
         fs.closeSync(fd);
       }
     } catch (err) {
       this.logger.warn?.(`[autoloop] coder reply evidence read failed: ${(err as Error).message}`);
-      return { text: null, tooLarge: false };
+      return { status: 'unreadable' };
     }
   }
 
@@ -1075,16 +1069,17 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
    * Planner prompt for directive_ack. Safe short clarifications keep the
    * historical JSON line. Incomplete turns (and clarifications that could not
    * be safely reflected) get an explicit system handoff plus a bounded
-   * conclusion from this send's msg_id-keyed reply file only.
+   * conclusion from this send's dispatchId-keyed reply file only.
    */
   private composeDirectiveAckPrompt(iter: number, payload: DirectiveAckPayload): string {
     if (payload.understood === false && payload.clarification === undefined) {
       const resolved = this.resolveValidatedReplyRef(payload.reply_ref);
-      const evidence = resolved ? this.readBoundedReplyEvidence(resolved.abs) : { text: null, tooLarge: false };
+      const evidence = resolved ? this.readBoundedReplyEvidence(resolved.abs) : ({ status: 'missing' } as const);
+      const loadedText = evidence.status === 'loaded' ? evidence.text : null;
       const bounded =
-        payload.reply_body_omitted || evidence.tooLarge || !evidence.text
+        payload.reply_body_omitted || evidence.status === 'too_large' || !loadedText
           ? null
-          : boundAutoloopReflectedText(evidence.text, AUTOLOOP_CONCLUSION_MAX);
+          : boundAutoloopReflectedText(loadedText, AUTOLOOP_CONCLUSION_MAX);
       const lines = [
         `[system] Coder turn ended without a valid iter_complete (iter=${iter}). No review was requested and the iteration was not advanced.`,
         'You may: (1) send_directive for the same iteration to continue the existing Coder, (2) ask the user, or (3) stop.',
@@ -1092,16 +1087,27 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       ];
       if (bounded) {
         lines.push('Coder conclusion (bounded, validated):', bounded);
-      } else {
+      } else if (payload.reply_body_omitted || evidence.status === 'too_large') {
         lines.push(
-          payload.reply_body_omitted || evidence.tooLarge
-            ? 'Coder reply body omitted from prompt (details unsafe, oversized, or too large to load); use the send-bound reference.'
-            : 'Coder conclusion omitted (unavailable, oversized, or unsafe to reflect).',
+          'Coder reply body omitted from prompt (details unsafe, oversized, or too large to load for inline reflection).',
         );
+      } else {
+        lines.push('Coder conclusion omitted (unavailable, oversized, or unsafe to reflect).');
       }
-      if (resolved && fs.existsSync(resolved.abs)) {
+      // Only advertise a readable reference after a successful access check
+      // (loaded body, or intentional too_large after successful stat).
+      if (resolved && (evidence.status === 'loaded' || evidence.status === 'too_large')) {
         lines.push(`Full send-bound coder reply reference (readable on disk): ${resolved.abs}`);
         lines.push(`Workspace-relative: ${resolved.rel}`);
+        if (evidence.status === 'too_large') {
+          lines.push(
+            'Inline body skipped because the evidence file exceeds the bounded read cap; the file itself remains readable at the reference above.',
+          );
+        }
+      } else if (evidence.status === 'unreadable') {
+        lines.push(
+          'Full send-bound coder reply evidence exists but could not be read (permission or I/O failure); reference not advertised as readable.',
+        );
       } else {
         lines.push('Full send-bound coder reply reference unavailable for this acknowledgement.');
       }
@@ -1402,8 +1408,8 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       await this.maybeCompact('coder', this.coderName);
       const clarificationQ = extractClarification(parsed.calls);
       if (clarificationQ) {
-        // Persist the question itself under this directive's msg_id (not the raw fence).
-        const replyRef = this.writeCurrentCoderReply(env.iter, env.msg_id, clarificationQ);
+        // Persist the question under this send's dispatchId (not the raw fence).
+        const replyRef = this.writeCurrentCoderReply(env.iter, dispatchId, clarificationQ);
         if (!parsed.cleaned_reply) {
           this.appendChatEntry({
             who: 'coder',
@@ -1425,7 +1431,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         ];
       }
       const currentTurnText = parsed.cleaned_reply || replyText;
-      const replyRef = this.writeCurrentCoderReply(env.iter, env.msg_id, currentTurnText);
+      const replyRef = this.writeCurrentCoderReply(env.iter, dispatchId, currentTurnText);
       if (!parsed.cleaned_reply) {
         this.appendChatEntry({
           who: 'coder',

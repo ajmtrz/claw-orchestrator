@@ -1582,4 +1582,104 @@ describe('ClaudeAgentDispatcher — partial Coder terminal handoff', () => {
 
     runner.stop();
   });
+
+  it('keeps distinct accepted message identities mapped to distinct immutable evidence', async () => {
+    const { dispatcher, calls, workspace } = makeDispatcher(
+      {},
+      { sendOutputs: ['FIRST_DISTINCT_REPLY', 'SECOND_DISTINCT_REPLY'] },
+    );
+    await dispatcher.spawnSubagents();
+    const makeD = (id: string) =>
+      fixedIdentity(Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }), id);
+    // Colon vs slash would collide under underscore sanitization; dispatchId must not.
+    const first = await dispatcher.deliver(makeD('logical:turn'));
+    const second = await dispatcher.deliver(makeD('logical/turn'));
+    expect(calls.sendMessage.mock.calls.filter((c) => c[0] === 'autoloop-r1-coder')).toHaveLength(2);
+    await dispatcher.deliver(first[0]);
+    const refs = [first[0], second[0]].map((m) => (m as { payload: { reply_ref: string } }).payload.reply_ref);
+    expect(refs[0]).not.toBe(refs[1]);
+    expect(fs.readFileSync(path.join(workspace, refs[0]), 'utf8')).toBe('FIRST_DISTINCT_REPLY');
+    expect(fs.readFileSync(path.join(workspace, refs[1]), 'utf8')).toBe('SECOND_DISTINCT_REPLY');
+    const prompt = plannerPrompts(calls).at(-1) ?? '';
+    expect(prompt).toContain('FIRST_DISTINCT_REPLY');
+    expect(prompt).not.toContain('SECOND_DISTINCT_REPLY');
+    expect(prompt).toContain(refs[0]);
+  });
+
+  it('does not advertise unreadable reply evidence as readable', async () => {
+    const { dispatcher, calls, workspace } = makeDispatcher({}, { sendOutput: 'REPLY_NEEDING_READABLE_REFERENCE' });
+    await dispatcher.spawnSubagents();
+    const acks = await dispatcher.deliver(
+      Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }),
+    );
+    const ref = (acks[0] as { payload: { reply_ref: string } }).payload.reply_ref;
+    const replyPath = path.join(workspace, ref);
+    fs.chmodSync(replyPath, 0o000);
+    try {
+      expect(() => fs.readFileSync(replyPath, 'utf8')).toThrow();
+      await dispatcher.deliver(acks[0]);
+      const prompt = plannerPrompts(calls).at(-1) ?? '';
+      expect(prompt).toMatch(/without (a )?valid iter_complete/i);
+      expect(prompt).toMatch(/send_directive/i);
+      expect(prompt).not.toContain('(readable on disk)');
+      expect(prompt).toMatch(/could not be read/i);
+    } finally {
+      fs.chmodSync(replyPath, 0o600);
+    }
+  });
+
+  it('reports missing evidence without claiming a readable reference', async () => {
+    const { dispatcher, calls, workspace } = makeDispatcher({}, { sendOutput: 'WILL_DELETE_EVIDENCE' });
+    await dispatcher.spawnSubagents();
+    const acks = await dispatcher.deliver(
+      Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }),
+    );
+    const ref = (acks[0] as { payload: { reply_ref: string } }).payload.reply_ref;
+    fs.unlinkSync(path.join(workspace, ref));
+    await dispatcher.deliver(acks[0]);
+    const prompt = plannerPrompts(calls).at(-1) ?? '';
+    expect(prompt).toMatch(/without (a )?valid iter_complete/i);
+    expect(prompt).not.toContain('(readable on disk)');
+    expect(prompt).toMatch(/unavailable/i);
+  });
+
+  it('keeps oversized and malformed-only queued replies associated after later sends', async () => {
+    const large = 'L'.repeat(9000) + 'FIRST_LARGE_TAIL';
+    const malformed =
+      '```autoloop\n' +
+      JSON.stringify({ tool: 'iter_complete', args: null, summary: 'SECOND_MALFORMED_REPLY' }) +
+      '\n```';
+    const { dispatcher, calls, workspace } = makeDispatcher({}, { sendOutputs: [large, malformed] });
+    await dispatcher.spawnSubagents();
+    const d = () => Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 });
+    const first = await dispatcher.deliver(d());
+    const second = await dispatcher.deliver(d());
+    await dispatcher.deliver(first[0]);
+    await dispatcher.deliver(second[0]);
+    const refs = [first[0], second[0]].map((m) => (m as { payload: { reply_ref: string } }).payload.reply_ref);
+    expect(refs[0]).not.toBe(refs[1]);
+    expect(fs.readFileSync(path.join(workspace, refs[0]), 'utf8')).toBe(large);
+    expect(fs.readFileSync(path.join(workspace, refs[1]), 'utf8')).toBe(malformed);
+    const prompts = plannerPrompts(calls);
+    expect(prompts[0]).toContain(refs[0]);
+    expect(prompts[0]).toContain('(readable on disk)');
+    expect(prompts[0]).not.toContain('FIRST_LARGE_TAIL');
+    expect(prompts[1]).toContain(refs[1]);
+    expect(prompts[1]).not.toContain('FIRST_LARGE_TAIL');
+  });
+
+  it('maps long accepted IDs with a common prefix to distinct dispatch-bound evidence', async () => {
+    const idA = `logical-prefix-${'a'.repeat(140)}`;
+    const idB = `logical-prefix-${'b'.repeat(140)}`;
+    const { dispatcher, workspace } = makeDispatcher({}, { sendOutputs: ['LONG_ID_REPLY_A', 'LONG_ID_REPLY_B'] });
+    await dispatcher.spawnSubagents();
+    const makeD = (id: string) =>
+      fixedIdentity(Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }), id);
+    const first = await dispatcher.deliver(makeD(idA));
+    const second = await dispatcher.deliver(makeD(idB));
+    const refs = [first[0], second[0]].map((m) => (m as { payload: { reply_ref: string } }).payload.reply_ref);
+    expect(refs[0]).not.toBe(refs[1]);
+    expect(fs.readFileSync(path.join(workspace, refs[0]), 'utf8')).toBe('LONG_ID_REPLY_A');
+    expect(fs.readFileSync(path.join(workspace, refs[1]), 'utf8')).toBe('LONG_ID_REPLY_B');
+  });
 });

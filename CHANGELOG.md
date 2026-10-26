@@ -14,12 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   truncated `clarification` prefix only. Planner receives system wording that the turn
   ended without `iter_complete`, that review/iteration did not advance, the choices to
   `send_directive` for the same iteration / ask the user / stop, a bounded validated
-  conclusion when safe, and a send-bound `iter/<n>/coder_reply_<msg_id>.txt` reference
-  on optional `reply_ref`. Structured `request_clarification` keeps the short
-  clarification ack shape (multiline whitespace-normalized); rejected/oversized or
-  malformed-UTF-16 questions use `reply_body_omitted` with that send-bound reference.
-  Unpaired UTF-16 surrogates are rejected at every position; evidence reads for prompt
-  reflection are byte-bounded.
+  conclusion when safe, and a send-bound `iter/<n>/coder_reply_<dispatch_id>.txt`
+  reference on optional `reply_ref` (reuses the existing collision-resistant dispatch
+  identity). Structured `request_clarification` keeps the short clarification ack
+  shape (multiline whitespace-normalized); rejected/oversized or malformed-UTF-16
+  questions use `reply_body_omitted` with that send-bound reference. Unpaired UTF-16
+  surrogates are rejected at every position; evidence reads are byte-bounded and
+  references are advertised as readable only after a successful access check.
 
 ### Added
 

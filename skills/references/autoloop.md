@@ -362,14 +362,17 @@ review or advance the iteration:
   without `iter_complete`, no review/advance occurred, Planner may
   `send_directive` for the same iteration / ask the user / stop, a bounded
   validated conclusion when safe to reflect, and a readable
-  `<ledger>/iter/<n>/coder_reply_<directive_msg_id>.txt` written from **this**
-  send (cleaned reply when present, otherwise the raw reply — including
-  malformed tool-only turns with empty `cleaned_reply`). The path is carried on
-  optional `reply_ref` so a later same-iteration send cannot overwrite another
-  acknowledgement's evidence. The handoff does not scan `chat.jsonl`. Prompt
-  evidence reads are byte-capped; oversized or control-bearing / unpaired
-  UTF-16 text is omitted from new prompt interpolation (generic wording +
-  reference) rather than truncated and presented as complete.
+  `<ledger>/iter/<n>/coder_reply_<dispatch_id>.txt` written from **this** send
+  (cleaned reply when present, otherwise the raw reply — including malformed
+  tool-only turns with empty `cleaned_reply`). The path uses the existing
+  collision-resistant dispatch identity and is carried on optional `reply_ref`,
+  so distinct accepted message IDs and later same-iteration sends cannot share
+  or overwrite another acknowledgement's evidence. The handoff does not scan
+  `chat.jsonl`. Prompt evidence reads are byte-capped; a reference is labeled
+  readable only after a successful access check (loaded or intentionally
+  oversized after `stat`). Failed/missing reads report evidence unavailable
+  without claiming readability. Oversized or control-bearing / unpaired UTF-16
+  text is omitted from new prompt interpolation rather than truncated as complete.
 
 The runner counts consecutive `phase_error`s and:
 

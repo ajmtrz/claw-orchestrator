@@ -47,8 +47,9 @@ export interface DirectiveAckPayload {
   reply_body_omitted?: boolean;
   /**
    * Workspace-relative path to this send's immutable reply evidence
-   * (`tasks/<run>/iter/<n>/coder_reply_<msg_id>.txt`). Written by the dispatcher
-   * from the directive's system `msg_id`; optional so historical consumers ignore it.
+   * (`tasks/<run>/iter/<n>/coder_reply_<dispatch_id>.txt`). Written by the
+   * dispatcher from the existing collision-resistant dispatch identity; optional
+   * so historical consumers ignore it.
    */
   reply_ref?: string;
 }
