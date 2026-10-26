@@ -369,10 +369,11 @@ review or advance the iteration:
   so distinct accepted message IDs and later same-iteration sends cannot share
   or overwrite another acknowledgement's evidence. The handoff does not scan
   `chat.jsonl`. Prompt evidence reads are byte-capped; a reference is labeled
-  readable only after a successful access check (loaded or intentionally
-  oversized after `stat`). Failed/missing reads report evidence unavailable
-  without claiming readability. Oversized or control-bearing / unpaired UTF-16
-  text is omitted from new prompt interpolation rather than truncated as complete.
+  readable only after a successful open and bounded read (full load, or a
+  1-byte peek when the file exceeds the read cap). `stat`/existence alone is
+  not enough. Failed/missing reads report evidence unavailable without claiming
+  readability. Oversized or control-bearing / unpaired UTF-16 text is omitted
+  from new prompt interpolation rather than truncated as complete.
 
 The runner counts consecutive `phase_error`s and:
 

@@ -1682,4 +1682,44 @@ describe('ClaudeAgentDispatcher — partial Coder terminal handoff', () => {
     expect(fs.readFileSync(path.join(workspace, refs[0]), 'utf8')).toBe('LONG_ID_REPLY_A');
     expect(fs.readFileSync(path.join(workspace, refs[1]), 'utf8')).toBe('LONG_ID_REPLY_B');
   });
+
+  it('never labels unreadable evidence readable, including bodies beyond the read cap', async () => {
+    for (const text of ['SMALL_UNREADABLE_BODY', `${'X'.repeat(9000)}LARGE_UNREADABLE_TAIL`]) {
+      const { dispatcher, calls, workspace } = makeDispatcher({}, { sendOutput: text });
+      await dispatcher.spawnSubagents();
+      const acks = await dispatcher.deliver(
+        Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }),
+      );
+      const ref = (acks[0] as { payload: { reply_ref: string } }).payload.reply_ref;
+      const replyPath = path.join(workspace, ref);
+      fs.chmodSync(replyPath, 0o000);
+      try {
+        expect(() => fs.readFileSync(replyPath, 'utf8')).toThrow();
+        await dispatcher.deliver(acks[0]);
+        const prompt = plannerPrompts(calls).at(-1) ?? '';
+        expect(prompt).toMatch(/without (a )?valid iter_complete/i);
+        expect(prompt).not.toContain('(readable on disk)');
+        expect(prompt).not.toContain('file itself remains readable');
+        expect(prompt).toMatch(/could not be read/i);
+      } finally {
+        fs.chmodSync(replyPath, 0o600);
+      }
+    }
+  });
+
+  it('retains evidence for long accepted IDs with an identical 140-character prefix', async () => {
+    const { dispatcher, workspace } = makeDispatcher({}, { sendOutputs: ['PREFIX_REPLY_A', 'PREFIX_REPLY_B'] });
+    await dispatcher.spawnSubagents();
+    const d = (suffix: string) =>
+      fixedIdentity(
+        Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }),
+        `${'p'.repeat(140)}${suffix}`,
+      );
+    const first = await dispatcher.deliver(d('a'));
+    const second = await dispatcher.deliver(d('b'));
+    const refs = [first[0], second[0]].map((m) => (m as { payload: { reply_ref: string } }).payload.reply_ref);
+    expect(refs[0]).not.toBe(refs[1]);
+    expect(fs.readFileSync(path.join(workspace, refs[0]), 'utf8')).toBe('PREFIX_REPLY_A');
+    expect(fs.readFileSync(path.join(workspace, refs[1]), 'utf8')).toBe('PREFIX_REPLY_B');
+  });
 });

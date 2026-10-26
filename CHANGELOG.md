@@ -20,7 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shape (multiline whitespace-normalized); rejected/oversized or malformed-UTF-16
   questions use `reply_body_omitted` with that send-bound reference. Unpaired UTF-16
   surrogates are rejected at every position; evidence reads are byte-bounded and
-  references are advertised as readable only after a successful access check.
+  references are advertised as readable only after a successful open/bounded
+  read (including a 1-byte peek for oversized files — not `stat` alone).
 
 ### Added
 

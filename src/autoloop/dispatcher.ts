@@ -1040,9 +1040,9 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   }
 
   /**
-   * Bounded evidence access for prompt reflection. Distinguishes intentional
-   * oversized omission (stat succeeded) from missing or unreadable files —
-   * existence alone is not treated as proof of readability.
+   * Bounded evidence access for prompt reflection. Every size branch opens the
+   * file and performs a bounded read before reporting access — `stat`/existence
+   * alone is never treated as proof of readability. Descriptors are always closed.
    */
   private readBoundedReplyEvidence(
     abs: string,
@@ -1050,9 +1050,14 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     try {
       if (!fs.existsSync(abs)) return { status: 'missing' };
       const size = fs.statSync(abs).size;
-      if (size > AUTOLOOP_EVIDENCE_READ_MAX_BYTES) return { status: 'too_large' };
       const fd = fs.openSync(abs, 'r');
       try {
+        if (size > AUTOLOOP_EVIDENCE_READ_MAX_BYTES) {
+          // Prove read access with a 1-byte peek; do not allocate/load the body.
+          const peek = Buffer.alloc(1);
+          fs.readSync(fd, peek, 0, 1, 0);
+          return { status: 'too_large' };
+        }
         const buf = Buffer.alloc(Math.min(size, AUTOLOOP_EVIDENCE_READ_MAX_BYTES));
         const n = fs.readSync(fd, buf, 0, buf.length, 0);
         return { status: 'loaded', text: buf.subarray(0, n).toString('utf8') };
@@ -1094,14 +1099,14 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       } else {
         lines.push('Coder conclusion omitted (unavailable, oversized, or unsafe to reflect).');
       }
-      // Only advertise a readable reference after a successful access check
-      // (loaded body, or intentional too_large after successful stat).
+      // Advertise a readable reference only after a successful open+bounded read
+      // (full load, or 1-byte peek for too_large). Does not claim future access.
       if (resolved && (evidence.status === 'loaded' || evidence.status === 'too_large')) {
         lines.push(`Full send-bound coder reply reference (readable on disk): ${resolved.abs}`);
         lines.push(`Workspace-relative: ${resolved.rel}`);
         if (evidence.status === 'too_large') {
           lines.push(
-            'Inline body skipped because the evidence file exceeds the bounded read cap; the file itself remains readable at the reference above.',
+            'Inline body skipped because the evidence file exceeds the bounded read cap; a bounded open/read for this handoff succeeded — see the reference above for the full body.',
           );
         }
       } else if (evidence.status === 'unreadable') {
