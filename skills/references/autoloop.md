@@ -349,33 +349,12 @@ Subprocess deaths (Claude session lost), failed `git commit` in an iter, and
 other phase-bound failures surface as `phase_error` messages instead of
 silently masquerading as a "clarification request". An empty or whitespace-only
 Coder reply is also a phase error. A non-empty Coder reply without a valid
-`iter_complete` returns `directive_ack` to Planner and does **not** request
-review or advance the iteration:
-
-- Structured `request_clarification` keeps the historical short clarification
-  ack (`understood: false` + `clarification` question). Multiline questions are
-  whitespace-normalized before reflection. If the question is oversized or still
-  contains disallowed controls after normalization, the ack omits `clarification`
-  and uses the incomplete-turn handoff so Planner still gets a readable
-  current-turn reference.
-- Any other incomplete turn builds an explicit Planner handoff: the turn ended
-  without `iter_complete`, no review/advance occurred, Planner may
-  `send_directive` for the same iteration / ask the user / stop, a bounded
-  validated conclusion when safe to reflect, and a readable
-  `<ledger>/iter/<n>/coder_reply_<dispatch_id>.txt` written from **this** send
-  (cleaned reply when present, otherwise the raw reply — including malformed
-  tool-only turns with empty `cleaned_reply`). The path uses the existing
-  collision-resistant dispatch identity and is carried on optional `reply_ref`,
-  so distinct accepted message IDs and later same-iteration sends cannot share
-  or overwrite another acknowledgement's evidence. The handoff does not scan
-  `chat.jsonl`. Prompt evidence reads are byte-capped; a reference is labeled
-  readable only after a successful open and bounded read (full load, or a
-  1-byte peek when the file exceeds the read cap). `stat`/existence alone is
-  not enough. Failed/missing reads report evidence unavailable without claiming
-  readability. Oversized or control-bearing / unpaired UTF-16 text is omitted
-  from new prompt interpolation rather than truncated as complete.
-
-The runner counts consecutive `phase_error`s and:
+`iter_complete` returns `directive_ack` (`understood: false`) without review or
+iteration advance. Structured `request_clarification` keeps a short
+`clarification` question. Any other incomplete turn puts fixed status/decision
+wording, a labelled sanitized truncated reply tail, and a write-time persisted
+path (`iter/<n>/coder_reply_<dispatch_id>.txt`) or generic not-persisted result
+into `clarification`. The runner counts consecutive `phase_error`s and:
 
 1. Fires `on_phase_error` on each one (defaults to error / both channels).
 2. After `phaseErrorCircuit` consecutive errors (default **3**) emits a

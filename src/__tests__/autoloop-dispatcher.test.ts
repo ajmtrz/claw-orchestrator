@@ -1135,591 +1135,121 @@ describe('ClaudeAgentDispatcher — evicted role sessions', () => {
   });
 });
 
-/**
- * CLAWO-BUG-PARTIAL-CODER-TERMINAL-HANDOFF-20261025
- *
- * Authentic offline regression: real ClaudeAgentDispatcher + mocked manager.
- * Desired Planner prompt semantics must fail on base (lost text after 500 /
- * missing incomplete-turn handoff) and pass once the handoff is fixed.
- */
+// prettier-ignore
 describe('ClaudeAgentDispatcher — partial Coder terminal handoff', () => {
-  const TERMINAL_MARKER = 'TERMINAL_PARTIAL_NO_FREEZE_CONCLUSION_UNIQUE_9f3c';
-  const PREFIX_PAD = 'A'.repeat(520);
+  const MARKER = 'TERMINAL_PARTIAL_NO_FREEZE_CONCLUSION_UNIQUE_9f3c';
+  const longReply = () => `${'A'.repeat(520)}\n${MARKER}\nend`;
+  const d0 = (goal: string) => Msg.directive(0, { goal, constraints: [], success_criteria: [], max_attempts: 1 });
+  const coderSends = (c: StubCalls) => c.sendMessage.mock.calls.filter((x) => x[0] === 'autoloop-r1-coder').length;
+  const plannerPrompts = (c: StubCalls) =>
+    c.sendMessage.mock.calls.filter((x) => x[0] === 'autoloop-r1-planner').map((x) => x[1] as string);
 
-  function longIncompleteCoderReply(): string {
-    return `${PREFIX_PAD}\n${TERMINAL_MARKER}\nPlanner must see this after char 500.`;
-  }
-
-  function coderSendCount(calls: StubCalls): number {
-    return calls.sendMessage.mock.calls.filter((c) => (c[0] as string) === 'autoloop-r1-coder').length;
-  }
-
-  function plannerPrompts(calls: StubCalls): string[] {
-    return calls.sendMessage.mock.calls
-      .filter((c) => (c[0] as string) === 'autoloop-r1-planner')
-      .map((c) => c[1] as string);
-  }
-
-  it('G1/G2: Planner prompt retains terminal conclusion or readable full-reply ref after incomplete Coder turn', async () => {
-    const reply = longIncompleteCoderReply();
-    expect(reply.indexOf(TERMINAL_MARKER)).toBeGreaterThan(500);
-
+  it('G1: incomplete turn exposes status, terminal tail and persisted path', async () => {
+    const reply = longReply();
+    expect(reply.indexOf(MARKER)).toBeGreaterThan(500);
     const { dispatcher, calls, workspace } = makeDispatcher({}, { sendOutput: reply });
     await dispatcher.spawnSubagents();
-
-    const coderReplies = await dispatcher.deliver(
-      Msg.directive(0, { goal: 'ship handoff', constraints: [], success_criteria: [], max_attempts: 1 }),
-    );
-    expect(coderReplies).toHaveLength(1);
-    expect(coderReplies[0].type).toBe('directive_ack');
-    if (coderReplies[0].type !== 'directive_ack') throw new Error('expected directive_ack');
-    expect(coderReplies[0].payload.understood).toBe(false);
-
-    // Deliver the ack through the real Planner prompt path and inspect it.
-    await dispatcher.deliver(coderReplies[0]);
-    const prompts = plannerPrompts(calls);
-    expect(prompts.length).toBeGreaterThanOrEqual(1);
-    const plannerPrompt = prompts[prompts.length - 1];
-
-    expect(plannerPrompt).toMatch(/without (a )?valid iter_complete/i);
-    expect(plannerPrompt).toMatch(/send_directive/i);
-    expect(plannerPrompt).toMatch(/same iter/i);
-    expect(plannerPrompt).toMatch(/ask (the )?user/i);
-    expect(plannerPrompt).toMatch(/\bstop\b/i);
-
-    const replyRef = coderReplies[0].payload.reply_ref;
-    expect(typeof replyRef).toBe('string');
-    const replyPath = path.join(workspace, replyRef!);
-    expect(fs.existsSync(replyPath)).toBe(true);
-    expect(fs.readFileSync(replyPath, 'utf-8')).toContain(TERMINAL_MARKER);
-
-    const hasInlineConclusion = plannerPrompt.includes(TERMINAL_MARKER);
-    const hasReadableRef = plannerPrompt.includes(path.basename(replyPath)) && plannerPrompt.includes(replyPath);
-    expect(hasInlineConclusion || hasReadableRef).toBe(true);
-    // Prefix-only truncation must not be presented as the full conclusion.
-    if (plannerPrompt.includes(TERMINAL_MARKER)) {
-      expect(plannerPrompt).not.toMatch(new RegExp(`${'A'.repeat(500)}\\s*$`));
-    }
-  });
-
-  it('G3: short request_clarification stays a clarification ack without incomplete-turn framing', async () => {
-    const question = 'Should I touch the eval script?';
-    const { dispatcher, calls } = makeDispatcher(
-      {},
-      {
-        sendOutput: ['Need a decision before editing.', plannerControl('request_clarification', { question })].join(
-          '\n',
-        ),
-      },
-    );
-    await dispatcher.spawnSubagents();
-    const acks = await dispatcher.deliver(
-      Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }),
-    );
-    expect(acks[0]).toMatchObject({
-      type: 'directive_ack',
-      payload: { understood: false, clarification: question },
-    });
+    const acks = await dispatcher.deliver(d0('g'));
+    const clarification = (acks[0] as { payload: { clarification: string } }).payload.clarification;
+    expect(acks[0]).toMatchObject({ type: 'directive_ack', payload: { understood: false } });
+    expect(clarification).toMatch(/without (a )?valid iter_complete/i);
+    expect(clarification).toMatch(/send_directive[\s\S]*ask (the )?user[\s\S]*\bstop\b/i);
+    expect(clarification).toContain(MARKER);
+    const rel = clarification.match(/persisted at handoff:\s+([^\s"]+\.txt)/)?.[1];
+    expect(rel && fs.readFileSync(path.join(workspace, rel), 'utf8')).toContain(MARKER);
     await dispatcher.deliver(acks[0]);
-    const prompt = plannerPrompts(calls).at(-1) ?? '';
-    expect(prompt).toContain(question);
-    expect(prompt).not.toMatch(/without (a )?valid iter_complete/i);
+    expect(plannerPrompts(calls).at(-1) ?? '').toContain(MARKER);
   });
 
-  it('G3: valid iter_complete still emits iter_artifacts (not an incomplete handoff)', async () => {
+  it('G2: valid iter_complete emits iter_artifacts', async () => {
     const { dispatcher, workspace } = makeDispatcher(
       {},
-      {
-        sendOutput: [
-          'done',
-          plannerControl('iter_complete', {
-            summary: 'noop',
-            eval_output: { metric: 1, gates: [] },
-            files_changed: [],
-          }),
-        ].join('\n'),
-      },
+      { sendOutput: `done\n${plannerControl('iter_complete', { summary: 'ok', eval_output: { metric: 1 }, files_changed: [] })}` },
     );
-    // Workspace must be a git repo for the iter_complete commit path.
     const { execFileSync } = await import('node:child_process');
-    execFileSync('git', ['init'], { cwd: workspace });
-    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: workspace });
-    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: workspace });
-    execFileSync('git', ['commit', '--allow-empty', '-m', 'base'], { cwd: workspace });
-
-    await dispatcher.spawnSubagents();
-    const out = await dispatcher.deliver(
-      Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }),
-    );
-    expect(out.some((m) => m.type === 'iter_artifacts')).toBe(true);
-    expect(out.some((m) => m.type === 'directive_ack' && m.payload.understood === false)).toBe(false);
-  });
-
-  it('G5: oversized and control-bearing coder text is not newly interpolated into the Planner prompt', async () => {
-    const controlPayload = `safe-prefix\u0007CONTROL_BEL_MARKER\nsuffix`;
-    const oversized = `${'B'.repeat(12_000)}\n${TERMINAL_MARKER}\noversized-tail`;
-
-    for (const toxic of [controlPayload, oversized]) {
-      const { dispatcher, calls, workspace } = makeDispatcher({}, { sendOutput: toxic });
-      await dispatcher.spawnSubagents();
-      const acks = await dispatcher.deliver(
-        Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }),
-      );
-      await dispatcher.deliver(acks[0]);
-      const prompt = plannerPrompts(calls).at(-1) ?? '';
-      expect(prompt).not.toContain('\u0007');
-      expect(prompt).not.toContain('CONTROL_BEL_MARKER');
-      // Full oversized body must not appear; a bounded/generic path + readable ref is required.
-      expect(prompt.includes('B'.repeat(12_000))).toBe(false);
-      const replyRef = (acks[0] as { payload: { reply_ref?: string } }).payload.reply_ref;
-      expect(typeof replyRef).toBe('string');
-      const replyPath = path.join(workspace, replyRef!);
-      expect(prompt).toContain(path.basename(replyPath));
-      expect(fs.existsSync(replyPath)).toBe(true);
-      expect(fs.readFileSync(replyPath, 'utf-8')).toBe(toxic);
+    for (const args of [['init'], ['config', 'user.email', 't@e'], ['config', 'user.name', 't'], ['commit', '--allow-empty', '-m', 'b']]) {
+      execFileSync('git', args, { cwd: workspace });
     }
-  });
-
-  it('does not attribute a prior conclusion when the current turn is malformed tool-only (empty cleaned_reply)', async () => {
-    const { dispatcher, calls, workspace } = makeDispatcher({}, { sendOutput: 'OLD_CONCLUSION_UNIQUE' });
     await dispatcher.spawnSubagents();
-    const d = () => Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 });
-    await dispatcher.deliver(d());
-
-    const malformedOnly =
-      '```autoloop\n' +
-      JSON.stringify({ tool: 'iter_complete', args: null, summary: 'CURRENT_FAILURE_UNIQUE' }) +
-      '\n```';
-    calls.sendMessage.mockResolvedValueOnce({ output: malformedOnly, error: undefined });
-    const acks = await dispatcher.deliver(d());
-    await dispatcher.deliver(acks[0]);
-    const prompt = plannerPrompts(calls).at(-1) ?? '';
-    const replyRef = (acks[0] as { payload: { reply_ref?: string } }).payload.reply_ref!;
-    const replyPath = path.join(workspace, replyRef);
-    expect(fs.existsSync(replyPath)).toBe(true);
-    expect(fs.readFileSync(replyPath, 'utf-8')).toContain('CURRENT_FAILURE_UNIQUE');
-    expect(
-      prompt.includes('CURRENT_FAILURE_UNIQUE') ||
-        fs.readFileSync(replyPath, 'utf-8').includes('CURRENT_FAILURE_UNIQUE'),
-    ).toBe(true);
-    expect(prompt).not.toContain('OLD_CONCLUSION_UNIQUE');
+    const out = await dispatcher.deliver(d0('g'));
+    expect(out.some((m) => m.type === 'iter_artifacts')).toBe(true);
+    expect(out.some((m) => m.type === 'directive_ack')).toBe(false);
   });
 
-  it('first-turn malformed tool-only handoff never claims a missing current-turn reply', async () => {
-    const malformedOnly =
-      '```autoloop\n' +
-      JSON.stringify({ tool: 'iter_complete', args: null, summary: 'FIRST_TURN_CURRENT_UNIQUE' }) +
-      '\n```';
-    const { dispatcher, calls, workspace } = makeDispatcher({}, { sendOutput: malformedOnly });
-    await dispatcher.spawnSubagents();
-    const acks = await dispatcher.deliver(
-      Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }),
-    );
-    await dispatcher.deliver(acks[0]);
-    const prompt = plannerPrompts(calls).at(-1) ?? '';
-    const replyRef = (acks[0] as { payload: { reply_ref?: string } }).payload.reply_ref!;
-    const replyPath = path.join(workspace, replyRef);
-    expect(fs.readFileSync(replyPath, 'utf-8')).toContain('FIRST_TURN_CURRENT_UNIQUE');
-    expect(prompt).toContain(path.basename(replyPath));
-    expect(prompt).toContain(replyPath);
-    expect(prompt).not.toMatch(/reply reference unavailable/i);
-  });
-
-  it('preserves a short multiline genuine clarification through whitespace normalization', async () => {
-    const question = 'Should I edit the source?\nOr only document it?';
+  it('G3: short clarification ack (multiline normalized)', async () => {
+    const q = 'Line one?\nLine two about eval?';
     const { dispatcher, calls } = makeDispatcher(
       {},
-      {
-        sendOutput: [question, plannerControl('request_clarification', { question })].join('\n'),
-      },
+      { sendOutput: `Need a decision.\n${plannerControl('request_clarification', { question: q })}` },
     );
     await dispatcher.spawnSubagents();
-    const acks = await dispatcher.deliver(
-      Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }),
-    );
-    expect(acks[0]).toMatchObject({
-      type: 'directive_ack',
-      payload: {
-        understood: false,
-        clarification: 'Should I edit the source? Or only document it?',
-      },
-    });
+    const acks = await dispatcher.deliver(d0('g'));
+    expect(acks[0]).toMatchObject({ type: 'directive_ack', payload: { understood: false, clarification: 'Line one? Line two about eval?' } });
     await dispatcher.deliver(acks[0]);
     const prompt = plannerPrompts(calls).at(-1) ?? '';
-    expect(prompt).toContain('Should I edit the source?');
+    expect(prompt).toContain('Line one? Line two about eval?');
     expect(prompt).not.toMatch(/without (a )?valid iter_complete/i);
   });
 
-  it('G5 exact bounds, Cf and unpaired-surrogate rejection for reflected handoff text', async () => {
-    const { boundAutoloopReflectedText, AUTOLOOP_CLARIFICATION_MAX, AUTOLOOP_CONCLUSION_MAX } =
-      await import('../autoloop/reflected-text.js');
-
-    expect(boundAutoloopReflectedText('x'.repeat(AUTOLOOP_CLARIFICATION_MAX), AUTOLOOP_CLARIFICATION_MAX)?.length).toBe(
-      AUTOLOOP_CLARIFICATION_MAX,
-    );
-    expect(
-      boundAutoloopReflectedText('x'.repeat(AUTOLOOP_CLARIFICATION_MAX + 1), AUTOLOOP_CLARIFICATION_MAX),
-    ).toBeNull();
-    expect(boundAutoloopReflectedText('y'.repeat(AUTOLOOP_CONCLUSION_MAX), AUTOLOOP_CONCLUSION_MAX)?.length).toBe(
-      AUTOLOOP_CONCLUSION_MAX,
-    );
-    expect(boundAutoloopReflectedText('y'.repeat(AUTOLOOP_CONCLUSION_MAX + 1), AUTOLOOP_CONCLUSION_MAX)).toBeNull();
-    expect(boundAutoloopReflectedText('ok\u200Bcf')).toBeNull();
-    expect(boundAutoloopReflectedText('ok\u0007bel')).toBeNull();
-    // Unpaired surrogates rejected at every position — never silently repaired.
-    expect(boundAutoloopReflectedText('\uD800')).toBeNull();
-    expect(boundAutoloopReflectedText('ok\uD800')).toBeNull();
-    expect(boundAutoloopReflectedText('\uD800ok')).toBeNull();
-    expect(boundAutoloopReflectedText('before\uD800after')).toBeNull();
-    expect(boundAutoloopReflectedText('before\uDC00after')).toBeNull();
-    expect(boundAutoloopReflectedText('\uDC00')).toBeNull();
-    expect(boundAutoloopReflectedText('\uD800\uD800')).toBeNull();
-    expect(boundAutoloopReflectedText('\uD800\uDC00\uD800')).toBeNull();
-    // Valid astral pair remains accepted within the UTF-16 budget.
-    expect(boundAutoloopReflectedText('ok\uD83D\uDE00')).toBe('ok\uD83D\uDE00');
-
-    const oversizedQ = 'Q'.repeat(AUTOLOOP_CLARIFICATION_MAX + 1);
-    const { dispatcher, calls, workspace } = makeDispatcher(
-      {},
-      {
-        sendOutput: plannerControl('request_clarification', { question: oversizedQ }),
-      },
-    );
-    await dispatcher.spawnSubagents();
-    const acks = await dispatcher.deliver(
-      Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }),
-    );
-    expect(acks[0]).toMatchObject({
-      type: 'directive_ack',
-      payload: { understood: false, reply_body_omitted: true },
-    });
-    expect((acks[0] as { payload: { clarification?: string } }).payload.clarification).toBeUndefined();
-    const replyRef = (acks[0] as { payload: { reply_ref?: string } }).payload.reply_ref!;
-    await dispatcher.deliver(acks[0]);
-    const prompt = plannerPrompts(calls).at(-1) ?? '';
-    expect(prompt).not.toContain(oversizedQ);
-    expect(prompt).toMatch(/without (a )?valid iter_complete/i);
-    expect(prompt).toMatch(/omitted from prompt/i);
-    const replyPath = path.join(workspace, replyRef);
-    expect(fs.readFileSync(replyPath, 'utf-8')).toBe(oversizedQ);
-    expect(prompt).toContain(replyPath);
-  });
-
-  it('rejects internal unpaired high surrogate in structured clarification before reflecting it', async () => {
-    const invalid = 'before\uD800after';
-    const { boundAutoloopReflectedText } = await import('../autoloop/reflected-text.js');
-    expect(boundAutoloopReflectedText(invalid)).toBeNull();
-    const { dispatcher, calls, workspace } = makeDispatcher(
-      {},
-      { sendOutput: plannerControl('request_clarification', { question: invalid }) },
-    );
-    await dispatcher.spawnSubagents();
-    const acks = await dispatcher.deliver(
-      Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }),
-    );
-    expect(acks[0].payload).toMatchObject({ understood: false, reply_body_omitted: true });
-    expect((acks[0] as { payload: { clarification?: string } }).payload.clarification).toBeUndefined();
-    const replyRef = (acks[0] as { payload: { reply_ref?: string } }).payload.reply_ref!;
-    const stored = fs.readFileSync(path.join(workspace, replyRef), 'utf-8');
-    // UTF-8 persistence may replace unpaired surrogates; evidence must still exist
-    // and must not be reflected as a clarification/conclusion body.
-    expect(stored.includes('before') && stored.includes('after')).toBe(true);
-    expect(fs.existsSync(path.join(workspace, replyRef))).toBe(true);
-    await dispatcher.deliver(acks[0]);
-    const prompt = plannerPrompts(calls).at(-1) ?? '';
-    expect(prompt).not.toContain('\uD800');
-    expect(prompt).not.toMatch(/"clarification":/);
-    expect(prompt).toContain(replyRef);
-  });
-
-  it('correlates each queued same-iteration directive acknowledgement with its own reply', async () => {
+  it('G4: no review/advance/duplicate; queued sends keep distinct evidence', async () => {
     const { manager, calls } = makeStubManager();
     const workspace = tmpRoot;
-    const ledgerDir = path.join(workspace, 'tasks', 'r1');
     const dispatcher = new ClaudeAgentDispatcher({ manager, runId: 'r1', workspace });
-    let coderTurns = 0;
-    let plannerTurns = 0;
-    const ackRefs: string[] = [];
+    let n = 0;
     calls.sendMessage.mockImplementation(async (name: string) => {
-      if (name === 'autoloop-r1-coder') {
-        return {
-          output: ++coderTurns === 1 ? 'FIRST_TURN_UNIQUE' : 'SECOND_TURN_UNIQUE',
-          error: undefined,
-        };
-      }
-      if (name === 'autoloop-r1-planner') {
-        plannerTurns += 1;
-        if (plannerTurns === 1) {
-          return {
-            output: [
-              plannerControl('send_directive', {
-                goal: 'first',
-                constraints: [],
-                success_criteria: [],
-                max_attempts: 1,
-              }),
-              plannerControl('send_directive', {
-                goal: 'second',
-                constraints: [],
-                success_criteria: [],
-                max_attempts: 1,
-              }),
-            ].join('\n'),
-            error: undefined,
-          };
-        }
-        return { output: 'acknowledged', error: undefined };
-      }
-      return { output: '', error: undefined };
+      if (name === 'autoloop-r1-coder') { n += 1; return { output: `${longReply()}\n(coder turn ${n})`, error: undefined }; }
+      return { output: name.endsWith('-planner') ? 'ack' : '', error: undefined };
     });
-
+    const types: string[] = [];
     const runner = new AutoloopRunner({
-      run_id: 'r1',
-      workspace,
-      ledger_dir: ledgerDir,
-      dispatcher,
-      notifyUser: vi.fn(async () => undefined),
-      stallCheckIntervalMs: 24 * 60 * 60 * 1000,
+      run_id: 'r1', workspace, ledger_dir: path.join(workspace, 'tasks', 'r1'), dispatcher,
+      notifyUser: vi.fn(async () => undefined), stallCheckIntervalMs: 86_400_000,
     });
-    runner.on('message', (env: AnyAutoloopMessage) => {
-      if (env.type === 'directive_ack' && env.payload.reply_ref) ackRefs.push(env.payload.reply_ref);
-    });
-
+    runner.on('message', (env: AnyAutoloopMessage) => types.push(`${env.from}->${env.to}:${env.type}`));
     await runner.start();
     await dispatcher.spawnSubagents();
-    try {
-      await runner.chat('issue the two explicit directives');
-      const handoffs = plannerPrompts(calls).filter((p) => /without (a )?valid iter_complete/i.test(p));
-      expect(coderTurns).toBe(2);
-      expect(handoffs).toHaveLength(2);
-      expect(ackRefs).toHaveLength(2);
-      expect(ackRefs[0]).not.toBe(ackRefs[1]);
-      expect(handoffs[0]).toContain('FIRST_TURN_UNIQUE');
-      expect(handoffs[0]).not.toContain('SECOND_TURN_UNIQUE');
-      expect(handoffs[1]).toContain('SECOND_TURN_UNIQUE');
-      expect(fs.readFileSync(path.join(workspace, ackRefs[0]), 'utf-8')).toBe('FIRST_TURN_UNIQUE');
-      expect(fs.readFileSync(path.join(workspace, ackRefs[1]), 'utf-8')).toBe('SECOND_TURN_UNIQUE');
-      // Full evidence remains associated after the later same-iteration send.
-      expect(handoffs[0]).toContain(ackRefs[0]);
-      expect(fs.existsSync(path.join(workspace, ackRefs[0]))).toBe(true);
-      expect(coderSendCount(calls)).toBe(2);
-    } finally {
-      runner.stop();
-    }
-  });
-
-  it('G4: runner-backed incomplete handoff does not review/advance/duplicate; explicit continuation sends once', async () => {
-    const { manager, calls } = makeStubManager();
-    const workspace = tmpRoot;
-    const ledgerDir = path.join(workspace, 'tasks', 'r1');
-    const dispatcher = new ClaudeAgentDispatcher({ manager, runId: 'r1', workspace });
-
-    let coderTurns = 0;
-    calls.sendMessage.mockImplementation(async (name: string) => {
-      if (name === 'autoloop-r1-coder') {
-        coderTurns += 1;
-        // Both turns stay incomplete so the runner never enters review/advance;
-        // the assertion is that the second send targets the same pending iter.
-        return {
-          output: `${longIncompleteCoderReply()}\n(coder turn ${coderTurns})`,
-          error: undefined,
-        };
-      }
-      if (name === 'autoloop-r1-planner') {
-        // No tools: incomplete ack must not fabricate progress.
-        return { output: 'acknowledged incomplete handoff', error: undefined };
-      }
-      return { output: '', error: undefined };
-    });
-
-    const deliveredTypes: string[] = [];
-    const runner = new AutoloopRunner({
-      run_id: 'r1',
-      workspace,
-      ledger_dir: ledgerDir,
-      dispatcher,
-      notifyUser: vi.fn(async () => undefined),
-      stallCheckIntervalMs: 24 * 60 * 60 * 1000,
-    });
-    runner.on('message', (env: AnyAutoloopMessage) => {
-      deliveredTypes.push(`${env.from}->${env.to}:${env.type}`);
-    });
-
-    await runner.start();
-    await dispatcher.spawnSubagents();
-
-    await runner.send(
-      Msg.directive(0, { goal: 'incomplete path', constraints: [], success_criteria: [], max_attempts: 1 }),
-    );
-
-    expect(coderSendCount(calls)).toBe(1);
-    expect(deliveredTypes.some((t) => t.includes('review_request'))).toBe(false);
-    expect(deliveredTypes.some((t) => t.includes('iter_artifacts'))).toBe(false);
-    expect(deliveredTypes.some((t) => t.includes('iter_done'))).toBe(false);
+    await runner.send(d0('a'));
+    expect(coderSends(calls)).toBe(1);
+    expect(types.some((t) => /review_request|iter_done/.test(t))).toBe(false);
     expect(runner.state.iter).toBe(0);
-    expect(fs.existsSync(path.join(ledgerDir, 'iter', '0', 'eval_output.json'))).toBe(false);
-
-    const prompts = plannerPrompts(calls);
-    expect(prompts.some((p) => /without (a )?valid iter_complete/i.test(p))).toBe(true);
-
-    const sendsBefore = coderSendCount(calls);
-    const continueDirective = Msg.directive(0, {
-      goal: 'continue same iter',
-      constraints: [],
-      success_criteria: [],
-      max_attempts: 1,
-    });
-    expect(continueDirective.iter).toBe(runner.state.iter);
-    await runner.send(continueDirective);
-    expect(coderSendCount(calls)).toBe(sendsBefore + 1);
-    expect(coderTurns).toBe(2);
+    await runner.send(d0('b'));
+    expect(coderSends(calls)).toBe(2);
     expect(runner.state.iter).toBe(0);
-    expect(deliveredTypes.filter((t) => t.includes('review_request'))).toEqual([]);
-    // Second incomplete handoff remains resolvable on the Planner path.
-    expect(
-      plannerPrompts(calls).filter((p) => /without (a )?valid iter_complete/i.test(p)).length,
-    ).toBeGreaterThanOrEqual(2);
-
+    const prompts = plannerPrompts(calls).filter((p) => /without (a )?valid iter_complete/i.test(p));
+    expect(prompts.length).toBeGreaterThanOrEqual(2);
+    const paths = prompts.map((p) => p.match(/persisted at handoff:\s+([^\s"]+\.txt)/)?.[1]).filter(Boolean) as string[];
+    expect(new Set(paths).size).toBe(2);
+    expect(fs.readFileSync(path.join(workspace, paths[0]), 'utf8')).toContain('(coder turn 1)');
+    expect(fs.readFileSync(path.join(workspace, paths[1]), 'utf8')).toContain('(coder turn 2)');
     runner.stop();
   });
 
-  it('keeps distinct accepted message identities mapped to distinct immutable evidence', async () => {
-    const { dispatcher, calls, workspace } = makeDispatcher(
-      {},
-      { sendOutputs: ['FIRST_DISTINCT_REPLY', 'SECOND_DISTINCT_REPLY'] },
-    );
-    await dispatcher.spawnSubagents();
-    const makeD = (id: string) =>
-      fixedIdentity(Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }), id);
-    // Colon vs slash would collide under underscore sanitization; dispatchId must not.
-    const first = await dispatcher.deliver(makeD('logical:turn'));
-    const second = await dispatcher.deliver(makeD('logical/turn'));
-    expect(calls.sendMessage.mock.calls.filter((c) => c[0] === 'autoloop-r1-coder')).toHaveLength(2);
-    await dispatcher.deliver(first[0]);
-    const refs = [first[0], second[0]].map((m) => (m as { payload: { reply_ref: string } }).payload.reply_ref);
-    expect(refs[0]).not.toBe(refs[1]);
-    expect(fs.readFileSync(path.join(workspace, refs[0]), 'utf8')).toBe('FIRST_DISTINCT_REPLY');
-    expect(fs.readFileSync(path.join(workspace, refs[1]), 'utf8')).toBe('SECOND_DISTINCT_REPLY');
-    const prompt = plannerPrompts(calls).at(-1) ?? '';
-    expect(prompt).toContain('FIRST_DISTINCT_REPLY');
-    expect(prompt).not.toContain('SECOND_DISTINCT_REPLY');
-    expect(prompt).toContain(refs[0]);
-  });
-
-  it('does not advertise unreadable reply evidence as readable', async () => {
-    const { dispatcher, calls, workspace } = makeDispatcher({}, { sendOutput: 'REPLY_NEEDING_READABLE_REFERENCE' });
-    await dispatcher.spawnSubagents();
-    const acks = await dispatcher.deliver(
-      Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }),
-    );
-    const ref = (acks[0] as { payload: { reply_ref: string } }).payload.reply_ref;
-    const replyPath = path.join(workspace, ref);
-    fs.chmodSync(replyPath, 0o000);
+  it('G5: control chars omit raw interpolation; write failure is not persisted', async () => {
+    const { dispatcher: d1, calls: c1 } = makeDispatcher({}, { sendOutput: `ok\u0007BEL ${MARKER}` });
+    await d1.spawnSubagents();
+    const a1 = await d1.deliver(d0('g'));
+    await d1.deliver(a1[0]);
+    const p1 = plannerPrompts(c1).at(-1) ?? '';
+    expect(p1).toMatch(/tail omitted|disallowed form/i);
+    expect(p1).not.toContain('\u0007');
+    const originalWrite = fsDefault.writeFileSync;
+    fsDefault.writeFileSync = ((file: fs.PathLike | number, data: string | NodeJS.ArrayBufferView, options?: fs.WriteFileOptions) => {
+      if (typeof file === 'string' && String(file).includes('coder_reply_')) throw new Error('EACCES');
+      return originalWrite(file, data, options);
+    }) as typeof fs.writeFileSync;
+    syncBuiltinESMExports();
     try {
-      expect(() => fs.readFileSync(replyPath, 'utf8')).toThrow();
-      await dispatcher.deliver(acks[0]);
-      const prompt = plannerPrompts(calls).at(-1) ?? '';
-      expect(prompt).toMatch(/without (a )?valid iter_complete/i);
-      expect(prompt).toMatch(/send_directive/i);
-      expect(prompt).not.toContain('(readable on disk)');
-      expect(prompt).toMatch(/could not be read/i);
+      const { dispatcher: d2, calls: c2 } = makeDispatcher({}, { sendOutput: longReply() });
+      await d2.spawnSubagents();
+      const a2 = await d2.deliver(d0('g'));
+      await d2.deliver(a2[0]);
+      const p2 = plannerPrompts(c2).at(-1) ?? '';
+      expect(p2).toMatch(/not persisted/i);
+      expect(p2).toContain(MARKER);
+      expect(p2).not.toMatch(/persisted at handoff:/);
     } finally {
-      fs.chmodSync(replyPath, 0o600);
+      fsDefault.writeFileSync = originalWrite;
+      syncBuiltinESMExports();
     }
-  });
-
-  it('reports missing evidence without claiming a readable reference', async () => {
-    const { dispatcher, calls, workspace } = makeDispatcher({}, { sendOutput: 'WILL_DELETE_EVIDENCE' });
-    await dispatcher.spawnSubagents();
-    const acks = await dispatcher.deliver(
-      Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }),
-    );
-    const ref = (acks[0] as { payload: { reply_ref: string } }).payload.reply_ref;
-    fs.unlinkSync(path.join(workspace, ref));
-    await dispatcher.deliver(acks[0]);
-    const prompt = plannerPrompts(calls).at(-1) ?? '';
-    expect(prompt).toMatch(/without (a )?valid iter_complete/i);
-    expect(prompt).not.toContain('(readable on disk)');
-    expect(prompt).toMatch(/unavailable/i);
-  });
-
-  it('keeps oversized and malformed-only queued replies associated after later sends', async () => {
-    const large = 'L'.repeat(9000) + 'FIRST_LARGE_TAIL';
-    const malformed =
-      '```autoloop\n' +
-      JSON.stringify({ tool: 'iter_complete', args: null, summary: 'SECOND_MALFORMED_REPLY' }) +
-      '\n```';
-    const { dispatcher, calls, workspace } = makeDispatcher({}, { sendOutputs: [large, malformed] });
-    await dispatcher.spawnSubagents();
-    const d = () => Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 });
-    const first = await dispatcher.deliver(d());
-    const second = await dispatcher.deliver(d());
-    await dispatcher.deliver(first[0]);
-    await dispatcher.deliver(second[0]);
-    const refs = [first[0], second[0]].map((m) => (m as { payload: { reply_ref: string } }).payload.reply_ref);
-    expect(refs[0]).not.toBe(refs[1]);
-    expect(fs.readFileSync(path.join(workspace, refs[0]), 'utf8')).toBe(large);
-    expect(fs.readFileSync(path.join(workspace, refs[1]), 'utf8')).toBe(malformed);
-    const prompts = plannerPrompts(calls);
-    expect(prompts[0]).toContain(refs[0]);
-    expect(prompts[0]).toContain('(readable on disk)');
-    expect(prompts[0]).not.toContain('FIRST_LARGE_TAIL');
-    expect(prompts[1]).toContain(refs[1]);
-    expect(prompts[1]).not.toContain('FIRST_LARGE_TAIL');
-  });
-
-  it('maps long accepted IDs with a common prefix to distinct dispatch-bound evidence', async () => {
-    const idA = `logical-prefix-${'a'.repeat(140)}`;
-    const idB = `logical-prefix-${'b'.repeat(140)}`;
-    const { dispatcher, workspace } = makeDispatcher({}, { sendOutputs: ['LONG_ID_REPLY_A', 'LONG_ID_REPLY_B'] });
-    await dispatcher.spawnSubagents();
-    const makeD = (id: string) =>
-      fixedIdentity(Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }), id);
-    const first = await dispatcher.deliver(makeD(idA));
-    const second = await dispatcher.deliver(makeD(idB));
-    const refs = [first[0], second[0]].map((m) => (m as { payload: { reply_ref: string } }).payload.reply_ref);
-    expect(refs[0]).not.toBe(refs[1]);
-    expect(fs.readFileSync(path.join(workspace, refs[0]), 'utf8')).toBe('LONG_ID_REPLY_A');
-    expect(fs.readFileSync(path.join(workspace, refs[1]), 'utf8')).toBe('LONG_ID_REPLY_B');
-  });
-
-  it('never labels unreadable evidence readable, including bodies beyond the read cap', async () => {
-    for (const text of ['SMALL_UNREADABLE_BODY', `${'X'.repeat(9000)}LARGE_UNREADABLE_TAIL`]) {
-      const { dispatcher, calls, workspace } = makeDispatcher({}, { sendOutput: text });
-      await dispatcher.spawnSubagents();
-      const acks = await dispatcher.deliver(
-        Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }),
-      );
-      const ref = (acks[0] as { payload: { reply_ref: string } }).payload.reply_ref;
-      const replyPath = path.join(workspace, ref);
-      fs.chmodSync(replyPath, 0o000);
-      try {
-        expect(() => fs.readFileSync(replyPath, 'utf8')).toThrow();
-        await dispatcher.deliver(acks[0]);
-        const prompt = plannerPrompts(calls).at(-1) ?? '';
-        expect(prompt).toMatch(/without (a )?valid iter_complete/i);
-        expect(prompt).not.toContain('(readable on disk)');
-        expect(prompt).not.toContain('file itself remains readable');
-        expect(prompt).toMatch(/could not be read/i);
-      } finally {
-        fs.chmodSync(replyPath, 0o600);
-      }
-    }
-  });
-
-  it('retains evidence for long accepted IDs with an identical 140-character prefix', async () => {
-    const { dispatcher, workspace } = makeDispatcher({}, { sendOutputs: ['PREFIX_REPLY_A', 'PREFIX_REPLY_B'] });
-    await dispatcher.spawnSubagents();
-    const d = (suffix: string) =>
-      fixedIdentity(
-        Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }),
-        `${'p'.repeat(140)}${suffix}`,
-      );
-    const first = await dispatcher.deliver(d('a'));
-    const second = await dispatcher.deliver(d('b'));
-    const refs = [first[0], second[0]].map((m) => (m as { payload: { reply_ref: string } }).payload.reply_ref);
-    expect(refs[0]).not.toBe(refs[1]);
-    expect(fs.readFileSync(path.join(workspace, refs[0]), 'utf8')).toBe('PREFIX_REPLY_A');
-    expect(fs.readFileSync(path.join(workspace, refs[1]), 'utf8')).toBe('PREFIX_REPLY_B');
   });
 });

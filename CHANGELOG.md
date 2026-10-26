@@ -9,20 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Incomplete Coder turns without `iter_complete` hand off explicitly to Planner.** A
-  non-empty Coder reply that lacks a valid `iter_complete` no longer arrives as a
-  truncated `clarification` prefix only. Planner receives system wording that the turn
-  ended without `iter_complete`, that review/iteration did not advance, the choices to
-  `send_directive` for the same iteration / ask the user / stop, a bounded validated
-  conclusion when safe, and a send-bound `iter/<n>/coder_reply_<dispatch_id>.txt`
-  reference on optional `reply_ref` (reuses the existing collision-resistant dispatch
-  identity). Structured `request_clarification` keeps the short clarification ack
-  shape (multiline whitespace-normalized); rejected/oversized or malformed-UTF-16
-  questions use `reply_body_omitted` with that send-bound reference. Unpaired UTF-16
-  surrogates are rejected at every position; evidence reads are byte-bounded and
-  references are advertised as readable only after a successful open/bounded
-  read (including a 1-byte peek for oversized files — not `stat` alone).
+- **Incomplete Coder turns without `iter_complete` hand off explicitly to Planner.** The
+  acknowledgement states the turn finished incomplete, that review/iteration did not
+  advance, and the choices to `send_directive` for the same iteration / ask the user /
+  stop; includes a labelled sanitized truncated reply tail and a write-time persisted
+  `iter/<n>/coder_reply_<dispatch_id>.txt` path or generic not-persisted wording.
+  Structured `request_clarification` keeps the short clarification ack.
 
+### Added
 ### Added
 
 - **`fanout_start` agents declare `permissionMode` and `sandboxMode`.** Same enums as
