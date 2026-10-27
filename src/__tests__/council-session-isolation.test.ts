@@ -30,8 +30,9 @@ import { SessionManager } from '../session-manager.js';
 import { Council } from '../council.js';
 import { isValidRunId } from '../kernel/store.js';
 
-const REPORT =
-  `${'Isolation marker report. '.repeat(8)}\n` + `Detail line for length. `.repeat(4) + `\n[CONSENSUS: YES]`;
+const REPORT_BODY = `${'Isolation marker report. '.repeat(8)}\n` + `Detail line for length. `.repeat(4);
+const REPORT = `${REPORT_BODY}\n[CONSENSUS: YES]`;
+const REPORT_NO = `${REPORT_BODY}\n[CONSENSUS: NO]`;
 
 type Deferred<T = void> = {
   promise: Promise<T>;
@@ -337,6 +338,15 @@ describe('council member-session isolation', () => {
         expect(isValidRunId(sessionB.id)).toBe(true);
         expect(sessionA.id.startsWith('council-')).toBe(true);
         expect(sessionB.id.startsWith('council-')).toBe(true);
+
+        const ledger = mgr.getRunLedger({ since: '1h' }).rows;
+        const rowsA = ledger.filter((r) => r.session === nameA);
+        const rowsB = ledger.filter((r) => r.session === nameB);
+        expect(rowsA.length).toBeGreaterThan(0);
+        expect(rowsB.length).toBeGreaterThan(0);
+        expect(rowsA.every((r) => r.parent === sessionA.id)).toBe(true);
+        expect(rowsB.every((r) => r.parent === sessionB.id)).toBe(true);
+        expect(sessionA.id).not.toBe(sessionB.id);
       } finally {
         aSendHold.resolve();
         bSendHold.resolve();
@@ -357,7 +367,8 @@ describe('council member-session isolation', () => {
     ) => {
       if (config.name) names.push(config.name);
       return new FakeEngine(config, {
-        bodyFor: () => REPORT,
+        // Round 1 must vote strict NO so the council actually opens round 2.
+        bodyFor: (session) => (String(session.config.name ?? '').endsWith('-r1') ? REPORT_NO : REPORT),
       });
     };
 
@@ -366,18 +377,48 @@ describe('council member-session isolation', () => {
         { name: 'Architect', emoji: '🟠', persona: 'A', engine: 'codex' },
         { name: 'Engineer', emoji: '🟢', persona: 'E', engine: 'codex' },
       ],
-      maxRounds: 1,
+      maxRounds: 2,
       projectDir: project,
     });
     await waitRun(mgr, session.id);
 
-    const arch = names.filter((n) => n.includes('Architect-r1'));
-    const eng = names.filter((n) => n.includes('Engineer-r1'));
-    expect(arch).toHaveLength(1);
-    expect(eng).toHaveLength(1);
-    expect(arch[0]).not.toBe(eng[0]);
-    expect(arch[0]).toContain(session.id);
-    expect(eng[0]).toContain(session.id);
+    const archR1 = names.filter((n) => n.endsWith('Architect-r1'));
+    const engR1 = names.filter((n) => n.endsWith('Engineer-r1'));
+    const archR2 = names.filter((n) => n.endsWith('Architect-r2'));
+    const engR2 = names.filter((n) => n.endsWith('Engineer-r2'));
+    expect(archR1).toHaveLength(1);
+    expect(engR1).toHaveLength(1);
+    expect(archR2).toHaveLength(1);
+    expect(engR2).toHaveLength(1);
+    expect(archR1[0]).not.toBe(engR1[0]);
+    expect(archR1[0]).not.toBe(archR2[0]);
+    expect(engR1[0]).not.toBe(engR2[0]);
+    for (const n of [archR1[0], engR1[0], archR2[0], engR2[0]]) {
+      expect(n).toContain(session.id);
+    }
+
+    const status = mgr.councilStatus(session.id);
+    expect(status?.status).toBe('awaiting_user');
+    const responses = status!.responses;
+    expect(responses.filter((r) => r.round === 1)).toHaveLength(2);
+    expect(responses.filter((r) => r.round === 2)).toHaveLength(2);
+
+    const resp = (agent: string, round: number) => responses.find((r) => r.agent === agent && r.round === round)!;
+    expect(resp('Architect', 1).sessionKey).toBe(archR1[0]);
+    expect(resp('Engineer', 1).sessionKey).toBe(engR1[0]);
+    expect(resp('Architect', 2).sessionKey).toBe(archR2[0]);
+    expect(resp('Engineer', 2).sessionKey).toBe(engR2[0]);
+    expect(resp('Architect', 1).consensus).toBe(false);
+    expect(resp('Engineer', 1).consensus).toBe(false);
+    expect(resp('Architect', 2).consensus).toBe(true);
+    expect(resp('Engineer', 2).consensus).toBe(true);
+
+    const ledger = mgr.getRunLedger({ since: '1h' }).rows;
+    for (const name of [archR1[0]!, engR1[0]!, archR2[0]!, engR2[0]!]) {
+      const owned = ledger.filter((r) => r.session === name);
+      expect(owned.length).toBeGreaterThan(0);
+      expect(owned.every((r) => r.parent === session.id)).toBe(true);
+    }
   });
 
   it('allows a second council execution after the first settles', { timeout: 60_000 }, async () => {
