@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   omission; live/cold validation and audit remain manager-owned. Distinct from
   `workflow_resume`.
 
+### Fixed
+
+- **`autoloop_resume` public help distinguishes live vs cold timeout resume.**
+  Tool description and tools reference no longer state the live pending-ID pair
+  as a universal requirement; cold omission/reconstruction and timeout-only
+  increase without pending are documented explicitly. Runtime behavior unchanged.
+
 ## [7.16.0] - 2026-10-28
 
 ### Added

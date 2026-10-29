@@ -682,25 +682,31 @@ larger than the run's latest effective value (600000 for runs that predate this 
 or smaller values are rejected, and there is deliberately no
 `allow_decrease`. Lease and hard-cap overrides are not accepted on resume.
 Each successful increase appends one migration row to `decisions.jsonl`; the
-original run spec, history, and prior audit bytes are not rewritten. The
-matching live awaiting-resume condition is advanced without replaying the
-timed-out logical dispatch. A live ordinary or activity-lease pause
-(`pending_dispatch` null) resumes with no timeout fields: the call returns once
-the run is active again, the lease re-arms without moving the hard deadline,
-and Planner chat parked during the pause is then delivered once, in order. A
-no-option resume does not clear a pending send timeout.
+original run spec, history, and prior audit bytes are not rewritten. Live
+semantics: a live ordinary or activity-lease pause (`pending_dispatch` null)
+resumes with no timeout fields (active again, lease re-armed, hard deadline
+unchanged, parked Planner chat delivered once); a live send-timeout pending
+pause is a no-op when timeout fields are omitted (pending is not cleared), and
+advancing it needs the matching live awaiting-resume increase plus
+`pending_dispatch_id` without replaying the timed-out logical dispatch. Cold
+semantics: omission still follows manager reconstruction even when a pending
+dispatch was stored; `pending_dispatch_id` is required only when an increase
+and pending coexist; a cold timeout-only increase without pending remains
+supported.
 
 ### `autoloop_resume`
 
 Resume a v2 autoloop run through the same manager path as the HTTP resume route.
 Returns `{ ok, state }` (normalized by the plugin result wrapper). A paused or
-terminated state is not completed project work.
+terminated state is not completed project work. Live pending omission is a
+no-op; cold omission follows reconstruction; pending ID is conditional on
+increase+pending; cold timeout-only increase without pending is supported.
 
 | Parameter                 | Type   | Required | Description                                                                 |
 | ------------------------- | ------ | -------- | --------------------------------------------------------------------------- |
 | `run_id`                  | string | yes      | Run id from `autoloop_start`                                                |
 | `send_timeout_ms`         | number |          | Optional strict increase (schema range 5000–7200000; no default)            |
-| `pending_dispatch_id`     | string |          | Optional exact pending dispatch id for a recoverable send-timeout resume    |
+| `pending_dispatch_id`     | string |          | Exact pending id when increasing while a pending dispatch exists            |
 | `plannerCustomEngineRef`  | string |          | Host secret name for Planner custom engine (`CLAWO_CUSTOM_ENGINE_<REF>`)    |
 | `coderCustomEngineRef`    | string |          | Host secret name for Coder custom engine                                    |
 | `reviewerCustomEngineRef` | string |          | Host secret name for Reviewer custom engine                                 |

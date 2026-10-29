@@ -826,6 +826,45 @@ describe('native autoloop_resume facade', () => {
     });
   }
 
+  it('public resume help distinguishes live pending no-op from cold reconstruction and conditional pending-ID', async () => {
+    const registration = collectRegistration();
+    try {
+      const tool = registration.tools.find((t) => t.name === 'autoloop_resume');
+      expect(tool).toBeDefined();
+      const description = tool!.description;
+      // Must not present the live send-timeout migration pair as a universal rule.
+      expect(description).not.toMatch(
+        /A recoverable send-timeout pause requires an explicit send_timeout_ms increase and the matching pending_dispatch_id/i,
+      );
+      expect(description).toMatch(/live/i);
+      expect(description).toMatch(/no-op|unchanged/i);
+      expect(description).toMatch(/cold/i);
+      expect(description).toMatch(/reconstruct/i);
+      expect(description).toMatch(/coexist|when (an |a )?increase.*pending|pending.*increase/i);
+      expect(description).toMatch(/timeout-only|without pending/i);
+
+      const { fileURLToPath } = await import('node:url');
+      const { dirname, join } = await import('node:path');
+      const toolsMd = fs.readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), '../../skills/references/tools.md'),
+        'utf8',
+      );
+      const recoveryIdx = toolsMd.indexOf('Recovery is exposed by `autoloop_resume`');
+      expect(recoveryIdx).toBeGreaterThan(-1);
+      const recoveryBlock = toolsMd.slice(recoveryIdx, toolsMd.indexOf('### `autoloop_resume`', recoveryIdx));
+      expect(recoveryBlock).toMatch(/live/i);
+      expect(recoveryBlock).toMatch(/no-op|does not clear a pending send timeout/i);
+      expect(recoveryBlock).toMatch(/cold/i);
+      expect(recoveryBlock).toMatch(/reconstruct/i);
+      expect(recoveryBlock).toMatch(/coexist|when (an |a )?increase.*pending|pending.*increase/i);
+      expect(recoveryBlock).toMatch(/timeout-only|without pending/i);
+      // Unqualified universal claim must not remain as the sole guidance.
+      expect(recoveryBlock).not.toMatch(/^A no-option resume does not clear a pending send timeout\.\s*$/m);
+    } finally {
+      registration.services[0]?.stop();
+    }
+  });
+
   it('registers exactly one autoloop_resume with required run_id and optional migration/ref fields, no defaults', () => {
     const registration = collectRegistration();
     try {

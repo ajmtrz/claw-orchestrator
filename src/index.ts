@@ -2305,7 +2305,7 @@ const plugin = {
     registerTool({
       name: 'autoloop_resume',
       description:
-        'Resume a v2 autoloop run. Ordinary and activity-lease pauses resume with no timeout fields. A recoverable send-timeout pause requires an explicit send_timeout_ms increase and the matching pending_dispatch_id. Optional *CustomEngineRef names resolve against CLAWO_CUSTOM_ENGINE_<REF> on the orchestrator host for cold custom-engine runs. Returns { ok, state }; a paused or terminated state is not completed project work.',
+        'Resume a v2 autoloop run. Ordinary and activity-lease pauses resume with no timeout fields. Live send-timeout pending: omitting timeout fields is a no-op (pending is not cleared); advancing it needs an explicit send_timeout_ms increase and the matching pending_dispatch_id. Cold resume: omission still follows manager reconstruction even when a pending dispatch was stored; pending_dispatch_id is required only when an increase and pending coexist; a cold timeout-only increase without pending remains supported. Optional *CustomEngineRef names resolve against CLAWO_CUSTOM_ENGINE_<REF> on the orchestrator host for cold custom-engine runs. Returns { ok, state }; a paused or terminated state is not completed project work.',
       parameters: {
         type: 'object',
         properties: {
@@ -2320,7 +2320,7 @@ const plugin = {
           pending_dispatch_id: {
             type: 'string',
             description:
-              'Optional exact pending dispatch id for a recoverable send-timeout resume. Required by the manager when increasing the timeout while a pending dispatch exists; omit with ordinary resume.',
+              'Optional exact pending dispatch id. Required by the manager only when increasing the timeout while a pending dispatch exists (live or cold); omit for ordinary resume and for cold timeout-only increase without pending.',
           },
           plannerCustomEngineRef: {
             type: 'string',
