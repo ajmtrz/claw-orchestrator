@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Autoloop incomplete Coder reply persistence now derives the save destination
+  from the existing iteration directory (`iterDir`) and displays the
+  workspace-relative reference from that same path. Observable handoff behavior
+  is unchanged.
+
 ### Added
 
 - **`autoloop_resume` native tool.** One plugin/MCP registration that forwards
