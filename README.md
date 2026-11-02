@@ -42,6 +42,8 @@ https://github.com/user-attachments/assets/5bf9bea8-e5ac-4632-a292-a80a45831dff
 
 ## News
 
+- **[2026-11]** v7.17.0: an agent can resume a paused autoloop run itself (`autoloop_resume`), and a Codex goal
+  that hits a model at capacity is resumed on its thread instead of failing.
 - **[2026-10]** v7.16.0: `clawo goal --engine claude` runs a goal on Claude Code's `/goal`, with the same
   checkpointing, resume and verification as a Codex goal.
 - **[2026-10]** [ResearchBoost-Agent](https://github.com/AI4AI-for-Anything/ResearchBoost-Agent), an autonomous agent
@@ -190,14 +192,17 @@ Using Claw Orchestrator in a project or paper? Open a pull request to add it her
 
 ## Citation
 
-If Claw Orchestrator helps your research, please cite it:
+If Claw Orchestrator helps your research, please cite its
+[technical report](https://doi.org/10.5281/zenodo.23874036):
 
 ```bibtex
-@misc{fang2026claworchestrator,
-  title        = {Claw Orchestrator: A Unified Runtime for Coding Agent CLIs},
-  author       = {Fang, Guian},
-  year         = {2026},
-  howpublished = {\url{https://github.com/Enderfga/claw-orchestrator}}
+@techreport{fang2026claworchestrator,
+  title     = {Claw Orchestrator: A Unified Runtime for Coding Agent CLIs},
+  author    = {Fang, Guian},
+  year      = {2026},
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.23874036},
+  url       = {https://doi.org/10.5281/zenodo.23874036}
 }
 ```
 
