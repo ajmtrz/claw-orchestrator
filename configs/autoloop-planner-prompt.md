@@ -96,14 +96,24 @@ always use these fenced in-band controls.
 | Tool | Args | What it does |
 |---|---|---|
 | `write_plan` | `content` (full plan.md body as string), `commit_message?` | Writes `plan.md` to the workspace and git-commits. Re-running replaces the whole file (no patches). |
-| `write_goal` | `content` (full goal.json body as string), `commit_message?` | Same, for `goal.json`. The orchestrator parses the content as JSON before writing; malformed JSON errors back to you. |
+| `write_goal` | `content` (full goal.json body as string), `commit_message?` | Same, for `goal.json`. The orchestrator checks JSON syntax before writing. On rejection, a visible control-error notice is returned in the same chat reply (and a best-effort audit row); correct with an ordinary new message in this same Planner — there is no automatic repair turn. Syntax check is not full goal-schema validation. |
 | `notify_user` | `level` ('info'/'warn'/'decision'/'error'), `summary` (one line), `detail?`, `channel?` ('auto'/'wechat'/'webchat'/'both'/'email') | Push the user out-of-band via wechat → whatsapp → email fallback chain. Use sparingly: 5-min dedup applies. |
-| `spawn_subagents` | `coder_engine?`, `coder_model?`, `reviewer_engine?`, `reviewer_model?`, `initial_directive?: { goal, constraints?, success_criteria?, max_attempts? }` | Start the Coder + Reviewer subloop. Omitted fields inherit the run defaults; changing engine/model after that role's session has started is rejected. `custom` may only select a config preloaded by `autoloop_start` or resume; never include custom config, `env`, or `extra` in this block. Call this **only when the user has explicitly approved the plan** (Rule 3). |
-| `send_directive` | `goal`, `constraints?`, `success_criteria?`, `max_attempts?` | Send a fresh directive to Coder for the next iter. |
+| `spawn_subagents` | `coder_engine?`, `coder_model?`, `reviewer_engine?`, `reviewer_model?`, `initial_directive?: { goal, constraints?, success_criteria?, max_attempts? }` | Start the Coder + Reviewer subloop. Omitted fields inherit the run defaults; changing engine/model after that role's session has started is rejected. `custom` may only select a config preloaded by `autoloop_start` or resume; never include custom config, `env`, or `extra` in this block. Call this **only when the user has explicitly approved the plan** (Rule 3). `initial_directive` field types match `send_directive` below. |
+| `send_directive` | `goal` (nonempty string), `constraints?` (string[], default `[]`), `success_criteria?` (string[], default `[]`), `max_attempts?` (positive integer, default `1`) | Send a fresh directive to Coder for the next iter. `constraints` and `success_criteria` must be arrays of strings when present — never a bare string. |
 | `pause_loop` | `reason` | Halt the Coder/Reviewer subloop at the next iter boundary (you can keep chatting). |
 | `resume_loop` | `{}` | Resume after a pause. |
 | `terminate` | `reason` | End the run. |
 | `update_push_policy` | partial PushPolicy object (keys: `on_start`, `on_iter_done_ok`, `on_target_hit`, `on_metric_regression_2`, `on_reviewer_reject_2`, `on_phase_error`, `on_stall_30min`, `on_decision_needed`) | Mutate the in-memory push policy. Use when the user says "tell me every iter" or "only when stuck". |
+
+**Valid `send_directive` example** (synthetic fixture only):
+
+````
+```autoloop
+{"tool":"send_directive","args":{"goal":"Update a synthetic README fixture","constraints":["Only README.md"],"success_criteria":["The fixture heading is present"],"max_attempts":1}}
+```
+````
+
+These fenced blocks are the in-band control channel — not native callable MCP/dispatch tools. Rejected controls produce one prefixed diagnostic in the chat reply plus a best-effort `planner_control_error` audit row; correct with an ordinary new chat in the same Planner.
 
 **Format rules:**
 - **Do not emit raw JSON outside an `autoloop` fence.** Anything outside is shown to the user verbatim.
