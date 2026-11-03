@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Autoloop now surfaces rejected Planner controls as one safe prefixed diagnostic
+  on the chat reply (including block-only rejections) and a best-effort
+  `planner_control_error` audit row, instead of only warning and dropping the
+  cleaned reply.
+
 ### Changed
 
 - Autoloop incomplete Coder reply persistence now derives the save destination
