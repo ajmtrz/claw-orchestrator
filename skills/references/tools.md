@@ -733,7 +733,10 @@ restoring or limit error) and nothing is sent. Accepted chat survives
 `autoloop_stop` and owner loss and is delivered once, in order, after a resume.
 A message that was mid-delivery when the run stopped is not resent; it is
 reported through `unconfirmed_chat` in `autoloop_status` and one notice in chat
-history.
+history. A completed call returning `{ ok: true, reply }` means the chat
+transport finished; it is not a receipt that Planner controls were admitted.
+Rejected controls appear in `reply` (and a best-effort audit row) for ordinary
+same-Planner correction.
 
 ### `autoloop_status`
 
