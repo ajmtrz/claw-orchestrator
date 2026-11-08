@@ -355,6 +355,7 @@ export interface LegacyCouncilArgs {
   maxTurnsPerAgent?: number;
   maxBudgetUsd?: number;
   defaultPermissionMode?: string;
+  inputs?: CouncilNode['inputs'];
 }
 
 export function legacyCouncilWorkflow(args: LegacyCouncilArgs): WorkflowSpec {
@@ -377,6 +378,7 @@ export function legacyCouncilWorkflow(args: LegacyCouncilArgs): WorkflowSpec {
         maxTurnsPerAgent: args.maxTurnsPerAgent,
         maxBudgetUsd: args.maxBudgetUsd,
         defaultPermissionMode: args.defaultPermissionMode,
+        inputs: args.inputs,
       },
     ],
   };

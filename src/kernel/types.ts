@@ -127,6 +127,8 @@ export interface CouncilNode extends NodeBase {
   maxTurnsPerAgent?: number;
   maxBudgetUsd?: number;
   defaultPermissionMode?: string;
+  /** Declared input manifest (path + sha256 + optional source). */
+  inputs?: Array<{ path: string; sha256: string; source?: string }>;
   /** One agent's send; `timeoutMs` bounds the whole council. Falls back to `timeoutMs`. */
   agentTimeoutMs?: number;
 }

@@ -434,12 +434,21 @@ Start a multi-agent council. Runs in background, returns session ID immediately.
 | ----------------------- | -------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `task`                  | string         | yes      | Task description                                                                                                                                        |
 | `projectDir`            | string         | yes      | Working directory                                                                                                                                       |
-| `agents`                | AgentPersona[] |          | Agent list (defaults to 3-agent team)                                                                                                                   |
+| `agents`                | AgentPersona[] |          | Agent list (defaults to 3-agent team). Each agent may set `permissionMode`, `sandboxMode`, and optional `inputs` (`path` + `sha256` + optional `source`). |
 | `maxRounds`             | number         |          | Max rounds (default 15)                                                                                                                                 |
 | `agentTimeoutMs`        | number         |          | Per-agent timeout (default 1800000)                                                                                                                     |
 | `maxTurnsPerAgent`      | number         |          | Max tool turns per agent (default 30)                                                                                                                   |
 | `maxBudgetUsd`          | number         |          | Max API spend per agent                                                                                                                                 |
 | `defaultPermissionMode` | string         |          | Default permission mode for agents (`acceptEdits`, `bypassPermissions`, etc.). Overridden by agent-level `permissionMode`. Default: `bypassPermissions` |
+
+Per-agent `permissionMode` / `sandboxMode` use the same enums as `session_start`.
+Optional `inputs` is a host-verified manifest (≤32 entries, ≤32 MiB each, relative `path`,
+streamed sha256). When any agent opts into modes or inputs, one preflight runs before
+views or sessions: mixed RO/writable → `contract-mixed`; unknown capability (e.g. `dontAsk`
+in git mode) → `capability-unknown` with correction `sandboxMode read-only`. Read-only
+councils use detached base views and refuse accept/reject/review. Configuration readiness,
+orchestrator input verification, and native policy are distinct; native outside-read stays OPEN.
+See [council.md](./council.md#bound-input-preflight-and-read-only-mode).
 
 ### `council_status`
 

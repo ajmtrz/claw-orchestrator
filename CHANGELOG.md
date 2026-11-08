@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Council bound-input preflight and per-agent `sandboxMode`.** `council_start` agents
+  declare `permissionMode` / `sandboxMode` and an optional `inputs` manifest (`path` +
+  `sha256` + optional `source`). When inputs or a strict request are present, one
+  preflight runs before any view or session: mixed RO/writable fails; unknown
+  capabilities (e.g. `dontAsk` in git mode) fail with a fixed-vocabulary correction to
+  `sandboxMode read-only`. Read-only councils use detached base views, RO prompts, and
+  refuse `council_accept` / `reject` / `review`. Configuration readiness, orchestrator
+  input verification, and native policy remain distinct; native outside-read stays OPEN.
 - **`fanout_start` agents declare `permissionMode` and `sandboxMode`.** Same enums as
   `session_start`. `permissionMode: plan` binds Claude only; `sandboxMode` is
   engine-agnostic and is already forwarded into each worker session. Synthesis is

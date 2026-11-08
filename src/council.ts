@@ -58,6 +58,23 @@ import {
 } from './constants.js';
 import { type Logger, createConsoleLogger } from './logger.js';
 import { mapBounded } from './concurrency.js';
+import {
+  needsPreflight,
+  normalizeEffectiveMembers,
+  selectMode,
+  classifyCapability,
+  validateManifest,
+  captureHead,
+  createReadOnlyView,
+  deliverInputToView,
+  verifyInputsInView,
+  buildReadOnlyPrompt,
+  hashFileStreamed,
+  UNSUPPORTED_OPERATION_REASON,
+  type CouncilPreflightResult,
+  type CouncilInputSpec,
+} from './council-preflight.js';
+import { treeFingerprint } from './verify/baseline.js';
 
 // Forward-declare SessionManager to avoid circular imports at the type level.
 // The actual instance is injected via constructor.
@@ -526,6 +543,7 @@ export class Council extends EventEmitter {
           model: agent.model,
           baseUrl: agent.baseUrl,
           permissionMode: agent.permissionMode ?? this.config.defaultPermissionMode ?? 'bypassPermissions',
+          sandboxMode: agent.sandboxMode,
           appendSystemPrompt: systemPrompt,
           maxTurns: this.config.maxTurnsPerAgent || DEFAULT_MAX_TURNS_PER_AGENT,
           maxBudgetUsd: this.config.maxBudgetUsd,
@@ -647,13 +665,48 @@ export class Council extends EventEmitter {
     this.logger.info(`Starting: ${this.config.agents.length} agents, max ${this.config.maxRounds} rounds`);
     this.logger.info(`Task: ${trimmedTask}`);
     this.logger.info(`Dir: ${this.config.projectDir}`);
-    this.logger.warn('Agents run with permissionMode=bypassPermissions for autonomous execution');
     this.emitEvent({ type: 'session-start', sessionId: session.id, task: trimmedTask });
 
-    // Set up git worktrees
+    const inputs = (this.config.inputs ?? []) as CouncilInputSpec[];
+    const runPreflight = needsPreflight(
+      this.config.agents,
+      inputs.length ? inputs : undefined,
+      this.config.defaultPermissionMode,
+    );
+    let runMode: 'read-only' | 'git' = 'git';
+    let boundBase = this.config.boundBaseSha;
+    const fingerprints = new Map<string, string | undefined>();
+
+    // Set up member views (git worktrees or read-only detached views)
     let worktreeMap: Map<string, string>;
     try {
-      worktreeMap = await setupWorktrees(this.config.projectDir, this.config.agents, this.logger);
+      if (runPreflight) {
+        const preflight = await this._runPreflight(session, inputs, boundBase);
+        session.preflight = preflight;
+        if (!preflight.ok) {
+          session.status = 'error';
+          session.endTime = new Date().toISOString();
+          this.emitEvent({
+            type: 'error',
+            sessionId: session.id,
+            error: 'preflight-failed',
+          });
+          this.emitEvent({ type: 'complete', sessionId: session.id, status: session.status });
+          return session;
+        }
+        runMode = preflight.mode;
+        boundBase = preflight.base;
+        worktreeMap = new Map(preflight.members.map((m) => [m.member, m.view]));
+        this.logger.info(`Council mode=${runMode} base=${boundBase}`);
+        for (const m of preflight.members) {
+          this.logger.info(
+            `  ${m.member}: engine=${m.engine} permissionMode=${this.config.agents.find((a) => a.name === m.member)?.permissionMode ?? this.config.defaultPermissionMode ?? 'bypassPermissions'} sandboxMode=${this.config.agents.find((a) => a.name === m.member)?.sandboxMode ?? '(unset)'}`,
+          );
+        }
+      } else {
+        this.logger.warn('Agents run with permissionMode=bypassPermissions for autonomous execution');
+        worktreeMap = await setupWorktrees(this.config.projectDir, this.config.agents, this.logger);
+      }
     } catch (err) {
       session.status = 'error';
       session.endTime = new Date().toISOString();
@@ -664,6 +717,12 @@ export class Council extends EventEmitter {
     this.logger.info('Worktrees:');
     for (const [name, wtPath] of worktreeMap) {
       this.logger.info(`  ${name}: ${wtPath}`);
+    }
+
+    if (runMode === 'read-only') {
+      for (const [, wtPath] of worktreeMap) {
+        fingerprints.set(wtPath, await treeFingerprint(wtPath));
+      }
     }
 
     try {
@@ -680,11 +739,17 @@ export class Council extends EventEmitter {
         // Build prompts for all agents
         const agentTasks = this.config.agents.map((agent) => {
           const workDir = worktreeMap.get(agent.name) || this.config.projectDir;
-          let prompt = buildAgentPrompt(agent, trimmedTask, round, session.responses, this.config.agents);
-          if (injection) {
+          let prompt =
+            runMode === 'read-only'
+              ? buildReadOnlyPrompt(agent, trimmedTask, round)
+              : buildAgentPrompt(agent, trimmedTask, round, session.responses, this.config.agents);
+          if (injection && runMode !== 'read-only') {
             prompt += `\n\n## User Injection\n\n${injection}`;
           }
-          const systemPrompt = buildSystemPrompt(agent, this.config.agents, workDir, this.config.projectDir);
+          const systemPrompt =
+            runMode === 'read-only'
+              ? `${agent.persona}\n\nRead-only council member. Inspect and report only.`
+              : buildSystemPrompt(agent, this.config.agents, workDir, this.config.projectDir);
           return { agent, prompt, systemPrompt, workDir };
         });
 
@@ -723,6 +788,23 @@ export class Council extends EventEmitter {
           }
         }
 
+        if (runMode === 'read-only' && inputs.length > 0) {
+          for (const [, wtPath] of worktreeMap) {
+            const inputFails = verifyInputsInView(wtPath, inputs);
+            if (inputFails.length > 0) {
+              session.status = 'error';
+              session.preflight = {
+                ...(session.preflight as CouncilPreflightResult),
+                ok: false,
+                failures: [...(session.preflight?.failures ?? []), ...inputFails],
+              };
+              this.emitEvent({ type: 'error', sessionId: session.id, round, error: 'preflight-failed' });
+              break;
+            }
+          }
+          if (session.status === 'error') break;
+        }
+
         const allYes = roundVotes.length === this.config.agents.length && roundVotes.every((v) => v);
         this.emitEvent({ type: 'round-end', sessionId: session.id, round, status: allYes ? 'consensus' : 'continue' });
 
@@ -737,6 +819,27 @@ export class Council extends EventEmitter {
 
         if (round < this.config.maxRounds) {
           await sleep(INTER_ROUND_DELAY_MS);
+        }
+      }
+
+      if (runMode === 'read-only' && session.status !== 'error') {
+        for (const [wtPath, before] of fingerprints) {
+          const after = await treeFingerprint(wtPath);
+          if (before && after && before !== after) {
+            session.status = 'error';
+            const failure = {
+              check: 'fingerprint',
+              subject: 'view',
+              reason: 'net-change-detected' as const,
+            };
+            session.preflight = {
+              ...(session.preflight as CouncilPreflightResult),
+              ok: false,
+              failures: [...(session.preflight?.failures ?? []), failure],
+            };
+            this.emitEvent({ type: 'error', sessionId: session.id, error: 'preflight-failed' });
+            break;
+          }
         }
       }
 
@@ -760,6 +863,15 @@ export class Council extends EventEmitter {
       } else if (session.status === 'running') {
         session.status = 'max_rounds';
         this.logger.info(`Max rounds (${this.config.maxRounds}) reached`);
+      }
+
+      // Read-only views: remove by exact path only when unchanged.
+      if (runMode === 'read-only' && !this._aborted) {
+        const { removeViewIfUnchanged } = await import('./council-preflight.js');
+        for (const [wtPath, before] of fingerprints) {
+          await removeViewIfUnchanged(wtPath, before);
+        }
+        this._worktreeMap.clear();
       }
 
       session.endTime = new Date().toISOString();
@@ -860,6 +972,23 @@ export class Council extends EventEmitter {
   async review(): Promise<CouncilReviewResult> {
     const session = this._session;
     if (!session) throw new Error('Council not initialised');
+    if (this.isReadOnlyCouncil()) {
+      return {
+        councilId: session.id,
+        projectDir: session.config.projectDir,
+        status: 'error',
+        rounds: 0,
+        planExists: false,
+        changedFiles: [],
+        branches: [],
+        worktrees: [],
+        reviews: [],
+        agentSummaries: [],
+        reviewerGuidance: '',
+        unsupportedOperation: true,
+        reason: UNSUPPORTED_OPERATION_REASON,
+      };
+    }
     const dir = session.config.projectDir;
 
     // Gather branches
@@ -1058,6 +1187,168 @@ export class Council extends EventEmitter {
     return result;
   }
 
+  private isReadOnlyCouncil(): boolean {
+    if (this._session?.preflight?.mode === 'read-only') return true;
+    // Reconstructed sessions after restart may lack a live preflight object; derive
+    // from the persisted agent effective modes so accept/reject/review still refuse.
+    const agents = this._session?.config.agents ?? [];
+    if (!agents.length) return false;
+    return normalizeEffectiveMembers(agents, this._session?.config.defaultPermissionMode).every(
+      (m) => m.readOnlyEffective,
+    );
+  }
+
+  /**
+   * Configuration readiness + orchestrator input verification before any worker.
+   * Native engine policy is never claimed.
+   */
+  private async _runPreflight(
+    session: CouncilSession,
+    inputs: CouncilInputSpec[],
+    boundBaseSha: string | undefined,
+  ): Promise<CouncilPreflightResult> {
+    const failures: CouncilPreflightResult['failures'] = [];
+    const membersEff = normalizeEffectiveMembers(this.config.agents, this.config.defaultPermissionMode);
+
+    failures.push(...validateManifest(inputs.length ? inputs : undefined));
+
+    const modeSel = selectMode(membersEff);
+    if (modeSel.failure) {
+      failures.push(modeSel.failure);
+      return {
+        ok: false,
+        mode: 'git',
+        base: boundBaseSha ?? '',
+        members: [],
+        failures,
+      };
+    }
+    const mode = modeSel.mode!;
+
+    for (const m of membersEff) {
+      const cap = classifyCapability(m, mode, this.config.projectDir);
+      if (cap === 'unsupported' || cap === 'unknown') {
+        failures.push({
+          member: m.agent.name,
+          engine: m.engine,
+          check: 'capability',
+          subject: mode,
+          reason: cap === 'unsupported' ? 'capability-unsupported' : 'capability-unknown',
+          correction: 'sandboxMode read-only',
+        });
+      }
+    }
+
+    let base = boundBaseSha;
+    if (!base) {
+      base = await captureHead(this.config.projectDir);
+    }
+    if (!base) {
+      failures.push({ check: 'base', subject: 'HEAD', reason: 'base-absent' });
+    }
+
+    if (failures.length > 0 || !base) {
+      return { ok: false, mode, base: base ?? '', members: [], failures };
+    }
+
+    const memberRecords: CouncilPreflightResult['members'] = [];
+    const viewMap = new Map<string, string>();
+
+    if (mode === 'read-only') {
+      for (const m of membersEff) {
+        const created = await createReadOnlyView(this.config.projectDir, base, session.id, m.agent.name);
+        if (!created.ok) {
+          failures.push({
+            member: m.agent.name,
+            engine: m.engine,
+            check: 'view',
+            subject: 'target',
+            reason: created.reason,
+          });
+          continue;
+        }
+        viewMap.set(m.agent.name, created.view);
+        for (const entry of inputs) {
+          const fail = deliverInputToView(created.view, entry, this.config.projectDir);
+          if (fail) {
+            failures.push({ ...fail, member: m.agent.name, engine: m.engine });
+          }
+        }
+        const head = await captureHead(created.view);
+        if (!head || head !== base) {
+          failures.push({
+            member: m.agent.name,
+            engine: m.engine,
+            check: 'head',
+            subject: 'HEAD',
+            reason: 'head-mismatch',
+          });
+        }
+        const inputStatus = inputs.map((entry) => {
+          const dest = path.join(created.view, entry.path);
+          const hashed = hashFileStreamed(dest, 32 * 1024 * 1024);
+          return {
+            path: entry.path,
+            sha256: entry.sha256,
+            ok: hashed.ok === true && hashed.sha256 === entry.sha256,
+          };
+        });
+        memberRecords.push({
+          member: m.agent.name,
+          engine: m.engine,
+          view: created.view,
+          head: head ?? undefined,
+          inputs: inputStatus,
+          outsideRead: 'unknown',
+        });
+      }
+    } else {
+      // git mode — existing setupWorktrees from the bound base
+      const map = await setupWorktrees(this.config.projectDir, this.config.agents, this.logger);
+      for (const m of membersEff) {
+        const view = map.get(m.agent.name) || this.config.projectDir;
+        viewMap.set(m.agent.name, view);
+        // Reset to bound base when possible
+        try {
+          await spawnAsync('git', ['-C', view, 'reset', '--hard', base], { timeout: GIT_CMD_TIMEOUT_MS });
+        } catch {
+          failures.push({
+            member: m.agent.name,
+            engine: m.engine,
+            check: 'head',
+            subject: 'HEAD',
+            reason: 'head-mismatch',
+          });
+        }
+        const head = await captureHead(view);
+        if (!head || head !== base) {
+          failures.push({
+            member: m.agent.name,
+            engine: m.engine,
+            check: 'head',
+            subject: 'HEAD',
+            reason: 'head-mismatch',
+          });
+        }
+        for (const entry of inputs) {
+          const fail = deliverInputToView(view, entry, this.config.projectDir);
+          if (fail) failures.push({ ...fail, member: m.agent.name, engine: m.engine });
+        }
+        memberRecords.push({
+          member: m.agent.name,
+          engine: m.engine,
+          view,
+          head: head ?? undefined,
+          inputs: inputs.map((e) => ({ path: e.path, sha256: e.sha256, ok: true })),
+          outsideRead: 'unknown',
+        });
+      }
+    }
+
+    this._worktreeMap = viewMap;
+    return { ok: failures.length === 0, mode, base, members: memberRecords, failures };
+  }
+
   /**
    * Accept the council's work: clean up worktrees, branches, plan.md, and reviews/.
    * Should only be called after reviewing via `review()`.
@@ -1065,6 +1356,17 @@ export class Council extends EventEmitter {
   async accept(): Promise<CouncilAcceptResult> {
     const session = this._session;
     if (!session) throw new Error('Council not initialised');
+    if (this.isReadOnlyCouncil()) {
+      return {
+        councilId: session.id,
+        branchesDeleted: [],
+        worktreesRemoved: [],
+        planDeleted: false,
+        reviewsDeleted: false,
+        unsupportedOperation: true,
+        reason: UNSUPPORTED_OPERATION_REASON,
+      };
+    }
     const dir = session.config.projectDir;
 
     // Ensure we're on main
@@ -1094,6 +1396,15 @@ export class Council extends EventEmitter {
   async reject(feedback: string): Promise<CouncilRejectResult> {
     const session = this._session;
     if (!session) throw new Error('Council not initialised');
+    if (this.isReadOnlyCouncil()) {
+      return {
+        councilId: session.id,
+        planRewritten: false,
+        feedback: '',
+        unsupportedOperation: true,
+        reason: UNSUPPORTED_OPERATION_REASON,
+      };
+    }
     const dir = session.config.projectDir;
 
     const planPath = path.join(dir, 'plan.md');

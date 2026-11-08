@@ -157,7 +157,10 @@ Every node takes `retry: { max, backoffMs }`, `timeoutMs`, and
 Direct agent bindings use the same optional `engine`, `model`, and `effort`
 fields. Fan-out and council entries configure them per agent; `effort` accepts
 `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, or `auto`. Omission preserves
-the session default.
+the session default. Council agents may also set `permissionMode`, `sandboxMode`,
+and optional bound `inputs` (path + sha256); when those are present the council
+node runs the same preflight as `council_start` before views or sessions — see
+[`council.md`](./council.md#bound-input-preflight-and-read-only-mode).
 
 Fan-out agents may also set `persona` for role instructions. When no non-empty
 per-agent `prompt` exists, the executor sends the persona followed by a

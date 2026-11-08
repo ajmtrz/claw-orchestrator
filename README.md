@@ -193,6 +193,15 @@ wrapper's failure modes.
 verifier → router → an agent that drafts the alignment on a `sweep/<date>` branch → a human gate.
 A person reviews and merges; the orchestrator does not edit its own code unattended.
 
+## Known Limitations
+
+- **Council native outside-read** remains OPEN: orchestrator preflight verifies
+  configuration readiness and declared inputs; it does not claim OS-enforced denial
+  of undeclared paths for every engine. Configuration readiness, host input
+  verification, and native policy stay distinct statements.
+- **Live heterogeneous council rounds** and **Node 22/24** coverage are not claimed
+  from this tree's default CI host (see evidence notes when present).
+
 ## Contributing
 
 See [`CONTRIBUTING.md`](./CONTRIBUTING.md). Run `npm run build && npm run lint && npm run format:check && npm run test` before submitting.

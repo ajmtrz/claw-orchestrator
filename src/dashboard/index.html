@@ -2214,6 +2214,19 @@
           if (j.ok) {
             state.council.session = j.session;
             paintCouncilState();
+            // Persisted preflight failures on reload with zero responses: system
+            // error entries only (escaped). Never echo raw paths that failed validation.
+            const pf = j.session.preflight;
+            if (pf && pf.ok === false && Array.isArray(pf.failures) && !(j.session.responses || []).length) {
+              pf.failures.forEach((f) => {
+                const parts = [f.check, f.subject, f.reason, f.correction].filter(Boolean);
+                state.council.events.push({
+                  ts: j.session.endTime || j.session.startTime || new Date().toISOString(),
+                  who: 'system',
+                  text: `[error] ${parts.join(' ')}`,
+                });
+              });
+            }
             // Replay existing responses as initial entries.
             (j.session.responses || []).forEach((resp) => {
               state.council.events.push({

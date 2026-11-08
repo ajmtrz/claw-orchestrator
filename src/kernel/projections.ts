@@ -48,11 +48,34 @@ export interface CouncilNodeData {
   agents: CouncilSession['config']['agents'];
   maxRounds: number;
   projectDir: string;
+  preflight?: CouncilSession['preflight'];
+  boundBaseSha?: string;
+}
+
+/** Prefer legacy `main`, else the first `council` node in the workflow spec. */
+export function councilNodeId(record: RunRecord): string {
+  if (record.nodes[LEGACY_NODE] || record.spec?.nodes?.some((n) => n.id === LEGACY_NODE && n.kind === 'council')) {
+    return LEGACY_NODE;
+  }
+  const fromSpec = record.spec?.nodes?.find((n) => n.kind === 'council')?.id;
+  if (fromSpec) return fromSpec;
+  const fromData = Object.keys(record.nodes).find((id) => {
+    const d = record.nodes[id]?.data as CouncilNodeData | undefined;
+    return d != null && Array.isArray(d.agents);
+  });
+  return fromData ?? LEGACY_NODE;
 }
 
 export function toCouncilSession(record: RunRecord): CouncilSession {
-  const data = node(record)?.data as CouncilNodeData | undefined;
-  const declared = spec<{ task: string; agents: CouncilSession['config']['agents']; maxRounds?: number }>(record);
+  const id = councilNodeId(record);
+  const data = node(record, id)?.data as CouncilNodeData | undefined;
+  const declared = spec<{
+    task: string;
+    agents: CouncilSession['config']['agents'];
+    maxRounds?: number;
+    defaultPermissionMode?: CouncilSession['config']['defaultPermissionMode'];
+    inputs?: CouncilSession['config']['inputs'];
+  }>(record, id);
   return {
     id: record.runId,
     task: data?.task ?? declared?.task ?? record.workflow,
@@ -60,6 +83,9 @@ export function toCouncilSession(record: RunRecord): CouncilSession {
       agents: data?.agents ?? declared?.agents ?? [],
       maxRounds: data?.maxRounds ?? declared?.maxRounds ?? 0,
       projectDir: data?.projectDir ?? record.cwd,
+      defaultPermissionMode: declared?.defaultPermissionMode,
+      inputs: declared?.inputs,
+      boundBaseSha: data?.boundBaseSha ?? data?.preflight?.base,
     },
     responses: data?.responses ?? [],
     // The council's own status is preserved when it reported one; otherwise the
@@ -71,6 +97,7 @@ export function toCouncilSession(record: RunRecord): CouncilSession {
     endTime: record.endedAt,
     finalSummary: data?.finalSummary,
     compactContext: data?.compactContext,
+    preflight: data?.preflight,
   };
 }
 

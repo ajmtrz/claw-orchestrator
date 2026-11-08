@@ -19,8 +19,21 @@ export async function executeCouncilNode(node: NodeSpec, ctx: NodeContext): Prom
 
   // Same story as the fan-out node: forward every field. Dropping
   // `customEngine` here did not merely lose configuration — a council agent on a
-  // custom engine could not start at all without it.
+  // custom engine could not start at all without it. sandboxMode must reach
+  // startSession the same way permissionMode already did.
   const customEngines = (ctx.secrets.agentCustomEngines ?? {}) as Record<string, unknown>;
+  const projectDir = spec.projectDir || ctx.cwd;
+  // Prefer the run record's base when the council cwd is the same tree the kernel captured.
+  let boundBaseSha: string | undefined;
+  try {
+    const fs = await import('node:fs');
+    if (fs.realpathSync(projectDir) === fs.realpathSync(ctx.cwd)) {
+      boundBaseSha = ctx.record.baseSha;
+    }
+  } catch {
+    boundBaseSha = undefined;
+  }
+
   const { Council } = await import('../../council.js');
   const council = new Council(
     {
@@ -33,16 +46,19 @@ export async function executeCouncilNode(node: NodeSpec, ctx: NodeContext): Prom
         model: a.model,
         baseUrl: a.baseUrl,
         permissionMode: a.permissionMode as never,
+        sandboxMode: a.sandboxMode,
         effort: a.effort as never,
         ultracode: a.ultracode,
         customEngine: customEngines[a.name] as never,
       })),
       maxRounds: spec.maxRounds ?? 8,
-      projectDir: spec.projectDir || ctx.cwd,
+      projectDir,
       agentTimeoutMs: spec.agentTimeoutMs ?? spec.timeoutMs,
       maxTurnsPerAgent: spec.maxTurnsPerAgent,
       maxBudgetUsd: spec.maxBudgetUsd,
       defaultPermissionMode: spec.defaultPermissionMode as never,
+      inputs: spec.inputs,
+      boundBaseSha,
       // A cancelled run, or an attempt the kernel timed out, must not keep opening rounds.
       signal: ctx.signal,
     },
@@ -65,11 +81,31 @@ export async function executeCouncilNode(node: NodeSpec, ctx: NodeContext): Prom
         compactContext: live.compactContext,
         agents: spec.agents,
         maxRounds: spec.maxRounds ?? 8,
-        projectDir: spec.projectDir || ctx.cwd,
+        projectDir,
+        preflight: live.preflight,
       });
     }
   });
   const session = await council.run(spec.task);
+
+  // Persist a captured bound base for resume when the council published one.
+  if (session.preflight?.base) {
+    const published = ctx.publish({
+      task: session.task,
+      responses: session.responses,
+      councilStatus: session.status,
+      finalSummary: session.finalSummary,
+      compactContext: session.compactContext,
+      agents: spec.agents,
+      maxRounds: spec.maxRounds ?? 8,
+      projectDir,
+      preflight: session.preflight,
+      boundBaseSha: session.preflight.base,
+    });
+    if (!published && session.preflight && !session.preflight.ok) {
+      // publish failure on a failing preflight is already an error path
+    }
+  }
 
   const consensusVotes: ConsensusVote[] = session.responses.map((r) => {
     const { vote, source } = parseConsensusWithSource(r.content ?? '');
@@ -86,7 +122,11 @@ export async function executeCouncilNode(node: NodeSpec, ctx: NodeContext): Prom
     output:
       session.finalSummary ??
       session.responses.map((r) => `## ${r.agent} (round ${r.round})\n\n${r.content}`).join('\n\n'),
-    error: ok ? undefined : 'council ended in error',
+    error: ok
+      ? undefined
+      : session.preflight && !session.preflight.ok
+        ? 'council preflight failed'
+        : 'council ended in error',
     consensusVotes,
     data: {
       task: session.task,
@@ -96,7 +136,8 @@ export async function executeCouncilNode(node: NodeSpec, ctx: NodeContext): Prom
       compactContext: session.compactContext,
       agents: spec.agents,
       maxRounds: spec.maxRounds ?? 8,
-      projectDir: spec.projectDir || ctx.cwd,
+      projectDir,
+      preflight: session.preflight,
     },
   };
 }

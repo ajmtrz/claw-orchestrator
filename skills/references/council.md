@@ -261,6 +261,26 @@ Each `CouncilChangedFile` carries `change` — git's own account (`added` /
 `modified` / `deleted`). `status` is optional and stays undefined until a
 reviewer assesses the file.
 
+## Bound-input preflight and read-only mode
+
+When any agent sets `sandboxMode`, `permissionMode: plan` / `dontAsk`, or `inputs` is
+non-empty, the council runs a single preflight before creating views or sessions:
+
+- **Mode**: all members read-only-effective → read-only detached worktrees at the bound
+  base; no strict request → legacy git worktrees (byte-identical to prior behaviour);
+  mixed RO + writable → `contract-mixed`.
+- **Capability**: static table only (configuration readiness). Unknown/unsupported
+  (e.g. Claude `dontAsk` in git mode, Codex git writes) fails with
+  `capability-unknown` / `capability-unsupported` and correction `sandboxMode read-only`.
+- **Inputs**: at most 32 entries, 32 MiB each; `path` relative; `source` optional absolute
+  provenance after blocked-location checks; host streams sha256 (never model-reported).
+- **Read-only**: prompts/charter omit write and VCS-mutation vocabulary; accept/reject/review
+  return `{ unsupportedOperation: true, reason: "read-only-council" }`.
+- **Native policy** (outside-read denial, OS isolation) is not claimed; OPEN until evidenced.
+
+Failures persist on the run record (`preflight` in node data / `council_status`) and the
+dashboard reloads them as escaped system errors when there are zero responses.
+
 ## Related
 
 - [`verification.md`](./verification.md) — acceptance contracts

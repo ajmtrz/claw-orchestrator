@@ -138,6 +138,7 @@ import { autoloopStateFromRecord, makeAutoloopExecutor, type AutoloopHandle } fr
 import { isValidRunId, loadRun, readNodeOutput, type RunSummary } from './kernel/store.js';
 import {
   LEGACY_NODE,
+  councilNodeId,
   joinFindings,
   toCouncilSession,
   toFanoutSession,
@@ -3205,6 +3206,7 @@ export class SessionManager {
         maxTurnsPerAgent: config.maxTurnsPerAgent,
         maxBudgetUsd: config.maxBudgetUsd,
         defaultPermissionMode: config.defaultPermissionMode,
+        inputs: config.inputs,
       }),
       { runId, cwd: config.projectDir, secrets: { agentCustomEngines: secrets } },
     );
@@ -3281,10 +3283,15 @@ export class SessionManager {
    * impossible.
    */
   private _councilForPostProcessing(id: string): Council {
-    const live = this.kernel.handle<Council>(id, LEGACY_NODE);
-    if (live) return live;
     const record = loadRun(id);
-    if (!record || record.workflow !== 'council') throw new Error(`Council '${id}' not found`);
+    const hasCouncilNode =
+      !!record &&
+      (record.workflow === 'council' ||
+        (record.spec.nodes ?? []).some((n) => (n as { kind?: string }).kind === 'council'));
+    if (!record || !hasCouncilNode) throw new Error(`Council '${id}' not found`);
+    const nodeId = councilNodeId(record);
+    const live = this.kernel.handle<Council>(id, nodeId);
+    if (live) return live;
     const session = toCouncilSession(record);
     const council = new Council(session.config, this, this.logger);
     council.adoptSession(session);

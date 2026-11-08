@@ -872,10 +872,40 @@ export interface AgentPersona extends AgentBinding {
   role?: string;
   baseUrl?: string;
   permissionMode?: PermissionMode;
+  /** Engine-agnostic sandbox; `read-only` holds on every engine that supports it. */
+  sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
   customEngine?: CustomEngineConfig;
   /** Per-agent reasoning effort passed to the agent's session. */
   /** Per-agent ultracode / dynamic workflows (council, claude engine only). */
   ultracode?: boolean;
+}
+
+export interface CouncilInputManifestEntry {
+  path: string;
+  sha256: string;
+  source?: string;
+}
+
+export interface CouncilPreflightSnapshot {
+  ok: boolean;
+  mode: 'read-only' | 'git';
+  base: string;
+  members: Array<{
+    member: string;
+    engine: string;
+    view: string;
+    head?: string;
+    inputs: Array<{ path: string; sha256: string; ok: boolean }>;
+    outsideRead: 'open' | 'unavailable' | 'unknown';
+  }>;
+  failures: Array<{
+    member?: string;
+    engine?: string;
+    check: string;
+    subject: string;
+    reason: string;
+    correction?: string;
+  }>;
 }
 
 export interface CouncilConfig {
@@ -893,6 +923,10 @@ export interface CouncilConfig {
   maxTurnsPerAgent?: number;
   maxBudgetUsd?: number;
   defaultPermissionMode?: PermissionMode;
+  /** Declared input manifest delivered into each member view when preflight runs. */
+  inputs?: CouncilInputManifestEntry[];
+  /** Bound base SHA when the caller already captured one (kernel record.baseSha). */
+  boundBaseSha?: string;
   /** Polled like `abort()`; set by the kernel so a cancelled or timed-out run stops opening sessions. */
   signal?: { aborted: boolean };
 }
@@ -916,6 +950,8 @@ export interface CouncilSession {
   endTime?: string;
   finalSummary?: string;
   compactContext?: string;
+  /** Set when preflight ran (inputs present or any strict permission/sandbox request). */
+  preflight?: CouncilPreflightSnapshot;
 }
 
 // ─── Council Post-Processing Types ─────────────────────────────────────────
@@ -961,6 +997,8 @@ export interface CouncilReviewResult {
   agentSummaries: Array<{ agent: string; consensus: boolean; preview: string }>;
   /** Reviewer guidance loaded from configs/council-reviewer-prompt.md */
   reviewerGuidance: string;
+  unsupportedOperation?: true;
+  reason?: 'read-only-council';
 }
 
 export interface CouncilAcceptResult {
@@ -969,10 +1007,15 @@ export interface CouncilAcceptResult {
   worktreesRemoved: string[];
   planDeleted: boolean;
   reviewsDeleted: boolean;
+  /** Fixed vocabulary when the council ran (or was reconstructed) in read-only mode. */
+  unsupportedOperation?: true;
+  reason?: 'read-only-council';
 }
 
 export interface CouncilRejectResult {
   councilId: string;
   planRewritten: boolean;
   feedback: string;
+  unsupportedOperation?: true;
+  reason?: 'read-only-council';
 }

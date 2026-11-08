@@ -1649,7 +1649,7 @@ const plugin = {
     registerTool({
       name: 'council_start',
       description:
-        'Start a multi-agent council that collaborates on a task using git worktree isolation, round-based execution, and consensus voting. Agents can use different engines (Claude, Codex) and models.',
+        'Start a multi-agent council that collaborates on a task using git worktree isolation, round-based execution, and consensus voting. Agents can use different engines (Claude, Codex) and models. Optional per-agent permissionMode/sandboxMode and an inputs manifest trigger bound-base preflight; read-only councils refuse accept/reject/review.',
       parameters: {
         type: 'object',
         properties: {
@@ -1681,6 +1681,18 @@ const plugin = {
                   type: 'boolean',
                   description: 'Per-agent ultracode / dynamic workflows (claude engine only).',
                 },
+                permissionMode: {
+                  type: 'string',
+                  enum: ['acceptEdits', 'bypassPermissions', 'default', 'manual', 'dontAsk', 'plan', 'auto'],
+                  description:
+                    'Per-agent permission mode. plan binds Claude only; mixed with writable members fails preflight.',
+                },
+                sandboxMode: {
+                  type: 'string',
+                  enum: ['read-only', 'workspace-write', 'danger-full-access'],
+                  description:
+                    'Engine-agnostic sandbox. read-only triggers bound-base preflight and read-only member views.',
+                },
               },
               required: ['name', 'emoji', 'persona'],
             },
@@ -1693,6 +1705,21 @@ const plugin = {
             type: 'string',
             enum: ['acceptEdits', 'bypassPermissions', 'default', 'manual', 'dontAsk', 'plan', 'auto'],
             description: 'Default permission mode for council agents (default: bypassPermissions)',
+          },
+          inputs: {
+            type: 'array',
+            maxItems: 32,
+            description:
+              'Declared input manifest: [{path, sha256, source?}]. path is relative to the member view; source is optional absolute provenance. Triggers preflight.',
+            items: {
+              type: 'object',
+              properties: {
+                path: { type: 'string', description: 'Relative path inside the member view' },
+                sha256: { type: 'string', description: 'Lowercase hex sha256 of the bytes' },
+                source: { type: 'string', description: 'Optional absolute host path of provenance bytes' },
+              },
+              required: ['path', 'sha256'],
+            },
           },
         },
         required: ['task', 'projectDir'],
@@ -1711,6 +1738,7 @@ const plugin = {
           maxTurnsPerAgent: args.maxTurnsPerAgent as number | undefined,
           maxBudgetUsd: args.maxBudgetUsd as number | undefined,
           defaultPermissionMode: args.defaultPermissionMode as CouncilConfig['defaultPermissionMode'],
+          inputs: args.inputs as CouncilConfig['inputs'],
         };
 
         const session = await getManager().councilStart(args.task as string, config);
