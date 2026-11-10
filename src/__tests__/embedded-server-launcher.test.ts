@@ -757,3 +757,70 @@ describe('POST /autoloop/:id/resume + GET /autoloop/:id/chat_history', () => {
     expect(r.status).toBe(404);
   });
 });
+
+// `launcher` is the argv prefix an engine binary runs under, so a request body
+// carrying one names an arbitrary program — the same class as an inline custom
+// engine, which this surface already refuses. Checked on every body, at any depth.
+describe('launcher over HTTP', () => {
+  let manager: SessionManager;
+  let server: EmbeddedServer;
+  let port: number;
+  let token: string;
+
+  beforeAll(async () => {
+    manager = new SessionManager({});
+    vi.spyOn(manager, 'startSession').mockImplementation(
+      async (config) =>
+        ({ name: config.name ?? 's', cwd: '/tmp' }) as Awaited<ReturnType<SessionManager['startSession']>>,
+    );
+    vi.spyOn(manager, 'workflowStart').mockImplementation(
+      async () =>
+        ({ runId: 'wf', state: 'running' }) as unknown as Awaited<ReturnType<SessionManager['workflowStart']>>,
+    );
+    const ephemeral = await freePort();
+    server = new EmbeddedServer(manager, ephemeral);
+    port = await server.start();
+    token = fs.readFileSync(path.join(os.homedir(), '.openclaw', 'server-token'), 'utf-8').trim();
+  });
+  afterAll(async () => {
+    await server.stop();
+    await manager.shutdown();
+  });
+
+  const post = (route: string, body: unknown) =>
+    fetch(`http://127.0.0.1:${port}${route}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+
+  it('refuses /session/start with a launcher instead of spawning it', async () => {
+    vi.mocked(manager.startSession).mockClear();
+    for (const launcher of [['/bin/sh', '-c', 'echo owned'], 'sh']) {
+      const r = await post('/session/start', { name: 'l', cwd: '/tmp', engine: 'claude', launcher });
+      expect(r.status).toBe(400);
+      const payload = (await r.json()) as { ok: boolean; error: string };
+      expect(payload.ok).toBe(false);
+      expect(payload.error).toContain('launcher may not be given over HTTP');
+    }
+    expect(manager.startSession).not.toHaveBeenCalled();
+  });
+
+  it('refuses a launcher nested in a workflow spec', async () => {
+    vi.mocked(manager.workflowStart).mockClear();
+    const r = await post('/workflow/new', {
+      spec: { name: 'w', nodes: [{ id: 'g', kind: 'goal', goal: 'x', launcher: ['/bin/sh', '-c', 'echo owned'] }] },
+    });
+    expect(r.status).toBe(400);
+    expect(manager.workflowStart).not.toHaveBeenCalled();
+  });
+
+  it('still starts a session without a launcher, or with an empty one', async () => {
+    vi.mocked(manager.startSession).mockClear();
+    for (const extra of [{}, { launcher: [] }]) {
+      const r = await post('/session/start', { name: 'ok', cwd: '/tmp', engine: 'claude', ...extra });
+      expect(r.status).toBe(200);
+    }
+    expect(manager.startSession).toHaveBeenCalledTimes(2);
+  });
+});

@@ -83,6 +83,11 @@ function autoloopErrorStatus(error: unknown): number {
 // `acpAgent` is the same thing for the `acp` engine: an inline config names the
 // command to run.
 const CUSTOM_ENGINE_KEY = /(custom_?engines?|acp_?agents?)$/i;
+// `launcher` is the argv prefix an engine binary runs under (a sandbox wrapper,
+// say). It names a program and its arguments just as an inline custom engine
+// does, so it is refused on the same terms: a session, workflow node or any
+// nested config may carry one from a local caller, never from this surface.
+const LAUNCHER_KEY = 'launcher';
 const MAX_SCAN_DEPTH = 12;
 
 /**
@@ -108,6 +113,7 @@ function findCustomEngineKey(value: unknown, depth = 0, trail = ''): string | nu
     // allows — and `engine: 'codex'` spawns an executable too, so "spawns
     // something" was never the line. Arbitrary argv is.
     if (CUSTOM_ENGINE_KEY.test(key) && isInlineCustomEngine(child)) return path;
+    if (key === LAUNCHER_KEY && isLauncherArgv(child)) return LAUNCHER_KEY;
     const hit = findCustomEngineKey(child, depth + 1, path);
     if (hit) return hit;
   }
@@ -141,9 +147,22 @@ function isInlineCustomEngine(value: unknown): boolean {
   );
 }
 
+/**
+ * A launcher value that would be spawned: `spawnEngine` runs any non-empty
+ * launcher, and a string is spread into characters, so both forms count. A
+ * JSON Schema *description* of the property (`{ type: 'array', … }`) is an
+ * object and passes, as the tool schemas a host sends back must.
+ */
+function isLauncherArgv(value: unknown): boolean {
+  return (Array.isArray(value) || typeof value === 'string') && value.length > 0;
+}
+
 function rejectCustomEngineOverHttp(body: unknown): string | null {
   const key = findCustomEngineKey(body);
   if (!key) return null;
+  if (key === LAUNCHER_KEY) {
+    return 'launcher may not be given over HTTP: it is the program and arguments an engine runs under, so it is accepted only from a local caller (MCP tool / SessionManager API).';
+  }
   return `${key} may not be given as an inline config over HTTP: it names an executable and its arguments, so it is accepted only from a local caller (MCP tool / SessionManager API). Pass the id of a bundled engine preset instead, or use a built-in engine.`;
 }
 
