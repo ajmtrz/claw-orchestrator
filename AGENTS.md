@@ -263,8 +263,9 @@ npm view @enderfga/claw-orchestrator version   # should equal X.Y.Z
 ### ClawHub
 
 The same GitHub release also triggers `clawhub-publish.yml`. It builds and packs the package, then publishes
-it to [ClawHub](https://clawhub.ai) through ClawHub's reusable `package-publish.yml` workflow, pinned by commit
-SHA, and waits for ClawHub's security checks. It runs only when the repository secret `CLAWHUB_TOKEN` exists;
+it to [ClawHub](https://clawhub.ai) with the ClawHub CLI (pinned version) on Node 22, and waits for ClawHub's
+security checks. ClawHub's reusable `package-publish.yml` workflow is not used: it runs plugin validation under
+Bun, which the CLI refuses. It runs only when the repository secret `CLAWHUB_TOKEN` exists;
 without it, release runs skip. One-time setup:
 
 1. Sign in at [clawhub.ai](https://clawhub.ai) with the GitHub account that owns the `@enderfga` scope, and

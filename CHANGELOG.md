@@ -18,9 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **GitHub releases can also publish to ClawHub.** `.github/workflows/clawhub-publish.yml` packs a tarball
-  equivalent to the npm publish and publishes it through ClawHub's reusable `package-publish.yml` workflow (pinned by
-  commit SHA). It runs once the repository secret `CLAWHUB_TOKEN` is set and skips releases until then; setup
-  is in `AGENTS.md` under Release Process.
+  equivalent to the npm publish and publishes it with the ClawHub CLI (pinned version) on Node 22, waiting for
+  ClawHub's security checks. ClawHub's reusable `package-publish.yml` workflow is not used: it runs plugin
+  validation under Bun, which the CLI refuses. It runs once the repository secret `CLAWHUB_TOKEN` is set and skips
+  releases until then; setup is in `AGENTS.md` under Release Process.
 
 ## [7.21.0] - 2026-11-10
 

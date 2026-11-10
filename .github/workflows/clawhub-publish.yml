@@ -47,10 +47,11 @@ jobs:
             echo "::notice::CLAWHUB_TOKEN is not set; skipping the ClawHub publish of this release."
           fi
 
-  pack:
+  publish:
     needs: check
     if: needs.check.outputs.enabled == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
@@ -63,6 +64,7 @@ jobs:
             echo "::error::A real manual publish must run on tag $expected, not $GITHUB_REF_NAME."
             exit 1
           fi
+      # The ClawHub CLI's plugin validation needs Node.js 22.13+ or 24+, and refuses to run under Bun.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -70,22 +72,22 @@ jobs:
       - run: npm run build
       # The repository does not commit dist/; this builds a tarball equivalent to the npm publish.
       - run: mkdir -p clawpack && npm pack --pack-destination clawpack
-      - uses: actions/upload-artifact@v4
-        with:
-          name: clawhub-package
-          path: clawpack/*.tgz
-          if-no-files-found: error
-          retention-days: 7
-
-  publish:
-    needs: pack
-    permissions:
-      actions: read
-      contents: read
-      id-token: write
-    uses: openclaw/clawhub/.github/workflows/package-publish.yml@32c8be8ff5a85dc605c671c1e73df489ae6abbda
-    with:
-      package_artifact_name: clawhub-package
-      dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
-    secrets:
-      clawhub_token: ${{ secrets.CLAWHUB_TOKEN }}
+      - name: Publish
+        env:
+          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$CLAWHUB_TOKEN" ]]; then
+            export CLAWHUB_CONFIG_PATH="$RUNNER_TEMP/clawhub-config.json"
+            node -e 'require("node:fs").writeFileSync(process.env.CLAWHUB_CONFIG_PATH, JSON.stringify({ registry: "https://clawhub.ai", token: process.env.CLAWHUB_TOKEN }), { mode: 0o600 })'
+          fi
+          # An absolute path: the CLI reads a relative "dir/file.tgz" as a GitHub owner/repo source.
+          tarballs=("$PWD"/clawpack/*.tgz)
+          args=(package publish "${tarballs[0]}" --source-repo "$GITHUB_REPOSITORY" --source-commit "$GITHUB_SHA" --source-ref "$GITHUB_REF" --json)
+          if [[ "$DRY_RUN" == "true" ]]; then
+            args+=(--dry-run)
+          else
+            args+=(--wait --wait-timeout 1800)
+          fi
+          npx --yes clawhub@0.25.1 "${args[@]}"
