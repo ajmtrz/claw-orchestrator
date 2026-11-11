@@ -2,13 +2,13 @@
 
 ## Supported versions
 
-Security fixes are released only on top of the latest release; older minor release lines are not patched. Upgrade to
-the newest release to receive them.
+Only the latest minor release line receives security fixes; older minor lines are not patched. A fix ships in a new
+release, so upgrade to the newest release to receive it.
 
-| Version                                                          | Supported |
-| ---------------------------------------------------------------- | --------- |
-| Latest minor release (for example, 7.22.x while 7.22 is current) | Yes       |
-| Older minor releases                                             | No        |
+| Version                                                               | Supported |
+| --------------------------------------------------------------------- | --------- |
+| Latest minor release line (for example, 7.22.x while 7.22 is current) | Yes       |
+| Older minor release lines                                             | No        |
 
 ## Reporting a vulnerability
 
@@ -44,8 +44,14 @@ Out of scope, because they are the documented security model rather than flaws (
 - on a non-loopback bind or a tunnel with no authenticating layer in front, what the security model already says
   is exposed: control for anyone with the token, or for anyone at all when authentication is disabled. A way past
   the token is in scope on any bind;
-- anything that needs the server's own user (or root), who can already read the token and run commands.
+- anything that needs the server's own user (or root), who can already read the token and run commands;
+- what an engine session does within the permission mode, sandbox and tools it was started with, including when
+  its model follows instructions planted in files, web pages or tool output (prompt injection). A way for such
+  content to widen those settings, or to make the orchestrator itself act outside them, is in scope.
 
 Vulnerabilities in the engine CLIs Claw Orchestrator drives (Claude Code, Codex, Antigravity, Grok Build, OpenCode,
 ACP agents) or in OpenClaw itself belong to those projects; report them there. If Claw Orchestrator invokes one of them
 in a way that creates the problem, report it here.
+
+A vulnerability in a dependency belongs here only if it can be exploited through Claw Orchestrator as published;
+otherwise report it to the dependency's project.
